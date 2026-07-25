@@ -1,0 +1,38 @@
+[package]
+name = "rdp-webrtc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native Teams-Optimized WebRTC redirector: the com.microsoft.rdc.dvc.webrtc.1 JSON-RPC protocol, decoupled from the Windows add-in DLL"
+
+[features]
+default = []
+# The real WebRTC engine (webrtc-rs). Kept behind a feature so the protocol
+# layers (framing/capture/rpc/objects/session) stay pure and quick to build; the
+# heavy async/media tree is only pulled when you want a live engine.
+engine = ["dep:webrtc", "dep:tokio", "dep:bytes"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+webrtc = { version = "0.17", optional = true }
+# `rt-multi-thread` + `macros` + `net` back the sync↔async bridge (dedicated
+# runtime thread, `tokio::select!`, and the io driver `enable_all()` needs for the
+# engine's ICE sockets); `rt`/`sync`/`time` cover spawn/channels/`interval`.
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+    "net",
+], optional = true }
+bytes = { version = "1", optional = true }
+
+[dev-dependencies]
+# For the async engine tests (#[tokio::test]); always available to tests.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

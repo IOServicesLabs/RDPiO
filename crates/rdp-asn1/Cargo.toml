@@ -1,0 +1,10 @@
+[package]
+name = "rdp-asn1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Minimal BER/PER/DER ASN.1 codec for RDP (MCS/GCC, CredSSP)"
+
+[dependencies]
+thiserror.workspace = true

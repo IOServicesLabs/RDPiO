@@ -1,0 +1,142 @@
+name: Release
+
+# Every push to main publishes/refreshes a rolling `nightly` prerelease.
+# Pushing a `v*` tag publishes a permanent release for that version.
+# Pull requests build and test only — they never publish.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # A release build carries no debug info, so keep incremental off for speed.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: rdpio.exe
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: rdpio
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+          rustup default stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ matrix.name }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.name }}-cargo-
+
+      # The protocol crates are sans-I/O and test on both platforms. On Linux
+      # the client builds headless (see PORTING.md), so its Windows-only
+      # modules are cfg'd out and simply aren't covered there.
+      - name: Test
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked -p rdp-client --target ${{ matrix.target }}
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          staging="rdpio-${{ matrix.name }}"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$staging/"
+          cp README.md "$staging/"
+          tar -czf "$staging.tar.gz" "$staging"
+          sha256sum "$staging.tar.gz" > "$staging.tar.gz.sha256"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $staging = "rdpio-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" $staging
+          Copy-Item README.md $staging
+          Compress-Archive -Path $staging -DestinationPath "$staging.zip" -Force
+          (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower() + "  $staging.zip" |
+            Out-File -Encoding ascii "$staging.zip.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdpio-${{ matrix.name }}
+          path: |
+            rdpio-${{ matrix.name }}.tar.gz*
+            rdpio-${{ matrix.name }}.zip*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Never publish from a pull request.
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            title="$tag"
+            flags=(--latest)
+            notes="Release $tag (${GITHUB_SHA:0:7})."
+          else
+            tag="nightly"
+            title="Nightly build"
+            flags=(--prerelease)
+            notes="Rolling build of \`main\` at ${GITHUB_SHA:0:7}. Replaced on every push."
+            # Move the rolling tag to this commit: drop the old release and tag
+            # first, otherwise the release would keep pointing at the old commit.
+            gh release delete "$tag" --cleanup-tag --yes || true
+          fi
+
+          gh release create "$tag" dist/* \
+            --title "$title" \
+            --notes "$notes" \
+            --target "$GITHUB_SHA" \
+            "${flags[@]}"

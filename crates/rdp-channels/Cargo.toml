@@ -1,0 +1,12 @@
+[package]
+name = "rdp-channels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Static MCS channels and DRDYNVC dynamic virtual channels"
+
+[dependencies]
+rdp-pdu.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

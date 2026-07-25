@@ -1,0 +1,9 @@
+[package]
+name = "rdp-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure-Rust crypto primitives for Standard RDP Security (RC4, MD5, SHA-1, RSA)"
+
+[dependencies]

@@ -1,0 +1,275 @@
+//! Remote Desktop Protocol: Input Virtual Channel Extension (MS-RDPEI).
+//!
+//! RDPEI carries multi-touch (and pen) input from client to server over a
+//! dynamic virtual channel named `Microsoft::Windows::RDS::Input`. This module
+//! implements the initializing phase (server-ready / client-ready handshake) and
+//! the minimal touch-frame format needed for basic multi-touch support.
+//!
+//! The module is sans-I/O: it serializes PDUs but does not read from or write
+//! to the channel directly; the DVC manager in [`crate::channel`] wraps the
+//! payloads produced here.
+
+/// The dynamic channel name for the RDPEI touch/pen input channel.
+pub const RDPINPUT_CHANNEL: &str = "Microsoft::Windows::RDS::Input";
+
+const EVENTID_SC_READY: u16 = 0x0001;
+const EVENTID_CS_READY: u16 = 0x0002;
+const EVENTID_TOUCH: u16 = 0x0003;
+
+const PROTOCOL_V100: u32 = 0x0001_0000;
+// const PROTOCOL_V101: u32 = 0x0001_0001;
+// const PROTOCOL_V200: u32 = 0x0002_0000;
+
+const CS_READY_FLAGS_DISABLE_TIMESTAMP_INJECTION: u32 = 0x0000_0002;
+
+/// Contact state flags for an [`RdpInputContact`].
+pub const CONTACT_FLAG_DOWN: u32 = 0x0001;
+pub const CONTACT_FLAG_UPDATE: u32 = 0x0002;
+pub const CONTACT_FLAG_UP: u32 = 0x0004;
+pub const CONTACT_FLAG_INRANGE: u32 = 0x0008;
+pub const CONTACT_FLAG_INCONTACT: u32 = 0x0010;
+pub const CONTACT_FLAG_CANCELED: u32 = 0x0020;
+
+/// One touch contact in virtual-desktop coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RdpInputContact {
+    /// Contact identifier (0-255). Windows assigns a stable ID per touch point.
+    pub id: u8,
+    /// X coordinate in virtual-desktop pixels.
+    pub x: i32,
+    /// Y coordinate in virtual-desktop pixels.
+    pub y: i32,
+    /// A combination of `CONTACT_FLAG_*` values.
+    pub flags: u32,
+}
+
+/// State machine for the RDPEI channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RdpInputState {
+    /// No channel open yet, or the handshake has not completed.
+    #[default]
+    Idle,
+    /// The server has sent its ready PDU and the client has replied.
+    Ready(u32),
+}
+
+/// Minimal RDPEI encoder / state machine.
+#[derive(Debug, Default)]
+pub struct RdpInputChannel {
+    state: RdpInputState,
+}
+
+impl RdpInputChannel {
+    pub fn new() -> Self {
+        Self {
+            state: RdpInputState::Idle,
+        }
+    }
+
+    pub fn state(&self) -> RdpInputState {
+        self.state
+    }
+
+    /// Process a server payload received on the RDPEI channel. Returns the
+    /// client response that must be sent back on the same channel, if any.
+    pub fn process_server_payload(&mut self, channel_id: u32, payload: &[u8]) -> Option<Vec<u8>> {
+        if payload.len() < 6 {
+            return None;
+        }
+        let event_id = u16::from_le_bytes([payload[0], payload[1]]);
+        // let pdu_length = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+
+        match event_id {
+            EVENTID_SC_READY => {
+                // V100 handshake: header + 4-byte protocolVersion. V300 may add
+                // supportedFeatures, but we answer with V100 and ignore extras.
+                if payload.len() >= 10 {
+                    // let protocol_version = u32::from_le_bytes([payload[6], payload[7], payload[8], payload[9]]);
+                    self.state = RdpInputState::Ready(channel_id);
+                    tracing::info!(
+                        channel_id,
+                        "rdpei: server ready; sending client ready (multi-touch enabled)"
+                    );
+                    Some(client_ready_pdu())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Build a touch-event PDU carrying `contacts` as a single frame. The caller
+    /// (the DVC manager) wraps the returned bytes with the DRDYNVC data header.
+    pub fn touch_event(&self, contacts: &[RdpInputContact]) -> Option<Vec<u8>> {
+        if contacts.is_empty() {
+            return None;
+        }
+        let frame = touch_frame(contacts);
+        let mut body = Vec::with_capacity(6 + 16 + frame.len());
+        // encodeTime: 0 ms (we disable timestamp injection).
+        body.extend_from_slice(&EVENTID_TOUCH.to_le_bytes());
+        // pduLength is filled in below.
+        let length_offset = body.len();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&write_vu32(0)); // encodeTime
+        body.extend_from_slice(&write_vu16(1)); // frameCount
+        body.extend_from_slice(&frame);
+        let pdu_length = body.len() as u32;
+        body[length_offset..length_offset + 4].copy_from_slice(&pdu_length.to_le_bytes());
+        Some(body)
+    }
+}
+
+fn client_ready_pdu() -> Vec<u8> {
+    let mut body = Vec::with_capacity(6 + 4 + 4 + 2);
+    body.extend_from_slice(&EVENTID_CS_READY.to_le_bytes());
+    body.extend_from_slice(&((6 + 4 + 4 + 2) as u32).to_le_bytes());
+    body.extend_from_slice(&CS_READY_FLAGS_DISABLE_TIMESTAMP_INJECTION.to_le_bytes());
+    body.extend_from_slice(&PROTOCOL_V100.to_le_bytes());
+    body.extend_from_slice(&256u16.to_le_bytes()); // maxTouchContacts
+    body
+}
+
+fn touch_frame(contacts: &[RdpInputContact]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(8 + contacts.len() * 20);
+    frame.extend_from_slice(&write_vu16(contacts.len() as u16)); // contactCount
+    frame.extend_from_slice(&write_vu64(0)); // frameOffset (0 because timestamp injection disabled)
+    for c in contacts {
+        frame.push(c.id);
+        frame.extend_from_slice(&write_vu16(0)); // fieldsPresent: no rect/orientation/pressure
+        frame.extend_from_slice(&write_vu32(c.x as u32));
+        frame.extend_from_slice(&write_vu32(c.y as u32));
+        frame.extend_from_slice(&write_vu32(c.flags));
+    }
+    frame
+}
+
+/// Variable-length unsigned integer, 1-2 bytes (TWO_BYTE_UNSIGNED_INTEGER).
+///
+/// Encoding follows MS-RDPBCGR 2.2.2.1.1: the high two bits of the first byte
+/// select the length class and the remaining bits hold the most-significant
+/// bits of the value; subsequent bytes are the rest of the value in
+/// big-endian order.
+fn write_vu16(value: u16) -> Vec<u8> {
+    if value <= 0x3F {
+        vec![value as u8]
+    } else {
+        debug_assert!(value <= 0x3FFF);
+        vec![0x40 | ((value >> 8) & 0x3F) as u8, (value & 0xFF) as u8]
+    }
+}
+
+/// Variable-length unsigned integer, 1-4 bytes (FOUR_BYTE_UNSIGNED_INTEGER).
+fn write_vu32(value: u32) -> Vec<u8> {
+    if value <= 0x3F {
+        vec![value as u8]
+    } else if value <= 0x3FFF {
+        vec![0x40 | ((value >> 8) & 0x3F) as u8, (value & 0xFF) as u8]
+    } else if value <= 0x3F_FFFF {
+        vec![
+            0x80 | ((value >> 16) & 0x3F) as u8,
+            ((value >> 8) & 0xFF) as u8,
+            (value & 0xFF) as u8,
+        ]
+    } else if value <= 0x3FFF_FFFF {
+        vec![
+            0xC0 | ((value >> 24) & 0x3F) as u8,
+            ((value >> 16) & 0xFF) as u8,
+            ((value >> 8) & 0xFF) as u8,
+            (value & 0xFF) as u8,
+        ]
+    } else {
+        // Value does not fit in 30 bits; clamp to the maximum representable value.
+        vec![0xC0 | 0x3F, 0xFF, 0xFF, 0xFF]
+    }
+}
+
+/// Variable-length unsigned integer, 1-8 bytes (EIGHT_BYTE_UNSIGNED_INTEGER).
+///
+/// RDPEI only uses this for `frameOffset`; in practice the value is 0. Values
+/// beyond 30 bits are clamped because the RDP variable-length format only
+/// encodes 30 bits in its four-byte form.
+fn write_vu64(value: u64) -> Vec<u8> {
+    if value <= 0x3F {
+        vec![value as u8]
+    } else if value <= 0x3FFF {
+        vec![0x40 | ((value >> 8) & 0x3F) as u8, (value & 0xFF) as u8]
+    } else if value <= 0x3F_FFFF {
+        vec![
+            0x80 | ((value >> 16) & 0x3F) as u8,
+            ((value >> 8) & 0xFF) as u8,
+            (value & 0xFF) as u8,
+        ]
+    } else if value <= 0x3FFF_FFFF {
+        vec![
+            0xC0 | ((value >> 24) & 0x3F) as u8,
+            ((value >> 16) & 0xFF) as u8,
+            ((value >> 8) & 0xFF) as u8,
+            (value & 0xFF) as u8,
+        ]
+    } else {
+        vec![0xC0 | 0x3F, 0xFF, 0xFF, 0xFF]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn variable_length_u16() {
+        assert_eq!(write_vu16(0x00), vec![0x00]);
+        assert_eq!(write_vu16(0x3F), vec![0x3F]);
+        // Two-byte form: top 2 bits = 01, low 6 bits = high 6 bits of value.
+        assert_eq!(write_vu16(0x40), vec![0x40, 0x40]);
+        assert_eq!(write_vu16(0x1234), vec![0x52, 0x34]);
+    }
+
+    #[test]
+    fn variable_length_u32() {
+        assert_eq!(write_vu32(0), vec![0]);
+        assert_eq!(write_vu32(0x3F), vec![0x3F]);
+        assert_eq!(write_vu32(0x40), vec![0x40, 0x40]);
+        // 0x001A1B1C -> {0x9A, 0x1B, 0x1C} per MS-RDPEGDI example.
+        assert_eq!(write_vu32(0x001A_1B1C), vec![0x9A, 0x1B, 0x1C]);
+        // 0x12345678 -> four-byte form.
+        assert_eq!(write_vu32(0x1234_5678), vec![0xD2, 0x34, 0x56, 0x78]);
+    }
+
+    #[test]
+    fn client_ready_well_formed() {
+        let pdu = client_ready_pdu();
+        assert_eq!(u16::from_le_bytes([pdu[0], pdu[1]]), EVENTID_CS_READY);
+        assert_eq!(u32::from_le_bytes([pdu[2], pdu[3], pdu[4], pdu[5]]) as usize, pdu.len());
+        assert_eq!(pdu.len(), 16);
+    }
+
+    #[test]
+    fn handshake_advances_to_ready() {
+        let mut ch = RdpInputChannel::new();
+        let mut sc = vec![0u8; 10];
+        sc[0..2].copy_from_slice(&EVENTID_SC_READY.to_le_bytes());
+        sc[2..6].copy_from_slice(&10u32.to_le_bytes());
+        sc[6..10].copy_from_slice(&PROTOCOL_V100.to_le_bytes());
+        assert!(ch.process_server_payload(7, &sc).is_some());
+        assert_eq!(ch.state(), RdpInputState::Ready(7));
+    }
+
+    #[test]
+    fn touch_event_has_one_frame() {
+        let ch = RdpInputChannel::new();
+        let contacts = [RdpInputContact {
+            id: 1,
+            x: 100,
+            y: 200,
+            flags: CONTACT_FLAG_DOWN | CONTACT_FLAG_INCONTACT | CONTACT_FLAG_INRANGE,
+        }];
+        let pdu = ch.touch_event(&contacts).unwrap();
+        assert_eq!(u16::from_le_bytes([pdu[0], pdu[1]]), EVENTID_TOUCH);
+        assert_eq!(u32::from_le_bytes([pdu[2], pdu[3], pdu[4], pdu[5]]) as usize, pdu.len());
+        // After the 6-byte header: encodeTime (vu32) == 0, frameCount (vu16) == 1.
+        assert_eq!(pdu[6], 0);
+        assert_eq!(pdu[7], 1);
+    }
+}

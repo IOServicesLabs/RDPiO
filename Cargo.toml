@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rdp-asn1",
+    "crates/rdp-crypto",
+    "crates/rdp-pdu",
+    "crates/rdp-core",
+    "crates/rdp-nla",
+    "crates/rdp-channels",
+    "crates/rdp-graphics",
+    "crates/rdp-gpu",
+    "crates/rdp-client",
+    "crates/rdp-webrtc",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/TossAyeCoin/RDPiO"
+description = "GPU-accelerated RDP client in Rust"
+
+[workspace.dependencies]
+# Internal crates
+rdp-asn1 = { path = "crates/rdp-asn1", version = "0.0.1" }
+rdp-crypto = { path = "crates/rdp-crypto", version = "0.0.1" }
+rdp-pdu = { path = "crates/rdp-pdu", version = "0.0.1" }
+rdp-core = { path = "crates/rdp-core", version = "0.0.1" }
+rdp-nla = { path = "crates/rdp-nla", version = "0.0.1" }
+rdp-channels = { path = "crates/rdp-channels", version = "0.0.1" }
+rdp-graphics = { path = "crates/rdp-graphics", version = "0.0.1" }
+rdp-gpu = { path = "crates/rdp-gpu", version = "0.0.1" }
+
+# Third-party, pure and cross-platform
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+byteorder = "1.5"
+bitflags = "2.6"
+wide = "0.7"
+ureq = { version = "2.10", features = ["json"] }
+serde_json = "1.0"
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+url = "2.5"
+http = "1.0"
+webview2-com = "0.39" # uses windows ^0.62 — matches the workspace windows below
+
+# Microsoft OS bindings. Only the windows-gated crates (rdp-nla, rdp-gpu,
+# rdp-client) enable this; each opts into the exact feature modules it needs.
+# Must match the `windows` version webview2-com pulls, so the WebView2 COM
+# types (ICoreWebView2*, HWND params) unify into a single `windows` crate.
+[workspace.dependencies.windows]
+version = "0.62"
+default-features = false
+
+[profile.release]
+opt-level = 3
+codegen-units = 16
+panic = "abort"
