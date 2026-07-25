@@ -1,0 +1,13 @@
+[package]
+name = "rdp-pdu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RDP wire PDU types with encode/decode (sans-I/O)"
+
+[dependencies]
+rdp-asn1.workspace = true
+thiserror.workspace = true
+byteorder.workspace = true
+bitflags.workspace = true

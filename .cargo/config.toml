@@ -1,0 +1,11 @@
+# Cross-build configuration for the LLVM-MinGW Windows target.
+#
+# `-static` makes the LLVM-MinGW runtime (libunwind, libc++abi, libwinpthread)
+# link statically so the produced rdpio.exe is self-contained — without it the
+# exe depends on libunwind.dll, which isn't present on a stock Windows machine
+# and makes the loader abort the process before main() (exit 0xC0000135: "the
+# program can't start because libunwind.dll is missing"). System DLLs
+# (kernel32, d3d11, mf*, etc.) stay dynamically linked as normal.
+[target.x86_64-pc-windows-gnullvm]
+linker = "x86_64-w64-mingw32-clang"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"]

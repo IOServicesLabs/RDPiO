@@ -1,0 +1,80 @@
+[package]
+name = "rdp-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RDPiO — the GPU-accelerated RDP client binary"
+
+[[bin]]
+name = "rdpio"
+path = "src/main.rs"
+
+[dependencies]
+rdp-core.workspace = true
+rdp-pdu.workspace = true
+rdp-crypto.workspace = true
+rdp-channels.workspace = true
+rdp-graphics.workspace = true
+rdp-gpu.workspace = true
+rdp-nla.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ureq.workspace = true
+serde_json.workspace = true
+tungstenite.workspace = true
+url.workspace = true
+http.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+# Linux/Unix TLS for the RDP Enhanced Security path (SChannel's counterpart).
+# Versions track what ureq already pins, so no new tree is pulled in.
+rustls = "0.23"
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+
+[target.'cfg(windows)'.dependencies]
+# Native Teams "Optimized" WebRTC engine (`--teams-native`): the portable
+# webrtc-rs-backed reimplementation of the add-in's DVC contract. Windows-only for
+# now because it's wired into the Windows graphics session; the crate itself is
+# platform-neutral and will move to a general dependency when the Linux path
+# consumes it. `engine` pulls in webrtc-rs/tokio.
+rdp-webrtc = { path = "../rdp-webrtc", features = ["engine"] }
+webview2-com.workspace = true
+# Direct dependency so the `#[implement]` macro's generated `windows_core::…`
+# paths (COM object vtables for the WebRTC add-in host) resolve. Version tracks
+# the umbrella `windows` crate above.
+windows-core = "0.62"
+windows = { workspace = true, features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Touch",
+    "Win32_Graphics_Gdi",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_Media_Audio",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_WinRT",
+    "Win32_System_Variant",
+    "Win32_Graphics_Printing",
+    "Win32_UI_Shell",
+] }

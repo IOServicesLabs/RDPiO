@@ -1,0 +1,23 @@
+[package]
+name = "rdp-nla"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CredSSP / NLA for RDP (TSRequest framing + SSPI Negotiate)"
+
+[dependencies]
+rdp-pdu.workspace = true
+rdp-asn1.workspace = true
+rdp-crypto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+    "Win32_System_Rpc",
+] }

@@ -1,0 +1,13 @@
+[package]
+name = "rdp-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sans-I/O RDP connection state machine"
+
+[dependencies]
+rdp-pdu.workspace = true
+rdp-channels.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
