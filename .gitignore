@@ -18,6 +18,11 @@
 
 # Connection files and credential/token caches. `.rdp` files carry hostnames,
 # usernames, tenant and Cloud PC identifiers; the caches carry live tokens.
+# Match cache *data* only: a bare `password_cache*` also swallowed
+# crates/rdp-client/src/password_cache.rs, which broke the Windows build (the
+# module is `#[cfg(windows)]`, so Linux never noticed it was missing).
 *.rdp
 token_cache*.json
-password_cache*
+password_cache*.json
+password_cache*.bin
+w365_password.bin
