@@ -18,7 +18,7 @@ own — the only required argument is `--host`.
 **Windows** — download the latest build and connect:
 
 ```powershell
-irm https://github.com/TossAyeCoin/RDPiO/releases/download/nightly/rdpio-windows-x86_64.zip -OutFile rdpio.zip
+irm https://github.com/IOServicesLabs/RDPiO/releases/download/nightly/rdpio-windows-x86_64.zip -OutFile rdpio.zip
 Expand-Archive rdpio.zip -DestinationPath . -Force
 .\rdpio-windows-x86_64\rdpio.exe --host 192.168.1.50 --user alice --password 'hunter2' --insecure
 ```
@@ -26,7 +26,7 @@ Expand-Archive rdpio.zip -DestinationPath . -Force
 **Linux** — same, but headless (it runs the protocol and logs frames; no window yet):
 
 ```bash
-curl -L https://github.com/TossAyeCoin/RDPiO/releases/download/nightly/rdpio-linux-x86_64.tar.gz | tar xz
+curl -L https://github.com/IOServicesLabs/RDPiO/releases/download/nightly/rdpio-linux-x86_64.tar.gz | tar xz
 RUST_LOG=info ./rdpio-linux-x86_64/rdpio --host 192.168.1.50 --user alice --password 'hunter2'
 ```
 
@@ -34,7 +34,7 @@ RUST_LOG=info ./rdpio-linux-x86_64/rdpio --host 192.168.1.50 --user alice --pass
 MSVC toolchain on Windows):
 
 ```bash
-git clone https://github.com/TossAyeCoin/RDPiO
+git clone https://github.com/IOServicesLabs/RDPiO
 cd RDPiO
 cargo build --release -p rdp-client
 ./target/release/rdpio --host 192.168.1.50 --user alice --password 'hunter2' --insecure
