@@ -325,3 +325,5 @@ and publishes the artifacts.
 ## License
 
 Licensed under either of MIT or Apache-2.0 at your option.
+
+## DEVELOPED IN THE USA
