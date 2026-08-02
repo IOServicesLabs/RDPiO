@@ -109,6 +109,9 @@ fn main() {
     crate::window::set_process_dpi_aware();
     let args = Args::from_env();
     init_tracing(args.log_file.as_deref());
+    // First line of every log: which build produced it. Field reports from a
+    // stale rdpio.exe are indistinguishable from current ones without this.
+    tracing::info!(build = env!("RDPIO_BUILD"), "rdpio starting");
     // Log the faulting module on any native crash (e.g. inside a hosted add-in),
     // so a hard crash is diagnosable instead of a silently-truncated log.
     #[cfg(windows)]
@@ -3952,13 +3955,20 @@ mod win {
                         // desktop and input is already in absolute desktop space.
                         if let (Some((w, h)), false) = (resize, per_monitor) {
                             if let Err(e) = renderer.resize(w, h) {
-                                if !is_device_lost(&e) {
-                                    return Err(e.into());
+                                // Same policy as presenting below: no GPU error
+                                // here is worth killing the app over — rebuild
+                                // and reconnect (bounded by MAX_RECONNECT).
+                                if is_device_lost(&e) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "GPU device lost while resizing; rebuilding and reconnecting"
+                                    );
+                                } else {
+                                    tracing::error!(
+                                        error = %e, w, h,
+                                        "swapchain resize failed (not device-lost); rebuilding GPU and reconnecting"
+                                    );
                                 }
-                                tracing::warn!(
-                                    error = %e,
-                                    "GPU device lost while resizing; rebuilding and reconnecting"
-                                );
                                 // Leaving the loop with `window_closed` false is
                                 // what routes us back into the reconnect path.
                                 device_lost = true;
@@ -4151,16 +4161,24 @@ mod win {
                         if pending_present && pace_ready {
                             let present_start = std::time::Instant::now();
                             if let Err(e) = renderer.present_frame() {
-                                if !is_device_lost(&e) {
-                                    return Err(e.into());
+                                // Don't take the session down with the GPU:
+                                // drop this connection, rebuild the renderer,
+                                // and let the reconnect path resume from the
+                                // cookie. This used to be device-lost-only,
+                                // and any other present error killed the whole
+                                // app; a presentation failure never deserves
+                                // that (bounded by MAX_RECONNECT regardless).
+                                if is_device_lost(&e) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "GPU device lost while presenting; rebuilding and reconnecting"
+                                    );
+                                } else {
+                                    tracing::error!(
+                                        error = %e,
+                                        "present failed (not device-lost); rebuilding GPU and reconnecting — see the preceding rdp_gpu error for the failing call"
+                                    );
                                 }
-                                // Don't take the session down with the device:
-                                // drop this connection, rebuild the GPU, and let
-                                // the reconnect path resume from the cookie.
-                                tracing::warn!(
-                                    error = %e,
-                                    "GPU device lost while presenting; rebuilding and reconnecting"
-                                );
                                 // Leaving the loop with `window_closed` false is
                                 // what routes us back into the reconnect path.
                                 device_lost = true;
