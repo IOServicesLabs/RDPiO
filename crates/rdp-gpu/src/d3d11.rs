@@ -566,15 +566,19 @@ impl D3D11Renderer {
         unsafe {
             // The RTV must be released before resizing the buffers.
             self.rtv = None;
-            self.swap_chain.ResizeBuffers(
-                0,
-                width,
-                height,
-                DXGI_FORMAT_UNKNOWN,
-                // ResizeBuffers must be given the same flags the chain was
-                // created with, or it silently drops the waitable/tearing modes.
-                DXGI_SWAP_CHAIN_FLAG(self.sc_flags as i32),
-            )?;
+            self.swap_chain
+                .ResizeBuffers(
+                    0,
+                    width,
+                    height,
+                    DXGI_FORMAT_UNKNOWN,
+                    // ResizeBuffers must be given the same flags the chain was
+                    // created with, or it silently drops the waitable/tearing modes.
+                    DXGI_SWAP_CHAIN_FLAG(self.sc_flags as i32),
+                )
+                .inspect_err(
+                    |e| tracing::error!(error = %e, width, height, "swapchain ResizeBuffers failed"),
+                )?;
             self.sc_width = width;
             self.sc_height = height;
             // The scalers were sized for the old backbuffer; rebuild on demand.
@@ -1250,7 +1254,10 @@ impl D3D11Renderer {
             let fb = self.framebuffer.clone().expect("framebuffer present");
             let copy_rects = self.stale_region();
             unsafe {
-                let back_buffer: ID3D11Texture2D = self.swap_chain.GetBuffer(0)?;
+                let back_buffer: ID3D11Texture2D = self
+                    .swap_chain
+                    .GetBuffer(0)
+                    .inspect_err(|e| tracing::error!(error = %e, "present: GetBuffer(0) failed"))?;
                 match copy_rects.as_deref() {
                     Some(rects) => {
                         for &(x, y, w, h) in rects {
@@ -1396,7 +1403,9 @@ impl D3D11Renderer {
                 }
             }
         }
-        self.swap_chain.Present(sync, flags).ok()
+        self.swap_chain.Present(sync, flags).ok().inspect_err(
+            |e| tracing::error!(error = %e, sync, "present: full-frame Present failed"),
+        )
     }
 
     /// Clone the device + immediate context so the session worker can run a DXVA
