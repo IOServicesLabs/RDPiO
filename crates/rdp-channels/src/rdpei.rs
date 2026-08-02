@@ -100,22 +100,42 @@ impl RdpInputChannel {
         }
     }
 
-    /// Build a touch-event PDU carrying `contacts` as a single frame. The caller
-    /// (the DVC manager) wraps the returned bytes with the DRDYNVC data header.
+    /// Build a touch-event PDU carrying `contacts`, split into temporal
+    /// frames. The caller (the DVC manager) wraps the returned bytes with the
+    /// DRDYNVC data header.
+    ///
+    /// A frame is a *simultaneous* snapshot, so a contact id may appear at
+    /// most once per frame — but the caller's queue is temporal: under load
+    /// it batches sequential events of the same finger (down + first moves).
+    /// Encoding those into one frame is malformed; a server that rejects it
+    /// never registers the finger-down, which then invalidates every later
+    /// event for that contact (observed as completely dead touch). Contacts
+    /// are therefore packed greedily into frames such that each id appears
+    /// once per frame, preserving order.
     pub fn touch_event(&self, contacts: &[RdpInputContact]) -> Option<Vec<u8>> {
         if contacts.is_empty() {
             return None;
         }
-        let frame = touch_frame(contacts);
-        let mut body = Vec::with_capacity(6 + 16 + frame.len());
-        // encodeTime: 0 ms (we disable timestamp injection).
+        let mut frames: Vec<Vec<RdpInputContact>> = Vec::new();
+        for c in contacts {
+            match frames.last_mut() {
+                Some(f) if !f.iter().any(|e| e.id == c.id) => f.push(*c),
+                _ => frames.push(vec![*c]),
+            }
+        }
+        let mut body = Vec::with_capacity(6 + 16 + contacts.len() * 16);
         body.extend_from_slice(&EVENTID_TOUCH.to_le_bytes());
         // pduLength is filled in below.
         let length_offset = body.len();
         body.extend_from_slice(&0u32.to_le_bytes());
-        body.extend_from_slice(&write_vu32(0)); // encodeTime
-        body.extend_from_slice(&write_vu16(1)); // frameCount
-        body.extend_from_slice(&frame);
+        body.extend_from_slice(&write_vu32(0)); // encodeTime (timestamp injection disabled)
+        body.extend_from_slice(&write_vu16(frames.len() as u16)); // frameCount
+        for (i, f) in frames.iter().enumerate() {
+            // frameOffset: first frame 0; later frames a nominal 1 ms after
+            // the previous (100-microsecond units), keeping same-contact
+            // events distinct in time for the server-side injector.
+            body.extend_from_slice(&touch_frame(f, if i == 0 { 0 } else { 10 }));
+        }
         let pdu_length = body.len() as u32;
         body[length_offset..length_offset + 4].copy_from_slice(&pdu_length.to_le_bytes());
         Some(body)
@@ -132,14 +152,17 @@ fn client_ready_pdu() -> Vec<u8> {
     // after which every touch frame is silently discarded. The touch wire
     // format is identical across the two versions.
     body.extend_from_slice(&PROTOCOL_V101.to_le_bytes());
-    body.extend_from_slice(&256u16.to_le_bytes()); // maxTouchContacts
+    // 10, matching what real clients (and real digitizers) advertise. The
+    // earlier 256 was within the field's range but beyond anything a server
+    // expects to see, and one more excuse for a validator to junk the PDU.
+    body.extend_from_slice(&10u16.to_le_bytes()); // maxTouchContacts
     body
 }
 
-fn touch_frame(contacts: &[RdpInputContact]) -> Vec<u8> {
+fn touch_frame(contacts: &[RdpInputContact], frame_offset: u64) -> Vec<u8> {
     let mut frame = Vec::with_capacity(8 + contacts.len() * 20);
     frame.extend_from_slice(&write_vu16(contacts.len() as u16)); // contactCount
-    frame.extend_from_slice(&write_vu64(0)); // frameOffset (0 because timestamp injection disabled)
+    frame.extend_from_slice(&write_vu64(frame_offset)); // offset from previous frame, 100us units
     for c in contacts {
         frame.push(c.id);
         frame.extend_from_slice(&write_vu16(0)); // fieldsPresent: no rect/orientation/pressure
@@ -314,11 +337,56 @@ mod tests {
             y: 3,
             flags: CONTACT_FLAG_UPDATE | CONTACT_FLAG_INCONTACT | CONTACT_FLAG_INRANGE,
         }];
-        let frame = touch_frame(&contacts);
+        let frame = touch_frame(&contacts, 0);
         // contactCount(1) + frameOffset(1) + id(1) + fieldsPresent(1)
         //   + x(3) + y(1) + flags(1)
         assert_eq!(frame.len(), 9);
         assert_eq!(&frame[4..7], &[0x80, 0x20, 0x00]);
+    }
+
+    #[test]
+    fn touch_event_splits_same_contact_into_frames() {
+        // A down + move of the SAME finger batched into one call (worker lag)
+        // must become two frames — one frame may hold a contact id only once.
+        let ch = RdpInputChannel::new();
+        let down = RdpInputContact {
+            id: 0,
+            x: 10,
+            y: 10,
+            flags: CONTACT_FLAG_DOWN | CONTACT_FLAG_INRANGE | CONTACT_FLAG_INCONTACT,
+        };
+        let mv = RdpInputContact {
+            id: 0,
+            x: 12,
+            y: 14,
+            flags: CONTACT_FLAG_UPDATE | CONTACT_FLAG_INRANGE | CONTACT_FLAG_INCONTACT,
+        };
+        let pdu = ch.touch_event(&[down, mv]).unwrap();
+        assert_eq!(pdu[6], 0); // encodeTime
+        assert_eq!(pdu[7], 2); // frameCount == 2
+        // Frame 1: contactCount=1, frameOffset=0, then the down contact.
+        assert_eq!(pdu[8], 1);
+        assert_eq!(pdu[9], 0);
+        // Frame 2 begins after frame 1 (1+1+1+1+1+1+1 = 7 bytes for small
+        // coords): contactCount=1, frameOffset=10 (1 ms).
+        assert_eq!(pdu[15], 1);
+        assert_eq!(pdu[16], 10);
+        assert_eq!(u32::from_le_bytes([pdu[2], pdu[3], pdu[4], pdu[5]]) as usize, pdu.len());
+    }
+
+    #[test]
+    fn touch_event_keeps_simultaneous_contacts_in_one_frame() {
+        // Two DIFFERENT fingers (pinch) stay in a single frame.
+        let ch = RdpInputChannel::new();
+        let mk = |id: u8| RdpInputContact {
+            id,
+            x: 10,
+            y: 10,
+            flags: CONTACT_FLAG_DOWN | CONTACT_FLAG_INRANGE | CONTACT_FLAG_INCONTACT,
+        };
+        let pdu = ch.touch_event(&[mk(0), mk(1)]).unwrap();
+        assert_eq!(pdu[7], 1); // frameCount == 1
+        assert_eq!(pdu[8], 2); // contactCount == 2
     }
 
     #[test]
