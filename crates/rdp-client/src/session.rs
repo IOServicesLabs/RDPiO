@@ -2083,7 +2083,23 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         if !touches.is_empty() {
             if let (Some(ch), Some(pdu)) = (dvc_channel, graphics.wrap_touch_event(&touches)) {
                 session.send_dvc(stream, ch, &pdu)?;
+                // First frame at info so a log shows whether touch input is
+                // reaching the wire at all; the rest stay at trace.
+                static TOUCH_FLOWING: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !TOUCH_FLOWING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(contacts = touches.len(), "touch input active: first RDPEI touch frame sent");
+                }
                 tracing::trace!(contacts = touches.len(), "sent RDPEI touch frame");
+            } else {
+                static TOUCH_DROPPED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !TOUCH_DROPPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        contacts = touches.len(),
+                        "touch input dropped: RDPEI channel not open/ready (server may not support touch, or the handshake failed)"
+                    );
+                }
             }
         }
 

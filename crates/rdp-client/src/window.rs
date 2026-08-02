@@ -890,9 +890,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if ok {
                 let (ox, oy) = window_offset(hwnd);
                 for ti in inputs {
-                    // TOUCHINPUT coordinates are in hundredths of a pixel.
-                    let x = (ti.x as i32) / 100 + ox;
-                    let y = (ti.y as i32) / 100 + oy;
+                    // TOUCHINPUT coordinates are hundredths of a *screen*
+                    // pixel — unlike mouse messages, which arrive in client
+                    // coordinates. Convert to client space first, then apply
+                    // the multi-monitor desktop offset like every other
+                    // pointer path.
+                    let mut pt = windows::Win32::Foundation::POINT {
+                        x: (ti.x as i32) / 100,
+                        y: (ti.y as i32) / 100,
+                    };
+                    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+                    let x = pt.x + ox;
+                    let y = pt.y + oy;
                     let flags = ti.dwFlags;
                     let phase = if (flags.0 & TOUCHEVENTF_DOWN.0) != 0 {
                         0u8

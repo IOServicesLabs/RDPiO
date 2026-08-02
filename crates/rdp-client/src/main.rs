@@ -3580,6 +3580,9 @@ mod win {
         let mut client = (width, height); // current window client size, for scaling
         let mut desktop = (desktop_w, desktop_h); // current remote desktop size (resizable)
         let mut last_pos = (0u16, 0u16); // last pointer position (desktop pixels)
+        // Windows digitizer contact ids (TOUCHINPUT.dwID) are arbitrary u32
+        // driver cursor ids; RDPEI contact ids must be stable 0-255 slots.
+        let mut touch_slots: std::collections::HashMap<u32, u8> = std::collections::HashMap::new();
 
         // Performance telemetry: shared across the UI, network, and decode threads.
         // Drained and logged every 10 seconds by the UI loop.
@@ -3994,7 +3997,8 @@ mod win {
                                 .into_iter()
                                 .filter_map(|raw| {
                                     if let RawInput::Touch { id, x, y, phase } = raw {
-                                        touches.push(touch_to_contact(id, x, y, phase, desktop, client));
+                                        let slot = touch_slot(&mut touch_slots, id, phase);
+                                        touches.push(touch_to_contact(slot, x, y, phase, desktop, client));
                                         return None;
                                     }
                                     map_input(raw, desktop, client, &mut last_pos, rel_capture)
@@ -4324,10 +4328,34 @@ mod win {
         out
     }
 
+    /// Map a Windows digitizer contact id to a stable RDPEI slot (0-255): the
+    /// lowest slot not held by another live contact, held from down to up.
+    /// MS-RDPEI contact ids are a single byte, and servers track the contact
+    /// state machine per id — truncating the raw driver id could collide two
+    /// simultaneous contacts or break down/up pairing.
+    fn touch_slot(slots: &mut std::collections::HashMap<u32, u8>, id: u32, phase: u8) -> u8 {
+        if let Some(&s) = slots.get(&id) {
+            if phase == 1 {
+                slots.remove(&id);
+            }
+            return s;
+        }
+        let mut slot = 0u8;
+        while slots.values().any(|&v| v == slot) && slot < u8::MAX {
+            slot += 1;
+        }
+        // An up for an unknown contact still reports the computed slot; it is
+        // not retained, so a stray up cannot leak a slot.
+        if phase != 1 {
+            slots.insert(id, slot);
+        }
+        slot
+    }
+
     /// Map a multi-touch contact from window client pixels to RDPEI virtual-
     /// desktop coordinates and contact-state flags.
     fn touch_to_contact(
-        id: u32,
+        slot: u8,
         x: i32,
         y: i32,
         phase: u8,
@@ -4344,11 +4372,14 @@ mod win {
         let dy = (y.max(0) as u32).saturating_mul(desktop.1) / ch;
         let flags = match phase {
             0 => CONTACT_FLAG_DOWN | CONTACT_FLAG_INRANGE | CONTACT_FLAG_INCONTACT,
-            1 => CONTACT_FLAG_UP | CONTACT_FLAG_INRANGE,
+            // UP alone: UP|INRANGE is the "lifted but still hovering" pen
+            // transition, which is invalid for a touch digitizer's end-of-
+            // contact and gets the frame rejected by strict servers.
+            1 => CONTACT_FLAG_UP,
             _ => CONTACT_FLAG_UPDATE | CONTACT_FLAG_INRANGE | CONTACT_FLAG_INCONTACT,
         };
         rdp_channels::rdpei::RdpInputContact {
-            id: id as u8,
+            id: slot,
             x: dx as i32,
             y: dy as i32,
             flags,

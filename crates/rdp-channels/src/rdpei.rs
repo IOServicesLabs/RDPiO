@@ -16,8 +16,9 @@ const EVENTID_SC_READY: u16 = 0x0001;
 const EVENTID_CS_READY: u16 = 0x0002;
 const EVENTID_TOUCH: u16 = 0x0003;
 
+#[cfg(test)]
 const PROTOCOL_V100: u32 = 0x0001_0000;
-// const PROTOCOL_V101: u32 = 0x0001_0001;
+const PROTOCOL_V101: u32 = 0x0001_0001;
 // const PROTOCOL_V200: u32 = 0x0002_0000;
 
 const CS_READY_FLAGS_DISABLE_TIMESTAMP_INJECTION: u32 = 0x0000_0002;
@@ -126,7 +127,11 @@ fn client_ready_pdu() -> Vec<u8> {
     body.extend_from_slice(&EVENTID_CS_READY.to_le_bytes());
     body.extend_from_slice(&((6 + 4 + 4 + 2) as u32).to_le_bytes());
     body.extend_from_slice(&CS_READY_FLAGS_DISABLE_TIMESTAMP_INJECTION.to_le_bytes());
-    body.extend_from_slice(&PROTOCOL_V100.to_le_bytes());
+    // V101, not V100: DISABLE_TIMESTAMP_INJECTION is only defined from V101
+    // on, and a server validating the pair can junk the whole client-ready —
+    // after which every touch frame is silently discarded. The touch wire
+    // format is identical across the two versions.
+    body.extend_from_slice(&PROTOCOL_V101.to_le_bytes());
     body.extend_from_slice(&256u16.to_le_bytes()); // maxTouchContacts
     body
 }
@@ -138,8 +143,11 @@ fn touch_frame(contacts: &[RdpInputContact]) -> Vec<u8> {
     for c in contacts {
         frame.push(c.id);
         frame.extend_from_slice(&write_vu16(0)); // fieldsPresent: no rect/orientation/pressure
-        frame.extend_from_slice(&write_vu32(c.x as u32));
-        frame.extend_from_slice(&write_vu32(c.y as u32));
+        // x/y are FOUR_BYTE_SIGNED_INTEGER on the wire: the sign bit lives in
+        // bit 5 of the first byte and the first byte carries only 5 value
+        // bits, so the unsigned encoding diverges from coordinate 0x2000 up.
+        frame.extend_from_slice(&write_vi32(c.x));
+        frame.extend_from_slice(&write_vi32(c.y));
         frame.extend_from_slice(&write_vu32(c.flags));
     }
     frame
@@ -157,6 +165,36 @@ fn write_vu16(value: u16) -> Vec<u8> {
     } else {
         debug_assert!(value <= 0x3FFF);
         vec![0x40 | ((value >> 8) & 0x3F) as u8, (value & 0xFF) as u8]
+    }
+}
+
+/// Variable-length signed integer, 1-4 bytes (FOUR_BYTE_SIGNED_INTEGER).
+///
+/// First byte: 2-bit length class, then the sign bit (0x20), then the top 5
+/// bits of the magnitude; remaining bytes are the magnitude in big-endian
+/// order. Magnitudes beyond 29 bits are clamped (RDPEI coordinates never
+/// approach that).
+fn write_vi32(value: i32) -> Vec<u8> {
+    let sign = if value < 0 { 0x20u8 } else { 0 };
+    let v = value.unsigned_abs();
+    if v <= 0x1F {
+        vec![sign | v as u8]
+    } else if v <= 0x1FFF {
+        vec![0x40 | sign | ((v >> 8) & 0x1F) as u8, (v & 0xFF) as u8]
+    } else if v <= 0x1F_FFFF {
+        vec![
+            0x80 | sign | ((v >> 16) & 0x1F) as u8,
+            ((v >> 8) & 0xFF) as u8,
+            (v & 0xFF) as u8,
+        ]
+    } else {
+        let v = v.min(0x1FFF_FFFF);
+        vec![
+            0xC0 | sign | ((v >> 24) & 0x1F) as u8,
+            ((v >> 16) & 0xFF) as u8,
+            ((v >> 8) & 0xFF) as u8,
+            (v & 0xFF) as u8,
+        ]
     }
 }
 
@@ -243,6 +281,44 @@ mod tests {
         assert_eq!(u16::from_le_bytes([pdu[0], pdu[1]]), EVENTID_CS_READY);
         assert_eq!(u32::from_le_bytes([pdu[2], pdu[3], pdu[4], pdu[5]]) as usize, pdu.len());
         assert_eq!(pdu.len(), 16);
+        // DISABLE_TIMESTAMP_INJECTION is only defined from V101 on; the pair
+        // must stay consistent or servers may junk the whole client-ready.
+        let version = u32::from_le_bytes([pdu[10], pdu[11], pdu[12], pdu[13]]);
+        assert_eq!(version, PROTOCOL_V101);
+    }
+
+    #[test]
+    fn variable_length_i32() {
+        // One byte: 5 value bits + sign.
+        assert_eq!(write_vi32(0), vec![0x00]);
+        assert_eq!(write_vi32(0x1F), vec![0x1F]);
+        assert_eq!(write_vi32(-1), vec![0x21]);
+        // Two bytes from 0x20 (the unsigned form switches at 0x40).
+        assert_eq!(write_vi32(0x20), vec![0x40, 0x20]);
+        assert_eq!(write_vi32(-0x20), vec![0x60, 0x20]);
+        // 8192 (0x2000) is where a signed value no longer fits two bytes —
+        // the old unsigned encoding kept it in two and corrupted the stream.
+        assert_eq!(write_vi32(0x1FFF), vec![0x5F, 0xFF]);
+        assert_eq!(write_vi32(0x2000), vec![0x80, 0x20, 0x00]);
+        assert_eq!(write_vi32(-0x2000), vec![0xA0, 0x20, 0x00]);
+        // Four-byte form.
+        assert_eq!(write_vi32(0x0200_0000), vec![0xC2, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn touch_frame_encodes_signed_coordinates() {
+        // A coordinate past 0x1FFF must take the three-byte signed form.
+        let contacts = [RdpInputContact {
+            id: 0,
+            x: 0x2000,
+            y: 3,
+            flags: CONTACT_FLAG_UPDATE | CONTACT_FLAG_INCONTACT | CONTACT_FLAG_INRANGE,
+        }];
+        let frame = touch_frame(&contacts);
+        // contactCount(1) + frameOffset(1) + id(1) + fieldsPresent(1)
+        //   + x(3) + y(1) + flags(1)
+        assert_eq!(frame.len(), 9);
+        assert_eq!(&frame[4..7], &[0x80, 0x20, 0x00]);
     }
 
     #[test]
