@@ -207,6 +207,20 @@ fn take_touch_queue() -> Vec<rdp_channels::rdpei::RdpInputContact> {
     TOUCH_QUEUE.lock().ok().map_or(Vec::new(), |mut q| std::mem::take(&mut *q))
 }
 
+/// Whether the RDPEI touch channel is open and past its handshake, i.e.
+/// contacts queued now will actually reach the server. The UI thread reads
+/// this to decide whether to swallow touch-promoted mouse messages (native
+/// touch active) or keep them (promotion is the only touch support left).
+/// Tracks the live session: reset when a (re)connect starts, refreshed from
+/// the graphics channel state by the worker loop.
+#[cfg(windows)]
+static RDPEI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+pub(crate) fn rdpei_active() -> bool {
+    RDPEI_ACTIVE.load(Ordering::Relaxed)
+}
+
 /// The server's `TS_INPUT_CAPABILITYSET.inputFlags` from the latest Demand
 /// Active (bit 15 marks "seen", so 0 = not yet known). The UI thread reads this
 /// to decide whether mouse-capture mode may send relative pointer events.
@@ -1631,6 +1645,10 @@ pub fn run_session<S: Read + Write, F: FrameSink>(
     session: &mut ActiveSession,
     sink: &mut F,
 ) -> Result<(), ActivateError> {
+    // No RDPEI on the legacy path: never leave a previous graphics session's
+    // flag swallowing touch-promoted mouse input here.
+    #[cfg(windows)]
+    RDPEI_ACTIVE.store(false, Ordering::Relaxed);
     loop {
         if pump_once(stream, session, sink)? == Pump::Painted {
             sink.present();
@@ -2077,6 +2095,11 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                 pending_resize = Some((monitors, since));
             }
         }
+
+        // Publish the touch channel's state for the UI thread's promoted-mouse
+        // dedup; self-corrects across reconnects (a fresh session's channel
+        // starts un-ready).
+        RDPEI_ACTIVE.store(graphics.rdpei_ready(), Ordering::Relaxed);
 
         // Forward any queued multi-touch contacts over the RDPEI channel.
         let touches = take_touch_queue();

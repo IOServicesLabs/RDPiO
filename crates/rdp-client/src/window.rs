@@ -646,6 +646,16 @@ unsafe fn window_offset(hwnd: HWND) -> (i32, i32) {
     (((v >> 32) & 0xffff_ffff) as i32, (v & 0xffff_ffff) as i32)
 }
 
+/// Whether the mouse message being processed was synthesized from touch/pen
+/// (documented signature in the message extra info: upper 24 bits 0xFF5157).
+/// Only meaningful while handling the message on its own thread.
+unsafe fn promoted_from_touch() -> bool {
+    const MI_WP_SIGNATURE: u32 = 0xFF51_5700;
+    const SIGNATURE_MASK: u32 = 0xFFFF_FF00;
+    let extra = windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo();
+    (extra.0 as u32) & SIGNATURE_MASK == MI_WP_SIGNATURE
+}
+
 /// Whether mouse-capture (game) mode is engaged.
 pub fn capture_mode() -> bool {
     CAPTURE.load(Ordering::SeqCst)
@@ -819,6 +829,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_MOUSEMOVE => {
+            // A finger on the touchscreen arrives twice: as WM_TOUCH and again
+            // as promoted mouse messages (measured on Win11: promotion happens
+            // even when WM_TOUCH is processed). While the touch channel is
+            // live, forwarding the promoted copy makes every finger drive the
+            // remote cursor and stomp the touch stream — swallow it. Without
+            // RDPEI the promotion is deliberately kept: it is the only touch
+            // functionality (tap = click) the session can offer.
+            if promoted_from_touch() && crate::session::rdpei_active() {
+                return LRESULT(0);
+            }
             // In relative capture mode absolute moves are noise (the cursor is
             // parked at the window centre); motion flows via WM_INPUT instead.
             if CAPTURE.load(Ordering::SeqCst) && crate::session::rel_mouse_supported() {
@@ -833,6 +853,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
         | WM_MBUTTONUP => {
+            // Touch-promoted buttons (incl. press-and-hold right-click): same
+            // dedup as WM_MOUSEMOVE above — the contact already went via RDPEI.
+            if promoted_from_touch() && crate::session::rdpei_active() {
+                return LRESULT(0);
+            }
             let (button, down) = match msg {
                 WM_LBUTTONDOWN => (0u8, true),
                 WM_LBUTTONUP => (0, false),
@@ -921,7 +946,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
             let _ = CloseTouchInputHandle(htouch);
-            LRESULT(1)
+            // MSDN: an application that processes WM_TOUCH returns zero.
+            LRESULT(0)
         }
         WM_KILLFOCUS => {
             // Never hold the cursor hostage while another window has focus.
