@@ -156,13 +156,26 @@ impl CameraEnumerator {
                 let mut out = vec![message(msg::SELECT_VERSION_RESPONSE, &[CAM_VERSION])];
                 if !self.announced {
                     for dev in &self.devices {
+                        tracing::info!(
+                            device = %dev.name,
+                            channel = %dev.channel_name,
+                            "announcing local camera to the session"
+                        );
                         out.push(device_added(dev));
+                    }
+                    if self.devices.is_empty() {
+                        tracing::info!(
+                            "camera redirection: no local cameras found; none announced"
+                        );
                     }
                     self.announced = true;
                 }
                 out
             }
-            _ => Vec::new(),
+            other => {
+                tracing::debug!(message_id = other, "unhandled camera enumerator message");
+                Vec::new()
+            }
         }
     }
 }

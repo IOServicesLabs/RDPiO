@@ -9,8 +9,11 @@
     It picks sensible flags for either gaming/low-latency or office/clarity use.
 
 .PARAMETER Mode
-    gaming  = low latency, AVC420-only, render-scale + RTX VSR upscale
-    office  = clarity-first, full AVC444, bicubic upscale
+    gaming  = AVC420-only codec preset, render-scale + FSR upscale (FSR runs on
+              any GPU — VSR needs an NVIDIA RTX / Intel Arc driver and silently
+              degrades elsewhere). Run rdpio.exe directly with --low-latency
+              if you also want tearing presents (lowest lag, visible shear).
+    office  = clarity-first defaults: vsync, 1:1 rendering, bicubic.
 
 .PARAMETER RdpHost
     RDP host IP or name. (Not named -Host: $Host is a read-only PowerShell
@@ -73,29 +76,34 @@ if ($Log) {
 
 switch ($Mode) {
     'gaming' {
+        # FSR, not VSR: VSR is an NVIDIA RTX / Intel Arc driver feature — on
+        # anything else (e.g. Intel UHD iGPUs) it can't engage and the scaled
+        # frame goes through a lesser fallback. FSR's EASU+RCAS shader runs on
+        # any GPU and reconstructs game imagery best.
+        # No --udp: the UDP side-band is experimental and corrupts the stream
+        # under packet loss (artifacts); re-add once the transport is fixed.
+        # No --low-latency: tearing presents are an opt-in trade-off.
         $flags = @(
             '--gaming'
-            '--low-latency'
-            '--udp'
-            '--upscale', 'vsr'
+            '--upscale', 'fsr'
         )
         if ($PSBoundParameters.ContainsKey('RenderScale')) {
             $flags += '--render-scale', $RenderScale
         } else {
             $flags += '--render-scale', '0.7'
         }
-        Write-Host 'Launching RDPiO in GAMING mode (latency-first, AVC420, render-scale, VSR)...' -ForegroundColor Green
+        Write-Host 'Launching RDPiO in GAMING mode (AVC420, render-scale, FSR)...' -ForegroundColor Green
     }
     'office' {
-        $flags = @(
-            '--office'
-            '--force-avc444'
-            '--upscale', 'bicubic'
-        )
+        # --office already selects vsync, 1:1 rendering and bicubic; only a
+        # user-chosen render-scale needs forwarding. (No --force-avc444: the
+        # GPU decode path cannot use the extra chroma stream yet, so it would
+        # double the host's encode work for an identical picture.)
+        $flags = @('--office')
         if ($PSBoundParameters.ContainsKey('RenderScale')) {
             $flags += '--render-scale', $RenderScale
         }
-        Write-Host 'Launching RDPiO in OFFICE mode (clarity-first, AVC444, bicubic)...' -ForegroundColor Green
+        Write-Host 'Launching RDPiO in OFFICE mode (clarity-first: vsync, 1:1, bicubic)...' -ForegroundColor Green
     }
 }
 

@@ -40,6 +40,11 @@ byteorder = "1.5"
 bitflags = "2.6"
 wide = "0.7"
 ureq = { version = "2.10", features = ["json"] }
+# Allocator. The default on Windows is HeapAlloc, whose per-heap lock is
+# contended across our network / decode / UI threads, and the tile codecs
+# allocate a buffer per tile — hundreds per frame. mimalloc's per-thread free
+# lists take that contention off the hot path.
+mimalloc = "0.1"
 serde_json = "1.0"
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 url = "2.5"
@@ -56,5 +61,14 @@ default-features = false
 
 [profile.release]
 opt-level = 3
-codegen-units = 16
+# One codegen unit per crate lets LLVM see each whole crate at once, which is
+# what lets it inline and vectorise the per-pixel hot loops (YUV conversion,
+# ClearCodec, progressive RLGR). Costs build time (~20s → ~42s), not runtime.
+#
+# NOTE: `lto` is deliberately NOT set. Both `lto = "fat"` and `lto = "thin"`
+# crash rustc on this dependency set — fat with STATUS_ACCESS_VIOLATION building
+# `webrtc`, thin with STATUS_STACK_BUFFER_OVERRUN linking `rdpio`. Worth
+# retrying on a future toolchain; it would mainly buy cross-crate inlining
+# between rdp-graphics and rdp-client.
+codegen-units = 1
 panic = "abort"

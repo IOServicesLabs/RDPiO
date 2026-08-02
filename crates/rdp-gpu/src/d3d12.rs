@@ -66,12 +66,16 @@ ByteAddressBuffer nv12 : register(t0);
 RWTexture2D<float4> framebuffer : register(u0);
 
 cbuffer Params : register(b0) {
-    uint width;
-    uint height;
-    uint dest_x;
+    uint width;      // full NV12 frame width (the Y/UV stride)
+    uint height;     // full frame height
+    uint dest_x;     // desktop position of the frame origin
     uint dest_y;
     uint fb_width;
     uint fb_height;
+    uint region_x;   // dirty region within the frame (one dispatch per region)
+    uint region_y;
+    uint region_w;
+    uint region_h;
 };
 
 static const float3x3 yuv_to_rgb = {
@@ -80,21 +84,29 @@ static const float3x3 yuv_to_rgb = {
     1.16438356,  2.01723214, 0.0
 };
 
+// ByteAddressBuffer loads whole 32-bit words at 4-byte-aligned addresses;
+// extract the single byte the address actually names.
+uint load_byte(uint addr) {
+    return (nv12.Load(addr & ~3u) >> ((addr & 3u) * 8u)) & 0xffu;
+}
+
 [numthreads(8, 8, 1)]
 void cs_main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= width || id.y >= height) return;
-    uint dx = id.x + dest_x;
-    uint dy = id.y + dest_y;
+    if (id.x >= region_w || id.y >= region_h) return;
+    uint sx = region_x + id.x;
+    uint sy = region_y + id.y;
+    if (sx >= width || sy >= height) return;
+    uint dx = sx + dest_x;
+    uint dy = sy + dest_y;
     if (dx >= fb_width || dy >= fb_height) return;
 
-    uint y_idx = id.y * width + id.x;
-    float y = nv12.Load(y_idx) / 255.0;
+    float y = load_byte(sy * width + sx) / 255.0;
 
-    uint uv_row = id.y / 2;
-    uint uv_col = (id.x / 2) * 2;
+    uint uv_row = sy / 2;
+    uint uv_col = (sx / 2) * 2;
     uint uv_base = width * height + uv_row * width + uv_col;
-    float u = nv12.Load(uv_base) / 255.0 - 0.5;
-    float v = nv12.Load(uv_base + 1) / 255.0 - 0.5;
+    float u = load_byte(uv_base) / 255.0 - 0.5;
+    float v = load_byte(uv_base + 1) / 255.0 - 0.5;
 
     float3 yuv = float3(y - 16.0 / 255.0, u, v);
     float3 rgb = mul(yuv, yuv_to_rgb);
@@ -102,8 +114,222 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// Compute-shader mirror of the D3D11 scale/sharpen kernels (see the D3D11
+/// backend's `SCALE_HLSL` for the algorithm commentary): bilinear, Catmull-Rom
+/// bicubic, FSR 1.0 EASU, nearest, and the FSR 1.0 RCAS sharpen. Each thread
+/// writes one destination pixel; every tap is clamped to the `srcOff`/`srcSize`
+/// slice so per-monitor slices never bleed across a seam. `Bilinear` exists
+/// here because D3D12 has no VideoProcessor scale path.
+const SCALE_CS_HLSL: &str = r#"
+Texture2D<float4> src : register(t0);
+RWTexture2D<float4> dst : register(u0);
+SamplerState samp : register(s0);
+cbuffer Params : register(b0) {
+    float2 srcOff;      // slice top-left within src, texels
+    float2 srcSize;     // slice size, texels
+    float2 outSize;     // destination size, pixels
+    float2 invTexSize;  // 1 / full src size
+    float2 texSize;     // full src size
+    float  sharpness;   // RCAS linear intensity (exp2(-stops))
+    float  _pad;
+};
+
+float3 loadTexel(float2 p) {
+    float2 c = clamp(p, srcOff, srcOff + srcSize - 1.0);
+    return src.Load(int3(int2(c), 0)).rgb;
+}
+
+float fsrLuma(float3 c) { return 0.5 * c.r + c.g + 0.5 * c.b; }
+
+[numthreads(8, 8, 1)]
+void cs_bilinear(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= (uint)outSize.x || id.y >= (uint)outSize.y) return;
+    float2 uv = (float2(id.xy) + 0.5) / outSize;
+    float2 samplePos = srcOff + uv * srcSize;
+    float2 lo = srcOff + 0.5;
+    float2 hi = srcOff + srcSize - 0.5;
+    float2 tuv = clamp(samplePos, lo, hi) * invTexSize;
+    dst[id.xy] = float4(src.SampleLevel(samp, tuv, 0.0).rgb, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void cs_nearest(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= (uint)outSize.x || id.y >= (uint)outSize.y) return;
+    float2 uv = (float2(id.xy) + 0.5) / outSize;
+    float2 samplePos = srcOff + uv * srcSize;
+    dst[id.xy] = float4(loadTexel(floor(samplePos)), 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void cs_bicubic(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= (uint)outSize.x || id.y >= (uint)outSize.y) return;
+    float2 uv = (float2(id.xy) + 0.5) / outSize;
+    float2 samplePos = srcOff + uv * srcSize;
+    float2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    float2 f = samplePos - texPos1;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 offset12 = w2 / w12;
+    float2 lo = srcOff + 0.5;
+    float2 hi = srcOff + srcSize - 0.5;
+    float2 p0  = clamp(texPos1 - 1.0,      lo, hi) * invTexSize;
+    float2 p3  = clamp(texPos1 + 2.0,      lo, hi) * invTexSize;
+    float2 p12 = clamp(texPos1 + offset12, lo, hi) * invTexSize;
+    float4 r = float4(0.0, 0.0, 0.0, 0.0);
+    r += src.SampleLevel(samp, float2(p0.x,  p0.y),  0.0) * (w0.x  * w0.y);
+    r += src.SampleLevel(samp, float2(p12.x, p0.y),  0.0) * (w12.x * w0.y);
+    r += src.SampleLevel(samp, float2(p3.x,  p0.y),  0.0) * (w3.x  * w0.y);
+    r += src.SampleLevel(samp, float2(p0.x,  p12.y), 0.0) * (w0.x  * w12.y);
+    r += src.SampleLevel(samp, float2(p12.x, p12.y), 0.0) * (w12.x * w12.y);
+    r += src.SampleLevel(samp, float2(p3.x,  p12.y), 0.0) * (w3.x  * w12.y);
+    r += src.SampleLevel(samp, float2(p0.x,  p3.y),  0.0) * (w0.x  * w3.y);
+    r += src.SampleLevel(samp, float2(p12.x, p3.y),  0.0) * (w12.x * w3.y);
+    r += src.SampleLevel(samp, float2(p3.x,  p3.y),  0.0) * (w3.x  * w3.y);
+    r.a = 1.0;
+    dst[id.xy] = r;
+}
+
+void easuSet(inout float2 dir, inout float len, float w,
+             float lA, float lB, float lC, float lD, float lE) {
+    float dc = lD - lC;
+    float cb = lC - lB;
+    float lenX = max(abs(dc), abs(cb));
+    lenX = 1.0 / max(lenX, 1.0 / 32768.0);
+    float dirX = lD - lB;
+    dir.x += dirX * w;
+    lenX = saturate(abs(dirX) * lenX);
+    lenX *= lenX;
+    len += lenX * w;
+    float ec = lE - lC;
+    float ca = lC - lA;
+    float lenY = max(abs(ec), abs(ca));
+    lenY = 1.0 / max(lenY, 1.0 / 32768.0);
+    float dirY = lE - lA;
+    dir.y += dirY * w;
+    lenY = saturate(abs(dirY) * lenY);
+    lenY *= lenY;
+    len += lenY * w;
+}
+
+void easuTap(inout float3 aC, inout float aW, float2 off, float2 dir,
+             float2 len, float lob, float clp, float3 c) {
+    float2 v;
+    v.x = off.x * dir.x + off.y * dir.y;
+    v.y = -off.x * dir.y + off.y * dir.x;
+    v *= len;
+    float d2 = min(v.x * v.x + v.y * v.y, clp);
+    float wB = 0.4 * d2 - 1.0;
+    float wA = lob * d2 - 1.0;
+    wB *= wB;
+    wA *= wA;
+    wB = 1.5625 * wB - 0.5625;
+    float w = wB * wA;
+    aC += c * w;
+    aW += w;
+}
+
+[numthreads(8, 8, 1)]
+void cs_easu(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= (uint)outSize.x || id.y >= (uint)outSize.y) return;
+    float2 uv = (float2(id.xy) + 0.5) / outSize;
+    float2 pp = srcOff + uv * srcSize - 0.5;
+    float2 fp = floor(pp);
+    float2 f = pp - fp;
+    float3 cB = loadTexel(fp + float2( 0.0, -1.0));
+    float3 cC = loadTexel(fp + float2( 1.0, -1.0));
+    float3 cE = loadTexel(fp + float2(-1.0,  0.0));
+    float3 cF = loadTexel(fp + float2( 0.0,  0.0));
+    float3 cG = loadTexel(fp + float2( 1.0,  0.0));
+    float3 cH = loadTexel(fp + float2( 2.0,  0.0));
+    float3 cI = loadTexel(fp + float2(-1.0,  1.0));
+    float3 cJ = loadTexel(fp + float2( 0.0,  1.0));
+    float3 cK = loadTexel(fp + float2( 1.0,  1.0));
+    float3 cL = loadTexel(fp + float2( 2.0,  1.0));
+    float3 cN = loadTexel(fp + float2( 0.0,  2.0));
+    float3 cO = loadTexel(fp + float2( 1.0,  2.0));
+    float lB = fsrLuma(cB); float lC = fsrLuma(cC);
+    float lE = fsrLuma(cE); float lF = fsrLuma(cF);
+    float lG = fsrLuma(cG); float lH = fsrLuma(cH);
+    float lI = fsrLuma(cI); float lJ = fsrLuma(cJ);
+    float lK = fsrLuma(cK); float lL = fsrLuma(cL);
+    float lN = fsrLuma(cN); float lO = fsrLuma(cO);
+    float2 dir = float2(0.0, 0.0);
+    float len = 0.0;
+    easuSet(dir, len, (1.0 - f.x) * (1.0 - f.y), lB, lE, lF, lG, lJ);
+    easuSet(dir, len, f.x * (1.0 - f.y),         lC, lF, lG, lH, lK);
+    easuSet(dir, len, (1.0 - f.x) * f.y,         lF, lI, lJ, lK, lN);
+    easuSet(dir, len, f.x * f.y,                 lG, lJ, lK, lL, lO);
+    float dirR = dir.x * dir.x + dir.y * dir.y;
+    bool zro = dirR < (1.0 / 32768.0);
+    dirR = rsqrt(max(dirR, 1.0 / 32768.0));
+    dirR = zro ? 1.0 : dirR;
+    dir.x = zro ? 1.0 : dir.x;
+    dir *= dirR;
+    len = len * 0.5;
+    len *= len;
+    float stretch = 1.0 / max(max(abs(dir.x), abs(dir.y)), 1.0 / 32768.0);
+    float2 len2 = float2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+    float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
+    float clp = 1.0 / max(lob, 1.0 / 32768.0);
+    float3 min4 = min(min(cF, cG), min(cJ, cK));
+    float3 max4 = max(max(cF, cG), max(cJ, cK));
+    float3 aC = float3(0.0, 0.0, 0.0);
+    float aW = 0.0;
+    easuTap(aC, aW, float2( 0.0, -1.0) - f, dir, len2, lob, clp, cB);
+    easuTap(aC, aW, float2( 1.0, -1.0) - f, dir, len2, lob, clp, cC);
+    easuTap(aC, aW, float2(-1.0,  0.0) - f, dir, len2, lob, clp, cE);
+    easuTap(aC, aW, float2( 0.0,  0.0) - f, dir, len2, lob, clp, cF);
+    easuTap(aC, aW, float2( 1.0,  0.0) - f, dir, len2, lob, clp, cG);
+    easuTap(aC, aW, float2( 2.0,  0.0) - f, dir, len2, lob, clp, cH);
+    easuTap(aC, aW, float2(-1.0,  1.0) - f, dir, len2, lob, clp, cI);
+    easuTap(aC, aW, float2( 0.0,  1.0) - f, dir, len2, lob, clp, cJ);
+    easuTap(aC, aW, float2( 1.0,  1.0) - f, dir, len2, lob, clp, cK);
+    easuTap(aC, aW, float2( 2.0,  1.0) - f, dir, len2, lob, clp, cL);
+    easuTap(aC, aW, float2( 0.0,  2.0) - f, dir, len2, lob, clp, cN);
+    easuTap(aC, aW, float2( 1.0,  2.0) - f, dir, len2, lob, clp, cO);
+    float3 pix = min(max4, max(min4, aC * (1.0 / aW)));
+    dst[id.xy] = float4(pix, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void cs_rcas(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= (uint)outSize.x || id.y >= (uint)outSize.y) return;
+    float2 ip = srcOff + float2(id.xy);
+    float3 b = loadTexel(ip + float2( 0.0, -1.0));
+    float3 d = loadTexel(ip + float2(-1.0,  0.0));
+    float3 e = loadTexel(ip);
+    float3 f = loadTexel(ip + float2( 1.0,  0.0));
+    float3 h = loadTexel(ip + float2( 0.0,  1.0));
+    float bL = fsrLuma(b);
+    float dL = fsrLuma(d);
+    float eL = fsrLuma(e);
+    float fL = fsrLuma(f);
+    float hL = fsrLuma(h);
+    float nz = 0.25 * (bL + dL + fL + hL) - eL;
+    float rangeMax = max(max(max(bL, dL), max(eL, fL)), hL);
+    float rangeMin = min(min(min(bL, dL), min(eL, fL)), hL);
+    nz = saturate(abs(nz) / max(rangeMax - rangeMin, 1.0 / 32768.0));
+    nz = -0.5 * nz + 1.0;
+    float3 mn4 = min(min(b, d), min(f, h));
+    float3 mx4 = max(max(b, d), max(f, h));
+    float2 peakC = float2(1.0, -4.0);
+    float3 hitMin = mn4 / max(4.0 * mx4, 1.0 / 32768.0);
+    float3 hitMax = (peakC.x - mx4) / (4.0 * mn4 + peakC.y - (1.0 / 32768.0));
+    float3 lobeRGB = max(-hitMin, hitMax);
+    float lobe = max(-0.1875, min(max(max(lobeRGB.r, lobeRGB.g), lobeRGB.b), 0.0)) * sharpness;
+    lobe *= nz;
+    float rcpL = 1.0 / (4.0 * lobe + 1.0);
+    float3 pix = ((b + d + f + h) * lobe + e) * rcpL;
+    dst[id.xy] = float4(pix, 1.0);
+}
+"#;
+
 /// One extra per-monitor present target sharing the same D3D12 device and
-/// command queue.
+/// command queue. When `src_size` differs from the window (`width`×`height`)
+/// — render-scale under per-monitor — the slice is upscaled on present.
 struct PresentTarget {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -111,6 +337,41 @@ struct PresentTarget {
     frame_wait: Option<HANDLE>,
     tearing: bool,
     src: (u32, u32),
+    src_size: (u32, u32),
+}
+
+/// Which compute kernel a scale dispatch runs (the D3D12 mirror of the D3D11
+/// pixel-shader kernels; `Bilinear` exists here because D3D12 has no
+/// VideoProcessor path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ScaleKernel {
+    Bilinear,
+    Bicubic,
+    Easu,
+    Nearest,
+    Rcas,
+}
+
+impl ScaleKernel {
+    fn entry(self) -> windows::core::PCSTR {
+        match self {
+            Self::Bilinear => windows::core::s!("cs_bilinear"),
+            Self::Bicubic => windows::core::s!("cs_bicubic"),
+            Self::Easu => windows::core::s!("cs_easu"),
+            Self::Nearest => windows::core::s!("cs_nearest"),
+            Self::Rcas => windows::core::s!("cs_rcas"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bilinear => "bilinear (compute)",
+            Self::Bicubic => "Catmull-Rom bicubic (compute)",
+            Self::Easu => "FSR 1.0 EASU (compute)",
+            Self::Nearest => "nearest-neighbour (compute)",
+            Self::Rcas => "FSR 1.0 RCAS sharpen (compute)",
+        }
+    }
 }
 
 /// Direct3D 12 renderer.
@@ -156,7 +417,25 @@ pub struct D3D12Renderer {
     nv12_input: Option<ID3D12Resource>,
     nv12_capacity: usize,
     upscaler: Upscaler,
+    /// RCAS sharpen strength `0.0..=1.0` (`0.0` = off), see [`Self::set_sharpen`].
+    sharpen: f32,
     primary_src: (u32, u32),
+    /// Primary swapchain's framebuffer slice size in per-monitor mode
+    /// (`None` = swapchain-sized, 1:1).
+    primary_src_size: Option<(u32, u32)>,
+    /// Lazily-built compute upscale pipeline: a root signature (with a static
+    /// linear-clamp sampler) plus one PSO per [`ScaleKernel`]. `scale_disabled`
+    /// latches scaling off after any failure — crop copies from then on.
+    scale_root: Option<ID3D12RootSignature>,
+    scale_psos: HashMap<ScaleKernel, ID3D12PipelineState>,
+    scale_disabled: bool,
+    /// Intermediate UAV textures for the scale/sharpen chain, keyed by size
+    /// (`mid_a` holds the upscale output; `mid_b` the sharpened image).
+    mid_a: HashMap<(u32, u32), ID3D12Resource>,
+    mid_b: HashMap<(u32, u32), ID3D12Resource>,
+    /// Rotating descriptor cursor for scale passes — slots 2.. of the heap
+    /// (0/1 belong to the NV12 conversion).
+    desc_cursor: usize,
     extra_targets: Vec<PresentTarget>,
     gpu_timing_cb: Option<Box<dyn Fn(&str, u64) + Send + Sync>>,
 }
@@ -284,7 +563,15 @@ impl D3D12Renderer {
                 nv12_input: None,
                 nv12_capacity: 0,
                 upscaler: Upscaler::default(),
+                sharpen: 0.0,
                 primary_src: (0, 0),
+                primary_src_size: None,
+                scale_root: None,
+                scale_psos: HashMap::new(),
+                scale_disabled: false,
+                mid_a: HashMap::new(),
+                mid_b: HashMap::new(),
+                desc_cursor: 2,
                 extra_targets: Vec::new(),
                 gpu_timing_cb: None,
             })
@@ -337,7 +624,7 @@ impl D3D12Renderer {
                         Constants: windows::Win32::Graphics::Direct3D12::D3D12_ROOT_CONSTANTS {
                             ShaderRegister: 0,
                             RegisterSpace: 0,
-                            Num32BitValues: 6,
+                            Num32BitValues: 10,
                         },
                     },
                     ShaderVisibility: windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_ALL,
@@ -405,7 +692,9 @@ impl D3D12Renderer {
         unsafe {
             let desc = D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 8,
+                // 0/1: NV12 conversion. 2..: rotating SRV/UAV pairs for the
+                // scale/sharpen passes (up to two per present surface per frame).
+                NumDescriptors: 64,
                 Flags: windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             };
@@ -449,10 +738,13 @@ impl D3D12Renderer {
     }
 
     /// Open a new command list for this frame, resetting the allocator first if
-    /// this is the first list after a submit.
+    /// this is the first list after a submit. The allocator may only be reset
+    /// once its previous list has finished on the GPU, so wait out the fence
+    /// signalled by [`Self::flush_list`]/[`Self::submit_and_wait`] first.
     fn begin_list(&mut self) -> WinResult<()> {
         unsafe {
             if self.list.is_none() {
+                self.wait_for_fence();
                 self.allocator.Reset()?;
                 let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
                     0,
@@ -462,6 +754,43 @@ impl D3D12Renderer {
                 )?;
                 self.list = Some(list);
             }
+            Ok(())
+        }
+    }
+
+    /// Block (bounded) until every signalled fence value has completed.
+    fn wait_for_fence(&self) {
+        unsafe {
+            if self.fence.GetCompletedValue() < self.fence_value
+                && self
+                    .fence
+                    .SetEventOnCompletion(self.fence_value, self.fence_event)
+                    .is_ok()
+            {
+                let _ = windows::Win32::System::Threading::WaitForSingleObject(
+                    self.fence_event,
+                    5000,
+                );
+            }
+        }
+    }
+
+    /// Close and execute the current command list without blocking the CPU,
+    /// signalling the fence so the next [`Self::begin_list`] can safely reset
+    /// the allocator once the GPU is done.
+    fn flush_list(&mut self) -> WinResult<()> {
+        unsafe {
+            let list = match self.list.take() {
+                Some(l) => l,
+                None => return Ok(()),
+            };
+            list.Close()?;
+            let lists = [Some(
+                list.cast::<windows::Win32::Graphics::Direct3D12::ID3D12CommandList>()?,
+            )];
+            self.queue.ExecuteCommandLists(&lists);
+            self.fence_value += 1;
+            self.queue.Signal(&self.fence, self.fence_value)?;
             Ok(())
         }
     }
@@ -530,12 +859,30 @@ impl D3D12Renderer {
     }
 
     pub fn set_upscaler(&mut self, mode: Upscaler) {
-        self.upscaler = mode;
-        tracing::info!(?mode, "D3D12 upscaler selected (compute bilinear for now)");
+        // The driver AI super-resolution rides the D3D11 VideoProcessor, which
+        // this backend doesn't use — substitute the strongest shader kernel.
+        self.upscaler = if mode == Upscaler::Vsr {
+            tracing::info!("D3D12: AI video SR needs the D3D11 backend; using FSR (EASU) instead");
+            Upscaler::Fsr
+        } else {
+            mode
+        };
+        tracing::info!(mode = ?self.upscaler, "D3D12 upscaler selected");
     }
 
-    pub fn set_primary_src(&mut self, x: u32, y: u32) {
+    /// Set the RCAS adaptive-sharpen strength (`0.0` = off, `1.0` = maximum).
+    pub fn set_sharpen(&mut self, strength: f32) {
+        self.sharpen = strength.clamp(0.0, 1.0);
+        if self.sharpen > 0.0 {
+            tracing::info!(strength = self.sharpen, "D3D12 RCAS sharpen enabled");
+        }
+    }
+
+    /// Set the framebuffer slice the primary swapchain presents from (offset +
+    /// size; `src_w`/`src_h` of 0 = swapchain-sized, 1:1).
+    pub fn set_primary_src(&mut self, x: u32, y: u32, src_w: u32, src_h: u32) {
         self.primary_src = (x, y);
+        self.primary_src_size = (src_w != 0 && src_h != 0).then_some((src_w, src_h));
     }
 
     /// Resize the swapchain backbuffers.
@@ -554,6 +901,9 @@ impl D3D12Renderer {
             )?;
             self.sc_width = width;
             self.sc_height = height;
+            // Old destination-sized intermediates are stale now.
+            self.mid_a.clear();
+            self.mid_b.clear();
             Ok(())
         }
     }
@@ -735,6 +1085,7 @@ impl D3D12Renderer {
         w: u32,
         h: u32,
         nv12: &[u8],
+        regions: &[(u32, u32, u32, u32)],
     ) -> bool {
         if w == 0 || h == 0 || w % 2 != 0 || h % 2 != 0 {
             return false;
@@ -827,16 +1178,10 @@ impl D3D12Renderer {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             );
 
-            let params = [w, h, dest_x, dest_y, fb_width, self.fb_height];
-            std::ptr::copy_nonoverlapping(
-                params.as_ptr(),
-                cb_addr as *mut u32,
-                params.len(),
-            );
             list.SetComputeRootSignature(&root_signature);
             list.SetPipelineState(&pso);
             list.SetDescriptorHeaps(&[Some(descriptor_heap.clone())]);
-            list.SetComputeRoot32BitConstants(0, params.len() as u32, cb_addr as *const _, 0);
+            let _ = cb_addr; // constants are recorded per region below
             let heap_start = descriptor_heap.GetCPUDescriptorHandleForHeapStart();
             let srv_handle = heap_start;
             let uav_handle = D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -883,7 +1228,40 @@ impl D3D12Renderer {
             };
             list.SetComputeRootDescriptorTable(1, gpu_table);
 
-            list.Dispatch((cw + 7) / 8, (ch + 7) / 8, 1);
+            // One dispatch per dirty region (whole frame when none given):
+            // painting only the region rects keeps out-of-region reference
+            // content from stomping fresher pixels other codecs painted.
+            let whole = [(0u32, 0u32, cw, ch)];
+            let regions = if regions.is_empty() { &whole[..] } else { regions };
+            for &(rx, ry, rw, rh) in regions {
+                if rx >= cw || ry >= ch {
+                    continue;
+                }
+                let rw = rw.min(cw - rx);
+                let rh = rh.min(ch - ry);
+                if rw == 0 || rh == 0 {
+                    continue;
+                }
+                let params = [
+                    w,
+                    h,
+                    dest_x,
+                    dest_y,
+                    fb_width,
+                    self.fb_height,
+                    rx,
+                    ry,
+                    rw,
+                    rh,
+                ];
+                list.SetComputeRoot32BitConstants(
+                    0,
+                    params.len() as u32,
+                    params.as_ptr() as *const core::ffi::c_void,
+                    0,
+                );
+                list.Dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
+            }
 
             Self::transition(
                 list,
@@ -1229,14 +1607,11 @@ impl D3D12Renderer {
         }
     }
 
-    fn present_internal(&mut self,
-) -> WinResult<()> {
+    fn present_internal(&mut self) -> WinResult<()> {
+        // Execute pending work through flush_list so the fence is signalled and
+        // the next begin_list can safely reset the allocator.
+        self.flush_list()?;
         unsafe {
-            if let Some(list) = self.list.take() {
-                list.Close()?;
-                let lists = [Some(list.cast::<windows::Win32::Graphics::Direct3D12::ID3D12CommandList>()?)];
-                self.queue.ExecuteCommandLists(&lists);
-            }
             let (sync, flags) = if self.low_latency && self.tearing {
                 (0, DXGI_PRESENT_ALLOW_TEARING)
             } else {
@@ -1246,87 +1621,538 @@ impl D3D12Renderer {
         }
     }
 
-    /// Present the framebuffer, copying/scaling to the swapchain backbuffer.
+    /// Present the framebuffer, copying/scaling to the swapchain backbuffer(s).
+    /// A slice smaller than its destination (render-scale) — or an active
+    /// `--sharpen` — routes through the compute scale/sharpen chain; otherwise
+    /// (and on any scale failure) it is a plain crop/1:1 copy.
     pub fn present_frame(&mut self) -> WinResult<()> {
         self.wait_for_frame();
         self.submit_and_wait()?;
         if self.framebuffer.is_none() {
             return self.present_clear([0.06, 0.09, 0.16, 1.0]);
         }
+        let fb = self.framebuffer.as_ref().unwrap().clone();
         unsafe {
-            let fb = self.framebuffer.as_ref().unwrap().clone();
             if !self.extra_targets.is_empty() {
-                let _ = self.begin_list();
-                let list = self.list.as_ref().unwrap();
-                Self::present_slice_to_swapchain(
-                    list,
-                    &self.swap_chain,
-                    &fb,
-                    self.primary_src.0,
-                    self.primary_src.1,
-                    self.sc_width,
-                    self.sc_height,
-                )?;
-                for t in &self.extra_targets {
-                    Self::present_slice_to_swapchain(
-                        list,
-                        &t.swap_chain,
-                        &fb,
-                        t.src.0,
-                        t.src.1,
-                        t.width,
-                        t.height,
-                    )?;
-                    if let Some(h) = t.frame_wait {
-                        let _ = windows::Win32::System::Threading::WaitForSingleObjectEx(h, 100, false);
+                // Record every surface's paint into one list, execute it, then
+                // present each swapchain — Present rides the shared queue, so
+                // it is ordered after the executed list without a CPU wait.
+                let primary_dst = (self.sc_width, self.sc_height);
+                let primary_src_size = self.primary_src_size.unwrap_or(primary_dst);
+                let surfaces: Vec<(
+                    IDXGISwapChain3,
+                    (u32, u32),
+                    (u32, u32),
+                    (u32, u32),
+                    Option<HANDLE>,
+                    bool,
+                )> = std::iter::once((
+                    self.swap_chain.clone(),
+                    self.primary_src,
+                    primary_src_size,
+                    primary_dst,
+                    self.frame_wait,
+                    self.tearing,
+                ))
+                .chain(self.extra_targets.iter().map(|t| {
+                    (
+                        t.swap_chain.clone(),
+                        t.src,
+                        t.src_size,
+                        (t.width, t.height),
+                        t.frame_wait,
+                        t.tearing,
+                    )
+                }))
+                .collect();
+                for (chain, src, src_size, dst_size, _, _) in &surfaces {
+                    let bb_index = chain.GetCurrentBackBufferIndex();
+                    let back_buffer: ID3D12Resource = chain.GetBuffer(bb_index)?;
+                    self.record_surface_paint(&fb, &back_buffer, *src, *src_size, *dst_size)?;
+                }
+                self.flush_list()?;
+                for (chain, _, _, _, frame_wait, tearing) in &surfaces {
+                    if let Some(h) = frame_wait {
+                        let _ = windows::Win32::System::Threading::WaitForSingleObjectEx(
+                            *h, 100, false,
+                        );
                     }
-                    let (sync, flags) = if self.low_latency && t.tearing {
+                    let (sync, flags) = if self.low_latency && *tearing {
                         (0, DXGI_PRESENT_ALLOW_TEARING)
                     } else {
                         (1, DXGI_PRESENT(0))
                     };
-                    let _ = t.swap_chain.Present(sync, flags);
+                    let _ = chain.Present(sync, flags);
                 }
-            } else {
-                let bb_index = self.swap_chain.GetCurrentBackBufferIndex();
-                let back_buffer: ID3D12Resource = self.swap_chain.GetBuffer(bb_index)?;
-                let _ = self.begin_list();
-                let list = self.list.as_ref().unwrap();
-                Self::transition(list, &back_buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-                let (fb_w, fb_h) = (self.fb_width, self.fb_height);
-                let (sc_w, sc_h) = (self.sc_width, self.sc_height);
-                if (fb_w, fb_h) != (sc_w, sc_h) {
-                    // Smart-size not implemented yet for D3D12: crop to the
-                    // smaller of framebuffer and backbuffer.
-                    let cw = fb_w.min(sc_w);
-                    let ch = fb_h.min(sc_h);
-                    Self::copy_region(list, &fb, 0, 0, &back_buffer, 0, 0, cw, ch);
-                } else {
-                    Self::copy_whole_texture(list, &fb, &back_buffer);
-                }
-                Self::transition(list, &back_buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+                return Ok(());
             }
+            // Single window.
+            let bb_index = self.swap_chain.GetCurrentBackBufferIndex();
+            let back_buffer: ID3D12Resource = self.swap_chain.GetBuffer(bb_index)?;
+            let (fb_w, fb_h) = (self.fb_width, self.fb_height);
+            let (sc_w, sc_h) = (self.sc_width, self.sc_height);
+            self.record_surface_paint(&fb, &back_buffer, (0, 0), (fb_w, fb_h), (sc_w, sc_h))?;
             self.present_internal()
         }
     }
 
-    unsafe fn present_slice_to_swapchain(
-        list: &ID3D12GraphicsCommandList,
-        swap_chain: &IDXGISwapChain3,
+    /// Record one present surface's paint into the current command list: the
+    /// compute scale (+ optional RCAS sharpen) chain when the slice size differs
+    /// from the destination (or sharpening is on), else — and on any scale
+    /// failure — a crop/1:1 copy.
+    unsafe fn record_surface_paint(
+        &mut self,
         fb: &ID3D12Resource,
-        src_x: u32,
-        src_y: u32,
-        w: u32,
-        h: u32,
+        back_buffer: &ID3D12Resource,
+        src: (u32, u32),
+        src_size: (u32, u32),
+        dst_size: (u32, u32),
     ) -> WinResult<()> {
-        let bb_index = swap_chain.GetCurrentBackBufferIndex();
-        let back_buffer: ID3D12Resource = swap_chain.GetBuffer(bb_index)?;
-        Self::transition(list, &back_buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-        // Source box clamped to framebuffer.
-        // D3D12 copy source box handled by copy_region.
-        Self::copy_region(list, fb, src_x, src_y, &back_buffer, 0, 0, w, h);
-        Self::transition(list, &back_buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        let fb_size = (self.fb_width, self.fb_height);
+        let src_rect = (src.0, src.1, src_size.0, src_size.1);
+        let in_bounds =
+            src.0 + src_size.0 <= fb_size.0 && src.1 + src_size.1 <= fb_size.1;
+        let needs_scale = src_size != dst_size;
+        let sharpen_on = self.sharpen > 0.0;
+        if (needs_scale || sharpen_on)
+            && in_bounds
+            && src_size.0 > 0
+            && src_size.1 > 0
+            && dst_size.0 > 0
+            && dst_size.1 > 0
+            && !self.scale_disabled
+            && self.ensure_scale_pipeline()
+        {
+            match self.record_scale_chain(fb, fb_size, src_rect, back_buffer, dst_size, needs_scale)
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "D3D12 scale chain failed; cropping instead");
+                    self.scale_disabled = true;
+                }
+            }
+        }
+        // Crop/1:1 copy fallback, clipped to the framebuffer.
+        self.begin_list()?;
+        let list = self.list.clone().unwrap();
+        let cw = src_size.0.min(dst_size.0).min(fb_size.0.saturating_sub(src.0));
+        let ch = src_size.1.min(dst_size.1).min(fb_size.1.saturating_sub(src.1));
+        if cw > 0 && ch > 0 {
+            Self::transition(
+                &list,
+                back_buffer,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            Self::copy_region(&list, fb, src.0, src.1, back_buffer, 0, 0, cw, ch);
+            Self::transition(
+                &list,
+                back_buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
+        }
         Ok(())
+    }
+
+    /// Record the scale (+ optional sharpen) dispatches for one surface and the
+    /// copy of the finished image into its backbuffer.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_scale_chain(
+        &mut self,
+        fb: &ID3D12Resource,
+        fb_size: (u32, u32),
+        src_rect: (u32, u32, u32, u32),
+        back_buffer: &ID3D12Resource,
+        dst_size: (u32, u32),
+        needs_scale: bool,
+    ) -> WinResult<()> {
+        let sharpen_on = self.sharpen > 0.0;
+        let kernel = match self.upscaler {
+            Upscaler::Bicubic => ScaleKernel::Bicubic,
+            Upscaler::Fsr | Upscaler::Vsr => ScaleKernel::Easu,
+            Upscaler::Nearest => ScaleKernel::Nearest,
+            Upscaler::Bilinear => ScaleKernel::Bilinear,
+        };
+        let stops = 2.0 * (1.0 - self.sharpen.clamp(0.0, 1.0));
+        let sharpness = (-stops).exp2();
+        let full_rect = (0, 0, dst_size.0, dst_size.1);
+        let final_tex: ID3D12Resource = if !needs_scale {
+            // 1:1 — only the sharpen pass, straight from the framebuffer slice.
+            let out = self.ensure_mid(false, dst_size)?;
+            self.record_scale_dispatch(
+                ScaleKernel::Rcas,
+                fb,
+                fb_size,
+                src_rect,
+                &out,
+                dst_size,
+                sharpness,
+            )?;
+            out
+        } else if sharpen_on {
+            let a = self.ensure_mid(true, dst_size)?;
+            self.record_scale_dispatch(kernel, fb, fb_size, src_rect, &a, dst_size, 0.0)?;
+            let b = self.ensure_mid(false, dst_size)?;
+            self.record_scale_dispatch(
+                ScaleKernel::Rcas,
+                &a,
+                dst_size,
+                full_rect,
+                &b,
+                dst_size,
+                sharpness,
+            )?;
+            b
+        } else {
+            let a = self.ensure_mid(true, dst_size)?;
+            self.record_scale_dispatch(kernel, fb, fb_size, src_rect, &a, dst_size, 0.0)?;
+            a
+        };
+        // Copy the finished image to the backbuffer (swapchain buffers can't be
+        // UAVs, so the chain always ends in a copy).
+        self.begin_list()?;
+        let list = self.list.clone().unwrap();
+        Self::transition(
+            &list,
+            &final_tex,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+        Self::transition(
+            &list,
+            back_buffer,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        Self::copy_whole_texture(&list, &final_tex, back_buffer);
+        Self::transition(
+            &list,
+            back_buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+        Self::transition(
+            &list,
+            &final_tex,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+        Ok(())
+    }
+
+    /// Record one compute scale/sharpen dispatch: `src_rect` of `src_res` →
+    /// the whole of `dst_res` (`dst_size`).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_scale_dispatch(
+        &mut self,
+        kernel: ScaleKernel,
+        src_res: &ID3D12Resource,
+        src_tex_size: (u32, u32),
+        src_rect: (u32, u32, u32, u32),
+        dst_res: &ID3D12Resource,
+        dst_size: (u32, u32),
+        sharpness: f32,
+    ) -> WinResult<()> {
+        let pso = self.scale_pso(kernel)?;
+        let root = self
+            .scale_root
+            .clone()
+            .ok_or_else(windows::core::Error::from_thread)?;
+        self.begin_list()?;
+        let list = self.list.clone().unwrap();
+        let (srv_cpu, uav_cpu, gpu_table) = self.alloc_scale_descriptors();
+        self.device.CreateShaderResourceView(src_res, None, srv_cpu);
+        self.device.CreateUnorderedAccessView(
+            dst_res,
+            None,
+            Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_UAV {
+                        MipSlice: 0,
+                        PlaneSlice: 0,
+                    },
+                },
+            }),
+            uav_cpu,
+        );
+        Self::transition(
+            &list,
+            src_res,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        );
+        Self::transition(
+            &list,
+            dst_res,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        // Must mirror the HLSL `Params` cbuffer layout.
+        let params: [f32; 12] = [
+            src_rect.0 as f32,
+            src_rect.1 as f32,
+            src_rect.2 as f32,
+            src_rect.3 as f32,
+            dst_size.0 as f32,
+            dst_size.1 as f32,
+            1.0 / src_tex_size.0.max(1) as f32,
+            1.0 / src_tex_size.1.max(1) as f32,
+            src_tex_size.0 as f32,
+            src_tex_size.1 as f32,
+            sharpness,
+            0.0,
+        ];
+        list.SetComputeRootSignature(&root);
+        list.SetPipelineState(&pso);
+        list.SetDescriptorHeaps(&[Some(self.descriptor_heap.clone())]);
+        list.SetComputeRoot32BitConstants(
+            0,
+            params.len() as u32,
+            params.as_ptr() as *const core::ffi::c_void,
+            0,
+        );
+        list.SetComputeRootDescriptorTable(1, gpu_table);
+        list.Dispatch(dst_size.0.div_ceil(8), dst_size.1.div_ceil(8), 1);
+        Self::transition(
+            &list,
+            dst_res,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+        Self::transition(
+            &list,
+            src_res,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+        Ok(())
+    }
+
+    /// Build the scale root signature on first use. Returns `false` (latching
+    /// `scale_disabled`) if it can't be built.
+    fn ensure_scale_pipeline(&mut self) -> bool {
+        if self.scale_root.is_some() {
+            return true;
+        }
+        match Self::create_scale_root_signature(&self.device) {
+            Ok(rs) => {
+                self.scale_root = Some(rs);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "D3D12 scale root signature failed; scaling disabled");
+                self.scale_disabled = true;
+                false
+            }
+        }
+    }
+
+    /// Root signature for the scale kernels: 12 root constants (b0), a static
+    /// linear-clamp sampler (s0), and an SRV+UAV descriptor table (t0, u0).
+    fn create_scale_root_signature(device: &ID3D12Device) -> WinResult<ID3D12RootSignature> {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12SerializeRootSignature, D3D12_COMPARISON_FUNC_NEVER,
+            D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_SHADER_VISIBILITY_ALL,
+            D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK, D3D12_STATIC_SAMPLER_DESC,
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D_ROOT_SIGNATURE_VERSION_1_0,
+        };
+        unsafe {
+            let ranges = [
+                D3D12_DESCRIPTOR_RANGE {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                    NumDescriptors: 1,
+                    BaseShaderRegister: 0,
+                    RegisterSpace: 0,
+                    OffsetInDescriptorsFromTableStart: 0,
+                },
+                D3D12_DESCRIPTOR_RANGE {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                    NumDescriptors: 1,
+                    BaseShaderRegister: 0,
+                    RegisterSpace: 0,
+                    OffsetInDescriptorsFromTableStart: 1,
+                },
+            ];
+            let params = [
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            ShaderRegister: 0,
+                            RegisterSpace: 0,
+                            Num32BitValues: 12,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                            NumDescriptorRanges: ranges.len() as u32,
+                            pDescriptorRanges: ranges.as_ptr(),
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+            ];
+            let sampler = D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+                MinLOD: 0.0,
+                MaxLOD: f32::MAX,
+                ShaderRegister: 0,
+                RegisterSpace: 0,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            };
+            let desc = D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: 1,
+                pStaticSamplers: &sampler,
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            };
+            let mut signature: Option<ID3DBlob> = None;
+            let mut error: Option<ID3DBlob> = None;
+            D3D12SerializeRootSignature(
+                &desc,
+                D3D_ROOT_SIGNATURE_VERSION_1_0,
+                &mut signature,
+                Some(&mut error),
+            )?;
+            if let Some(err) = error {
+                let slice = core::slice::from_raw_parts(
+                    err.GetBufferPointer() as *const u8,
+                    err.GetBufferSize(),
+                );
+                tracing::warn!(error = %String::from_utf8_lossy(slice), "D3D12 scale root signature error");
+            }
+            let signature = signature.ok_or_else(windows::core::Error::from_thread)?;
+            let bytes = core::slice::from_raw_parts(
+                signature.GetBufferPointer() as *const u8,
+                signature.GetBufferSize(),
+            );
+            device.CreateRootSignature(0, bytes)
+        }
+    }
+
+    /// The PSO for `kernel`, compiling it on first use.
+    fn scale_pso(&mut self, kernel: ScaleKernel) -> WinResult<ID3D12PipelineState> {
+        if let Some(p) = self.scale_psos.get(&kernel) {
+            return Ok(p.clone());
+        }
+        let root = self
+            .scale_root
+            .clone()
+            .ok_or_else(windows::core::Error::from_thread)?;
+        unsafe {
+            let blob = compile_scale_kernel(kernel)?;
+            let bytes = core::slice::from_raw_parts(
+                blob.GetBufferPointer() as *const u8,
+                blob.GetBufferSize(),
+            );
+            let pso_desc =
+                windows::Win32::Graphics::Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: core::mem::ManuallyDrop::new(Some(root)),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr() as *const _,
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                };
+            let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&pso_desc)?;
+            self.scale_psos.insert(kernel, pso.clone());
+            tracing::info!(kernel = kernel.label(), "D3D12 scale kernel compiled");
+            Ok(pso)
+        }
+    }
+
+    /// The cached intermediate UAV texture for this size (`first` = the upscale
+    /// output `mid_a`; otherwise the sharpen output `mid_b`).
+    fn ensure_mid(&mut self, first: bool, size: (u32, u32)) -> WinResult<ID3D12Resource> {
+        let map = if first { &mut self.mid_a } else { &mut self.mid_b };
+        if let Some(t) = map.get(&size) {
+            return Ok(t.clone());
+        }
+        let tex = Self::create_uav_texture(&self.device, size.0, size.1)?;
+        map.insert(size, tex.clone());
+        Ok(tex)
+    }
+
+    /// A default-heap RGBA texture with UAV access (created in COMMON).
+    fn create_uav_texture(device: &ID3D12Device, w: u32, h: u32) -> WinResult<ID3D12Resource> {
+        unsafe {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Alignment: 0,
+                Width: w as u64,
+                Height: h,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            };
+            let props = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut tex: Option<ID3D12Resource> = None;
+            device.CreateCommittedResource(
+                &props,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut tex,
+            )?;
+            tex.ok_or_else(windows::core::Error::from_thread)
+        }
+    }
+
+    /// The next rotating SRV/UAV descriptor pair for a scale pass (slots 2..64;
+    /// 0/1 belong to the NV12 conversion). Safe to rotate because
+    /// [`Self::begin_list`] waits out the previous list before reuse.
+    fn alloc_scale_descriptors(
+        &mut self,
+    ) -> (
+        D3D12_CPU_DESCRIPTOR_HANDLE,
+        D3D12_CPU_DESCRIPTOR_HANDLE,
+        windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE,
+    ) {
+        const HEAP_SLOTS: usize = 64;
+        if self.desc_cursor + 2 > HEAP_SLOTS {
+            self.desc_cursor = 2;
+        }
+        let base = self.desc_cursor;
+        self.desc_cursor += 2;
+        unsafe {
+            let cpu_start = self.descriptor_heap.GetCPUDescriptorHandleForHeapStart();
+            let gpu_start = self.descriptor_heap.GetGPUDescriptorHandleForHeapStart();
+            let srv_cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: cpu_start.ptr + base * self.descriptor_size,
+            };
+            let uav_cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: cpu_start.ptr + (base + 1) * self.descriptor_size,
+            };
+            let gpu = windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: gpu_start.ptr + (base as u64) * (self.descriptor_size as u64),
+            };
+            (srv_cpu, uav_cpu, gpu)
+        }
     }
 
     /// Read the framebuffer back to CPU as tightly-packed RGBA.
@@ -1393,6 +2219,7 @@ impl D3D12Renderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_present_target(
         &mut self,
         hwnd_raw: isize,
@@ -1400,6 +2227,8 @@ impl D3D12Renderer {
         height: u32,
         src_x: u32,
         src_y: u32,
+        src_w: u32,
+        src_h: u32,
     ) -> WinResult<()> {
         unsafe {
             let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
@@ -1445,7 +2274,20 @@ impl D3D12Renderer {
                     frame_wait = Some(h);
                 }
             }
-            tracing::info!(width, height, src_x, src_y, "D3D12 per-monitor present target added");
+            let src_size = if src_w != 0 && src_h != 0 {
+                (src_w, src_h)
+            } else {
+                (width, height)
+            };
+            tracing::info!(
+                width,
+                height,
+                src_x,
+                src_y,
+                src_w = src_size.0,
+                src_h = src_size.1,
+                "D3D12 per-monitor present target added"
+            );
             self.extra_targets.push(PresentTarget {
                 swap_chain: sc,
                 width,
@@ -1453,6 +2295,7 @@ impl D3D12Renderer {
                 frame_wait,
                 tearing: flags & tearing_flag != 0,
                 src: (src_x, src_y),
+                src_size,
             });
             Ok(())
         }
@@ -1496,6 +2339,36 @@ unsafe fn compile_compute_shader() -> WinResult<ID3DBlob> {
     code.ok_or_else(windows::core::Error::from_thread)
 }
 
+/// Compile one [`SCALE_CS_HLSL`] kernel at runtime via d3dcompiler.
+unsafe fn compile_scale_kernel(kernel: ScaleKernel) -> WinResult<ID3DBlob> {
+    let mut code: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    let res = D3DCompile(
+        SCALE_CS_HLSL.as_ptr() as *const core::ffi::c_void,
+        SCALE_CS_HLSL.len(),
+        windows::core::s!("scale_cs.hlsl"),
+        None,
+        None,
+        kernel.entry(),
+        windows::core::s!("cs_5_1"),
+        0,
+        0,
+        &mut code,
+        Some(&mut errors),
+    );
+    if let Err(e) = res {
+        if let Some(err) = &errors {
+            let msg = core::slice::from_raw_parts(
+                err.GetBufferPointer() as *const u8,
+                err.GetBufferSize(),
+            );
+            tracing::warn!(error = %String::from_utf8_lossy(msg), "D3D12 scale shader compile failed");
+        }
+        return Err(e);
+    }
+    code.ok_or_else(windows::core::Error::from_thread)
+}
+
 impl Drop for D3D12Renderer {
     fn drop(&mut self) {
         unsafe {
@@ -1509,6 +2382,28 @@ impl Drop for D3D12Renderer {
                 }
             }
             let _ = windows::Win32::Foundation::CloseHandle(self.fence_event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod shader_tests {
+    use super::*;
+
+    /// Every compute scale kernel must compile via d3dcompiler (no GPU needed).
+    #[test]
+    fn scale_cs_hlsl_compiles_for_every_kernel() {
+        for kernel in [
+            ScaleKernel::Bilinear,
+            ScaleKernel::Bicubic,
+            ScaleKernel::Easu,
+            ScaleKernel::Nearest,
+            ScaleKernel::Rcas,
+        ] {
+            unsafe {
+                compile_scale_kernel(kernel)
+                    .unwrap_or_else(|e| panic!("{}: {e}", kernel.label()));
+            }
         }
     }
 }

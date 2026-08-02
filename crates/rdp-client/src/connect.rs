@@ -54,6 +54,22 @@ impl Transport {
             Transport::WebSocketTls(s) => s.get_ref().set_read_timeout(dur),
         }
     }
+
+    /// The raw TCP socket underlying this transport, when there is exactly one
+    /// carrying RDP bytes directly (the direct TCP/TLS paths) — what the
+    /// graphics worker registers for event-driven waits. The WebSocket paths
+    /// return `None`: their framing layer buffers whole messages above the
+    /// socket, so socket-level readability wouldn't match "a PDU is available"
+    /// — they keep timeout pacing instead.
+    #[cfg(windows)]
+    pub fn raw_socket(&self) -> Option<std::os::windows::io::RawSocket> {
+        use std::os::windows::io::AsRawSocket;
+        match self {
+            Transport::Tcp(s) => Some(s.as_raw_socket()),
+            Transport::Tls(s) => Some(s.get_ref().as_raw_socket()),
+            Transport::WebSocket(_) | Transport::WebSocketTls(_) => None,
+        }
+    }
 }
 
 impl Read for Transport {

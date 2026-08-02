@@ -223,37 +223,34 @@ fn caps_from_flags(
         tracing::info!("--force-avc444: advertising full AVC444/AVC420 caps");
         return egfx::CAPS_FULL.to_vec();
     }
-    match quality {
-        QualityPreset::Gaming => {
-            // Gaming default: advertise AVC420-only even when a GPU is present. A CPU-only
-            // host then software-encodes a single H.264 stream instead of AVC444's two
-            // (main + aux chroma) — and the GPU decode path discards the aux chroma
-            // anyway, so AVC444 would cost ~2x server encode for no visible gain.
-            tracing::info!("--gaming: advertising AVC420-only caps (halves CPU-only host encode)");
-            egfx::CAPS_AVC420_ONLY.to_vec()
-        }
-        QualityPreset::Office => {
-            // Office default: clarity-first. Use full AVC444 when the local GPU can
-            // decode it; otherwise fall back to AVC420 so CPU decode isn't the bottleneck.
-            if gpu_h264() {
-                tracing::info!("--office: advertising full AVC444/AVC420 caps");
-                egfx::CAPS_FULL.to_vec()
-            } else {
-                tracing::info!("--office: no GPU H.264 decode, advertising AVC420-only caps");
-                egfx::CAPS_AVC420_ONLY.to_vec()
-            }
-        }
-        QualityPreset::Balanced => {
-            // Balanced default: advertise the richest caps we can decode quickly.
-            if gpu_h264() {
-                tracing::info!("advertising full AVC444/AVC420 caps");
-                egfx::CAPS_FULL.to_vec()
-            } else {
-                tracing::info!("advertising AVC420-only caps");
-                egfx::CAPS_AVC420_ONLY.to_vec()
-            }
-        }
-    }
+    // AVC444 is TWO H.264 streams: a main 4:2:0 view plus an auxiliary stream
+    // carrying the chroma needed to reconstruct full 4:4:4. Asking for it roughly
+    // DOUBLES the host's encode work and the bytes on the wire.
+    //
+    // Only the CPU decode path performs that reconstruction. The zero-copy DXVA
+    // path decodes the main sub-stream and DISCARDS the auxiliary one (see
+    // `decode_avc444`) — so on a machine with GPU H.264, which is the case this
+    // client exists for, advertising AVC444 pays double for a picture identical
+    // to AVC420. The old policy had this exactly inverted: it asked for AVC444
+    // *because* a GPU was present, i.e. precisely when the extra stream would be
+    // thrown away.
+    //
+    // So: ask for AVC444 only when something will consume it. Today nothing does
+    // by default — the no-GPU case decodes on the CPU, where software-decoding a
+    // second 1080p stream costs far more than 4:2:0 chroma is worth. `--force-avc`
+    // remains for anyone who wants it.
+    //
+    // `quality` and `gpu_h264` stay in the signature deliberately: the moment the
+    // GPU path learns to combine the aux stream into 4:4:4, `office` on a
+    // GPU-capable client is exactly the case that should ask for AVC444 again.
+    // Not probing also keeps a decoder instantiation off the startup path.
+    let _ = (quality, gpu_h264);
+    tracing::info!(
+        "advertising AVC420-only caps (the AVC444 aux chroma stream is discarded by the \
+         decode path, so asking for it would double host encode and bandwidth for the \
+         same picture; --force-avc overrides)"
+    );
+    egfx::CAPS_AVC420_ONLY.to_vec()
 }
 
 /// Remote-desktop dimensions for client-side render-scaling: the native window
@@ -267,6 +264,78 @@ fn scaled_desktop_dims(win_w: u32, win_h: u32, scale: f32) -> (u32, u32) {
         s.clamp(200, 8192) & !1
     };
     (one(win_w), one(win_h))
+}
+
+/// One per-monitor window placement: where the borderless window sits on the
+/// physical screen, its offset within the *native* virtual desktop (the space
+/// per-monitor windows emit input in), and the framebuffer slice it presents
+/// (the scaled monitor rectangle under render-scale; the native one otherwise).
+#[derive(Debug, Clone, Copy)]
+struct MonitorPlacement {
+    /// Window position on the physical screen (virtual-screen coordinates).
+    screen: (i32, i32),
+    /// Window (monitor) size in native pixels.
+    size: (u32, u32),
+    /// Monitor offset within the native virtual desktop, for input mapping.
+    input_offset: (i32, i32),
+    /// This monitor's framebuffer slice origin.
+    src: (u32, u32),
+    /// This monitor's framebuffer slice size.
+    src_size: (u32, u32),
+}
+
+/// Scale a multi-monitor layout for client-side render-scale: the CS_MONITOR
+/// defs to advertise, the scaled desktop bounding box, and each monitor's
+/// slice rect (origin, size) within the scaled framebuffer.
+///
+/// Every edge goes through the same monotonic round-to-even map
+/// (`round(edge·scale/2)·2`), so an edge shared by two monitors maps to the
+/// same scaled coordinate — no 1-px gaps or overlaps at seams — the Windows
+/// primary keeps its (0,0) top-left (virtual-screen coordinates pin it there,
+/// and 0 maps to 0), and every monitor keeps even dimensions, which the
+/// server's H.264 4:2:0 encoder prefers. The server normalizes the layout by
+/// translating the bounding-box origin to desktop (0,0), which is exactly the
+/// subtraction used for the slice origins here, so EGFX surface offsets land
+/// on the same coordinates.
+fn scale_monitor_layout(
+    rects: &[rdp_pdu::gcc::VirtualScreenRect],
+    scale: f32,
+) -> (
+    Vec<rdp_pdu::gcc::MonitorDef>,
+    (u32, u32),
+    Vec<((u32, u32), (u32, u32))>,
+) {
+    let scale = scale.clamp(0.4, 1.0) as f64;
+    let e = |v: i32| -> i32 { (((v as f64) * scale / 2.0).round() as i32) * 2 };
+    let scaled: Vec<(i32, i32, i32, i32, bool)> = rects
+        .iter()
+        .map(|r| (e(r.left), e(r.top), e(r.right), e(r.bottom), r.primary))
+        .collect();
+    let min_x = scaled.iter().map(|r| r.0).min().unwrap_or(0);
+    let min_y = scaled.iter().map(|r| r.1).min().unwrap_or(0);
+    let max_x = scaled.iter().map(|r| r.2).max().unwrap_or(0);
+    let max_y = scaled.iter().map(|r| r.3).max().unwrap_or(0);
+    let defs = scaled
+        .iter()
+        .map(|&(l, t, r, b, primary)| rdp_pdu::gcc::MonitorDef {
+            left: l,
+            top: t,
+            right: r - 1,
+            bottom: b - 1,
+            primary,
+        })
+        .collect();
+    let slices = scaled
+        .iter()
+        .map(|&(l, t, r, b, _)| {
+            (
+                ((l - min_x) as u32, (t - min_y) as u32),
+                ((r - l).max(0) as u32, (b - t).max(0) as u32),
+            )
+        })
+        .collect();
+    let size = ((max_x - min_x).max(0) as u32, (max_y - min_y).max(0) as u32);
+    (defs, size, slices)
 }
 
 /// Exponential backoff with jitter for auto-reconnect retries.
@@ -348,7 +417,7 @@ fn config_from_args(args: &Args) -> ClientConfig {
             password: args.password.clone().unwrap_or_default(),
         },
         allow_invalid_certificate: args.insecure,
-        drive_path: args.drive.clone(),
+        drive_paths: crate::expand_drive_args(&args.drive),
         ..Default::default()
     };
     // Apply a requested resolution, clamped to RDP's range and rounded to an
@@ -497,15 +566,22 @@ impl session::FrameSink for LogSink {
     }
 }
 
-/// Quality preset that drives codec selection and latency/clarity trade-offs.
+/// Quality preset for the latency/clarity trade-offs the client controls.
+///
+/// NOTE: all presets advertise the same AVC420-only EGFX caps (see
+/// `gfx_caps_for` — the AVC444 aux chroma is discarded on the GPU decode path,
+/// so advertising it buys double host encode for the same picture). What the
+/// presets change is presentation: office pins vsync, 1:1 rendering and the
+/// bicubic upscaler; gaming permits render-scale and motion-first choices.
+/// Full 4:4:4 remains available explicitly via `--force-avc444`, whose chroma
+/// reconstruction runs on the CPU decode path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QualityPreset {
-    /// Low-latency, encode-friendly: AVC420-only, render-scale OK.
+    /// Motion-first: render-scale friendly, upscaler tuned for game imagery.
     Gaming,
-    /// Clarity-first: full AVC444 when the local GPU can decode it, no
-    /// render-scale, smooth vsync.
+    /// Clarity-first: no render-scale, smooth vsync, bicubic.
     Office,
-    /// Probe local decode capability and fall back sensibly (default).
+    /// The defaults (identical codec caps; see the enum docs).
     Balanced,
 }
 
@@ -525,8 +601,10 @@ struct Args {
     password: Option<String>,
     /// Accept self-signed / untrusted TLS server certificates (`--insecure`).
     insecure: bool,
-    /// Local directory to share as a redirected drive (`--drive PATH`).
-    drive: Option<String>,
+    /// Local directories/drive roots to share as redirected drives (`--drive
+    /// PATH`, repeatable; `--drive all` = every mounted drive letter, mapped
+    /// network drives included).
+    drive: Vec<String>,
     /// Span the remote desktop across all local monitors (`--multimon`).
     multimon: bool,
     /// Borderless fullscreen on the primary monitor (`--fullscreen`).
@@ -558,7 +636,8 @@ struct Args {
     /// Session color depth in bits (`--bpp 16|24|32`).
     bpp: Option<u16>,
     /// Present with tearing (no vsync) for absolute-minimum latency
-    /// (`--low-latency` / `--gaming`). Default off → smooth vsync for desktop work.
+    /// (`--low-latency` only — no preset implies it). Default off → smooth
+    /// vsync for desktop work.
     low_latency: bool,
     /// Quality preset that selects the best codec/path for the workload
     /// (`--quality gaming|office|balanced`, aliases `--gaming`, `--office`).
@@ -596,10 +675,16 @@ struct Args {
     pace: u16,
     /// GPU upscaler used when `--render-scale` (or a window larger than the remote
     /// desktop) means the client scales the desktop up on present (`--upscale
-    /// vsr|bicubic|bilinear`, alias `catmull`/`none`; `--vsr` = `--upscale vsr`).
-    /// Default Catmull-Rom bicubic — sharp without the text/UI ringing RTX VSR
-    /// causes on non-video content. `vsr` is best for full-screen gaming.
+    /// vsr|bicubic|fsr|nearest|bilinear`, alias `catmull`/`easu`/`integer`/`none`;
+    /// `--vsr` = `--upscale vsr`). Default Catmull-Rom bicubic — sharp without the
+    /// text/UI ringing AI video SR causes on non-video content. `fsr` (AMD
+    /// FidelityFX SR 1.0, any GPU) reconstructs game imagery best; `vsr` engages
+    /// the driver AI SR (NVIDIA RTX VSR / Intel VPE SR) for full-screen video.
     upscale: rdp_gpu::Upscaler,
+    /// RCAS adaptive-sharpen strength after the upscale (`--sharpen 0.0..=1.0`).
+    /// `None` = default: on (0.9) for `--upscale fsr` — FSR 1.0 is designed as
+    /// EASU+RCAS — off for everything else. `Some(0.0)` disables even for fsr.
+    sharpen: Option<f32>,
     /// GPU backend (`--backend d3d11|d3d12`). Default D3D11; D3D12 is experimental
     /// and enables the compute-shader YUV→RGB path.
     backend: rdp_gpu::Backend,
@@ -659,7 +744,7 @@ impl Args {
             domain: None,
             password: None,
             insecure: false,
-            drive: None,
+            drive: Vec::new(),
             multimon: false,
             fullscreen: false,
             cpu_yuv: false,
@@ -682,6 +767,7 @@ impl Args {
             no_seed: false,
             pace: 0,
             upscale: rdp_gpu::Upscaler::default(),
+            sharpen: None,
             backend: rdp_gpu::Backend::default(),
             replay_gfx: None,
             log_file: None,
@@ -696,9 +782,24 @@ impl Args {
             teams: false,
             teams_native: false,
         };
+        // Preset defaults must not silently override something the user asked for
+        // by name, so track which of the presettable knobs were set explicitly.
+        let mut low_latency_explicit = false;
+        let mut render_scale_explicit = false;
+        let mut upscale_explicit = false;
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             match flag.as_str() {
+                // Note: `-h` is --host (kept for compatibility), so help takes
+                // the long form plus the Windows-conventional `/?`.
+                "--help" | "--usage" | "-?" | "/?" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                "--version" | "-V" => {
+                    println!("rdpio {}", env!("CARGO_PKG_VERSION"));
+                    std::process::exit(0);
+                }
                 "--host" | "-h" => args.host = it.next(),
                 "--log-file" | "--log" => args.log_file = it.next(),
                 "--replay-gfx" => args.replay_gfx = it.next(),
@@ -709,17 +810,23 @@ impl Args {
                 "--domain" | "-d" => args.domain = it.next(),
                 "--password" | "-p" => args.password = it.next(),
                 "--insecure" | "-k" => args.insecure = true,
-                "--drive" | "-D" => args.drive = it.next(),
+                "--drive" | "-D" => {
+                    if let Some(v) = it.next() {
+                        args.drive.push(v);
+                    }
+                }
                 "--multimon" | "-m" => args.multimon = true,
                 "--fullscreen" | "-f" => args.fullscreen = true,
                 "--cpu-yuv" => args.cpu_yuv = true,
                 "--teams" | "--webrtc" => args.teams = true,
                 "--teams-native" | "--webrtc-native" => args.teams_native = true,
-                "--low-latency" => args.low_latency = true,
-                "--gaming" => {
+                "--low-latency" => {
                     args.low_latency = true;
-                    args.quality = QualityPreset::Gaming;
+                    low_latency_explicit = true;
                 }
+                // Deliberately does NOT imply --low-latency: tearing presents are
+                // an artifact trade-off the user must opt into by name.
+                "--gaming" => args.quality = QualityPreset::Gaming,
                 "--office" => args.quality = QualityPreset::Office,
                 "--quality" => {
                     if let Some(v) = it.next() {
@@ -739,6 +846,7 @@ impl Args {
                 "--render-scale" | "--scale" => {
                     if let Some(v) = it.next().and_then(|v| v.trim().parse::<f32>().ok()) {
                         args.render_scale = v.clamp(0.4, 1.0);
+                        render_scale_explicit = true;
                     }
                 }
                 "--per-monitor" | "--multimon-windows" => args.per_monitor = true,
@@ -753,10 +861,26 @@ impl Args {
                 "--upscale" | "--upscaler" => {
                     if let Some(v) = it.next() {
                         args.upscale = parse_upscaler(&v);
+                        upscale_explicit = true;
                     }
                 }
-                "--vsr" => args.upscale = rdp_gpu::Upscaler::Vsr,
-                "--no-vsr" => args.upscale = rdp_gpu::Upscaler::Bilinear,
+                "--vsr" => {
+                    args.upscale = rdp_gpu::Upscaler::Vsr;
+                    upscale_explicit = true;
+                }
+                "--no-vsr" => {
+                    args.upscale = rdp_gpu::Upscaler::Bilinear;
+                    upscale_explicit = true;
+                }
+                "--fsr" => {
+                    args.upscale = rdp_gpu::Upscaler::Fsr;
+                    upscale_explicit = true;
+                }
+                "--sharpen" => {
+                    if let Some(v) = it.next().and_then(|v| v.trim().parse::<f32>().ok()) {
+                        args.sharpen = Some(v.clamp(0.0, 1.0));
+                    }
+                }
                 "--backend" => {
                     if let Some(v) = it.next() {
                         args.backend = parse_backend(&v);
@@ -801,8 +925,151 @@ impl Args {
                 other => tracing::warn!("ignoring unknown argument: {other}"),
             }
         }
+        // `office` is the text-reading preset, and the three settings below are
+        // what actually decide whether text is crisp — so the preset has to own
+        // them, not just the advertised codec caps. Each yields to an explicit
+        // flag, so `--office --render-scale 0.8` still scales.
+        //
+        // - vsync, because tearing is at its most visible on scrolling text: the
+        //   display shows part of one frame and part of the next, so a line of
+        //   text sits offset by the scroll distance until the next present.
+        // - 1:1 rendering, because detail lost to downscaling cannot be restored
+        //   by any upscaler; glyph stems are exactly the high-frequency content
+        //   that goes first.
+        // - bicubic, because FSR's edge reconstruction plus RCAS sharpening is
+        //   tuned for rendered game frames and rings on glyph edges.
+        if args.quality == QualityPreset::Office {
+            if !low_latency_explicit {
+                args.low_latency = false;
+            }
+            if !render_scale_explicit {
+                args.render_scale = 1.0;
+            }
+            if !upscale_explicit {
+                args.upscale = rdp_gpu::Upscaler::Bicubic;
+            }
+        }
         args
     }
+}
+
+/// Print the full option reference for `--help`.
+///
+/// Written out rather than generated so each flag can carry the one line of
+/// context that actually decides whether you want it — the defaults and the
+/// trade-offs are the part that isn't guessable from the name.
+fn print_help() {
+    println!(
+        r#"rdpio {version} — GPU-accelerated RDP client
+
+USAGE
+    rdpio --host <ADDR> [-u <USER>] [-p <PASSWORD>] [OPTIONS]
+
+    rdpio --host 10.0.0.5 -u alice -p secret -k
+    rdpio --host server.corp --fullscreen --drive all --quality office
+    rdpio --w365                       # Windows 365 / Cloud PC via Entra sign-in
+
+CONNECTION
+    --host, -h <ADDR>      Server host name or IP. (-h is HOST, not help.)
+    --port <PORT>          TCP port. Default 3389.
+    --insecure, -k         Accept a self-signed / untrusted TLS certificate.
+                           RDP hosts almost always have one, so this is usually
+                           required. The session stays encrypted, but the
+                           certificate cannot prove you reached the right host.
+    --legacy               Use Standard RDP Security (RC4) instead of TLS/NLA,
+                           for hosts with Network Level Authentication disabled.
+    --udp                  Also open the UDP transport (MS-RDPEUDP) for graphics.
+    --shortpath            Azure Virtual Desktop RDP Shortpath (implies --udp).
+
+AUTHENTICATION
+    --user, -u <NAME>      User name.
+    --password, -p <PASS>  Password. Visible in shell history — prefer omitting
+                           it and letting the client prompt.
+    --domain, -d <DOMAIN>  Logon domain.
+    --forget-password      Clear the saved credential for this host and exit.
+
+DISPLAY
+    --fullscreen, -f       Borderless fullscreen on the current monitor.
+    --multimon, -m         Span every monitor as one desktop.
+    --per-monitor          One window per monitor instead of one spanning window.
+    --width <PX>           Desktop width  (default: the window's client area).
+    --height <PX>          Desktop height.
+    --size <WxH>           Both at once, e.g. --size 2560x1440.
+    --bpp <BITS>           Colour depth: 15, 16, 24 or 32. Default 32.
+    --keyboard-layout <ID> Layout ID, decimal or 0x-hex (e.g. 0x0409 = US).
+
+IMAGE QUALITY AND SCALING
+    --quality <MODE>       gaming | office | balanced. Default balanced.
+                           gaming  = AVC420-only, best for motion and video.
+                           office  = clarity first, best for reading text:
+                                     vsync, 1:1 rendering and bicubic upscale,
+                                     each overridable by naming it explicitly.
+    --gaming               Shorthand for --quality gaming. Does not change the
+                           present mode; add --low-latency if you want tearing
+                           presents too (lowest latency, visible shear).
+    --office               Shorthand for --quality office.
+    --render-scale <F>     Render the remote desktop at 0.4-1.0 of window size
+                           and upscale on the GPU. Less bandwidth and less host
+                           encode cost. Good for video and motion; bad for text,
+                           since glyph detail lost below 1.0 cannot be restored
+                           by any upscaler.
+    --upscale <MODE>       How a scaled desktop is enlarged:
+                             bicubic  Catmull-Rom, sharp on text (default)
+                             fsr      AMD FSR 1.0 (EASU+RCAS), best all-round
+                             vsr      Vendor AI super-resolution
+                                      (NVIDIA RTX VSR / Intel VPE SR)
+                             nearest  Point sampling, exact pixels
+                             bilinear Driver default, softest
+    --fsr / --vsr          Shorthand for the matching --upscale mode.
+    --sharpen <0.0-1.0>    RCAS sharpening after upscale. Defaults to 0.9 with
+                           --fsr, off otherwise.
+    --force-avc444         Advertise full 4:4:4 chroma. The extra chroma stream
+                           is only reconstructed on the CPU decode path — the
+                           GPU (DXVA) path renders its 4:2:0 main view and
+                           logs that the aux stream was discarded — so expect
+                           double host encode for a benefit only off-GPU.
+    --no-avc               Disable H.264 entirely (RemoteFX / progressive only).
+    --cpu-yuv              Skip GPU colour conversion. Diagnostic escape hatch.
+    --backend <API>        d3d11 (default) or d3d12.
+
+LATENCY
+    --low-latency          Present with tearing allowed instead of waiting for
+                           vsync. Lower lag, possible tearing.
+    --pace <HZ>            Cap presents to this rate (0 = uncapped, max 480).
+                           Useful to stop a 165 Hz panel burning battery.
+
+REDIRECTION
+    --drive, -D <PATH>     Share a local folder or drive into the session.
+                           Repeatable. `--drive all` shares every mounted drive.
+    --printer              Redirect the default Windows printer.
+    --clipboard-dir <DIR>  Where pasted files from the session are staged.
+                           Default: a per-session folder under %TEMP%.
+    --teams-native         Native WebRTC engine for Teams media optimization.
+    --teams                Teams optimization via the Microsoft add-in DLL.
+
+WINDOWS 365 / CLOUD PC
+    --w365                 Sign in to Windows 365 and connect to a Cloud PC.
+    --w365-device-code     Use device-code sign-in (no local browser).
+    --w365-relogin         Force a fresh sign-in, discarding cached tokens.
+    --tenant <ID>          Entra tenant ID.
+    --client-id <ID>       Override the OAuth client ID.
+    --feed <URL>           Connect through a specific workspace feed URL.
+    --rdp-file <PATH>      Read connection settings from an .rdp file.
+
+DIAGNOSTICS
+    --log-file <PATH>      Write the log to a file as well as the console.
+    --replay-gfx <PATH>    Replay a captured EGFX stream offline (no server).
+    --udp-debug            Verbose UDP transport tracing (implies --udp).
+    --no-seed              Skip the initial full-desktop refresh request.
+    --help, -?             Show this help.
+    --version, -V          Show the version.
+
+    Set RUST_LOG=debug (or trace) for per-PDU detail. At INFO the client prints
+    a periodic `metrics:` line with decode/present percentiles and frame rate.
+
+Requires a CPU with AVX2 (Intel Haswell / AMD Excavator, 2013 or newer)."#,
+        version = env!("CARGO_PKG_VERSION"),
+    );
 }
 
 fn parse_backend(v: &str) -> rdp_gpu::Backend {
@@ -821,13 +1088,49 @@ fn parse_backend(v: &str) -> rdp_gpu::Backend {
 /// unknown values fall back to the default (Catmull-Rom bicubic) with a warning.
 fn parse_upscaler(v: &str) -> rdp_gpu::Upscaler {
     match v.trim().to_ascii_lowercase().as_str() {
-        "vsr" | "rtx" | "superres" => rdp_gpu::Upscaler::Vsr,
+        "vsr" | "rtx" | "superres" | "ai" => rdp_gpu::Upscaler::Vsr,
         "bicubic" | "catmull" | "catmull-rom" => rdp_gpu::Upscaler::Bicubic,
+        "fsr" | "fsr1" | "easu" => rdp_gpu::Upscaler::Fsr,
+        "nearest" | "integer" | "point" | "pixel" => rdp_gpu::Upscaler::Nearest,
         "bilinear" | "linear" | "none" => rdp_gpu::Upscaler::Bilinear,
         other => {
             tracing::warn!("unknown --upscale mode {other:?}; using bicubic");
             rdp_gpu::Upscaler::Bicubic
         }
+    }
+}
+
+/// Expand `--drive` values into concrete roots: `all` becomes every mounted
+/// drive letter — fixed, removable, and mapped network drives alike (anything
+/// whose root opens) — and other values pass through. Order is kept; duplicates
+/// are dropped.
+fn expand_drive_args(drives: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for d in drives {
+        if d.eq_ignore_ascii_case("all") {
+            for letter in b'A'..=b'Z' {
+                let root = format!("{}:\\", letter as char);
+                if std::path::Path::new(&root).exists() {
+                    out.push(root);
+                }
+            }
+        } else {
+            out.push(d.clone());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.to_ascii_uppercase()));
+    out
+}
+
+/// The effective RCAS sharpen strength: an explicit `--sharpen` wins; otherwise
+/// FSR defaults to 0.9 (≈ AMD's recommended 0.2-stop RCAS attenuation — FSR 1.0
+/// is designed as the EASU+RCAS pair) and every other upscaler to off.
+fn effective_sharpen(sharpen: Option<f32>, upscale: rdp_gpu::Upscaler) -> f32 {
+    match sharpen {
+        Some(s) => s.clamp(0.0, 1.0),
+        None if upscale == rdp_gpu::Upscaler::Fsr => 0.9,
+        None => 0.0,
     }
 }
 
@@ -865,6 +1168,9 @@ mod connect;
 
 #[cfg(windows)]
 mod iocp;
+
+#[cfg(windows)]
+mod net_wait;
 
 #[cfg(windows)]
 mod tls;
@@ -975,22 +1281,25 @@ mod win {
             rgba: Vec<u8>,
         },
         /// An NV12 frame for the UI thread to color-convert on the GPU (with a
-        /// CPU fallback) and blit into the framebuffer.
+        /// CPU fallback) and blit into the framebuffer. `rects` are the
+        /// frame-relative dirty regions to paint (empty = whole frame).
         BlitNv12 {
             x: u16,
             y: u16,
             w: u16,
             h: u16,
             nv12: Vec<u8>,
+            rects: Vec<(u16, u16, u16, u16)>,
         },
         /// A GPU NV12 texture (zero-copy DXVA decode) for the UI thread to
-        /// color-convert on the GPU.
+        /// color-convert on the GPU. `rects` as in [`FrameMsg::BlitNv12`].
         BlitTexture {
             x: u16,
             y: u16,
             w: u16,
             h: u16,
             texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+            rects: Vec<(u16, u16, u16, u16)>,
         },
         /// GPU framebuffer→framebuffer copy (EGFX SurfaceToSurface).
         CopyRect {
@@ -1022,8 +1331,6 @@ mod win {
         Cookie(rdp_pdu::logon::ReconnectCookie),
         /// The server reset the desktop size (after a Display Control resize).
         Resize(u16, u16),
-        /// Adaptive pacing request from the worker: low-latency tearing on/off.
-        LowLatency(bool),
     }
 
     /// [`session::FrameSink`] that ships decoded rectangles to the UI thread.
@@ -1044,7 +1351,15 @@ mod win {
             }
             let _ = self.tx.send(FrameMsg::Blit { x, y, w, h, rgba });
         }
-        fn blit_nv12(&mut self, x: u16, y: u16, w: u16, h: u16, nv12: &[u8]) {
+        fn blit_nv12(
+            &mut self,
+            x: u16,
+            y: u16,
+            w: u16,
+            h: u16,
+            nv12: &[u8],
+            rects: &[(u16, u16, u16, u16)],
+        ) {
             // Hand the NV12 frame to the UI thread, which owns the D3D11 device
             // and converts it on the GPU (falling back to CPU there if needed).
             if let Some(m) = self.metrics.as_ref() {
@@ -1056,6 +1371,7 @@ mod win {
                 w,
                 h,
                 nv12: nv12.to_vec(),
+                rects: rects.to_vec(),
             });
         }
         fn blit_texture(
@@ -1065,6 +1381,7 @@ mod win {
             w: u16,
             h: u16,
             texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+            rects: &[(u16, u16, u16, u16)],
         ) {
             // The texture lives on the shared (multithread-protected) device, so
             // it's safe to hand to the UI thread, which color-converts it.
@@ -1074,6 +1391,7 @@ mod win {
                 w,
                 h,
                 texture: texture.clone(),
+                rects: rects.to_vec(),
             });
         }
         fn copy_rect(&mut self, sx: u16, sy: u16, w: u16, h: u16, dx: u16, dy: u16) {
@@ -1087,18 +1405,19 @@ mod win {
         }
         fn present(&mut self) {
             let _ = self.tx.send(FrameMsg::Present);
+            // A complete frame is queued — wake the UI thread now instead of
+            // letting it discover this on its next poll tick.
+            crate::window::signal_frame();
         }
         fn cursor(&mut self, update: session::CursorUpdate) {
             let _ = self.tx.send(FrameMsg::Cursor(update));
+            crate::window::signal_frame();
         }
         fn reconnect_cookie(&mut self, cookie: rdp_pdu::logon::ReconnectCookie) {
             let _ = self.tx.send(FrameMsg::Cookie(cookie));
         }
         fn resize(&mut self, w: u16, h: u16) {
             let _ = self.tx.send(FrameMsg::Resize(w, h));
-        }
-        fn set_low_latency(&mut self, on: bool) {
-            let _ = self.tx.send(FrameMsg::LowLatency(on));
         }
     }
 
@@ -1376,14 +1695,36 @@ mod win {
         /// texture). Populated only when a shared device is available and DXVA
         /// init succeeds; keyed by surface id like the CPU maps.
         gpu_decoders: std::collections::HashMap<u16, rdp_gpu::h264::H264GpuDecoder>,
+        /// Region rects for access units handed to a decoder but not yet answered
+        /// with a picture — oldest first, one entry per submitted unit, per surface.
+        ///
+        /// An H.264 decoder is a PIPELINE: feeding access unit N typically yields
+        /// unit N-1's picture (and the first few units yield nothing at all while
+        /// the MFT settles its output type). The region rects that mask a frame
+        /// belong to the unit that *encoded* it, so attaching the rects of the unit
+        /// we just submitted paints every frame through the wrong mask — a constant
+        /// off-by-one that never self-corrects, leaving scrolled text half-updated.
+        /// Queueing the rects and popping one per emitted picture re-pairs them.
+        pending_rects: std::collections::HashMap<
+            u16,
+            std::collections::VecDeque<(i64, Vec<(u16, u16, u16, u16)>)>,
+        >,
         /// The shared device/context for creating the DXVA decoder; `None` →
         /// always use the CPU path.
         device: Option<(
             windows::Win32::Graphics::Direct3D11::ID3D11Device,
             windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
         )>,
-        /// Latched once DXVA init failed, so we stop retrying and use the CPU path.
-        gpu_failed: bool,
+        /// DXVA failures so far. A transient MFT/DXVA error (a resolution
+        /// change, an adapter power transition) used to latch the whole session
+        /// onto software decode; instead each failure arms a backoff-and-retry,
+        /// and only `MAX_GPU_DECODE_FAILURES` strikes make the CPU fallback
+        /// permanent.
+        gpu_fail_count: u32,
+        /// When armed, the earliest time the DXVA path may be retried.
+        gpu_retry_at: Option<std::time::Instant>,
+        /// One-shot: warned that the GPU path renders AVC444 as 4:2:0.
+        avc444_gpu_warned: bool,
         surfaces: rdp_graphics::surface::SurfaceTable,
         desktop_w: u32,
         desktop_h: u32,
@@ -1430,8 +1771,11 @@ mod win {
                 cpu_decoders: std::collections::HashMap::new(),
                 cpu_aux_decoders: std::collections::HashMap::new(),
                 gpu_decoders: std::collections::HashMap::new(),
+                pending_rects: std::collections::HashMap::new(),
                 device,
-                gpu_failed: false,
+                gpu_fail_count: 0,
+                gpu_retry_at: None,
+                avc444_gpu_warned: false,
                 surfaces: rdp_graphics::surface::SurfaceTable::new(),
                 desktop_w,
                 desktop_h,
@@ -1578,6 +1922,30 @@ mod win {
         /// to the surface) and decode one Annex-B access unit. Returns the decoded
         /// frames; an init or decode error logs and yields none (the caller simply
         /// paints nothing).
+        /// Get (creating on first use) the CPU H.264 decoder for `surface_id`.
+        fn ensure_cpu_decoder<'d>(
+            decoders: &'d mut std::collections::HashMap<u16, rdp_gpu::h264::H264Decoder>,
+            surface_id: u16,
+            w: u32,
+            h: u32,
+            label: &str,
+        ) -> Option<&'d mut rdp_gpu::h264::H264Decoder> {
+            use std::collections::hash_map::Entry;
+            match decoders.entry(surface_id) {
+                Entry::Occupied(e) => Some(e.into_mut()),
+                Entry::Vacant(v) => match rdp_gpu::h264::H264Decoder::new(w, h) {
+                    Ok(d) => {
+                        tracing::info!(decoder = label, surface_id, w, h, "H.264 decoder created");
+                        Some(v.insert(d))
+                    }
+                    Err(e) => {
+                        tracing::warn!(decoder = label, surface_id, error = %e, "H.264 decoder init failed");
+                        None
+                    }
+                },
+            }
+        }
+
         fn decode_stream(
             decoders: &mut std::collections::HashMap<u16, rdp_gpu::h264::H264Decoder>,
             surface_id: u16,
@@ -1586,19 +1954,9 @@ mod win {
             label: &str,
             h264: &[u8],
         ) -> Vec<rdp_gpu::h264::DecodedFrame> {
-            use std::collections::hash_map::Entry;
-            let decoder = match decoders.entry(surface_id) {
-                Entry::Occupied(e) => e.into_mut(),
-                Entry::Vacant(v) => match rdp_gpu::h264::H264Decoder::new(w, h) {
-                    Ok(d) => {
-                        tracing::info!(decoder = label, surface_id, w, h, "H.264 decoder created");
-                        v.insert(d)
-                    }
-                    Err(e) => {
-                        tracing::warn!(decoder = label, surface_id, error = %e, "H.264 decoder init failed");
-                        return Vec::new();
-                    }
-                },
+            let Some(decoder) = Self::ensure_cpu_decoder(decoders, surface_id, w, h, label)
+            else {
+                return Vec::new();
             };
             match decoder.decode(h264) {
                 Ok(f) => f,
@@ -1606,6 +1964,37 @@ mod win {
                     tracing::warn!(decoder = label, surface_id, error = %e, "H.264 decode failed");
                     Vec::new()
                 }
+            }
+        }
+
+        /// Take the queued region rects for decoder output `unit_id`.
+        ///
+        /// Queue entries older than `unit_id` belong to units that produced no
+        /// picture (SPS/PPS-only, or dropped by the decoder) — discarding them
+        /// here is what keeps the pairing *exact* instead of drifting one-off
+        /// forever after any drop, which the old positional FIFO did. An
+        /// unknown id (decoder didn't echo the tag) falls back to FIFO order.
+        /// An empty return means "no bounded region" — the painter overpaints
+        /// the whole frame, the safe failure.
+        fn take_rects(
+            q: &mut std::collections::VecDeque<(i64, Vec<(u16, u16, u16, u16)>)>,
+            unit_id: i64,
+        ) -> Vec<(u16, u16, u16, u16)> {
+            if unit_id < 0 {
+                return q.pop_front().map(|(_, r)| r).unwrap_or_default();
+            }
+            while let Some((id, _)) = q.front() {
+                if *id < unit_id {
+                    q.pop_front();
+                } else {
+                    break;
+                }
+            }
+            match q.front() {
+                Some((id, _)) if *id == unit_id => {
+                    q.pop_front().map(|(_, r)| r).unwrap_or_default()
+                }
+                _ => Vec::new(),
             }
         }
 
@@ -1673,11 +2062,29 @@ mod win {
             rdp_graphics::yuv::yuv444_to_rgba(my, &u444, &v444, fw, fh, fw)
         }
 
+        /// Frame-relative dirty regions for the GPU/NV12 blit paths: `(x, y, w, h)`
+        /// tuples from the AVC metablock's `regionRects` (exclusive right/bottom).
+        fn region_tuples(rects: &[rdp_graphics::avc::Rect]) -> Vec<(u16, u16, u16, u16)> {
+            rects
+                .iter()
+                .map(|r| {
+                    (
+                        r.left,
+                        r.top,
+                        r.right.saturating_sub(r.left),
+                        r.bottom.saturating_sub(r.top),
+                    )
+                })
+                .collect()
+        }
+
         /// Decode an AVC420 payload into NV12 blits. The decoded H.264 frame is a
-        /// complete picture aligned to the surface origin, so we hand the whole
-        /// frame to the sink (which converts it on the GPU, or CPU as a fallback)
-        /// rather than cropping per region on the CPU — the dirty regions are
-        /// sub-areas of this frame, so painting it whole is correct.
+        /// complete picture aligned to the surface origin, but only the metablock's
+        /// `regionRects` hold valid NEW content — outside them the picture is the
+        /// encoder's reference, which goes stale as soon as another codec
+        /// (ClearCodec/progressive) paints the same surface. The rects ride along
+        /// with each blit so the painter clips to them (MS-RDPEGFX 2.2.4.4);
+        /// painting the whole frame caused ghosting/flicker under heavy motion.
         fn decode_avc420(
             &mut self,
             data: &[u8],
@@ -1691,39 +2098,115 @@ mod win {
                 return Vec::new();
             };
             let h264 = stream.h264.to_vec();
+            let rects = Self::region_tuples(&stream.rects);
             let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
             let (sw, sh) = self.surface_dims(surface_id);
 
             // Zero-copy GPU path: decode straight into GPU NV12 textures.
-            if let Some(blits) =
-                self.decode_avc420_gpu(surface_id, sw, sh, &h264, clamp(origin_x), clamp(origin_y))
-            {
+            if let Some(blits) = self.decode_avc420_gpu(
+                surface_id,
+                sw,
+                sh,
+                &h264,
+                clamp(origin_x),
+                clamp(origin_y),
+                &rects,
+            ) {
                 return blits;
             }
 
             // CPU fallback: software decode to NV12, converted on the UI thread.
+            // The software decoder is the same pipelined MFT, so its pictures
+            // need the same rect pairing as the GPU path. The decoder must
+            // exist BEFORE the push so this unit's rects can be queued under
+            // the id the decoder will stamp on it.
+            let unit_id = match Self::ensure_cpu_decoder(
+                &mut self.cpu_decoders,
+                surface_id,
+                sw,
+                sh,
+                "main",
+            ) {
+                Some(d) => d.next_unit_id(),
+                None => return Vec::new(),
+            };
+            {
+                let q = self.pending_rects.entry(surface_id).or_default();
+                q.push_back((unit_id, rects.clone()));
+                // Id-keyed pairing survives drops, so the cap is purely a
+                // memory bound, not a correctness cliff.
+                const MAX_PIPELINE_DEPTH: usize = 32;
+                while q.len() > MAX_PIPELINE_DEPTH {
+                    q.pop_front();
+                }
+            }
             let frames =
                 Self::decode_stream(&mut self.cpu_decoders, surface_id, sw, sh, "main", &h264);
+            let queued = self.pending_rects.entry(surface_id).or_default();
             let mut blits = Vec::new();
             for f in frames {
                 if f.width == 0 || f.height == 0 {
                     continue;
                 }
+                let rects = Self::take_rects(queued, f.unit_id);
                 blits.push(session::GfxBlit::Nv12 {
                     x: clamp(origin_x),
                     y: clamp(origin_y),
                     w: f.width as u16,
                     h: f.height as u16,
                     nv12: f.nv12,
+                    rects,
                 });
             }
             tracing::debug!(blits = blits.len(), "AVC420 decoded (NV12)");
             blits
         }
 
+        /// After this many DXVA failures the CPU fallback is permanent.
+        const MAX_GPU_DECODE_FAILURES: u32 = 3;
+
+        /// Whether the DXVA path may be tried right now: a device exists, the
+        /// failure count hasn't gone permanent, and any retry backoff elapsed.
+        fn gpu_decode_allowed(&mut self) -> bool {
+            if self.device.is_none() || self.gpu_fail_count >= Self::MAX_GPU_DECODE_FAILURES {
+                return false;
+            }
+            match self.gpu_retry_at {
+                Some(t) if std::time::Instant::now() < t => false,
+                Some(_) => {
+                    self.gpu_retry_at = None;
+                    tracing::info!(
+                        failures = self.gpu_fail_count,
+                        "retrying DXVA GPU decode after backoff"
+                    );
+                    true
+                }
+                None => true,
+            }
+        }
+
+        /// Record a DXVA failure: drop the decoders (their surfaces may be tied
+        /// to the failed state) and arm a backoff retry, or go permanent after
+        /// `MAX_GPU_DECODE_FAILURES` strikes.
+        fn note_gpu_failure(&mut self) {
+            self.gpu_fail_count += 1;
+            self.gpu_decoders.clear();
+            self.pending_rects.clear();
+            if self.gpu_fail_count >= Self::MAX_GPU_DECODE_FAILURES {
+                tracing::warn!(
+                    failures = self.gpu_fail_count,
+                    "DXVA failed repeatedly; CPU H.264 decode for the rest of the session"
+                );
+            } else {
+                let backoff = std::time::Duration::from_secs(2u64 << (self.gpu_fail_count - 1));
+                self.gpu_retry_at = Some(std::time::Instant::now() + backoff);
+            }
+        }
+
         /// Try the zero-copy DXVA path for an AVC420 unit. Returns `Some(blits)`
         /// when the GPU decoder is in use (possibly empty if a unit produced no
         /// frame), or `None` to signal "fall back to the CPU decoder".
+        #[allow(clippy::too_many_arguments)]
         fn decode_avc420_gpu(
             &mut self,
             surface_id: u16,
@@ -1732,8 +2215,9 @@ mod win {
             h264: &[u8],
             x: u16,
             y: u16,
+            rects: &[(u16, u16, u16, u16)],
         ) -> Option<Vec<session::GfxBlit>> {
-            if self.gpu_failed {
+            if !self.gpu_decode_allowed() {
                 return None;
             }
             // Lazily create the per-surface DXVA decoder from the shared device.
@@ -1746,33 +2230,60 @@ mod win {
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "DXVA decoder unavailable; using CPU decode");
-                        self.gpu_failed = true;
+                        self.note_gpu_failure();
                         return None;
                     }
                 }
             }
+            // Queue this unit's mask BEFORE decoding, keyed by the id the
+            // decoder will stamp on the picture it produces (the MFT echoes
+            // each input sample's time), then pair each output picture with
+            // its own unit's mask — see `pending_rects` and `take_rects`.
+            {
+                let unit_id = self.gpu_decoders.get(&surface_id)?.next_unit_id();
+                let q = self.pending_rects.entry(surface_id).or_default();
+                q.push_back((unit_id, rects.to_vec()));
+                // A decoder that swallows units without ever emitting them
+                // would grow this without bound; id-keyed pairing survives the
+                // drop, so this is purely a memory bound.
+                const MAX_PIPELINE_DEPTH: usize = 32;
+                while q.len() > MAX_PIPELINE_DEPTH {
+                    q.pop_front();
+                }
+            }
             let decoder = self.gpu_decoders.get_mut(&surface_id)?;
             match decoder.decode(h264) {
-                Ok(frames) => Some(
-                    frames
-                        .into_iter()
-                        .filter(|f| f.width != 0 && f.height != 0)
-                        .map(|f| session::GfxBlit::Texture {
-                            x,
-                            y,
-                            w: f.width as u16,
-                            h: f.height as u16,
-                            texture: f.texture,
-                        })
-                        .collect(),
-                ),
+                Ok(frames) => {
+                    let q = self.pending_rects.entry(surface_id).or_default();
+                    Some(
+                        frames
+                            .into_iter()
+                            .filter(|f| f.width != 0 && f.height != 0)
+                            .map(|f| {
+                                // An empty mask means "paint the whole frame" —
+                                // the safe failure when this picture's entry
+                                // was dropped from the queue.
+                                let rects = Self::take_rects(q, f.unit_id);
+                                session::GfxBlit::Texture {
+                                    x,
+                                    y,
+                                    w: f.width as u16,
+                                    h: f.height as u16,
+                                    texture: f.texture,
+                                    rects,
+                                }
+                            })
+                            .collect(),
+                    )
+                }
                 Err(e) => {
                     // A DXVA failure on one surface predicts failure on all (the
-                    // device/driver is the common cause), so the latch is global:
-                    // drop every GPU decoder and fall the whole session to CPU.
+                    // device/driver is the common cause), so the reaction is
+                    // global: drop every GPU decoder and fall to CPU — but with
+                    // a backoff retry, because the common causes (resolution
+                    // change, adapter power transition) are transient.
                     tracing::warn!(surface_id, error = %e, "DXVA decode failed; falling back to CPU");
-                    self.gpu_failed = true;
-                    self.gpu_decoders.clear();
+                    self.note_gpu_failure();
                     None
                 }
             }
@@ -1808,10 +2319,24 @@ mod win {
             // dropped here; the CPU path below reconstructs full chroma when the
             // GPU is unavailable. Luma — where text/edge detail lives — is
             // full-resolution either way.
-            if !self.gpu_failed && self.device.is_some() {
+            if self.gpu_decode_allowed() {
+                // Be loud (once) about the trade: the user asked for 4:4:4 and
+                // the server is paying double encode for it, but this path
+                // renders the 4:2:0 main view only.
+                if stream.stream2.is_some() && !self.avc444_gpu_warned {
+                    self.avc444_gpu_warned = true;
+                    tracing::warn!(
+                        "AVC444: GPU (DXVA) path discards the aux chroma stream — rendering \
+                         4:2:0. Full 4:4:4 reconstruction currently requires the CPU decode \
+                         path (e.g. --no-avc off-GPU machines, or a DXVA failure fallback)."
+                    );
+                }
                 let x = u16::try_from(origin_x).unwrap_or(u16::MAX);
                 let y = u16::try_from(origin_y).unwrap_or(u16::MAX);
-                if let Some(blits) = self.decode_avc420_gpu(surface_id, sw, sh, &main_h264, x, y) {
+                let rects = Self::region_tuples(&stream.stream1.rects);
+                if let Some(blits) =
+                    self.decode_avc420_gpu(surface_id, sw, sh, &main_h264, x, y, &rects)
+                {
                     return blits;
                 }
             }
@@ -1945,6 +2470,9 @@ mod win {
                 self.cpu_decoders.clear();
                 self.cpu_aux_decoders.clear();
                 self.gpu_decoders.clear();
+                // The queued masks belong to units the dropped decoders will now
+                // never emit; keeping them would offset every later frame.
+                self.pending_rects.clear();
                 self.progressive_decoders.clear();
                 self.fb_ensure(*width, *height);
                 return Vec::new();
@@ -1960,6 +2488,7 @@ mod win {
                 self.cpu_decoders.remove(surface_id);
                 self.cpu_aux_decoders.remove(surface_id);
                 self.gpu_decoders.remove(surface_id);
+                self.pending_rects.remove(surface_id);
                 self.progressive_decoders.remove(surface_id);
                 return Vec::new();
             }
@@ -2442,6 +2971,72 @@ mod win {
         Ok(())
     }
 
+    /// Whether a Direct3D/DXGI error means the GPU device is gone.
+    ///
+    /// This is not retryable in place: the device, its swapchain, the desktop
+    /// framebuffer and every DXVA decoder bound to it are all invalid, so the
+    /// only recovery is to build a new one. Causes are routine rather than
+    /// exotic — a driver reset (TDR), a driver update installing underneath us,
+    /// a GPU hang, and on laptops every suspend/resume cycle.
+    fn is_device_lost(err: &windows::core::Error) -> bool {
+        matches!(
+            err.code().0 as u32,
+            0x887A_0005 // DXGI_ERROR_DEVICE_REMOVED
+                | 0x887A_0006 // DXGI_ERROR_DEVICE_HUNG
+                | 0x887A_0007 // DXGI_ERROR_DEVICE_RESET
+                | 0x887A_0020 // DXGI_ERROR_DRIVER_INTERNAL_ERROR
+                | 0x8876_0868 // D3DERR_DEVICELOST (older runtimes)
+        )
+    }
+
+    /// Create the GPU renderer for `hwnd` and apply everything the session
+    /// depends on: colour-conversion mode, present pacing, upscaler, sharpening,
+    /// the desktop framebuffer, and the per-monitor present targets.
+    ///
+    /// This is one function precisely so a device lost mid-session can be rebuilt
+    /// *identically*. A rebuild path that quietly forgot, say, the upscaler or the
+    /// render-scale slices would leave the session subtly different after every
+    /// resume — the kind of drift that is very hard to notice and harder to
+    /// attribute.
+    fn build_renderer(
+        hwnd: isize,
+        sc_w: u32,
+        sc_h: u32,
+        args: &Args,
+        desktop: (u32, u32),
+        per_monitor_layout: Option<&Vec<crate::MonitorPlacement>>,
+        extra_hwnds: &[isize],
+    ) -> Result<Renderer, Box<dyn std::error::Error>> {
+        let mut renderer = Renderer::new(hwnd, sc_w, sc_h, args.backend)?;
+        if args.cpu_yuv {
+            renderer.disable_gpu_yuv();
+            tracing::info!("--cpu-yuv: forcing CPU YUV→RGB conversion");
+        }
+        renderer.set_low_latency(args.low_latency);
+        renderer.set_upscaler(args.upscale);
+        renderer.set_sharpen(crate::effective_sharpen(args.sharpen, args.upscale));
+        // The framebuffer is always the whole remote desktop; per-monitor windows
+        // present slices of it. Under render-scale it's smaller than the window
+        // and the present path upscales each slice to its swapchain.
+        renderer.ensure_framebuffer(desktop.0, desktop.1)?;
+        if let Some(placements) = per_monitor_layout {
+            let m = placements[0];
+            renderer.set_primary_src(m.src.0, m.src.1, m.src_size.0, m.src_size.1);
+            for (m, &target) in placements[1..].iter().zip(extra_hwnds) {
+                renderer.add_present_target(
+                    target,
+                    m.size.0,
+                    m.size.1,
+                    m.src.0,
+                    m.src.1,
+                    m.src_size.0,
+                    m.src_size.1,
+                )?;
+            }
+        }
+        Ok(renderer)
+    }
+
     /// Connect to `--host`, activate, then open a window and paint the live
     /// desktop. The blocking session read loop runs on a worker thread; the UI
     /// thread pumps window messages and presents decoded frames.
@@ -2705,7 +3300,7 @@ mod win {
         // fb_off_y) for each physical monitor, when `--per-monitor` is set. The
         // remote desktop is the same spanned virtual desktop as `--multimon`;
         // only the client presentation differs (one window per monitor).
-        let mut per_monitor_layout: Option<Vec<(i32, i32, u32, u32, i32, i32)>> = None;
+        let mut per_monitor_layout: Option<Vec<crate::MonitorPlacement>> = None;
         if args.multimon || args.per_monitor {
             let vd = crate::window::enumerate_monitors();
             if vd.size.0 > 0 && vd.size.1 > 0 {
@@ -2733,19 +3328,25 @@ mod win {
                 );
                 // Per-monitor mode needs each monitor's screen position, size and
                 // offset within the spanned framebuffer to drive one window each.
+                // The presented slice (`src`/`src_size`) starts native; the
+                // render-scale block below swaps in the scaled slice rects.
                 if args.per_monitor {
-                    let placements: Vec<(i32, i32, u32, u32, i32, i32)> = vd
+                    let placements: Vec<crate::MonitorPlacement> = vd
                         .rects
                         .iter()
                         .map(|r| {
-                            (
-                                r.left,
-                                r.top,
+                            let size = (
                                 (r.right - r.left).max(1) as u32,
                                 (r.bottom - r.top).max(1) as u32,
-                                r.left - vd.origin.0,
-                                r.top - vd.origin.1,
-                            )
+                            );
+                            let off = (r.left - vd.origin.0, r.top - vd.origin.1);
+                            crate::MonitorPlacement {
+                                screen: (r.left, r.top),
+                                size,
+                                input_offset: off,
+                                src: (off.0 as u32, off.1 as u32),
+                                src_size: size,
+                            }
                         })
                         .collect();
                     if !placements.is_empty() {
@@ -2784,23 +3385,65 @@ mod win {
 
         // Client-side render-scale: ask the host to render a smaller desktop (huge
         // encode-cost win on a CPU-only host) and upscale it to the native window on
-        // the client GPU at present time. Skipped for multi-monitor / per-monitor,
-        // whose spanned geometry must map 1:1 to the physical monitors.
-        let (desktop_w, desktop_h) = if !(args.multimon || args.per_monitor)
-            && args.render_scale < 0.999
-        {
-            let (dw, dh) = crate::scaled_desktop_dims(width, height, args.render_scale);
-            config.width = dw as u16;
-            config.height = dh as u16;
-            tracing::info!(
-                scale = args.render_scale,
-                window_w = width,
-                window_h = height,
-                desktop_w = dw,
-                desktop_h = dh,
-                "render-scale: host renders a smaller desktop; client GPU upscales"
-            );
-            (dw, dh)
+        // the client GPU at present time. Multi-monitor scales every monitor edge
+        // through one consistent map (seams stay seams), advertises the scaled
+        // CS_MONITOR layout, and upscales each monitor's slice on present.
+        let (desktop_w, desktop_h) = if args.render_scale < 0.999 {
+            if args.multimon || args.per_monitor {
+                // Recover the exclusive-edge monitor rects from the native defs
+                // set above, scale them consistently, and swap the scaled layout
+                // into the connection config.
+                let rects: Vec<rdp_pdu::gcc::VirtualScreenRect> = config
+                    .monitors
+                    .iter()
+                    .map(|m| rdp_pdu::gcc::VirtualScreenRect {
+                        left: m.left,
+                        top: m.top,
+                        right: m.right + 1,
+                        bottom: m.bottom + 1,
+                        primary: m.primary,
+                    })
+                    .collect();
+                if rects.is_empty() {
+                    (width, height)
+                } else {
+                    let (defs, (dw, dh), slices) =
+                        crate::scale_monitor_layout(&rects, args.render_scale);
+                    config.monitors = defs;
+                    config.width = dw.min(u16::MAX as u32) as u16;
+                    config.height = dh.min(u16::MAX as u32) as u16;
+                    // Point each per-monitor present at its scaled slice.
+                    if let Some(pl) = per_monitor_layout.as_mut() {
+                        for (m, s) in pl.iter_mut().zip(&slices) {
+                            m.src = s.0;
+                            m.src_size = s.1;
+                        }
+                    }
+                    tracing::info!(
+                        scale = args.render_scale,
+                        native_w = width,
+                        native_h = height,
+                        desktop_w = dw,
+                        desktop_h = dh,
+                        monitors = slices.len(),
+                        "multimon render-scale: host renders a smaller spanned desktop; client GPU upscales each monitor"
+                    );
+                    (dw, dh)
+                }
+            } else {
+                let (dw, dh) = crate::scaled_desktop_dims(width, height, args.render_scale);
+                config.width = dw as u16;
+                config.height = dh as u16;
+                tracing::info!(
+                    scale = args.render_scale,
+                    window_w = width,
+                    window_h = height,
+                    desktop_w = dw,
+                    desktop_h = dh,
+                    "render-scale: host renders a smaller desktop; client GPU upscales"
+                );
+                (dw, dh)
+            }
         } else {
             (width, height)
         };
@@ -2842,8 +3485,15 @@ mod win {
         // single-window path is spanning or normal-resizable as before.
         let window = match per_monitor_layout.as_ref() {
             Some(p) => {
-                let (px, py, pw, ph, pox, poy) = p[0];
-                Window::new_monitor("RDPiO", px, py, pw, ph, (pox, poy))?
+                let m = p[0];
+                Window::new_monitor(
+                    "RDPiO",
+                    m.screen.0,
+                    m.screen.1,
+                    m.size.0,
+                    m.size.1,
+                    m.input_offset,
+                )?
             }
             None => match span_origin {
                 Some((x, y)) => Window::new_spanning("RDPiO", x, y, width, height)?,
@@ -2853,39 +3503,41 @@ mod win {
         // The primary swapchain is sized to the primary monitor in per-monitor
         // mode, else to the whole window.
         let (sc_w, sc_h) = match per_monitor_layout.as_ref() {
-            Some(p) => (p[0].2, p[0].3),
+            Some(p) => p[0].size,
             None => (width, height),
         };
-        let mut renderer = Renderer::new(window.hwnd_raw(), sc_w, sc_h, args.backend)?;
-        if args.cpu_yuv {
-            renderer.disable_gpu_yuv();
-            tracing::info!("--cpu-yuv: forcing CPU YUV→RGB conversion");
-        }
-        renderer.set_low_latency(args.low_latency);
-        renderer.set_upscaler(args.upscale);
-        // When the user forces low latency, adaptive pacing toggles are ignored
-        // (the mode stays on); otherwise the worker drives it from motion.
-        let forced_low_latency = args.low_latency;
-        // The framebuffer is always the whole remote desktop; per-monitor windows
-        // present slices of it. Under render-scale it's smaller than the window and
-        // `present_frame`'s smart-size upscales it to the swapchain.
-        renderer.ensure_framebuffer(desktop_w, desktop_h)?;
-        // Per-monitor: point the primary swapchain at its slice and spin up a
-        // window + present target for every other monitor. The extra windows are
-        // kept alive (their HWNDs back the swapchains) for the connection.
+        // Per-monitor: one borderless window per physical monitor. They are all
+        // created BEFORE the renderer so building the renderer is a pure function
+        // of windows that already exist — which is what lets it be rebuilt
+        // identically if the GPU device is lost. The windows outlive any such
+        // rebuild (their HWNDs back the swapchains) for the whole connection.
         let mut extra_windows: Vec<crate::window::Window> = Vec::new();
         if let Some(placements) = per_monitor_layout.as_ref() {
-            renderer.set_primary_src(placements[0].4 as u32, placements[0].5 as u32);
-            for &(sx, sy, w, h, ox, oy) in &placements[1..] {
-                let win = Window::new_monitor("RDPiO", sx, sy, w, h, (ox, oy))?;
-                renderer.add_present_target(win.hwnd_raw(), w, h, ox as u32, oy as u32)?;
-                extra_windows.push(win);
+            for m in &placements[1..] {
+                extra_windows.push(Window::new_monitor(
+                    "RDPiO",
+                    m.screen.0,
+                    m.screen.1,
+                    m.size.0,
+                    m.size.1,
+                    m.input_offset,
+                )?);
             }
             tracing::info!(
                 monitors = placements.len(),
                 "per-monitor windows: one window per physical monitor"
             );
         }
+        let extra_hwnds: Vec<isize> = extra_windows.iter().map(|w| w.hwnd_raw()).collect();
+        let mut renderer = build_renderer(
+            window.hwnd_raw(),
+            sc_w,
+            sc_h,
+            args,
+            (desktop_w, desktop_h),
+            per_monitor_layout.as_ref(),
+            &extra_hwnds,
+        )?;
         let per_monitor = per_monitor_layout.is_some();
         renderer.present_clear(SLATE)?;
         tracing::info!("window up; streaming desktop updates");
@@ -2897,6 +3549,9 @@ mod win {
         // on our window being foreground, so clicking another local app restores
         // local Alt+Tab.
         crate::window::install_keyboard_hook();
+        // The event the session worker signals when a frame is ready, so the UI
+        // loop waits for work instead of polling on a timer.
+        crate::window::init_wake_event();
 
         // Borderless modes have no window frame to close from: add a floating
         // connection bar (Pin + Disconnect) on the primary monitor.
@@ -2929,7 +3584,12 @@ mod win {
         // Performance telemetry: shared across the UI, network, and decode threads.
         // Drained and logged every 10 seconds by the UI loop.
         let metrics = crate::metrics::Metrics::new();
-        {
+        // GPU timestamp queries cost driver work on every present; only pay for
+        // them when someone is actually reading the perf telemetry
+        // (RUST_LOG=perf=debug). The queries themselves are already gated on
+        // the callback being installed.
+        let gpu_timing = tracing::enabled!(target: "perf", tracing::Level::DEBUG);
+        if gpu_timing {
             let m = metrics.clone();
             renderer.set_gpu_timing_callback(Some(Box::new(move |label: &str, us: u64| {
                 if label == "present" {
@@ -2941,7 +3601,63 @@ mod win {
         // interface comes back up, instead of waiting out the backoff.
         let net_change_rx = net_listener::subscribe();
 
+        // Set when a renderer call reports the GPU device is gone, so the next
+        // pass through `'session` rebuilds it before reconnecting.
+        let mut device_lost = false;
+
         'session: loop {
+            // A lost GPU device invalidates the swapchain, the framebuffer and
+            // every decoder bound to it, so rebuild before touching the network.
+            // Rebuilding can itself fail for a while — after a resume the adapter
+            // may not be back yet — so retry on the same backoff the network path
+            // uses rather than giving up on the first attempt.
+            if device_lost {
+                let mut tries = 0u32;
+                loop {
+                    window.set_title("Reconnecting… — RDPiO");
+                    match build_renderer(
+                        window.hwnd_raw(),
+                        sc_w,
+                        sc_h,
+                        args,
+                        desktop,
+                        per_monitor_layout.as_ref(),
+                        &extra_hwnds,
+                    ) {
+                        Ok(mut r) => {
+                            if gpu_timing {
+                                let m = metrics.clone();
+                                r.set_gpu_timing_callback(Some(Box::new(
+                                    move |label: &str, us: u64| {
+                                        if label == "present" {
+                                            m.record_gpu_present_us(us);
+                                        }
+                                    },
+                                )));
+                            }
+                            renderer = r;
+                            device_lost = false;
+                            tracing::info!(attempts = tries, "GPU device rebuilt");
+                            break;
+                        }
+                        Err(e) if tries < MAX_RECONNECT => {
+                            tries += 1;
+                            let delay = reconnect_delay(tries);
+                            tracing::warn!(
+                                error = %e,
+                                attempt = tries,
+                                delay_ms = delay.as_millis() as u64,
+                                "GPU device not available yet; retrying"
+                            );
+                            std::thread::sleep(delay);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "could not rebuild the GPU device");
+                            return Err(e);
+                        }
+                    }
+                }
+            }
             // Obtain a connection: the first iteration uses the one we already
             // established; later iterations reconnect (with the server cookie).
             let conn = match pending.take() {
@@ -2986,9 +3702,9 @@ mod win {
                 protocol,
             } = conn;
             tracing::info!(?protocol, info = ?session.info(), "RDP session ACTIVE");
-            if attempts > 0 {
-                window.set_title("RDPiO");
-            }
+            // Unconditional: the title also says "Reconnecting…" after a GPU
+            // device rebuild, which can reach here with `attempts` still zero.
+            window.set_title("RDPiO");
 
             // Enhanced-security transports carry EGFX graphics: direct TLS *and*
             // the W365/AVD RDSTLS-over-WebSocket tunnel. Both must take the graphics
@@ -3021,7 +3737,10 @@ mod win {
             let shutdown = control;
             session.set_clipboard_provider(Box::new(
                 crate::clipboard::Win32Clipboard::new()
-                    .with_download_dir(args.clipboard_dir.clone().map(std::path::PathBuf::from)),
+                    .with_download_dir(args.clipboard_dir.clone().map(std::path::PathBuf::from))
+                    // The window owns the clipboard so Windows can ask it to
+                    // render the session's files (WM_RENDERFORMAT) on a paste.
+                    .with_owner(window.hwnd_raw()),
             ));
             session.set_audio_sink(Box::new(crate::audio::Win32Audio::new()));
             if args.printer {
@@ -3050,17 +3769,41 @@ mod win {
             // the window. Set by the UI thread before the join.
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_worker = stop.clone();
+            // Event-driven waits for the worker where the transport exposes its
+            // raw socket (direct TCP/TLS). Registering switches the socket to
+            // non-blocking event notification — the TLS read/write paths ride
+            // that out — and drops the worker's idle wakeups from 60-1000/s
+            // (the old 1 ms poll, a steady battery cost) to ~2/s. Input still
+            // ships instantly: every producer signals the worker's wake event.
+            let sock_wait = if graphics_path {
+                transport.raw_socket().and_then(|s| {
+                    match crate::net_wait::SocketWait::new(s) {
+                        Ok(w) => Some(w),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "socket event registration failed; using timeout pacing"
+                            );
+                            None
+                        }
+                    }
+                })
+            } else {
+                None
+            };
             let worker = std::thread::spawn(move || {
                 let mut session = session;
                 let mut transport = transport;
                 let result = if graphics_path {
-                    // 1 ms wake: the worker forwards queued input between reads,
-                    // so this bounds added input latency. Paired with fast-path
-                    // input, a flick's events ship within ~1 ms — below the
-                    // perceptual threshold (16 ms felt mushy in FPS games; the
-                    // idle cost of waking 1000×/s is negligible).
-                    if let Err(e) = transport.set_read_timeout(Some(Duration::from_millis(1))) {
-                        tracing::warn!(error = %e, "could not set input poll timeout; input may lag");
+                    if sock_wait.is_none() {
+                        // No waitable socket (WebSocket paths): fall back to the
+                        // 1 ms read-timeout poll so queued input still ships
+                        // promptly between reads.
+                        if let Err(e) =
+                            transport.set_read_timeout(Some(Duration::from_millis(1)))
+                        {
+                            tracing::warn!(error = %e, "could not set input poll timeout; input may lag");
+                        }
                     }
                     // Decode/composite runs on its OWN thread so decode time never
                     // blocks the network read + frame-ack loop. The heavy stateful
@@ -3142,6 +3885,7 @@ mod win {
                         Some(worker_metrics),
                         &stop_worker,
                         redirector,
+                        sock_wait,
                     );
                     // `run_graphics_session` returning drops `decode_tx`, so the
                     // decode thread's `recv()` ends; join it before we exit.
@@ -3204,24 +3948,40 @@ mod win {
                         // swapchain or rescale input — the framebuffer is the whole
                         // desktop and input is already in absolute desktop space.
                         if let (Some((w, h)), false) = (resize, per_monitor) {
-                            renderer.resize(w, h)?;
+                            if let Err(e) = renderer.resize(w, h) {
+                                if !is_device_lost(&e) {
+                                    return Err(e.into());
+                                }
+                                tracing::warn!(
+                                    error = %e,
+                                    "GPU device lost while resizing; rebuilding and reconnecting"
+                                );
+                                // Leaving the loop with `window_closed` false is
+                                // what routes us back into the reconnect path.
+                                device_lost = true;
+                                break;
+                            }
                             client = (w, h);
                             // Ask the server to resize the remote desktop to match
                             // the new window (Display Control; ignored if the
                             // server didn't open that channel) — scaled down by the
                             // render-scale, so the host keeps encoding fewer pixels.
-                            let (rw, rh) = if args.render_scale < 0.999 {
-                                crate::scaled_desktop_dims(w, h, args.render_scale)
-                            } else {
-                                (w, h)
-                            };
-                            crate::session::request_resize(vec![rdp_pdu::gcc::MonitorDef {
-                                left: 0,
-                                top: 0,
-                                right: rw as i32 - 1,
-                                bottom: rh as i32 - 1,
-                                primary: true,
-                            }]);
+                            // Spanned multimon keeps its fixed CS_MONITOR layout: a
+                            // single-monitor resize request would collapse it.
+                            if !args.multimon {
+                                let (rw, rh) = if args.render_scale < 0.999 {
+                                    crate::scaled_desktop_dims(w, h, args.render_scale)
+                                } else {
+                                    (w, h)
+                                };
+                                crate::session::request_resize(vec![rdp_pdu::gcc::MonitorDef {
+                                    left: 0,
+                                    top: 0,
+                                    right: rw as i32 - 1,
+                                    bottom: rh as i32 - 1,
+                                    primary: true,
+                                }]);
+                            }
                             dirty = true;
                             activity_deadline = std::time::Instant::now() + ACTIVITY_WINDOW;
                         }
@@ -3249,6 +4009,10 @@ mod win {
                                     }
                                 } else if graphics_path && input_tx.send(events).is_err() {
                                     tracing::debug!("input worker gone; dropping input");
+                                } else {
+                                    // Wake the (event-driven) worker so the
+                                    // queued input ships immediately.
+                                    crate::net_wait::worker_wake::signal();
                                 }
                             }
                             if !touches.is_empty() {
@@ -3270,12 +4034,6 @@ mod win {
                                         tracing::warn!(error = %e, "failed to persist reconnect cookie");
                                     }
                                 }
-                                    Ok(FrameMsg::LowLatency(on)) => {
-                                        // Adaptive pacing; a user-forced mode wins.
-                                        if !forced_low_latency {
-                                            renderer.set_low_latency(on);
-                                        }
-                                    }
                                     Ok(msg) => pending.push(msg),
                                     Err(TryRecvError::Empty) => break,
                                     Err(TryRecvError::Disconnected) => {
@@ -3301,26 +4059,55 @@ mod win {
                                         FrameMsg::Blit { x, y, w, h, rgba } => {
                                             renderer.update_rect(x, y, w, h, &rgba);
                                         }
-                                        FrameMsg::BlitNv12 { x, y, w, h, nv12 } => {
+                                        FrameMsg::BlitNv12 { x, y, w, h, nv12, rects } => {
                                             // GPU color-convert; fall back to CPU so
-                                            // the frame is never dropped.
+                                            // the frame is never dropped. Only the
+                                            // dirty region rects are painted.
+                                            let regions = region_tuples_u32(&rects);
                                             if !renderer.blit_nv12(
                                                 x as u32, y as u32, w as u32, h as u32, &nv12,
+                                                &regions,
                                             ) {
                                                 let (yp, uv) =
                                                     nv12.split_at((w as usize) * (h as usize));
                                                 if let Some(rgba) = rdp_graphics::yuv::nv12_to_rgba(
                                                     yp, uv, w as usize, h as usize, w as usize,
                                                 ) {
-                                                    renderer.update_rect(x, y, w, h, &rgba);
+                                                    blit_rgba_regions(
+                                                        &mut renderer, x, y, w, h, &rgba, &rects,
+                                                    );
                                                 }
                                             }
                                         }
-                                        FrameMsg::BlitTexture { x, y, w, h, texture } => {
+                                        FrameMsg::BlitTexture { x, y, w, h, texture, rects } => {
                                             // Zero-copy GPU NV12 texture color-convert.
-                                            renderer.blit_texture(
+                                            let regions = region_tuples_u32(&rects);
+                                            if !renderer.blit_texture(
                                                 x as u32, y as u32, w as u32, h as u32, &texture,
-                                            );
+                                                &regions,
+                                            ) {
+                                                // The video processor refused the
+                                                // frame. Read it back and convert on
+                                                // the CPU rather than dropping it:
+                                                // discarding the frame is what turned
+                                                // one rejected blit into a permanently
+                                                // blank screen (and, where another
+                                                // codec was also painting, text that
+                                                // never finished refreshing).
+                                                if let Some(nv12) =
+                                                    renderer.read_nv12(&texture, w as u32, h as u32)
+                                                {
+                                                    let (yp, uv) =
+                                                        nv12.split_at((w as usize) * (h as usize));
+                                                    if let Some(rgba) = rdp_graphics::yuv::nv12_to_rgba(
+                                                        yp, uv, w as usize, h as usize, w as usize,
+                                                    ) {
+                                                        blit_rgba_regions(
+                                                            &mut renderer, x, y, w, h, &rgba, &rects,
+                                                        );
+                                                    }
+                                                }
+                                            }
                                         }
                                         FrameMsg::CopyRect { sx, sy, w, h, dx, dy } => {
                                             renderer.copy_rect(sx, sy, w, h, dx, dy);
@@ -3341,9 +4128,7 @@ mod win {
                                             dirty = true;
                                         }
                                         // Handled during drain; never queued.
-                                        FrameMsg::Cursor(_)
-                                        | FrameMsg::Cookie(_)
-                                        | FrameMsg::LowLatency(_) => {}
+                                        FrameMsg::Cursor(_) | FrameMsg::Cookie(_) => {}
                                     }
                                 }
                             }
@@ -3361,7 +4146,22 @@ mod win {
                             pace_interval.map_or(true, |iv| last_present.elapsed() >= iv);
                         if pending_present && pace_ready {
                             let present_start = std::time::Instant::now();
-                            renderer.present_frame()?;
+                            if let Err(e) = renderer.present_frame() {
+                                if !is_device_lost(&e) {
+                                    return Err(e.into());
+                                }
+                                // Don't take the session down with the device:
+                                // drop this connection, rebuild the GPU, and let
+                                // the reconnect path resume from the cookie.
+                                tracing::warn!(
+                                    error = %e,
+                                    "GPU device lost while presenting; rebuilding and reconnecting"
+                                );
+                                // Leaving the loop with `window_closed` false is
+                                // what routes us back into the reconnect path.
+                                device_lost = true;
+                                break;
+                            }
                             let present_us = present_start.elapsed().as_micros() as u64;
                             let interval_us = last_present.elapsed().as_micros() as u64;
                             metrics.record_present_us(present_us);
@@ -3381,13 +4181,30 @@ mod win {
                         }
 
                         if !(pending_present && pace_ready) {
-                            // Adaptive idle poll: stay at 1 ms when low-latency mode
-                            // is forced, a frame is queued, or recent input/resize
-                            // arrived; drop to 8 ms when truly idle to save CPU/battery.
-                            let active = args.low_latency
-                                || pending_present
-                                || activity_deadline > std::time::Instant::now();
-                            std::thread::sleep(Duration::from_millis(if active { 1 } else { 8 }));
+                            // Wait for actual work rather than polling: the worker's
+                            // event fires the moment a frame is queued and window
+                            // messages wake us for input, so neither waits out a
+                            // sleep interval. The timeout only bounds time-based
+                            // work — the next paced present, else the telemetry
+                            // tick — so an idle session costs a couple of wakeups
+                            // a second instead of a thousand.
+                            let timeout_ms = match (pending_present, pace_interval) {
+                                (true, Some(iv)) => {
+                                    let left = iv.saturating_sub(last_present.elapsed());
+                                    (left.as_millis() as u32).clamp(1, 100)
+                                }
+                                _ => {
+                                    let active = args.low_latency
+                                        || pending_present
+                                        || activity_deadline > std::time::Instant::now();
+                                    if active {
+                                        100
+                                    } else {
+                                        250
+                                    }
+                                }
+                            };
+                            window.wait_for_work(timeout_ms);
                         }
                     }
                 }
@@ -3395,6 +4212,7 @@ mod win {
 
             // Tear down this connection's worker.
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::net_wait::worker_wake::signal(); // unblock an event wait
             if let Some(s) = &shutdown {
                 let _ = s.shutdown(Shutdown::Both); // unblock the worker's read
             }
@@ -3413,6 +4231,13 @@ mod win {
 
     /// Keep the window responsive (and showing the last frame) until the user
     /// closes it — used after a disconnect we can't (or won't) reconnect.
+    ///
+    /// Nothing animates here, so block on the message queue instead of pumping
+    /// on a 16 ms sleep: the flip-model swapchain retains its last present, so
+    /// DWM keeps compositing the final frame without our help. Re-presenting an
+    /// unchanged frame at ~60 fps only kept the CPU/GPU awake (battery) for a
+    /// dead session. A present is still needed after a resize, which rebuilds
+    /// the backbuffer.
     fn idle_until_close(
         window: &Window,
         renderer: &mut Renderer,
@@ -3423,11 +4248,53 @@ mod win {
                 Frame::Continue { resize } => {
                     if let Some((w, h)) = resize {
                         renderer.resize(w, h)?;
+                        renderer.present_frame()?;
                     }
-                    renderer.present_frame()?;
-                    std::thread::sleep(Duration::from_millis(16));
+                    window.wait_for_work(1_000);
                 }
             }
+        }
+    }
+
+    /// Frame-relative dirty rects widened to the u32 tuples the GPU blit API takes.
+    fn region_tuples_u32(rects: &[(u16, u16, u16, u16)]) -> Vec<(u32, u32, u32, u32)> {
+        rects
+            .iter()
+            .map(|&(x, y, w, h)| (x as u32, y as u32, w as u32, h as u32))
+            .collect()
+    }
+
+    /// CPU fallback for an NV12 frame that could not be GPU-converted: upload the
+    /// converted RGBA, clipped to the dirty region rects (whole frame when none) —
+    /// outside them the decoded picture is stale encoder reference content.
+    fn blit_rgba_regions(
+        renderer: &mut Renderer,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        rgba: &[u8],
+        rects: &[(u16, u16, u16, u16)],
+    ) {
+        if rects.is_empty() {
+            renderer.update_rect(x, y, w, h, rgba);
+            return;
+        }
+        for &(rx, ry, rw, rh) in rects {
+            if rx >= w || ry >= h {
+                continue;
+            }
+            let cw = rw.min(w - rx) as usize;
+            let ch = rh.min(h - ry) as usize;
+            if cw == 0 || ch == 0 {
+                continue;
+            }
+            let mut cropped = Vec::with_capacity(cw * ch * 4);
+            for row in 0..ch {
+                let start = ((ry as usize + row) * w as usize + rx as usize) * 4;
+                cropped.extend_from_slice(&rgba[start..start + cw * 4]);
+            }
+            renderer.update_rect(x + rx, y + ry, cw as u16, ch as u16, &cropped);
         }
     }
 
@@ -3605,7 +4472,10 @@ mod win {
 
 #[cfg(test)]
 mod policy_tests {
-    use super::{caps_from_flags, parse_upscaler, scaled_desktop_dims, QualityPreset};
+    use super::{
+        caps_from_flags, effective_sharpen, parse_upscaler, scale_monitor_layout,
+        scaled_desktop_dims, QualityPreset,
+    };
     use rdp_graphics::egfx;
 
     #[test]
@@ -3616,20 +4486,23 @@ mod policy_tests {
         assert_eq!(caps, egfx::CAPS_AVC420_ONLY.to_vec());
     }
 
+    /// AVC444 costs ~2x host encode and ~2x bandwidth for a second stream that the
+    /// decode path discards, so no preset asks for it — not even the clarity-first
+    /// one, and not even when a GPU is present (which is precisely when the aux
+    /// chroma gets thrown away). The probe must not be needed to know that.
     #[test]
-    fn office_advertises_full_caps_when_gpu_h264_present() {
-        assert_eq!(
-            caps_from_flags(false, false, QualityPreset::Office, || true),
-            egfx::CAPS_FULL.to_vec()
-        );
-    }
-
-    #[test]
-    fn office_falls_back_to_avc420_without_gpu_h264() {
-        assert_eq!(
-            caps_from_flags(false, false, QualityPreset::Office, || false),
-            egfx::CAPS_AVC420_ONLY.to_vec()
-        );
+    fn no_preset_asks_for_avc444_because_the_aux_chroma_is_discarded() {
+        for quality in [
+            QualityPreset::Office,
+            QualityPreset::Balanced,
+            QualityPreset::Gaming,
+        ] {
+            assert_eq!(
+                caps_from_flags(false, false, quality, || panic!("probe should be skipped")),
+                egfx::CAPS_AVC420_ONLY.to_vec(),
+                "{quality:?} should advertise AVC420-only"
+            );
+        }
     }
 
     #[test]
@@ -3644,13 +4517,19 @@ mod policy_tests {
         assert_eq!(caps, egfx::CAPS_NO_AVC.to_vec());
     }
 
+    /// `--force-avc` is the one way back to AVC444, and it wins over every preset.
     #[test]
-    fn balanced_default_follows_the_gpu_probe() {
-        assert_eq!(caps_from_flags(false, false, QualityPreset::Balanced, || true), egfx::CAPS_FULL.to_vec());
-        assert_eq!(
-            caps_from_flags(false, false, QualityPreset::Balanced, || false),
-            egfx::CAPS_AVC420_ONLY.to_vec()
-        );
+    fn force_avc444_overrides_every_preset() {
+        for quality in [
+            QualityPreset::Office,
+            QualityPreset::Balanced,
+            QualityPreset::Gaming,
+        ] {
+            assert_eq!(
+                caps_from_flags(false, true, quality, || unreachable!()),
+                egfx::CAPS_FULL.to_vec()
+            );
+        }
     }
 
     #[test]
@@ -3672,12 +4551,88 @@ mod policy_tests {
         use rdp_gpu::Upscaler;
         assert_eq!(parse_upscaler("vsr"), Upscaler::Vsr);
         assert_eq!(parse_upscaler("RTX"), Upscaler::Vsr); // case-insensitive
+        assert_eq!(parse_upscaler("ai"), Upscaler::Vsr);
         assert_eq!(parse_upscaler("bicubic"), Upscaler::Bicubic);
         assert_eq!(parse_upscaler("catmull-rom"), Upscaler::Bicubic);
+        assert_eq!(parse_upscaler("fsr"), Upscaler::Fsr);
+        assert_eq!(parse_upscaler("FSR1"), Upscaler::Fsr);
+        assert_eq!(parse_upscaler("easu"), Upscaler::Fsr);
+        assert_eq!(parse_upscaler("nearest"), Upscaler::Nearest);
+        assert_eq!(parse_upscaler("integer"), Upscaler::Nearest);
         assert_eq!(parse_upscaler("bilinear"), Upscaler::Bilinear);
         assert_eq!(parse_upscaler("none"), Upscaler::Bilinear);
         // Unknown values and the default both resolve to Catmull-Rom bicubic.
         assert_eq!(parse_upscaler("wat"), Upscaler::Bicubic);
         assert_eq!(Upscaler::default(), Upscaler::Bicubic);
+    }
+
+    #[test]
+    fn sharpen_defaults_on_for_fsr_only_and_explicit_wins() {
+        use rdp_gpu::Upscaler;
+        // FSR is designed as EASU + RCAS: default the sharpen pass on.
+        assert_eq!(effective_sharpen(None, Upscaler::Fsr), 0.9);
+        assert_eq!(effective_sharpen(None, Upscaler::Bicubic), 0.0);
+        assert_eq!(effective_sharpen(None, Upscaler::Vsr), 0.0);
+        // An explicit --sharpen always wins, clamped to 0..=1.
+        assert_eq!(effective_sharpen(Some(0.0), Upscaler::Fsr), 0.0);
+        assert_eq!(effective_sharpen(Some(0.5), Upscaler::Bilinear), 0.5);
+        assert_eq!(effective_sharpen(Some(7.0), Upscaler::Bicubic), 1.0);
+    }
+
+    fn rect(l: i32, t: i32, r: i32, b: i32, primary: bool) -> rdp_pdu::gcc::VirtualScreenRect {
+        rdp_pdu::gcc::VirtualScreenRect {
+            left: l,
+            top: t,
+            right: r,
+            bottom: b,
+            primary,
+        }
+    }
+
+    #[test]
+    fn scale_monitor_layout_keeps_seams_origin_and_even_dims() {
+        // Two 2560x1440 monitors side by side, primary first.
+        let rects = [rect(0, 0, 2560, 1440, true), rect(2560, 0, 5120, 1440, false)];
+        let (defs, size, slices) = scale_monitor_layout(&rects, 0.66);
+        // The shared seam at x=2560 maps to one coordinate on both sides:
+        // monitor 0's right edge == monitor 1's left edge (inclusive defs are
+        // exclusive-1).
+        assert_eq!(defs[0].right + 1, defs[1].left);
+        // Primary keeps its (0,0) top-left.
+        assert_eq!((defs[0].left, defs[0].top), (0, 0));
+        // Bounding box is the sum of the slices along x.
+        assert_eq!(size.0, slices[0].1 .0 + slices[1].1 .0);
+        // Every slice is even-sized and slice offsets match the defs.
+        for (def, (off, dim)) in defs.iter().zip(&slices) {
+            assert_eq!(dim.0 & 1, 0);
+            assert_eq!(dim.1 & 1, 0);
+            assert_eq!(off.0 as i32, def.left);
+            assert_eq!(off.1 as i32, def.top);
+        }
+    }
+
+    #[test]
+    fn scale_monitor_layout_handles_negative_origins() {
+        // A 1080p monitor left of the primary: virtual-screen coords go negative,
+        // the primary still anchors (0,0), and the bbox origin is the min corner.
+        let rects = [rect(-1920, 0, 0, 1080, false), rect(0, 0, 2560, 1440, true)];
+        let (defs, size, slices) = scale_monitor_layout(&rects, 0.5);
+        assert_eq!((defs[1].left, defs[1].top), (0, 0));
+        // Slice offsets are bbox-relative and non-negative.
+        assert_eq!(slices[0].0, (0, 0));
+        assert_eq!(slices[1].0 .0, slices[0].1 .0);
+        // The scaled bbox covers both scaled monitors.
+        assert_eq!(size.0, slices[0].1 .0 + slices[1].1 .0);
+        // Shared seam at x=0 stays shared.
+        assert_eq!(defs[0].right + 1, defs[1].left);
+    }
+
+    #[test]
+    fn scale_monitor_layout_is_identity_at_one() {
+        let rects = [rect(0, 0, 1920, 1080, true), rect(1920, 0, 3840, 1080, false)];
+        let (defs, size, slices) = scale_monitor_layout(&rects, 1.0);
+        assert_eq!(size, (3840, 1080));
+        assert_eq!((defs[0].left, defs[0].right), (0, 1919));
+        assert_eq!(slices[1], ((1920, 0), (1920, 1080)));
     }
 }

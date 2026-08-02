@@ -57,6 +57,15 @@ impl Renderer {
         }
     }
 
+    /// Set the RCAS adaptive-sharpen strength (`0.0` = off, `1.0` = maximum)
+    /// applied after the upscale (or at 1:1 when nothing is scaled).
+    pub fn set_sharpen(&mut self, strength: f32) {
+        match self {
+            Self::D3D11(r) => r.set_sharpen(strength),
+            Self::D3D12(r) => r.set_sharpen(strength),
+        }
+    }
+
     /// Resize the swapchain backbuffers to match the client area.
     pub fn resize(&mut self, width: u32, height: u32) -> windows::core::Result<()> {
         match self {
@@ -129,18 +138,28 @@ impl Renderer {
         }
     }
 
-    /// Convert an NV12 frame to RGB on the GPU and write it into the framebuffer.
-    pub fn blit_nv12(&mut self, dest_x: u32, dest_y: u32, w: u32, h: u32, nv12: &[u8]) -> bool {
+    /// Convert an NV12 frame to RGB on the GPU and write its dirty `regions`
+    /// (frame-relative; empty = whole frame) into the framebuffer.
+    pub fn blit_nv12(
+        &mut self,
+        dest_x: u32,
+        dest_y: u32,
+        w: u32,
+        h: u32,
+        nv12: &[u8],
+        regions: &[(u32, u32, u32, u32)],
+    ) -> bool {
         match self {
-            Self::D3D11(r) => r.blit_nv12(dest_x, dest_y, w, h, nv12),
-            Self::D3D12(r) => r.blit_nv12(dest_x, dest_y, w, h, nv12),
+            Self::D3D11(r) => r.blit_nv12(dest_x, dest_y, w, h, nv12, regions),
+            Self::D3D12(r) => r.blit_nv12(dest_x, dest_y, w, h, nv12, regions),
         }
     }
 
-    /// Color-convert a GPU NV12 texture into the framebuffer at `(dest_x, dest_y)`.
-    /// The D3D12 backend does not implement zero-copy DXVA in this version, so it
-    /// always returns `false` here; the caller falls back to CPU decode +
-    /// [`blit_nv12`].
+    /// Color-convert a GPU NV12 texture's dirty `regions` into the framebuffer
+    /// at `(dest_x, dest_y)`. The D3D12 backend does not implement zero-copy
+    /// DXVA in this version, so it always returns `false` here; the caller
+    /// falls back to CPU decode + [`Self::blit_nv12`].
+    #[allow(clippy::too_many_arguments)]
     pub fn blit_texture(
         &mut self,
         dest_x: u32,
@@ -148,10 +167,22 @@ impl Renderer {
         w: u32,
         h: u32,
         tex: &ID3D11Texture2D,
+        regions: &[(u32, u32, u32, u32)],
     ) -> bool {
         match self {
-            Self::D3D11(r) => r.blit_texture(dest_x, dest_y, w, h, tex),
+            Self::D3D11(r) => r.blit_texture(dest_x, dest_y, w, h, tex, regions),
             Self::D3D12(_r) => false,
+        }
+    }
+
+    /// Read an NV12 GPU texture back to the CPU as packed NV12, for when
+    /// [`Self::blit_texture`] reports the video processor would not take it.
+    /// `None` on the D3D12 backend, which has no zero-copy DXVA path to fall
+    /// back from (it never produces one of these textures in the first place).
+    pub fn read_nv12(&self, tex: &ID3D11Texture2D, w: u32, h: u32) -> Option<Vec<u8>> {
+        match self {
+            Self::D3D11(r) => r.read_nv12(tex, w, h),
+            Self::D3D12(_r) => None,
         }
     }
 
@@ -181,6 +212,9 @@ impl Renderer {
     }
 
     /// Add a per-monitor present target that presents a slice of the framebuffer.
+    /// `src_w`/`src_h` give the slice size (0 = window-sized, 1:1); a smaller
+    /// slice — render-scale under per-monitor — is upscaled on present.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_present_target(
         &mut self,
         hwnd_raw: isize,
@@ -188,18 +222,25 @@ impl Renderer {
         height: u32,
         src_x: u32,
         src_y: u32,
+        src_w: u32,
+        src_h: u32,
     ) -> windows::core::Result<()> {
         match self {
-            Self::D3D11(r) => r.add_present_target(hwnd_raw, width, height, src_x, src_y),
-            Self::D3D12(r) => r.add_present_target(hwnd_raw, width, height, src_x, src_y),
+            Self::D3D11(r) => {
+                r.add_present_target(hwnd_raw, width, height, src_x, src_y, src_w, src_h)
+            }
+            Self::D3D12(r) => {
+                r.add_present_target(hwnd_raw, width, height, src_x, src_y, src_w, src_h)
+            }
         }
     }
 
-    /// Set the framebuffer offset the primary swapchain presents from.
-    pub fn set_primary_src(&mut self, x: u32, y: u32) {
+    /// Set the framebuffer slice the primary swapchain presents from (offset +
+    /// size; a `src_w`/`src_h` of 0 means swapchain-sized, 1:1).
+    pub fn set_primary_src(&mut self, x: u32, y: u32, src_w: u32, src_h: u32) {
         match self {
-            Self::D3D11(r) => r.set_primary_src(x, y),
-            Self::D3D12(r) => r.set_primary_src(x, y),
+            Self::D3D11(r) => r.set_primary_src(x, y, src_w, src_h),
+            Self::D3D12(r) => r.set_primary_src(x, y, src_w, src_h),
         }
     }
 

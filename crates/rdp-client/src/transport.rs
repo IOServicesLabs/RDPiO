@@ -22,9 +22,16 @@ pub enum NegotiateError {
 }
 
 /// Read exactly one TPKT-framed PDU (4-byte header + body) from `reader`.
+///
+/// Every caller is an activation/handshake path that needs read-to-completion
+/// semantics, so transient no-data conditions — `WouldBlock` from the graphics
+/// worker's event-mode (non-blocking) socket, or a `SO_RCVTIMEO` timeout — are
+/// ridden out (bounded) rather than surfaced. `std::io::Read::read_exact`
+/// cannot be used for that: it drops the count of bytes already read when it
+/// errors, so a retry from scratch would corrupt framing.
 pub fn read_tpkt_pdu<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut header = [0u8; x224::TPKT_HEADER_LEN];
-    reader.read_exact(&mut header)?;
+    read_exact_riding_timeouts(reader, &mut header)?;
     let total = x224::read_tpkt_len(&header)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     if total < header.len() {
@@ -35,8 +42,44 @@ pub fn read_tpkt_pdu<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     }
     let mut pdu = vec![0u8; total];
     pdu[..header.len()].copy_from_slice(&header);
-    reader.read_exact(&mut pdu[header.len()..])?;
+    read_exact_riding_timeouts(reader, &mut pdu[header.len()..])?;
     Ok(pdu)
+}
+
+/// `read_exact` that preserves progress across `WouldBlock`/timeout errors
+/// (bounded at 30 s), so a partial read is resumed instead of lost.
+fn read_exact_riding_timeouts<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
+    let mut filled = 0usize;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "server closed the connection",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // 995/996/997: raced overlapped-I/O statuses Windows can surface for
+            // a read timeout (see `poll_tpkt_pdu`) — same "no data yet" meaning.
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut
+                    || matches!(e.raw_os_error(), Some(995 | 996 | 997)) =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for a full PDU",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Send the X.224 Connection Request and process the Connection Confirm,

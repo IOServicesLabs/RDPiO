@@ -43,6 +43,13 @@ cargo build --release -p rdp-client
 `--insecure` accepts a self-signed certificate, which is what a stock Windows
 host presents. Drop it once the host has a trusted cert.
 
+> **CPU requirement:** builds target `x86-64-v3` (AVX2), so they need a 2013-or-
+> newer CPU — Intel Haswell / AMD Excavator or later. The pixel-decode loops are
+> the client's main CPU cost and AVX2 doubles their vector width, which is worth
+> more than supporting hardware that predates the D3D11 GPU decoding this client
+> already assumes. To build for an older machine, override the baseline:
+> `RUSTFLAGS="-C target-cpu=x86-64" cargo build --release -p rdp-client`.
+
 Beyond a plain connection, these two cover most of what people actually want:
 
 ```powershell
@@ -94,11 +101,21 @@ rdpio --host 192.168.1.50 --user alice --domain CORP --password 'hunter2' `
 ```
 
 **Gaming / low latency** — cheaper host encode plus client-side GPU upscaling.
-Best single knob if motion is choppy:
+Best single knob if motion is choppy. `--upscale fsr` (AMD FidelityFX SR 1.0,
+runs on any GPU) reconstructs game imagery best; the default `bicubic` is the
+safer pick for mixed desktop + game use:
 
 ```powershell
 rdpio --host 192.168.1.50 --user alice --password 'hunter2' --insecure `
-      --gaming --render-scale 0.66 --upscale bicubic
+      --gaming --render-scale 0.66 --upscale fsr
+```
+
+Render-scale also works across monitors — the host renders a smaller spanned
+desktop and the client upscales each monitor's slice back to its native panel:
+
+```powershell
+rdpio --host 192.168.1.50 --user alice --password 'hunter2' --insecure `
+      --multimon --gaming --render-scale 0.66 --upscale fsr
 ```
 
 **A Windows 365 Cloud PC** — signs in through the browser and lists your Cloud
@@ -195,12 +212,13 @@ is silent — check the startup log if a flag seems to have no effect.
 
 | Flag | Effect |
 | --- | --- |
-| `--quality gaming\|office\|balanced` | Latency vs clarity preset. `--gaming` and `--office` are shorthands |
-| `--gaming`, `--low-latency` | Present with tearing (no vsync), and advertise AVC420-only so a CPU-only host encodes one H.264 stream instead of AVC444's two |
-| `--render-scale F`, `--scale F` | Render at fraction `F` (0.4–1.0) of the window and upscale on the client GPU — far fewer pixels for the host to encode; `0.66` ≈ 1080p→720p |
-| `--upscale vsr\|bicubic\|bilinear` | Upscaler for `--render-scale`. **`bicubic`** (default) is sharp without the text ringing VSR causes on UI; **`vsr`** is NVIDIA RTX Video Super Resolution (best for a full-screen game); **`bilinear`** is soft but artifact-free. Aliases: `--vsr`, `--no-vsr` |
+| `--quality gaming\|office\|balanced` | Latency vs clarity preset. `--gaming` and `--office` are shorthands. All presets advertise the same AVC420 codec caps; what they change is presentation (office pins vsync, 1:1 rendering and bicubic) |
+| `--low-latency` | Present with tearing (no vsync) for absolute-minimum latency. Opt-in only — no preset implies it, because the shear is very visible on scrolling text |
+| `--render-scale F`, `--scale F` | Render at fraction `F` (0.4–1.0) of the window and upscale on the client GPU — far fewer pixels for the host to encode; `0.66` ≈ 1080p→720p. Works under `--multimon`/`--per-monitor` too: every monitor edge scales through one consistent map (seams stay seams) and each monitor's slice is upscaled to its native panel |
+| `--upscale vsr\|bicubic\|fsr\|nearest\|bilinear` | Upscaler for `--render-scale`. **`bicubic`** (default) is sharp without the text ringing AI upscalers cause on UI; **`fsr`** is AMD FidelityFX Super Resolution 1.0 (EASU+RCAS, runs as a shader on **any** GPU — best edge reconstruction for game content); **`vsr`** engages the driver AI video SR — NVIDIA RTX Video Super Resolution or Intel VPE Super Resolution (best for full-screen video; AMD has no driver SR — use `fsr`); **`nearest`** is pixel-perfect at integer ratios (e.g. `0.5`); **`bilinear`** is soft but artifact-free. Aliases: `--vsr`, `--no-vsr`, `--fsr` |
+| `--sharpen F` | RCAS adaptive-sharpen strength 0–1 after the upscale (or at 1:1), composable with every `--upscale` mode. Defaults: on (`0.9`) for `fsr`, off otherwise; `--sharpen 0` disables. Counteracts H.264 4:2:0 softness without amplifying compression noise |
 | `--pace FPS`, `--smooth FPS` | Present on an even cadence (≤ `FPS`), always the newest frame, to smooth jittery motion for a few ms of latency. Default off |
-| `--force-avc444`, `--force-avc` | Opt back into full 4:4:4 chroma (overrides the `--gaming` AVC420 default) |
+| `--force-avc444`, `--force-avc` | Advertise full 4:4:4 chroma. Only the CPU decode path reconstructs the extra chroma stream — the GPU (DXVA) path renders its 4:2:0 main view and logs the discard — so this costs the host double encode for a benefit only off-GPU |
 | `--no-avc` | Advertise no-AVC caps so the server uses ClearCodec/planar/progressive instead of H.264 |
 | `--cpu-yuv` | Force CPU YCbCr→RGB (if GPU-decoded colors look wrong) |
 | `--backend d3d11\|d3d12` | GPU backend (default d3d11) |
@@ -211,9 +229,9 @@ is silent — check the startup log if a flag seems to have no effect.
 
 | Flag | Effect |
 | --- | --- |
-| `--drive PATH`, `-D` | Share a local folder as a redirected drive |
+| `--drive PATH`, `-D` | Share a local folder or drive root as a redirected drive. **Repeatable** (`--drive C:\ --drive D:\Media`), and `--drive all` shares every mounted drive letter — mapped network drives included. Each appears in the session under its drive letter or folder name |
 | `--printer` | Redirect the local default printer |
-| `--clipboard-dir DIR` | Save files copied in the session to DIR |
+| `--clipboard-dir DIR` | Stage files copied in the session under DIR instead of a temp folder. Clipboard file copy works **without** this flag; set it if you want the pasted files to persist (temp staging is deleted when the copy is superseded or the session ends) |
 | `--teams`, `--webrtc` | Teams "Optimized" A/V by hosting Microsoft's WebRTC add-in |
 | `--teams-native`, `--webrtc-native` | Teams "Optimized" through RDPiO's own WebRTC engine |
 
@@ -241,11 +259,11 @@ is silent — check the startup log if a flag seems to have no effect.
 
 | Area | What's implemented |
 | --- | --- |
-| **Display** | Multi-monitor spanning, per-monitor windows, borderless fullscreen, server-driven dynamic resize (MS-RDPEDISP) |
-| **Graphics** | GPU H.264 decode via the D3D11 video processor (CPU fallback); RDPGFX/EGFX pipeline; AVC420 + AVC444; ClearCodec, progressive, planar, RemoteFX |
+| **Display** | Multi-monitor spanning, per-monitor windows, borderless fullscreen, server-driven dynamic resize (MS-RDPEDISP), render-scale on every layout (single, spanned, per-monitor) |
+| **Graphics** | GPU H.264 decode via the D3D11 video processor (CPU fallback); RDPGFX/EGFX pipeline; AVC420 + AVC444; ClearCodec, progressive, planar, RemoteFX; client upscalers — AMD FSR 1.0 (EASU+RCAS, any GPU), Catmull-Rom bicubic, NVIDIA RTX VSR / Intel VPE SR, nearest — plus a composable RCAS sharpen pass, on both D3D11 and D3D12 |
 | **Latency** | UDP side-band transport: RDP-UDP handshake + TLS-over-UDP + RDPEMT tunnel, retransmission and ACK vectors, automatic TCP fallback |
-| **Drives** | Folder redirection (MS-RDPEFS) |
-| **Clipboard** | Text both ways; file copy local→remote and remote→local |
+| **Drives** | Folder and whole-drive redirection (MS-RDPEFS), any number at once, mapped network drives included |
+| **Clipboard** | Text and images (`CF_DIB`) both ways; file and folder copy both ways — streamed to disk (any size), fetched lazily on paste, staging cleaned up automatically |
 | **Audio** | Speaker output (MS-RDPEA) and microphone input (MS-RDPEAI) |
 | **Camera** | Webcam redirection (MS-RDPECAM) via Media Foundation, H.264 encoded on-device (NV12 fallback) |
 | **Printer** | Local printer redirection (MS-RDPEPC) via the Win32 spooler |

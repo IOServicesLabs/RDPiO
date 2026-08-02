@@ -30,4 +30,6 @@ impl Renderer {
     }
 
     pub fn set_upscaler(&mut self, _mode: crate::Upscaler) {}
+
+    pub fn set_sharpen(&mut self, _strength: f32) {}
 }

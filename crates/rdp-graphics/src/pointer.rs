@@ -177,13 +177,27 @@ fn decode_masks(
         let and_row = src * and_stride;
         for x in 0..width {
             let a_bit = and_bit(and, and_row, x);
-            let (r, g, b) = xor_color(xor, xor_row, x, bpp);
+            let (mut r, mut g, mut b) = xor_color(xor, xor_row, x, bpp);
             let alpha = if use_xor_alpha {
                 *xor.get(xor_row + x * 4 + 3).unwrap_or(&0)
             } else if a_bit == 0 {
                 0xFF // AND=0 → opaque
             } else {
-                0 // AND=1 → transparent (inversion is approximated as transparent)
+                // AND=1: black XOR → screen (transparent); white XOR → invert
+                // screen — a colour cursor can't express true inversion, so
+                // render it opaque black (what inversion shows on the light
+                // backgrounds it exists for; also FreeRDP's approximation).
+                // Rendering it transparent made the classic monochrome cursors
+                // — I-beam, the window-resize arrows — entirely INVISIBLE.
+                // Any other XOR colour: XOR-blend approximated as the colour.
+                match (r, g, b) {
+                    (0, 0, 0) => 0,
+                    (0xFF, 0xFF, 0xFF) => {
+                        (r, g, b) = (0, 0, 0);
+                        0xFF
+                    }
+                    _ => 0xFF,
+                }
             };
             let di = (y * width + x) * 4;
             out[di] = r;
@@ -363,5 +377,30 @@ mod tests {
         // width 0 is rejected.
         let pdu = color_pointer_pdu(0x0006, 0, 0, 2, &[], &[], None);
         assert_eq!(parse_pointer_update(&pdu), None);
+    }
+
+    #[test]
+    fn monochrome_inversion_pixels_render_visible_black() {
+        // Regression: the classic monochrome cursors (I-beam, window-resize
+        // arrows) draw with "invert screen" pixels — AND=1, XOR=1. Decoding
+        // them as transparent made those cursors entirely invisible; they must
+        // come out opaque black (the closest a colour cursor gets to inversion).
+        //
+        // 2x1 monochrome new pointer (xorBpp=1):
+        //   px0: AND=1, XOR=1 → inversion → opaque black
+        //   px1: AND=1, XOR=0 → screen    → transparent
+        // Masks are 1 row, bottom-up (same row), 1bpp, stride padded to 2 bytes.
+        let xor = vec![0b1000_0000, 0x00];
+        let and = vec![0b1100_0000, 0x00];
+        let pdu = color_pointer_pdu(0x0008, 2, 2, 1, &xor, &and, Some(1));
+        let PointerUpdate::Shape { shape, .. } = parse_pointer_update(&pdu).unwrap() else {
+            panic!("expected shape");
+        };
+        // px0: opaque black — visible.
+        assert_eq!(&shape.rgba[0..4], &[0x00, 0x00, 0x00, 0xFF]);
+        // px1: transparent.
+        assert_eq!(shape.rgba[7], 0x00);
+        // A fully "transparent+inversion" cursor is no longer all-alpha-zero.
+        assert!(shape.rgba.chunks_exact(4).any(|px| px[3] != 0));
     }
 }

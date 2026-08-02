@@ -43,6 +43,28 @@ fn win_err(context: &str, hr: i32) -> io::Error {
     io::Error::other(format!("{context}: 0x{hr:08X}"))
 }
 
+/// Turn a Schannel handshake failure into something a user can act on.
+///
+/// The case worth naming is certificate trust: RDP hosts almost always present a
+/// self-signed certificate, which makes this the single most likely reason a
+/// first connection fails — and a bare `0x80090325` tells nobody anything.
+fn handshake_err(hr: i32) -> io::Error {
+    let reason = match hr as u32 {
+        0x8009_0325 => "the server's certificate is not trusted (self-signed, or an unknown CA)",
+        0x8009_0327 => "the server's certificate could not be checked for revocation",
+        0x8009_0328 => "the server's certificate has expired",
+        0x800B_0101 => "the server's certificate has expired",
+        0x800B_0109 => "the server's certificate chain ends in an untrusted root",
+        0x8009_0322 | 0x800B_010F => "the server's certificate does not match the host name",
+        _ => return win_err("Schannel handshake", hr),
+    };
+    io::Error::other(format!(
+        "TLS handshake rejected: {reason} (0x{hr:08X}). RDP hosts normally present a \
+         self-signed certificate — pass --insecure (-k) to accept it. The session is still \
+         encrypted, but an unvalidated certificate cannot prove you reached the intended host."
+    ))
+}
+
 fn zero_handle() -> SecHandle {
     SecHandle {
         dwLower: 0,
@@ -218,7 +240,7 @@ impl<S: Read + Write> TlsStream<S> {
                     // before bailing, so a failed handshake leaks neither.
                     let _ = DeleteSecurityContext(&ctx);
                     let _ = FreeCredentialsHandle(&cred);
-                    return Err(win_err("Schannel handshake", hr.0));
+                    return Err(handshake_err(hr.0));
                 }
             }
 
@@ -311,19 +333,23 @@ impl<S: Read + Write> TlsStream<S> {
                 let hr = DecryptMessage(&self.ctx, &desc, 0, None);
 
                 if hr == SEC_E_OK || hr == SEC_I_RENEGOTIATE {
-                    let mut extra: Vec<u8> = Vec::new();
+                    let mut extra_len = 0usize;
                     for s in &secs {
                         if s.cbBuffer == 0 || s.pvBuffer.is_null() {
                             continue;
                         }
-                        let slice = std::slice::from_raw_parts(
-                            s.pvBuffer as *const u8,
-                            s.cbBuffer as usize,
-                        );
                         if s.BufferType == SECBUFFER_DATA {
+                            let slice = std::slice::from_raw_parts(
+                                s.pvBuffer as *const u8,
+                                s.cbBuffer as usize,
+                            );
                             self.plain.extend_from_slice(slice);
                         } else if s.BufferType == SECBUFFER_EXTRA {
-                            extra = slice.to_vec();
+                            // Points into `data`'s own tail (the unconsumed
+                            // suffix of the input) — remember the length and
+                            // reuse the allocation below instead of cloning a
+                            // fresh Vec per record.
+                            extra_len = s.cbBuffer as usize;
                         }
                     }
                     if hr == SEC_I_RENEGOTIATE {
@@ -334,6 +360,7 @@ impl<S: Read + Write> TlsStream<S> {
                         // leftover `SECBUFFER_EXTRA` holds the handshake record;
                         // feed it back through InitializeSecurityContext to
                         // consume it, then treat whatever remains as ciphertext.
+                        let extra = data[data.len() - extra_len.min(data.len())..].to_vec();
                         self.cipher = continue_handshake(
                             &mut self.inner,
                             &self.cred,
@@ -343,7 +370,14 @@ impl<S: Read + Write> TlsStream<S> {
                             extra,
                         )?;
                     } else {
-                        self.cipher = extra;
+                        // Shift the leftover to the front of `data` and keep the
+                        // allocation as the cipher buffer (one bounded memmove
+                        // instead of an alloc + copy + free per TLS record).
+                        let n = extra_len.min(data.len());
+                        let start = data.len() - n;
+                        data.copy_within(start.., 0);
+                        data.truncate(n);
+                        self.cipher = data;
                     }
                     if !self.plain.is_empty() {
                         return Ok(());
@@ -451,7 +485,7 @@ unsafe fn continue_handshake<S: Read + Write>(
         if out.cbBuffer > 0 && !out.pvBuffer.is_null() {
             let token =
                 std::slice::from_raw_parts(out.pvBuffer as *const u8, out.cbBuffer as usize);
-            let w = inner.write_all(token);
+            let w = write_all_riding_wouldblock(inner, token);
             let _ = FreeContextBuffer(out.pvBuffer);
             w?;
             inner.flush()?;
@@ -463,11 +497,11 @@ unsafe fn continue_handshake<S: Read + Write>(
             return Ok(extra_bytes(&in_secs[1], &in_buf));
         } else if hr == SEC_I_CONTINUE_NEEDED {
             in_buf = extra_bytes(&in_secs[1], &in_buf);
-            if !read_more(inner, &mut in_buf)? {
+            if !read_more_riding_wouldblock(inner, &mut in_buf)? {
                 return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
             }
         } else if hr == SEC_E_INCOMPLETE_MESSAGE {
-            if !read_more(inner, &mut in_buf)? {
+            if !read_more_riding_wouldblock(inner, &mut in_buf)? {
                 return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
             }
         } else {
@@ -476,10 +510,69 @@ unsafe fn continue_handshake<S: Read + Write>(
     }
 }
 
-/// Read one chunk from `inner`, appending to `buf`. Returns false on EOF.
+/// `write_all` that tolerates a non-blocking socket. The graphics worker puts
+/// the socket into event-notification mode (`WSAEventSelect`, which makes it
+/// non-blocking), so a full send buffer surfaces as `WouldBlock` instead of
+/// blocking. A TLS record must go out whole — abandoning one mid-write
+/// desynchronizes the stream — so ride the condition out with a short sleep
+/// until the buffer drains (bounded; a peer that stops reading for this long
+/// is a dead connection).
+fn write_all_riding_wouldblock<S: Write>(inner: &mut S, mut buf: &[u8]) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !buf.is_empty() {
+        match inner.write(buf) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "send buffer stayed full while writing a TLS record",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// [`read_more`], but riding out `WouldBlock`/timeouts from a non-blocking or
+/// timeout-bounded socket. Renegotiation cannot be suspended midway (its state
+/// lives on this call's stack), so block here — bounded — until the peer's
+/// next record arrives.
+fn read_more_riding_wouldblock<S: Read>(inner: &mut S, buf: &mut Vec<u8>) -> io::Result<bool> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match read_more(inner, buf) {
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "peer stalled mid TLS renegotiation",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Read one chunk from `inner`, appending to `buf` (directly into its tail —
+/// no intermediate stack buffer copy). Returns false on EOF.
 fn read_more<S: Read>(inner: &mut S, buf: &mut Vec<u8>) -> io::Result<bool> {
-    let mut tmp = [0u8; READ_CHUNK];
-    let n = match inner.read(&mut tmp) {
+    let old = buf.len();
+    buf.resize(old + READ_CHUNK, 0);
+    let n = match inner.read(&mut buf[old..]) {
         Ok(n) => n,
         // Under heavy inbound load a socket read that hits its SO_RCVTIMEO
         // deadline can surface as a transient *overlapped-I/O* status —
@@ -490,14 +583,18 @@ fn read_more<S: Read>(inner: &mut S, buf: &mut Vec<u8>) -> io::Result<bool> {
         // poll instead of tearing the session down (which froze W365 under lots
         // of on-screen motion).
         Err(e) if matches!(e.raw_os_error(), Some(995 | 996 | 997)) => {
+            buf.truncate(old);
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "socket read timed out"));
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            buf.truncate(old);
+            return Err(e);
+        }
     };
+    buf.truncate(old + n);
     if n == 0 {
         return Ok(false);
     }
-    buf.extend_from_slice(&tmp[..n]);
     Ok(true)
 }
 
@@ -553,7 +650,7 @@ impl<S: Read + Write> Write for TlsStream<S> {
                 let total = secs[0].cbBuffer as usize
                     + secs[1].cbBuffer as usize
                     + secs[2].cbBuffer as usize;
-                self.inner.write_all(&rec[..total])?;
+                write_all_riding_wouldblock(&mut self.inner, &rec[..total])?;
             }
             self.inner.flush()?;
             Ok(buf.len())

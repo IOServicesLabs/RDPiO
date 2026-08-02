@@ -26,6 +26,7 @@ serde_json.workspace = true
 tungstenite.workspace = true
 url.workspace = true
 http.workspace = true
+mimalloc.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 # Linux/Unix TLS for the RDP Enhanced Security path (SChannel's counterpart).

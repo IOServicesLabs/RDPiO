@@ -334,9 +334,19 @@ pub struct Connection {
     recv_source_total: u64,
     /// Source datagrams the peer's sequence numbers show as missing.
     recv_lost: u64,
-    /// Next inbound source sequence number we expect, for gap detection.
-    next_source_seq: Option<u32>,
+    /// Next inbound source sequence number to deliver, established from the
+    /// server's SYN+ACK initial sequence (or the first DATA seen). Delivery is
+    /// strictly in order — the payload feeds a TLS byte stream, which one
+    /// out-of-order or missing datagram desynchronizes permanently.
+    recv_next: Option<u32>,
+    /// Out-of-order source payloads held until the gap before them fills (the
+    /// peer retransmits unacknowledged data on the reliable channel). Bounded.
+    reorder: std::collections::BTreeMap<u32, Vec<u8>>,
 }
+
+/// Cap on held out-of-order datagrams. Past this the peer has stalled far
+/// beyond its send window and the tunnel is effectively dead.
+const MAX_REORDER: usize = 256;
 
 impl Connection {
     /// Start a connection: pick an initial sequence number and produce the SYN
@@ -352,7 +362,8 @@ impl Connection {
             unacked: std::collections::BTreeMap::new(),
             recv_source_total: 0,
             recv_lost: 0,
-            next_source_seq: None,
+            recv_next: None,
+            reorder: std::collections::BTreeMap::new(),
         };
         (conn, build_syn(initial_sequence, window, lossy))
     }
@@ -373,8 +384,15 @@ impl Connection {
 
     /// Process one received datagram, advancing the handshake and producing the
     /// actions to take (ACKs to send, payloads to deliver, state transitions).
+    ///
+    /// Delivery is strictly in-order: the payload stream feeds TLS, which one
+    /// missing or reordered datagram desynchronizes permanently. Out-of-order
+    /// arrivals are held in a bounded reorder buffer, the cumulative ack only
+    /// ever names the last in-order datagram actually received (so the peer's
+    /// retransmission repairs holes instead of being suppressed), and FEC
+    /// parity datagrams are never delivered as source data.
     pub fn on_receive(&mut self, datagram: &[u8]) -> Vec<Action> {
-        let Some((header, kind, _syn)) = classify(datagram) else {
+        let Some((header, kind, syn)) = classify(datagram) else {
             return Vec::new();
         };
         // Every datagram carries snSourceAck = the highest source seq the peer
@@ -387,41 +405,73 @@ impl Connection {
         match kind {
             DatagramKind::SynAck if self.state == State::SynSent => {
                 self.state = State::Established;
-                // ACK the server's initial sequence (carried in snSourceAck-style
-                // bookkeeping); reply with a bare ACK to finish the handshake.
-                self.recv_seq = header.sn_source_ack;
+                // The server's initial sequence arrives in the SYNDATA payload;
+                // its first source datagram is that + 1. The cumulative ack
+                // starts at the initial sequence itself.
+                if let Some(s) = syn {
+                    self.recv_seq = s.initial_sequence;
+                    self.recv_next = Some(s.initial_sequence.wrapping_add(1));
+                } else {
+                    // No SYNDATA (nonconforming peer): learn the numbering from
+                    // the first DATA datagram instead.
+                    self.recv_seq = header.sn_source_ack;
+                }
                 vec![
                     Action::Send(build_ack(self.recv_seq, self.window)),
                     Action::Established,
                 ]
             }
             DatagramKind::Data if self.state == State::Established => {
-                // Observe inbound loss from gaps in the source sequence numbers.
-                // Purely for metrics — it does not touch the ack bookkeeping.
-                if let Some(seq) = source_seq(datagram, header.flags) {
-                    match self.next_source_seq {
-                        Some(expected) => {
-                            let ahead = seq.wrapping_sub(expected);
-                            if ahead < 0x8000_0000 {
-                                // seq >= expected: the skipped numbers are missing.
-                                self.recv_lost += ahead as u64;
-                                self.next_source_seq = Some(seq.wrapping_add(1));
-                            }
-                            // seq < expected → a reorder/duplicate; ignore.
-                        }
-                        None => self.next_source_seq = Some(seq.wrapping_add(1)),
-                    }
+                // FEC parity datagrams share the DATA framing but are not
+                // source data — delivering their parity block into the TLS
+                // stream corrupts it even on a loss-free link. (Recovery from
+                // parity is not implemented; the reliable channel repairs by
+                // retransmission instead.)
+                if header.has(flags::FEC) {
+                    return vec![Action::Send(build_ack_with(
+                        self.recv_seq,
+                        self.window,
+                        self.recv_count,
+                    ))];
                 }
                 self.recv_source_total += 1;
-                // Advance our ack point, hand the source payload to the upper
-                // layer, and acknowledge with a vector reporting our receive
-                // window so the peer can prune its retransmit buffer.
-                self.recv_seq = self.recv_seq.wrapping_add(1);
-                self.recv_count = (self.recv_count + 1).min(self.window as u32);
+                let seq = source_seq(datagram, header.flags);
+                let payload = source_payload(datagram, header.flags)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_vec());
                 let mut actions = Vec::new();
-                if let Some(payload) = source_payload(datagram, header.flags) {
-                    if !payload.is_empty() {
-                        actions.push(Action::Deliver(payload.to_vec()));
+                // No sequence/payload → nothing to deliver; just re-ack below.
+                if let (Some(seq), Some(payload)) = (seq, payload) {
+                    // Learn the numbering from the first DATA if the SYN+ACK
+                    // carried no SYNDATA.
+                    let next = *self.recv_next.get_or_insert(seq);
+                    let ahead = seq.wrapping_sub(next);
+                    if ahead >= 0x8000_0000 {
+                        // seq < next: a duplicate of something already
+                        // delivered (our ack was lost) — re-ack, drop.
+                    } else if ahead == 0 {
+                        // In order: deliver, then drain everything the reorder
+                        // buffer now makes contiguous.
+                        let mut next = next;
+                        actions.push(Action::Deliver(payload));
+                        next = next.wrapping_add(1);
+                        self.recv_count = (self.recv_count + 1).min(self.window as u32);
+                        while let Some(held) = self.reorder.remove(&next) {
+                            actions.push(Action::Deliver(held));
+                            next = next.wrapping_add(1);
+                            self.recv_count = (self.recv_count + 1).min(self.window as u32);
+                        }
+                        self.recv_next = Some(next);
+                        self.recv_seq = next.wrapping_sub(1);
+                    } else {
+                        // A gap: hold this datagram until retransmission fills
+                        // the hole. The cumulative ack deliberately does NOT
+                        // advance — that is what tells the peer to retransmit
+                        // the missing datagrams.
+                        self.recv_lost += 1;
+                        if self.reorder.len() < MAX_REORDER {
+                            self.reorder.insert(seq, payload);
+                        }
                     }
                 }
                 actions.push(Action::Send(build_ack_with(
@@ -617,28 +667,86 @@ mod tests {
         assert!(conn.retransmit().is_empty());
     }
 
-    #[test]
-    fn inbound_gaps_count_as_loss() {
-        let (mut conn, _) = Connection::connect(1, 64, false);
-        conn.on_receive(&syn_ack(10));
-        // Source seqs 5, 6, 8 arrive — 7 is missing.
-        conn.on_receive(&data_datagram(5, &[0xAA]));
-        conn.on_receive(&data_datagram(6, &[0xBB]));
-        conn.on_receive(&data_datagram(8, &[0xCC]));
-        let (received, lost) = conn.loss_stats();
-        assert_eq!(received, 3);
-        assert_eq!(lost, 1); // the gap at seq 7
+    /// The delivered payloads of a list of actions, in order.
+    fn delivered(actions: &[Action]) -> Vec<Vec<u8>> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Deliver(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
+    /// The `snSourceAck` of the ACK an action list sends, if any.
+    fn ack_point(actions: &[Action]) -> Option<u32> {
+        actions.iter().find_map(|a| match a {
+            Action::Send(dg) => Some(u32::from_be_bytes([dg[0], dg[1], dg[2], dg[3]])),
+            _ => None,
+        })
+    }
+
+    /// A hole in the source sequence must (a) count as detected loss, (b) hold
+    /// later datagrams back rather than deliver them out of order into the TLS
+    /// stream, and (c) keep the cumulative ack at the last in-order datagram —
+    /// which is what makes the peer retransmit the missing one. When the hole
+    /// fills, everything held delivers in order.
     #[test]
-    fn reorder_does_not_count_as_loss() {
+    fn gap_holds_delivery_until_retransmission_fills_it() {
+        let (mut conn, _) = Connection::connect(1, 64, false);
+        conn.on_receive(&syn_ack(10)); // server ISN 10 → first data is 11
+        let a = conn.on_receive(&data_datagram(11, &[0xAA]));
+        assert_eq!(delivered(&a), vec![vec![0xAA]]);
+        assert_eq!(ack_point(&a), Some(11));
+        let b = conn.on_receive(&data_datagram(12, &[0xBB]));
+        assert_eq!(delivered(&b), vec![vec![0xBB]]);
+        // 13 is lost; 14 arrives — held, NOT delivered, ack stays at 12.
+        let c = conn.on_receive(&data_datagram(14, &[0xDD]));
+        assert!(delivered(&c).is_empty());
+        assert_eq!(ack_point(&c), Some(12));
+        let (received, lost) = conn.loss_stats();
+        assert_eq!(received, 3);
+        assert_eq!(lost, 1); // the gap at seq 13
+        // The retransmitted 13 arrives: 13 and the held 14 deliver in order.
+        let d = conn.on_receive(&data_datagram(13, &[0xCC]));
+        assert_eq!(delivered(&d), vec![vec![0xCC], vec![0xDD]]);
+        assert_eq!(ack_point(&d), Some(14));
+    }
+
+    /// A duplicate of an already-delivered datagram (our ACK was lost) is
+    /// re-acked but never re-delivered.
+    #[test]
+    fn duplicate_is_reacked_not_redelivered() {
         let (mut conn, _) = Connection::connect(1, 64, false);
         conn.on_receive(&syn_ack(10));
-        conn.on_receive(&data_datagram(5, &[0xAA]));
-        conn.on_receive(&data_datagram(4, &[0xBB])); // late / out of order
-        let (received, lost) = conn.loss_stats();
-        assert_eq!(received, 2);
-        assert_eq!(lost, 0);
+        conn.on_receive(&data_datagram(11, &[0xAA]));
+        let again = conn.on_receive(&data_datagram(11, &[0xAA]));
+        assert!(delivered(&again).is_empty());
+        assert_eq!(ack_point(&again), Some(11));
+    }
+
+    /// FEC parity datagrams share the DATA framing but are not source data;
+    /// delivering the parity block into the TLS stream corrupts it even on a
+    /// loss-free link.
+    #[test]
+    fn fec_parity_is_never_delivered() {
+        let (mut conn, _) = Connection::connect(1, 64, false);
+        conn.on_receive(&syn_ack(10));
+        let mut dg = Vec::new();
+        FecHeader {
+            sn_source_ack: 1,
+            receiver_window: 64,
+            flags: flags::DATA | flags::FEC,
+        }
+        .write(&mut dg);
+        dg.extend_from_slice(&11u32.to_be_bytes()); // snCoded
+        dg.extend_from_slice(&11u32.to_be_bytes()); // snSourceStart
+        dg.extend_from_slice(&[0x55; 16]); // parity block
+        let actions = conn.on_receive(&dg);
+        assert!(delivered(&actions).is_empty());
+        // Real source data afterwards still flows normally.
+        let a = conn.on_receive(&data_datagram(11, &[0xAA]));
+        assert_eq!(delivered(&a), vec![vec![0xAA]]);
     }
 
     #[test]

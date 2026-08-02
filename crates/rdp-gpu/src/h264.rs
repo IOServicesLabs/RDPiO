@@ -80,6 +80,12 @@ pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
     pub nv12: Vec<u8>,
+    /// The input-unit tag this picture decodes (the MFT echoes each input
+    /// sample's time onto its output picture). Lets the caller pair a decoded
+    /// picture with the metadata of the unit that *encoded* it — a pipelined
+    /// decoder emits pictures on its own schedule, so positional pairing
+    /// drifts. `-1` = the decoder didn't propagate a tag.
+    pub unit_id: i64,
 }
 
 impl DecodedFrame {
@@ -134,6 +140,9 @@ pub struct H264Decoder {
     height: u32,
     out_buf_size: usize,
     provides_samples: bool,
+    /// Tag for the next input unit (used as the MF sample time, echoed onto
+    /// the matching output picture).
+    next_unit_id: i64,
 }
 
 impl H264Decoder {
@@ -209,8 +218,15 @@ impl H264Decoder {
                 height,
                 out_buf_size,
                 provides_samples,
+                next_unit_id: 0,
             })
         }
+    }
+
+    /// The tag the next [`decode`](Self::decode) call will stamp on its input
+    /// unit — queue per-unit metadata under this id *before* decoding.
+    pub fn next_unit_id(&self) -> i64 {
+        self.next_unit_id
     }
 
     /// Decode one Annex-B access unit, returning any frames it produced (a unit
@@ -233,7 +249,11 @@ impl H264Decoder {
 
             let sample = MFCreateSample()?;
             sample.AddBuffer(&buffer)?;
-            sample.SetSampleTime(0)?;
+            // The sample time is a pure tag: the MFT echoes it onto the output
+            // picture this unit decodes to, which is what lets the caller pair
+            // pictures with per-unit metadata exactly.
+            sample.SetSampleTime(self.next_unit_id)?;
+            self.next_unit_id += 1;
             self.transform.ProcessInput(0, &sample, 0)?;
 
             self.drain()
@@ -329,6 +349,7 @@ impl H264Decoder {
     /// tested cross-platform).
     unsafe fn read_nv12(&self, sample: &IMFSample) -> WinResult<Option<DecodedFrame>> {
         let (stride, coded_h) = self.output_layout();
+        let unit_id = sample.GetSampleTime().unwrap_or(-1);
         let buffer = sample.ConvertToContiguousBuffer()?;
         let mut ptr: *mut u8 = std::ptr::null_mut();
         let mut len = 0u32;
@@ -348,6 +369,7 @@ impl H264Decoder {
                 width: self.width,
                 height: self.height,
                 nv12,
+                unit_id,
             })
         };
         buffer.Unlock()?;
@@ -530,6 +552,8 @@ pub struct DecodedTexture {
     pub texture: ID3D11Texture2D,
     pub width: u32,
     pub height: u32,
+    /// Input-unit tag echoed by the MFT (see [`DecodedFrame::unit_id`]).
+    pub unit_id: i64,
 }
 
 /// A DXVA (GPU) H.264 decoder: the system decoder MFT bound to the caller's
@@ -546,6 +570,34 @@ pub struct H264GpuDecoder {
     _manager: IMFDXGIDeviceManager,
     width: u32,
     height: u32,
+    /// Standalone NV12 output textures, reused across frames. Each frame is
+    /// handed to the renderer as a COM *clone*, so with the pool holding one
+    /// reference, `refcount == 1` means "the renderer dropped its clone" —
+    /// the fence that makes reuse safe. Keyed by coded size so a resolution
+    /// change naturally retires stale entries.
+    pool: Vec<(u32, u32, ID3D11Texture2D)>,
+    /// Tag for the next input unit (see [`H264Decoder::next_unit_id`]).
+    next_unit_id: i64,
+}
+
+/// How many output textures the decoder retains for reuse. Matches the
+/// renderer pipeline's practical depth; when all are still in flight a fresh
+/// unpooled texture is created (the pre-ring behavior).
+const OUTPUT_POOL_CAP: usize = 8;
+
+/// Current COM refcount of `obj`, read via a paired AddRef/Release (both
+/// return the post-operation count). The absolute value is documented as
+/// unstable in general, but for our single-device, two-holder scenario it is
+/// exact — and only the transition down to 1 (sole holder: the pool) is used.
+unsafe fn com_refcount<I: windows::core::Interface>(obj: &I) -> u32 {
+    type UnknownFn = unsafe extern "system" fn(*mut c_void) -> u32;
+    let raw = obj.as_raw();
+    let vtbl = *(raw as *const *const usize);
+    let addref: UnknownFn = std::mem::transmute(*vtbl.add(1));
+    let release: UnknownFn = std::mem::transmute(*vtbl.add(2));
+    let after_add = addref(raw);
+    release(raw);
+    after_add.saturating_sub(1)
 }
 
 impl H264GpuDecoder {
@@ -628,26 +680,52 @@ impl H264GpuDecoder {
                 _manager: manager,
                 width,
                 height,
+                pool: Vec::new(),
+                next_unit_id: 0,
             })
         }
     }
 
-    /// Allocate a standalone NV12 texture to copy a decoded frame into. Sized to the
+    /// The tag the next [`decode`](Self::decode) call will stamp on its input
+    /// unit — queue per-unit metadata under this id *before* decoding.
+    pub fn next_unit_id(&self) -> i64 {
+        self.next_unit_id
+    }
+
+    /// Get a standalone NV12 texture to copy a decoded frame into. Sized to the
     /// decoder pool's slice dimensions (and never below the display size rounded up to
     /// the 16-pixel macroblock grid), so the full-subresource copy from the decoder
     /// pool is exact and never clips the bottom/right padding rows; the video processor
     /// later samples only the top-left display region, so the padding is unused.
     ///
-    /// A *fresh* texture per frame is deliberate: the frame's texture is handed
-    /// across the channel to the renderer thread, where its COM refcount keeps
-    /// the pixels alive until present finishes and the renderer drops it. Reusing
-    /// a fixed ring instead let the decoder overwrite a frame still queued for
-    /// present, which is what corrupted fast motion. D3D11 recycles the freed
-    /// allocations internally, so per-frame creation is cheap.
+    /// Textures are reused through a refcount-fenced pool: the frame is handed
+    /// across the channel to the renderer thread as a COM clone, and an entry
+    /// is only reused once that clone has been dropped (`refcount == 1`, pool
+    /// as sole holder). An earlier *unfenced* ring let the decoder overwrite a
+    /// frame still queued for present (corrupted fast motion); the per-frame
+    /// allocation that replaced it cost a ~5 MB VidMM allocation plus free per
+    /// frame. The fence keeps both properties. GPU-side ordering is safe
+    /// because the copy into a reused texture is issued on the same immediate
+    /// context after the draws that sampled it.
     unsafe fn acquire_texture(&mut self, coded_w: u32, coded_h: u32) -> WinResult<ID3D11Texture2D> {
         // Never smaller than the display's macroblock-aligned size.
         let coded_w = coded_w.max((self.width + 15) & !15);
         let coded_h = coded_h.max((self.height + 15) & !15);
+        // A resolution change retires stale-sized entries; ones still in
+        // flight stay alive through the renderer's clone until it drops.
+        self.pool.retain(|(w, h, _)| *w == coded_w && *h == coded_h);
+        if let Some((_, _, t)) = self
+            .pool
+            .iter()
+            .find(|(_, _, t)| com_refcount(t) == 1)
+        {
+            return Ok(t.clone());
+        }
+        // SHADER_RESOURCE, because the renderer converts this surface with a
+        // pixel shader that samples the two NV12 planes directly. An earlier
+        // attempt to satisfy the D3D11 *video processor* instead (which rejects
+        // decoder-copied surfaces on Intel) tried DECODER bind flags here; that
+        // did not help, and the video processor is no longer the primary path.
         let desc = D3D11_TEXTURE2D_DESC {
             Width: coded_w,
             Height: coded_h,
@@ -662,7 +740,11 @@ impl H264GpuDecoder {
         };
         let mut t: Option<ID3D11Texture2D> = None;
         self.device.CreateTexture2D(&desc, None, Some(&mut t))?;
-        t.ok_or_else(windows::core::Error::from_thread)
+        let t = t.ok_or_else(windows::core::Error::from_thread)?;
+        if self.pool.len() < OUTPUT_POOL_CAP {
+            self.pool.push((coded_w, coded_h, t.clone()));
+        }
+        Ok(t)
     }
 
     /// Decode one Annex-B access unit, returning GPU NV12 textures (zero, one, or
@@ -684,7 +766,10 @@ impl H264GpuDecoder {
             buffer.Unlock()?;
             let sample = MFCreateSample()?;
             sample.AddBuffer(&buffer)?;
-            sample.SetSampleTime(0)?;
+            // Pure tag, echoed onto the matching output picture (see the CPU
+            // decoder) — the basis for exact picture↔metadata pairing.
+            sample.SetSampleTime(self.next_unit_id)?;
+            self.next_unit_id += 1;
             self.transform.ProcessInput(0, &sample, 0)?;
             self.drain()
         }
@@ -753,6 +838,7 @@ impl H264GpuDecoder {
             texture: dest,
             width: self.width,
             height: self.height,
+            unit_id: sample.GetSampleTime().unwrap_or(-1),
         }))
     }
 }

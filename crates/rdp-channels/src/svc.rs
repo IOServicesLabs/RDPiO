@@ -16,6 +16,11 @@ pub const CHANNEL_FLAG_SHOW_PROTOCOL: u32 = 0x0000_0010;
 /// Maximum bytes of channel data per chunk (the conventional VC chunk size).
 const CHUNK_SIZE: usize = 1600;
 
+/// Upper bound on the reassembly capacity carried between messages. Big enough
+/// that ordinary traffic never reallocates, small enough that one huge transfer
+/// doesn't pin memory for the rest of the session.
+const MAX_KEEP: usize = 1024 * 1024;
+
 /// Frame `data` as one or more static-VC chunks for a channel opened with
 /// `CHANNEL_OPTION_SHOW_PROTOCOL` (cliprdr, rdpsnd, rdpdr): each chunk carries
 /// `CHANNEL_FLAG_SHOW_PROTOCOL` so the server keeps the `CHANNEL_PDU_HEADER`
@@ -39,7 +44,8 @@ pub fn chunks_dvc(data: &[u8]) -> Vec<Vec<u8>> {
 /// chunk is the *total* length; `FIRST`/`LAST` flags bound the sequence.
 fn chunks_with(data: &[u8], base_flags: u32) -> Vec<Vec<u8>> {
     let total = data.len() as u32;
-    let mut out = Vec::new();
+    // A multi-megabyte send is thousands of chunks; size the outer vector once.
+    let mut out = Vec::with_capacity(data.len().div_ceil(CHUNK_SIZE).max(1));
     let mut off = 0;
     loop {
         let end = (off + CHUNK_SIZE).min(data.len());
@@ -82,13 +88,28 @@ impl Reassembler {
         if chunk.len() < 8 {
             return None;
         }
+        let total = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as usize;
         let flags = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
         if flags & CHANNEL_FLAG_FIRST != 0 {
             self.buf.clear();
+            // Every chunk carries the TOTAL message length, so size the buffer
+            // once up front. Growing by doubling instead would rebuild-and-copy
+            // ~log2(total/1600) times per message — for a multi-megabyte
+            // clipboard transfer (thousands of 1600-byte chunks) that is tens of
+            // megabytes of pointless memcpy per message. Capped so a malformed
+            // header can't make us reserve gigabytes.
+            const MAX_PREALLOC: usize = 64 * 1024 * 1024;
+            if total > self.buf.capacity() && total <= MAX_PREALLOC {
+                self.buf.reserve_exact(total);
+            }
         }
         self.buf.extend_from_slice(&chunk[8..]);
         if flags & CHANNEL_FLAG_LAST != 0 {
-            Some(std::mem::take(&mut self.buf))
+            // Hand the buffer off and keep a right-sized one for the next
+            // message, so a steady channel stops reallocating entirely.
+            let done = std::mem::take(&mut self.buf);
+            self.buf = Vec::with_capacity(done.len().min(MAX_KEEP));
+            Some(done)
         } else {
             None
         }
@@ -98,6 +119,40 @@ impl Reassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_message_reassembles_and_preallocates() {
+        // A multi-megabyte payload arrives as thousands of 1600-byte chunks.
+        let payload: Vec<u8> = (0..3_000_000).map(|i| (i % 251) as u8).collect();
+        let cs = chunks(&payload);
+        assert!(cs.len() > 1800, "expected many chunks, got {}", cs.len());
+
+        let mut r = Reassembler::new();
+        let mut out = None;
+        for (i, c) in cs.iter().enumerate() {
+            let got = r.push(c);
+            if i + 1 < cs.len() {
+                assert!(got.is_none(), "only the LAST chunk completes a message");
+            } else {
+                out = got;
+            }
+            // The buffer is sized from the header on the FIRST chunk, so it
+            // never grows by doubling (which would recopy megabytes).
+            if i == 0 {
+                assert!(r.buf.capacity() >= payload.len());
+            }
+        }
+        assert_eq!(out.unwrap(), payload);
+
+        // A second message reuses capacity instead of reallocating from zero.
+        let small = chunks(b"again");
+        assert!(r.buf.capacity() > 0, "capacity is carried between messages");
+        let mut last = None;
+        for c in &small {
+            last = r.push(c);
+        }
+        assert_eq!(last.unwrap(), b"again");
+    }
 
     #[test]
     fn small_payload_is_one_first_last_chunk() {
