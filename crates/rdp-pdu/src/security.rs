@@ -4,6 +4,12 @@
 
 /// Basic Security Header flag: the PDU carries the Security Exchange.
 pub const SEC_EXCHANGE_PKT: u16 = 0x0001;
+/// Basic Security Header flag: the PDU is a Server Initiate Multitransport
+/// Request (MS-RDPBCGR 2.2.15.1).
+pub const SEC_TRANSPORT_REQ: u16 = 0x0002;
+/// Basic Security Header flag: the PDU is a Client Initiate Multitransport
+/// Response (MS-RDPBCGR 2.2.15.2).
+pub const SEC_TRANSPORT_RSP: u16 = 0x0004;
 /// Basic Security Header flag: the PDU is a Client Info PDU.
 pub const SEC_INFO_PKT: u16 = 0x0040;
 /// Basic Security Header flag: the PDU payload is encrypted (Standard Security).
@@ -50,13 +56,12 @@ pub const PERF_DISABLE_CURSORSETTINGS: u32 = 0x40;
 pub const PERF_ENABLE_FONT_SMOOTHING: u32 = 0x80;
 
 /// Balanced experience flags, sent on every connect: drop the per-frame encode
-/// hogs (wallpaper, full-window-drag contents, menu animations) but keep theming
-/// and turn on font smoothing so text stays crisp. The same trade-off mstsc's
-/// default Experience settings make over a LAN. `0x87`.
-pub const PERF_BALANCED: u32 = PERF_DISABLE_WALLPAPER
-    | PERF_DISABLE_FULLWINDOWDRAG
-    | PERF_DISABLE_MENUANIMATIONS
-    | PERF_ENABLE_FONT_SMOOTHING;
+/// hogs (wallpaper, menu animations) but keep theming, keep window contents
+/// visible while dragging (H.264/EGFX encodes a moving window cheaply, and the
+/// outline-only drag reads as broken next to mstsc), and turn on font smoothing
+/// so text stays crisp. `0x85`.
+pub const PERF_BALANCED: u32 =
+    PERF_DISABLE_WALLPAPER | PERF_DISABLE_MENUANIMATIONS | PERF_ENABLE_FONT_SMOOTHING;
 
 #[inline]
 fn put_u16(v: u16, out: &mut Vec<u8>) {
@@ -239,7 +244,9 @@ mod tests {
         let n = payload.len();
         let perf = u32::from_le_bytes([payload[n - 6], payload[n - 5], payload[n - 4], payload[n - 3]]);
         assert_eq!(perf, PERF_BALANCED);
-        assert_eq!(perf, 0x87); // wallpaper|fullwindowdrag|menuanim|font_smoothing
+        // wallpaper|menuanim|font_smoothing — full-window-drag stays ENABLED so
+        // dragging shows window contents (not just an outline), like mstsc.
+        assert_eq!(perf, 0x85);
         // No auto-reconnect cookie on the initial connect.
         let cb = u16::from_le_bytes([payload[n - 2], payload[n - 1]]);
         assert_eq!(cb, 0);

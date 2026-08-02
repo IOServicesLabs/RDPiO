@@ -72,9 +72,10 @@ pub struct ClientConfig {
     /// (the chain is validated against the OS trust store). RDP hosts commonly
     /// present self-signed certs, so connecting to those requires opting in.
     pub allow_invalid_certificate: bool,
-    /// Local directory to share into the session as a redirected drive (rdpdr).
-    /// `None` disables drive redirection.
-    pub drive_path: Option<String>,
+    /// Local directories/drive roots to share into the session as redirected
+    /// drives (rdpdr) — one device per entry (mapped network drives included;
+    /// any openable root works). Empty disables drive redirection.
+    pub drive_paths: Vec<String>,
     /// Client monitor layout for a spanned multi-monitor desktop. Empty = single
     /// monitor (the `width`/`height` desktop size is used as-is).
     pub monitors: Vec<rdp_pdu::gcc::MonitorDef>,
@@ -119,7 +120,7 @@ impl Default for ClientConfig {
             credentials: Credentials::default(),
             allow_legacy_fallback: true,
             allow_invalid_certificate: false,
-            drive_path: None,
+            drive_paths: Vec::new(),
             monitors: Vec::new(),
             force_legacy: false,
             keyboard_layout: None,

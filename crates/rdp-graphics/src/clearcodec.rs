@@ -696,7 +696,7 @@ fn nsc_rle(input: &[u8], orig_size: usize) -> Vec<u8> {
 fn emit_column(
     dst: &mut [u8],
     w: usize,
-    _h: usize,
+    h: usize,
     dx: usize,
     y_start: usize,
     vbar_height: usize,
@@ -705,7 +705,12 @@ fn emit_column(
     if dx >= w {
         return;
     }
-    let rows = vbar_height.min(column.len() / 4);
+    // `y_start`/`vbar_height` come straight off the wire; clamp to the tile so
+    // a malformed band cannot write past `dst` (which would panic the decode
+    // thread and kill the session).
+    let rows = vbar_height
+        .min(column.len() / 4)
+        .min(h.saturating_sub(y_start));
     for y in 0..rows {
         let s = y * 4;
         let d = ((y_start + y) * w + dx) * 4;
@@ -734,6 +739,22 @@ fn background_column(count: usize, r: u8, g: u8, b: u8) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wire-controlled band whose `yStart + height` exceeds the tile must be
+    /// clipped, not panic (the band fields are attacker-controlled input).
+    #[test]
+    fn emit_column_clips_overflowing_band_to_tile() {
+        let (w, h) = (4usize, 4usize);
+        let mut dst = vec![0u8; w * h * 4];
+        let column = vec![0xAAu8; 8 * 4]; // 8 rows offered
+        // yStart 2 in a 4-row tile → only rows 2..4 may be written.
+        emit_column(&mut dst, w, h, 1, 2, 8, &column);
+        assert_eq!(&dst[(2 * w + 1) * 4..(2 * w + 1) * 4 + 4], &[0xAA; 4]);
+        assert_eq!(&dst[(3 * w + 1) * 4..(3 * w + 1) * 4 + 4], &[0xAA; 4]);
+        // yStart beyond the tile writes nothing at all.
+        emit_column(&mut dst, w, h, 0, 4, 8, &column);
+        assert!(dst[(3 * w) * 4..(3 * w) * 4 + 4].iter().all(|&b| b == 0));
+    }
 
     /// Build a CLEARCODEC_BITMAP_STREAM with the given layer payloads.
     fn stream(residual: &[u8], bands: &[u8], subcodec: &[u8]) -> Vec<u8> {

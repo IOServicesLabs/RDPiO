@@ -37,12 +37,15 @@ impl BufferPool {
     pub fn acquire(&mut self, len: usize) -> Vec<u8> {
         let idx = bucket_index(len);
         if idx < self.buckets.len() {
-            for mut candidate in self.buckets[idx].drain(..) {
-                if candidate.capacity() >= len {
-                    candidate.clear();
-                    candidate.resize(len, 0);
-                    return candidate;
-                }
+            // Take only the matching buffer; the rest of the bucket must stay
+            // pooled (a `drain(..)` here would free every remaining buffer the
+            // moment we returned, silently degrading the pool to malloc-per-tile).
+            let bucket = &mut self.buckets[idx];
+            if let Some(pos) = bucket.iter().position(|c| c.capacity() >= len) {
+                let mut candidate = bucket.swap_remove(pos);
+                candidate.clear();
+                candidate.resize(len, 0);
+                return candidate;
             }
         }
         vec![0u8; len]
@@ -96,6 +99,16 @@ mod tests {
         let buf2 = pool.acquire(1000);
         assert_eq!(buf2.capacity(), cap);
         assert_eq!(buf2.len(), 1000);
+    }
+
+    #[test]
+    fn acquire_keeps_other_pooled_buffers() {
+        let mut pool = BufferPool::new();
+        for _ in 0..4 {
+            pool.release(Vec::with_capacity(1024));
+        }
+        let _one = pool.acquire(1024);
+        assert_eq!(pool.buckets[bucket_index(1024)].len(), 3);
     }
 
     #[test]

@@ -1,4 +1,28 @@
-# Cross-build configuration for the LLVM-MinGW Windows target.
+# Build configuration.
+#
+# ## Baseline CPU: x86-64-v3 (AVX2)
+#
+# The pixel paths are the client's CPU cost: ClearCodec, progressive RLGR, the
+# planar/RemoteFX decoders and the CPU YUV→RGB fallback all run per-pixel loops
+# over whole tiles. Compiling for the stock x86-64 baseline caps those at SSE2
+# (128-bit), so LLVM auto-vectorises to 16 bytes per step and the `wide` SIMD
+# types lower to SSE. `x86-64-v3` raises the floor to AVX2 + FMA + BMI2, which
+# doubles the vector width to 256-bit and lets LLVM use the wider shuffles the
+# YUV and RLGR loops want.
+#
+# This makes the binaries require a 2013-or-newer CPU (Intel Haswell / AMD
+# Excavator). That is a deliberate trade: the client already requires D3D11 and
+# a hardware H.264 decoder to be worth running.
+#
+# NOTE: cargo does NOT merge rustflags — `target.<triple>.rustflags` REPLACES
+# `build.rustflags` when both could apply. So every target we build for has to
+# repeat the flag rather than relying on a shared `[build]` section.
+
+# Native Windows (MSVC) — the primary target.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# Cross-build for the LLVM-MinGW Windows target.
 #
 # `-static` makes the LLVM-MinGW runtime (libunwind, libc++abi, libwinpthread)
 # link statically so the produced rdpio.exe is self-contained — without it the
@@ -8,4 +32,12 @@
 # (kernel32, d3d11, mf*, etc.) stay dynamically linked as normal.
 [target.x86_64-pc-windows-gnullvm]
 linker = "x86_64-w64-mingw32-clang"
-rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-static"]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-static",
+    "-C", "target-cpu=x86-64-v3",
+]
+
+# Linux (the staged port; the sans-I/O protocol crates run here today).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

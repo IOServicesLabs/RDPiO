@@ -41,8 +41,24 @@ impl InitiateRequest {
     }
 
     /// Parse the 24-byte request body (requestId, requestedProtocol, reserved,
-    /// securityCookie). Returns `None` if too short or the protocol is unknown.
+    /// securityCookie). On the TLS path the server prefixes the 4-byte Basic
+    /// Security Header carrying `SEC_TRANSPORT_REQ` (2.2.15.1); that framing is
+    /// tried first — but only committed when the stripped bytes actually parse,
+    /// because a headerless requestId with bit 1 set looks identical up front.
+    /// Returns `None` if too short or the protocol is unknown.
     pub fn parse(body: &[u8]) -> Option<Self> {
+        if let (Some(flags), Some(0)) = (u16le(body, 0), u16le(body, 2)) {
+            if flags & crate::security::SEC_TRANSPORT_REQ != 0 {
+                if let Some(req) = Self::parse_body(&body[4..]) {
+                    return Some(req);
+                }
+            }
+        }
+        Self::parse_body(body)
+    }
+
+    /// Parse a bare (header-stripped) 24-byte request body.
+    fn parse_body(body: &[u8]) -> Option<Self> {
         if body.len() < 24 {
             return None;
         }
@@ -62,10 +78,21 @@ impl InitiateRequest {
     }
 }
 
-/// Build a Client Initiate Multitransport Response body (2.2.15.2): the echoed
-/// `request_id` and an `HRESULT` (`HR_S_OK` to accept, `HR_E_ABORT` to decline).
+#[inline]
+fn u16le(b: &[u8], off: usize) -> Option<u16> {
+    Some(u16::from_le_bytes([*b.get(off)?, *b.get(off + 1)?]))
+}
+
+/// Build a Client Initiate Multitransport Response (2.2.15.2), ready to send on
+/// the channel the request arrived on: the Basic Security Header carrying
+/// `SEC_TRANSPORT_RSP`, then the echoed `request_id` and an `HRESULT`
+/// (`HR_S_OK` to accept, `HR_E_ABORT` to decline). Sending the decline promptly
+/// matters: a server that never hears back waits out its own multitransport
+/// timeout before settling the session onto TCP at full rate.
 pub fn response(request_id: u32, hr: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8);
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&crate::security::SEC_TRANSPORT_RSP.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // flagsHi
     out.extend_from_slice(&request_id.to_le_bytes());
     out.extend_from_slice(&hr.to_le_bytes());
     out
@@ -106,11 +133,29 @@ mod tests {
         assert!(InitiateRequest::parse(&[0u8; 10]).is_none());
     }
 
+    /// The TLS path delivers the request with its Basic Security Header
+    /// (`SEC_TRANSPORT_REQ`) still attached; parse must strip it, or every
+    /// field lands 4 bytes off (and the tunnel dials with a garbage cookie).
+    #[test]
+    fn parses_request_behind_security_header() {
+        let cookie = [0xCD; 16];
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&crate::security::SEC_TRANSPORT_REQ.to_le_bytes());
+        wire.extend_from_slice(&0u16.to_le_bytes()); // flagsHi
+        wire.extend_from_slice(&request_body(0x0042, PROTOCOL_UDPFECL, cookie));
+        let req = InitiateRequest::parse(&wire).unwrap();
+        assert_eq!(req.request_id, 0x0042);
+        assert!(req.is_lossy());
+        assert_eq!(req.security_cookie, cookie);
+    }
+
     #[test]
     fn response_roundtrip() {
-        let r = response(0x1234, HR_S_OK);
-        assert_eq!(r.len(), 8);
-        assert_eq!(u32::from_le_bytes([r[0], r[1], r[2], r[3]]), 0x1234);
-        assert_eq!(u32::from_le_bytes([r[4], r[5], r[6], r[7]]), 0);
+        let r = response(0x1234, HR_E_ABORT);
+        assert_eq!(r.len(), 12);
+        // Basic Security Header: SEC_TRANSPORT_RSP, flagsHi 0.
+        assert_eq!(&r[0..4], &[0x04, 0x00, 0x00, 0x00]);
+        assert_eq!(u32::from_le_bytes([r[4], r[5], r[6], r[7]]), 0x1234);
+        assert_eq!(u32::from_le_bytes([r[8], r[9], r[10], r[11]]), HR_E_ABORT);
     }
 }

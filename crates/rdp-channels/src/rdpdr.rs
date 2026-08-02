@@ -171,15 +171,19 @@ struct OpenFile {
 struct DriveDevice {
     root: PathBuf,
     device_id: u32,
+    /// The name the session shows for this drive (≤7 ASCII chars — the
+    /// DEVICE_ANNOUNCE PreferredDosName limit), e.g. `"C"` for `C:\`.
+    dos_name: String,
     files: HashMap<u32, OpenFile>,
     next_file_id: u32,
 }
 
 impl DriveDevice {
-    fn new(root: PathBuf, device_id: u32) -> Self {
+    fn new(root: PathBuf, device_id: u32, dos_name: String) -> Self {
         Self {
             root,
             device_id,
+            dos_name,
             files: HashMap::new(),
             next_file_id: 1,
         }
@@ -448,7 +452,7 @@ impl DriveDevice {
 
     fn query_volume(&mut self, p: &[u8]) -> (u32, Vec<u8>) {
         let class = u32le(p, 0).unwrap_or(0);
-        let label = to_utf16(DRIVE_DOS_NAME);
+        let label = to_utf16(&self.dos_name);
         let fs_name = to_utf16("NTFS");
         let buf = match class {
             FILE_FS_VOLUME_INFORMATION => {
@@ -534,19 +538,43 @@ impl DriveDevice {
         v.extend_from_slice(&RDPDR_DTYP_FILESYSTEM.to_le_bytes());
         v.extend_from_slice(&self.device_id.to_le_bytes());
         let mut dos = [0u8; 8];
-        for (i, b) in DRIVE_DOS_NAME.bytes().take(7).enumerate() {
+        for (i, b) in self.dos_name.bytes().take(7).enumerate() {
             dos[i] = b;
         }
         v.extend_from_slice(&dos);
         // DeviceData = the share name (null-terminated UTF-16); length-prefixed.
         let data = {
-            let mut d = to_utf16(DRIVE_DOS_NAME);
+            let mut d = to_utf16(&self.dos_name);
             d.extend_from_slice(&[0, 0]);
             d
         };
         v.extend_from_slice(&(data.len() as u32).to_le_bytes());
         v.extend_from_slice(&data);
         v
+    }
+}
+
+/// The DOS name a shared path is announced under: `"C"` for a drive root
+/// (`C:\`), else the last path component squeezed to the 7 ASCII chars the
+/// DEVICE_ANNOUNCE PreferredDosName field allows, falling back to `"RDPIO"`.
+pub fn dos_name_for(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    let trimmed = s.trim_end_matches(['\\', '/']);
+    // Bare drive root, e.g. "C:".
+    if trimmed.len() == 2 && trimmed.ends_with(':') {
+        return trimmed[..1].to_ascii_uppercase();
+    }
+    let last = trimmed.rsplit(['\\', '/']).next().unwrap_or("");
+    let cleaned: String = last
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(7)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if cleaned.is_empty() {
+        DRIVE_DOS_NAME.to_string()
+    } else {
+        cleaned
     }
 }
 
@@ -788,30 +816,48 @@ impl PrinterDevice {
     }
 }
 
-/// The device-redirection channel: init handshake + an optional shared drive
-/// and an optional redirected printer.
+/// The device-redirection channel: init handshake + any number of shared
+/// drives and an optional redirected printer.
 #[derive(Default)]
 pub struct RdpdrChannel {
     client_id: u32,
-    drive: Option<DriveDevice>,
+    drives: Vec<DriveDevice>,
     printer: Option<PrinterDevice>,
 }
+
+/// The printer's device id — clear of the drive ids, which grow from 1.
+const PRINTER_DEVICE_ID: u32 = 100;
 
 impl RdpdrChannel {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Share `root` as a redirected drive (device id 1).
+    /// Share `root` as a redirected drive under a name derived from the path
+    /// (`"C"` for a drive root, else the folder name). See [`Self::add_drive`].
     pub fn set_drive(&mut self, root: PathBuf) {
-        self.drive = Some(DriveDevice::new(root, 1));
+        let name = dos_name_for(&root);
+        self.add_drive(root, name);
     }
 
-    /// Redirect a local printer (device id 2). `print_name` is shown in the
-    /// session; `driver_name` is the driver the server renders with; `sink`
-    /// spools the returned job to the local printer.
+    /// Share `root` as an additional redirected drive announced as `dos_name`
+    /// (truncated to the 7 ASCII chars the wire allows). Drives get sequential
+    /// device ids starting at 1.
+    pub fn add_drive(&mut self, root: PathBuf, dos_name: String) {
+        let device_id = self.drives.len() as u32 + 1;
+        self.drives.push(DriveDevice::new(root, device_id, dos_name));
+    }
+
+    /// Redirect a local printer. `print_name` is shown in the session;
+    /// `driver_name` is the driver the server renders with; `sink` spools the
+    /// returned job to the local printer.
     pub fn set_printer(&mut self, print_name: String, driver_name: String, sink: Box<dyn PrinterSink>) {
-        self.printer = Some(PrinterDevice::new(2, print_name, driver_name, sink));
+        self.printer = Some(PrinterDevice::new(
+            PRINTER_DEVICE_ID,
+            print_name,
+            driver_name,
+            sink,
+        ));
     }
 
     /// Process one inbound RDPDR PDU, returning the responses to send.
@@ -839,9 +885,9 @@ impl RdpdrChannel {
     fn device_io(&mut self, msg: &[u8]) -> Vec<Vec<u8>> {
         let device_id = u32le(msg, 4).unwrap_or(0);
         // Body starts after the 4-byte rdpdr header. Route to whichever device
-        // the request targets (drive or printer).
-        let io = if self.drive.as_ref().is_some_and(|d| d.device_id == device_id) {
-            self.drive.as_mut().map(|d| d.io(&msg[4..]))
+        // the request targets (one of the drives, or the printer).
+        let io = if let Some(d) = self.drives.iter_mut().find(|d| d.device_id == device_id) {
+            Some(d.io(&msg[4..]))
         } else if self.printer.as_ref().is_some_and(|p| p.device_id == device_id) {
             self.printer.as_mut().map(|p| p.io(&msg[4..]))
         } else {
@@ -900,7 +946,7 @@ impl RdpdrChannel {
     fn device_list(&self) -> Vec<u8> {
         let mut entries = Vec::new();
         let mut count = 0u32;
-        if let Some(d) = self.drive.as_ref() {
+        for d in &self.drives {
             entries.extend_from_slice(&d.announce_entry());
             count += 1;
         }
@@ -980,6 +1026,63 @@ mod tests {
         let dl = &out[2];
         assert_eq!(pkt_id(dl), PAKID_CORE_DEVICELIST_ANNOUNCE);
         assert_eq!(u32::from_le_bytes([dl[4], dl[5], dl[6], dl[7]]), 1); // DeviceCount
+    }
+
+    #[test]
+    fn dos_names_derive_from_paths() {
+        use std::path::Path;
+        // Drive roots become their letter — how mstsc labels redirected drives.
+        assert_eq!(dos_name_for(Path::new("C:\\")), "C");
+        assert_eq!(dos_name_for(Path::new("z:/")), "Z");
+        // Folders use the (squeezed) folder name, 7 chars max.
+        assert_eq!(dos_name_for(Path::new("C:\\Users\\a\\Shared Stuff")), "SHAREDS");
+        // Degenerate paths fall back to the classic share name.
+        assert_eq!(dos_name_for(Path::new("/")), "RDPIO");
+    }
+
+    #[test]
+    fn multiple_drives_announce_and_route_independently() {
+        let dir_a = tmp_dir().join("a");
+        let dir_b = tmp_dir().join("b");
+        let _ = fs::create_dir_all(&dir_a);
+        let _ = fs::create_dir_all(&dir_b);
+        fs::write(dir_b.join("only-in-b.txt"), b"b").unwrap();
+        let mut r = RdpdrChannel::new();
+        r.add_drive(dir_a, "C".into());
+        r.add_drive(dir_b, "D".into());
+
+        let mut body = vec![1, 0, 12, 0];
+        body.extend_from_slice(&7u32.to_le_bytes());
+        let out = r.process(&server_pdu(PAKID_CORE_SERVER_ANNOUNCE, &body));
+        let dl = &out[2];
+        assert_eq!(u32::from_le_bytes([dl[4], dl[5], dl[6], dl[7]]), 2); // both drives
+
+        // A create routed to device 2 opens the file that only exists in b.
+        let out = r.process(&io_request(
+            2,
+            0,
+            42,
+            IRP_MJ_CREATE,
+            0,
+            &create_params(FILE_OPEN, 0, "\\only-in-b.txt"),
+        ));
+        assert_eq!(out.len(), 1);
+        let comp = &out[0];
+        assert_eq!(pkt_id(comp), PAKID_CORE_DEVICE_IOCOMPLETION);
+        assert_eq!(u32::from_le_bytes([comp[4], comp[5], comp[6], comp[7]]), 2); // device id
+        let status = u32::from_le_bytes([comp[12], comp[13], comp[14], comp[15]]);
+        assert_eq!(status, STATUS_SUCCESS);
+        // The same path on device 1 (empty dir) does not resolve to a file.
+        let out = r.process(&io_request(
+            1,
+            0,
+            43,
+            IRP_MJ_CREATE,
+            0,
+            &create_params(FILE_OPEN, 0, "\\only-in-b.txt"),
+        ));
+        let status = u32::from_le_bytes([out[0][12], out[0][13], out[0][14], out[0][15]]);
+        assert_ne!(status, STATUS_SUCCESS);
     }
 
     #[test]
@@ -1074,16 +1177,17 @@ mod tests {
         assert_eq!(u32::from_le_bytes([dl[4], dl[5], dl[6], dl[7]]), 1); // one device
         assert_eq!(u32::from_le_bytes([dl[8], dl[9], dl[10], dl[11]]), RDPDR_DTYP_PRINT);
 
-        // Create (start job) → Write (spool) → Close (finish).
-        r.process(&io_request(2, 0, 1, IRP_MJ_CREATE, 0, &[]));
+        // Create (start job) → Write (spool) → Close (finish). The printer's
+        // device id sits clear of the (variable) drive ids.
+        r.process(&io_request(PRINTER_DEVICE_ID, 0, 1, IRP_MJ_CREATE, 0, &[]));
         let mut wparams = Vec::new();
         wparams.extend_from_slice(&5u32.to_le_bytes()); // Length
         wparams.extend_from_slice(&0u64.to_le_bytes()); // Offset
         wparams.extend_from_slice(&[0u8; 20]); // Padding
         wparams.extend_from_slice(b"hello"); // WriteData
-        let out = r.process(&io_request(2, 1, 2, IRP_MJ_WRITE, 0, &wparams));
+        let out = r.process(&io_request(PRINTER_DEVICE_ID, 1, 2, IRP_MJ_WRITE, 0, &wparams));
         assert_eq!(u32::from_le_bytes([out[0][12], out[0][13], out[0][14], out[0][15]]), STATUS_SUCCESS);
-        r.process(&io_request(2, 1, 3, IRP_MJ_CLOSE, 0, &[]));
+        r.process(&io_request(PRINTER_DEVICE_ID, 1, 3, IRP_MJ_CLOSE, 0, &[]));
 
         let jobs = jobs.lock().unwrap();
         assert_eq!(jobs.len(), 1);

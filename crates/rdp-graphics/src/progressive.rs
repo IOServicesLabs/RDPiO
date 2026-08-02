@@ -1214,6 +1214,32 @@ pub struct ProgressiveDecoder {
     /// Reused 64×64 RGBA output buffers; avoids per-tile heap allocation on
     /// the decode thread.
     pool: BufferPool,
+    /// Persistent scratch for the parallel batch workers, one entry per extra
+    /// worker thread. Each worker previously allocated fresh planes/temp/pool
+    /// on every frame (~40 KB per worker per frame of pure churn, and a cold
+    /// RGBA pool each time); now the scratch survives across frames.
+    worker_scratch: Vec<WorkerScratch>,
+}
+
+/// Per-worker decode scratch for the parallel batch path.
+struct WorkerScratch {
+    planes: [Vec<i16>; 3],
+    temp: Vec<i16>,
+    pool: BufferPool,
+}
+
+impl WorkerScratch {
+    fn new() -> Self {
+        Self {
+            planes: [
+                vec![0i16; COEFFS],
+                vec![0i16; COEFFS],
+                vec![0i16; COEFFS],
+            ],
+            temp: vec![0i16; COEFFS],
+            pool: BufferPool::new(),
+        }
+    }
 }
 
 impl Default for ProgressiveDecoder {
@@ -1229,6 +1255,7 @@ impl Default for ProgressiveDecoder {
             stats: FrameStats::default(),
             perf: PerfTotals::default(),
             pool: BufferPool::new(),
+            worker_scratch: Vec::new(),
         }
     }
 }
@@ -1598,26 +1625,36 @@ impl ProgressiveDecoder {
             .min(16);
         if batch.len() >= PAR_MIN && threads > 1 {
             let per = batch.len().div_ceil(threads);
+            // The calling thread decodes the first chunk itself (one fewer
+            // spawn+join), and each spawned worker gets a persistent scratch
+            // entry — planes/temp and a warmed RGBA pool reused across frames
+            // instead of reallocated per frame per worker. (A fully persistent
+            // thread pool would need lifetime-erased pointers — `Slot` borrows
+            // the wire buffer — and this crate deliberately denies unsafe
+            // code, so the threads themselves remain scoped.)
+            while self.worker_scratch.len() + 1 < threads {
+                self.worker_scratch.push(WorkerScratch::new());
+            }
+            let mut chunks = batch.chunks_mut(per);
+            let own = chunks.next();
+            let own_planes = &mut self.planes;
+            let own_temp = &mut self.temp;
+            let own_pool = &mut self.pool;
+            let own_perf = &mut self.perf;
+            let worker_scratch = &mut self.worker_scratch;
             let perfs: Vec<PerfTotals> = std::thread::scope(|s| {
-                let handles: Vec<_> = batch
-                    .chunks_mut(per)
-                    .map(|chunk| {
+                let handles: Vec<_> = chunks
+                    .zip(worker_scratch.iter_mut())
+                    .map(|(chunk, scratch)| {
                         s.spawn(move || {
-                            let mut planes = [
-                                vec![0i16; COEFFS],
-                                vec![0i16; COEFFS],
-                                vec![0i16; COEFFS],
-                            ];
-                            let mut temp = vec![0i16; COEFFS];
-                            let mut pool = BufferPool::new();
                             let mut perf = PerfTotals::default();
                             for slot in chunk {
                                 decode_slot(
                                     slot,
                                     extrapolate,
-                                    &mut planes,
-                                    &mut temp,
-                                    &mut pool,
+                                    &mut scratch.planes,
+                                    &mut scratch.temp,
+                                    &mut scratch.pool,
                                     &mut perf,
                                 );
                             }
@@ -1625,6 +1662,12 @@ impl ProgressiveDecoder {
                         })
                     })
                     .collect();
+                // Our own share decodes here while the workers run theirs.
+                if let Some(chunk) = own {
+                    for slot in chunk {
+                        decode_slot(slot, extrapolate, own_planes, own_temp, own_pool, own_perf);
+                    }
+                }
                 handles
                     .into_iter()
                     .map(|h| h.join().expect("progressive decode worker panicked"))
@@ -1712,6 +1755,7 @@ struct Slot<'a> {
     state: TileState,
     rgba: Option<Vec<u8>>,
 }
+
 
 /// Decode one slot: run the component transforms against the slot's own state
 /// and produce the tile's RGBA. Pure with respect to everything but the slot and

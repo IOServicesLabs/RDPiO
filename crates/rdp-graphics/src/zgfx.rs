@@ -183,11 +183,33 @@ impl Zgfx {
         }
     }
 
-    /// Append `src` to the ring history (used for literals runs / uncompressed).
+    /// Append `src` to the ring history (used for literals runs / uncompressed
+    /// data and match feedback). Chunked `copy_from_slice` — at most two
+    /// segments around the wrap — instead of a per-byte loop: every EGFX byte
+    /// flows through here, so the per-byte wrap check was a measurable
+    /// constant factor on the whole graphics stream.
     fn history_write(&mut self, src: &[u8]) {
-        for &b in src {
-            self.history_push(b);
+        let n = src.len();
+        if n == 0 {
+            return;
         }
+        if n >= HISTORY_SIZE {
+            // Only the trailing window survives; lay it out so the final
+            // write position matches the byte-at-a-time result exactly.
+            let tail = &src[n - HISTORY_SIZE..];
+            let end = (self.history_index + n) % HISTORY_SIZE;
+            let first_len = HISTORY_SIZE - end;
+            self.history[end..].copy_from_slice(&tail[..first_len]);
+            self.history[..end].copy_from_slice(&tail[first_len..]);
+            self.history_index = end;
+            return;
+        }
+        let idx = self.history_index;
+        let first = n.min(HISTORY_SIZE - idx);
+        self.history[idx..idx + first].copy_from_slice(&src[..first]);
+        let rest = n - first;
+        self.history[..rest].copy_from_slice(&src[first..]);
+        self.history_index = (idx + n) % HISTORY_SIZE;
     }
 
     /// Copy a `count`-byte match at `distance` from the history into `out`,
@@ -199,23 +221,18 @@ impl Zgfx {
         let start = out.len();
         let dist = (distance as usize) % HISTORY_SIZE;
         let index = (self.history_index + HISTORY_SIZE - dist) % HISTORY_SIZE;
-        // First chunk: up to `distance` bytes straight from history.
+        // First chunk: up to `distance` bytes straight from history — at most
+        // two contiguous runs around the ring wrap.
         let first = count.min(dist);
-        for i in 0..first {
-            out.push(self.history[(index + i) % HISTORY_SIZE]);
-        }
-        // Remainder repeats the just-produced bytes (LZ overlap).
-        let mut produced = first;
+        let run1 = first.min(HISTORY_SIZE - index);
+        out.extend_from_slice(&self.history[index..index + run1]);
+        out.extend_from_slice(&self.history[..first - run1]);
+        // Remainder repeats the just-produced bytes (LZ overlap): doubling
+        // block copies of the leading period.
         while out.len() - start < count {
-            let want = count - (out.len() - start);
-            let n = produced.min(want);
-            for i in 0..n {
-                out.push(out[start + i]);
-            }
-            produced <<= 1;
-            if n == 0 {
-                break; // defensive: distance==0 already handled, never reached
-            }
+            let produced = out.len() - start;
+            let n = produced.min(count - produced);
+            out.extend_from_within(start..start + n);
         }
     }
 
@@ -300,8 +317,10 @@ impl Zgfx {
                         }
                         let mstart = out.len();
                         self.match_into(distance, count, out);
-                        let produced: Vec<u8> = out[mstart..].to_vec();
-                        self.history_write(&produced);
+                        // Feed the produced bytes straight back into the ring
+                        // (the old heap clone per match token was pure waste —
+                        // `out` and `self.history` never alias).
+                        self.history_write(&out[mstart..]);
                     } else {
                         // Unencoded run: 15-bit count, then raw bytes, byte-aligned.
                         r.get(15);
@@ -329,6 +348,47 @@ impl Zgfx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chunked `history_write` must lay bytes out exactly like the old
+    /// byte-at-a-time push, across every wrap case (including a source bigger
+    /// than the whole ring, where only the tail survives).
+    #[test]
+    fn history_write_matches_byte_at_a_time_model() {
+        let mut z = Zgfx::new();
+        let mut model = vec![0u8; HISTORY_SIZE];
+        let mut mi = 0usize;
+        let chunks: Vec<Vec<u8>> = vec![
+            (0..1000u32).map(|i| (i % 251) as u8).collect(),
+            vec![7u8; HISTORY_SIZE - 500],
+            (0..(HISTORY_SIZE as u32 + 12_345)).map(|i| (i % 249) as u8).collect(),
+            vec![9u8; 3],
+        ];
+        for c in &chunks {
+            z.history_write(c);
+            for &b in c {
+                model[mi] = b;
+                mi = (mi + 1) % HISTORY_SIZE;
+            }
+            assert_eq!(z.history_index, mi);
+            assert_eq!(z.history, model);
+        }
+    }
+
+    /// A match whose source range spans the ring wrap point must come out
+    /// contiguous, and an overlapping match (count > distance) must repeat the
+    /// leading period.
+    #[test]
+    fn match_into_copies_across_the_ring_wrap() {
+        let mut z = Zgfx::new();
+        z.history_write(&vec![0u8; HISTORY_SIZE - 4]);
+        z.history_write(&[1, 2, 3, 4, 5, 6, 7, 8]); // last 4 bytes wrap to the front
+        let mut out = Vec::new();
+        z.match_into(8, 8, &mut out);
+        assert_eq!(out, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut out2 = Vec::new();
+        z.match_into(2, 7, &mut out2);
+        assert_eq!(out2, [7, 8, 7, 8, 7, 8, 7]);
+    }
 
     /// Single uncompressed segment: descriptor 0xE0 + flags(uncompressed) + raw.
     #[test]

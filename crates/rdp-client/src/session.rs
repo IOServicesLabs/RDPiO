@@ -44,6 +44,7 @@ pub(crate) fn clipboard_changed() {
         return; // our own SetClipboardData — don't echo it back
     }
     CLIPBOARD_DIRTY.store(true, Ordering::SeqCst);
+    crate::net_wait::worker_wake::signal();
 }
 
 /// Suppress the next local clipboard-change notification (the provider calls this
@@ -55,6 +56,113 @@ pub(crate) fn suppress_clipboard_echo() {
 
 fn take_clipboard_changed() -> bool {
     CLIPBOARD_DIRTY.swap(false, Ordering::SeqCst)
+}
+
+/// Hand-off for lazily-staged clipboard files, between the UI thread (which
+/// owns the clipboard and receives `WM_RENDERFORMAT` when someone pastes) and
+/// the session worker (which runs the actual transfer).
+///
+/// Files copied in the session are only ADVERTISED at first. On a paste the UI
+/// thread sets `wanted` and blocks on `done`; the worker notices, streams the
+/// files to disk, and publishes their paths — which the UI thread then turns
+/// into a real `CF_HDROP`.
+#[cfg(windows)]
+#[derive(Default)]
+struct ClipFileHandoff {
+    /// Entries the session currently offers (0 = nothing to paste).
+    offered: usize,
+    /// A paste is waiting for the bytes.
+    wanted: bool,
+    /// Staged local paths once the transfer finishes (empty = failed).
+    ready: Option<Vec<std::path::PathBuf>>,
+}
+
+#[cfg(windows)]
+static CLIP_FILES: std::sync::Mutex<ClipFileHandoff> =
+    std::sync::Mutex::new(ClipFileHandoff {
+        offered: 0,
+        wanted: false,
+        ready: None,
+    });
+#[cfg(windows)]
+static CLIP_FILES_DONE: std::sync::Condvar = std::sync::Condvar::new();
+
+#[cfg(windows)]
+fn clip_files() -> std::sync::MutexGuard<'static, ClipFileHandoff> {
+    CLIP_FILES.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The session announced `count` clipboard files (nothing transferred yet).
+#[cfg(windows)]
+pub(crate) fn clipboard_files_offered(count: usize) {
+    let mut g = clip_files();
+    g.offered = count;
+    g.wanted = false;
+    g.ready = None;
+}
+
+/// UI thread: a paste needs the files. Blocks (bounded) until the worker has
+/// staged them, and returns their local paths — empty if there is nothing to
+/// paste or the transfer failed.
+#[cfg(windows)]
+pub(crate) fn request_clipboard_files(timeout: std::time::Duration) -> Vec<std::path::PathBuf> {
+    let mut g = clip_files();
+    if g.offered == 0 {
+        return Vec::new();
+    }
+    if let Some(paths) = g.ready.clone() {
+        return paths; // already staged (e.g. a second paste)
+    }
+    g.wanted = true;
+    crate::net_wait::worker_wake::signal();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!("timed out staging clipboard files for a paste");
+            return Vec::new();
+        }
+        let (next, wait) = CLIP_FILES_DONE
+            .wait_timeout(g, remaining)
+            .unwrap_or_else(|p| p.into_inner());
+        g = next;
+        if let Some(paths) = g.ready.clone() {
+            return paths;
+        }
+        if wait.timed_out() {
+            tracing::warn!("timed out staging clipboard files for a paste");
+            return Vec::new();
+        }
+    }
+}
+
+/// Worker: whether a paste is waiting for the offered files. Clears the flag.
+#[cfg(windows)]
+fn take_clipboard_file_request() -> bool {
+    let mut g = clip_files();
+    std::mem::take(&mut g.wanted)
+}
+
+/// Worker: the files are staged at `paths` (empty = the transfer failed).
+#[cfg(windows)]
+pub(crate) fn clipboard_files_ready(paths: Vec<std::path::PathBuf>) {
+    let mut g = clip_files();
+    g.ready = Some(paths);
+    drop(g);
+    CLIP_FILES_DONE.notify_all();
+}
+
+/// UI thread: our advertised copy was superseded on the local clipboard, so
+/// anything already staged for it is no longer reachable and can be dropped.
+#[cfg(windows)]
+pub(crate) fn clipboard_files_discarded() {
+    let mut g = clip_files();
+    g.offered = 0;
+    g.wanted = false;
+    g.ready = None;
+    drop(g);
+    // Release any paste still blocked on us.
+    CLIP_FILES_DONE.notify_all();
 }
 
 /// A pending desktop-resize request, stored as the full monitor layout the UI
@@ -71,6 +179,7 @@ pub(crate) fn request_resize(monitors: Vec<gcc::MonitorDef>) {
     if let Ok(mut req) = RESIZE_REQUEST.lock() {
         *req = Some(monitors);
     }
+    crate::net_wait::worker_wake::signal();
 }
 
 #[cfg(windows)]
@@ -90,6 +199,7 @@ pub(crate) fn queue_touch(contacts: Vec<rdp_channels::rdpei::RdpInputContact>) {
     if let Ok(mut q) = TOUCH_QUEUE.lock() {
         q.extend(contacts);
     }
+    crate::net_wait::worker_wake::signal();
 }
 
 #[cfg(windows)]
@@ -207,7 +317,8 @@ impl SecuritySession {
 }
 
 /// The outbound (client→server) half of the security state: the RC4 encrypt
-/// cipher and the MAC key. Owned by the input sender after activation.
+/// cipher and the MAC key. Shared after activation between the session worker
+/// (channel replies, reactivation, share PDUs) and the [`InputSender`] thread.
 struct OutboundCrypto {
     encrypt: rdp_crypto::SessionCipher,
     mac_key: Vec<u8>,
@@ -218,6 +329,22 @@ impl OutboundCrypto {
     fn wrap(&mut self, extra_flags: u16, plaintext: &[u8]) -> Vec<u8> {
         wrap_security(&mut self.encrypt, &self.mac_key, extra_flags, plaintext)
     }
+}
+
+/// The outbound cipher, shared between the session worker and the input-sender
+/// thread on the legacy path. There is exactly ONE client→server RC4 keystream
+/// per connection, and both threads send on it: the worker answers channel
+/// traffic (cliprdr/rdpdr/drdynvc) and reactivations, the input thread sends
+/// pointer/keyboard events. Whoever encrypts a PDU must also put it on the wire
+/// before releasing the lock — RC4 and the MAC are stateful, so the server
+/// decrypts strictly in arrival order; encrypt-order ≠ wire-order desyncs the
+/// keystream and the server silently resets the connection.
+type SharedOutbound = std::sync::Arc<std::sync::Mutex<OutboundCrypto>>;
+
+/// Lock a [`SharedOutbound`], recovering the state from a poisoned mutex (a
+/// panicked peer thread leaves the cipher usable — RC4 state is just bytes).
+fn lock_outbound(c: &SharedOutbound) -> std::sync::MutexGuard<'_, OutboundCrypto> {
+    c.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// The inbound (server→client) half of the security state: the RC4 decrypt
@@ -253,10 +380,16 @@ fn wrap_security(
 /// Strip the basic security header from an inbound payload. On the legacy path
 /// (`inbound` present) RC4-decrypt the body and verify its 8-byte MAC; on the
 /// TLS/NLA path (`inbound` is `None`) the payload is the share PDU as-is.
-fn unwrap_inbound(inbound: Option<&mut InboundCrypto>, payload: &[u8]) -> Vec<u8> {
+fn unwrap_inbound<'a>(
+    inbound: Option<&mut InboundCrypto>,
+    payload: &'a [u8],
+) -> std::borrow::Cow<'a, [u8]> {
     match inbound {
-        Some(ic) => decrypt_and_verify(&mut ic.decrypt, &ic.mac_key, payload),
-        None => payload.to_vec(),
+        Some(ic) => {
+            std::borrow::Cow::Owned(decrypt_and_verify(&mut ic.decrypt, &ic.mac_key, payload))
+        }
+        // TLS path: the payload IS the share PDU — no copy.
+        None => std::borrow::Cow::Borrowed(payload),
     }
 }
 
@@ -542,7 +675,7 @@ pub fn activate<S: Read + Write>(
     tracing::info!("sent Client Info");
 
     // 6) Complete the licensing exchange, then wait for Demand Active.
-    let share_id = recv_demand_active(stream, &mut sec)?;
+    let share_id = recv_demand_active(stream, &mut sec, user_id, server.io_channel_id)?;
     tracing::info!(share_id, "received Demand Active");
 
     // 7) Confirm Active + finalization.
@@ -598,7 +731,7 @@ pub fn activate<S: Read + Write>(
     tracing::info!("sent Confirm Active + finalization");
 
     // 8) Wait for the server Font Map → Active.
-    recv_until(stream, &mut sec, "Font Map", |payload| {
+    recv_until(stream, &mut sec, user_id, server.io_channel_id, "Font Map", |payload| {
         (finalization::data_pdu_type2(payload) == Some(finalization::PDUTYPE2_FONTMAP))
             .then_some(())
     })?;
@@ -607,7 +740,10 @@ pub fn activate<S: Read + Write>(
     let (inbound, outbound) = match sec {
         Some(s) => {
             let (decrypt, out) = s.split();
-            (Some(decrypt), Some(out))
+            (
+                Some(decrypt),
+                Some(std::sync::Arc::new(std::sync::Mutex::new(out))),
+            )
         }
         None => (None, None),
     };
@@ -628,9 +764,11 @@ pub fn activate<S: Read + Write>(
         audio: AudioState::default(),
         rdpdr: {
             let mut s = RdpdrState::default();
-            if let Some(path) = &config.drive_path {
-                s.channel.set_drive(std::path::PathBuf::from(path));
-                tracing::info!(path, "sharing local directory as a redirected drive");
+            for path in &config.drive_paths {
+                let root = std::path::PathBuf::from(path);
+                let name = rdp_channels::rdpdr::dos_name_for(&root);
+                s.channel.add_drive(root, name.clone());
+                tracing::info!(path, name, "sharing local path as a redirected drive");
             }
             s
         },
@@ -642,12 +780,13 @@ pub fn activate<S: Read + Write>(
 }
 
 /// A live, activated RDP session. Holds the inbound (decrypt) cipher used to
-/// keep reading server PDUs, and — until taken by [`ActiveSession::take_input_sender`]
-/// — the outbound half needed to send client input.
+/// keep reading server PDUs, and the shared outbound half used both here (for
+/// channel replies and reactivation) and by the [`InputSender`] built via
+/// [`ActiveSession::take_input_sender`].
 pub struct ActiveSession {
     info: SessionInfo,
     inbound: Option<InboundCrypto>,
-    outbound: Option<OutboundCrypto>,
+    outbound: Option<SharedOutbound>,
     /// Server-cached cursor shapes; a `Cached` pointer update reuses one by
     /// index instead of re-sending the bitmap.
     cursor_cache: std::collections::HashMap<u16, rdp_graphics::pointer::CursorShape>,
@@ -714,14 +853,17 @@ impl ActiveSession {
         &self.info
     }
 
-    /// Take the outbound security half and build an [`InputSender`] over
-    /// `stream` (typically a clone of the session socket). After this the
-    /// session retains only the inbound cipher, so the reader and the input
-    /// sender can run on separate threads without sharing an RC4 cipher.
+    /// Build an [`InputSender`] over `stream` (typically a clone of the session
+    /// socket). The outbound cipher is SHARED with the session — the worker
+    /// still needs it for channel replies (cliprdr/rdpdr/drdynvc) and
+    /// reactivation; taking it away made those go out unencrypted, which an
+    /// encryption-required server answers with a hard TCP reset right after
+    /// activation. Both writers serialize on the cipher lock, held across the
+    /// socket write so keystream order matches wire order.
     pub fn take_input_sender<S: Write>(&mut self, stream: S) -> InputSender<S> {
         InputSender {
             stream,
-            crypto: self.outbound.take(),
+            crypto: self.outbound.clone(),
             user_id: self.info.user_channel_id,
             io_channel: self.info.io_channel_id,
             share_id: self.info.share_id,
@@ -738,11 +880,15 @@ impl ActiveSession {
         channel_id: u16,
         payload: &[u8],
     ) -> Result<(), ActivateError> {
-        let wrapped = match self.outbound.as_mut() {
-            Some(c) => c.wrap(0, payload),
-            None => payload.to_vec(),
-        };
-        send_payload(stream, self.info.user_channel_id, channel_id, &wrapped)
+        match self.outbound.as_ref() {
+            Some(c) => {
+                // Hold the cipher lock across the write (see [`SharedOutbound`]).
+                let mut c = lock_outbound(c);
+                let wrapped = c.wrap(0, payload);
+                send_payload(stream, self.info.user_channel_id, channel_id, &wrapped)
+            }
+            None => send_payload(stream, self.info.user_channel_id, channel_id, payload),
+        }
     }
 
     /// Send a DRDYNVC PDU on the (static) `drdynvc` channel, framing it with the
@@ -800,6 +946,37 @@ impl ActiveSession {
         Ok(())
     }
 
+    /// Start fetching the clipboard files the session offered, if a local paste
+    /// is waiting for them. This is the lazy half of file redirection: nothing
+    /// moves until [`request_clipboard_files`] flags a paste.
+    #[cfg(windows)]
+    fn pump_clipboard_files<S: Write>(&mut self, stream: &mut S) -> Result<(), ActivateError> {
+        if !take_clipboard_file_request() {
+            return Ok(());
+        }
+        let Some(cliprdr_id) = self.info.channel_id(rdp_pdu::gcc::CLIPRDR_CHANNEL) else {
+            clipboard_files_ready(Vec::new());
+            return Ok(());
+        };
+        let requests = self
+            .clipboard
+            .channel
+            .begin_file_fetch(self.clipboard.provider.as_mut());
+        if requests.is_empty() {
+            // Nothing to fetch (or a fetch is already running) — don't leave a
+            // paste blocked waiting for us.
+            clipboard_files_ready(Vec::new());
+            return Ok(());
+        }
+        tracing::info!("paste requested the session's clipboard files; transferring");
+        for req in requests {
+            for piece in rdp_channels::svc::chunks(&req) {
+                self.send_channel(stream, cliprdr_id, &piece)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Re-advertise the local clipboard to the server (called when the local
     /// clipboard changed), so the remote can paste from us. No-op before the
     /// cliprdr handshake completes or if the channel isn't present.
@@ -808,8 +985,23 @@ impl ActiveSession {
             return Ok(());
         };
         let has_text = self.clipboard.provider.get_text().is_some();
-        let has_files = !self.clipboard.provider.get_files().is_empty();
-        if let Some(msg) = self.clipboard.channel.announce_local(has_text, has_files) {
+        let files = self.clipboard.provider.get_files();
+        let has_files = !files.is_empty();
+        let has_image = self.clipboard.provider.get_image().is_some();
+        // What we advertise here decides whether the session ever asks for the
+        // data at all, so it is the first thing to check when a copy silently
+        // does nothing on the far side.
+        tracing::info!(
+            text = has_text,
+            files = files.len(),
+            image = has_image,
+            "local clipboard changed; advertising to the session"
+        );
+        if let Some(msg) = self
+            .clipboard
+            .channel
+            .announce_local(has_text, has_files, has_image)
+        {
             for piece in rdp_channels::svc::chunks(&msg) {
                 self.send_channel(stream, cliprdr_id, &piece)?;
             }
@@ -915,11 +1107,25 @@ impl ActiveSession {
         }
         let share =
             rdp_pdu::input::input_pdu(self.info.share_id, self.info.user_channel_id, events);
-        let payload = match self.outbound.as_mut() {
-            Some(c) => c.wrap(0, &share),
-            None => share,
-        };
-        send_payload(stream, self.info.user_channel_id, self.info.io_channel_id, &payload)
+        match self.outbound.as_ref() {
+            Some(c) => {
+                // Hold the cipher lock across the write (see [`SharedOutbound`]).
+                let mut c = lock_outbound(c);
+                let payload = c.wrap(0, &share);
+                send_payload(
+                    stream,
+                    self.info.user_channel_id,
+                    self.info.io_channel_id,
+                    &payload,
+                )
+            }
+            None => send_payload(
+                stream,
+                self.info.user_channel_id,
+                self.info.io_channel_id,
+                &share,
+            ),
+        }
     }
 
     /// If `plaintext` is a slow-path Pointer Update PDU, decode it and forward a
@@ -936,8 +1142,26 @@ impl ActiveSession {
             return false;
         };
         let Some(update) = pointer::parse_pointer_update(body) else {
-            return false;
+            // A pointer PDU we could not decode: the cursor silently keeps its
+            // previous shape — make that observable instead of invisible.
+            let message_type = body
+                .get(..2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]));
+            tracing::debug!(
+                ?message_type,
+                len = body.len(),
+                "pointer update parse failed; cursor unchanged"
+            );
+            return true;
         };
+        if let PointerUpdate::Shape { cache_index, shape } = &update {
+            tracing::debug!(
+                cache_index,
+                w = shape.width,
+                h = shape.height,
+                "pointer shape update"
+            );
+        }
         match update {
             PointerUpdate::Hidden => sink.cursor(CursorUpdate::Hide),
             PointerUpdate::SystemDefault => sink.cursor(CursorUpdate::Default),
@@ -963,11 +1187,25 @@ impl ActiveSession {
         stream: &mut S,
         share_pdu: &[u8],
     ) -> Result<(), ActivateError> {
-        let payload = match self.outbound.as_mut() {
-            Some(c) => c.wrap(0, share_pdu),
-            None => share_pdu.to_vec(),
-        };
-        send_payload(stream, self.info.user_channel_id, self.info.io_channel_id, &payload)
+        match self.outbound.as_ref() {
+            Some(c) => {
+                // Hold the cipher lock across the write (see [`SharedOutbound`]).
+                let mut c = lock_outbound(c);
+                let payload = c.wrap(0, share_pdu);
+                send_payload(
+                    stream,
+                    self.info.user_channel_id,
+                    self.info.io_channel_id,
+                    &payload,
+                )
+            }
+            None => send_payload(
+                stream,
+                self.info.user_channel_id,
+                self.info.io_channel_id,
+                share_pdu,
+            ),
+        }
     }
 
     /// React to a server Deactivate All by re-running the capability exchange:
@@ -1044,11 +1282,13 @@ fn cursor_update_from_shape(s: &rdp_graphics::pointer::CursorShape) -> CursorUpd
 }
 
 /// Sends client input (slow-path Input Event PDUs) to the server, RC4/MAC-
-/// wrapping them when the session is encrypted. Generic over the writable
-/// stream so it can be unit-tested without a socket.
+/// wrapping them when the session is encrypted. The cipher is shared with the
+/// session worker (see [`SharedOutbound`]); the lock is held across the socket
+/// write so the keystream order matches the wire order. Generic over the
+/// writable stream so it can be unit-tested without a socket.
 pub struct InputSender<S: Write> {
     stream: S,
-    crypto: Option<OutboundCrypto>,
+    crypto: Option<SharedOutbound>,
     user_id: u16,
     io_channel: u16,
     share_id: u32,
@@ -1061,13 +1301,21 @@ impl<S: Write> InputSender<S> {
             return Ok(());
         }
         let share = rdp_pdu::input::input_pdu(self.share_id, self.user_id, events);
-        let payload = match self.crypto.as_mut() {
-            Some(c) => c.wrap(0, &share),
-            None => share,
-        };
-        let request = mcs::send_data_request(self.user_id, self.io_channel, &payload);
-        self.stream.write_all(&mcs::frame(&request)?)?;
-        self.stream.flush()?;
+        match self.crypto.as_ref() {
+            Some(c) => {
+                // Hold the cipher lock across the write (see [`SharedOutbound`]).
+                let mut c = lock_outbound(c);
+                let payload = c.wrap(0, &share);
+                let request = mcs::send_data_request(self.user_id, self.io_channel, &payload);
+                self.stream.write_all(&mcs::frame(&request)?)?;
+                self.stream.flush()?;
+            }
+            None => {
+                let request = mcs::send_data_request(self.user_id, self.io_channel, &share);
+                self.stream.write_all(&mcs::frame(&request)?)?;
+                self.stream.flush()?;
+            }
+        }
         Ok(())
     }
 }
@@ -1103,21 +1351,42 @@ pub trait FrameSink {
         self.blit(x, y, w, h, &rgba);
     }
     /// Blit a `w`x`h` NV12 frame (Y plane then interleaved UV, stride `w`) at
-    /// (`x`,`y`). Default: convert to RGBA on the CPU and delegate to [`blit`],
-    /// so sinks without a GPU path still render. The windowed driver overrides
+    /// (`x`,`y`), painting only the frame-relative dirty `rects` (empty = whole
+    /// frame). Default: convert to RGBA on the CPU and delegate to [`blit`], so
+    /// sinks without a GPU path still render. The windowed driver overrides
     /// this to convert on the GPU (D3D11 video processor).
     #[cfg(windows)]
-    fn blit_nv12(&mut self, x: u16, y: u16, w: u16, h: u16, nv12: &[u8]) {
+    fn blit_nv12(&mut self, x: u16, y: u16, w: u16, h: u16, nv12: &[u8], rects: &[(u16, u16, u16, u16)]) {
         let (yp, uv) = nv12.split_at((w as usize) * (h as usize));
-        if let Some(rgba) =
+        let Some(rgba) =
             rdp_graphics::yuv::nv12_to_rgba(yp, uv, w as usize, h as usize, w as usize)
-        {
+        else {
+            return;
+        };
+        if rects.is_empty() {
             self.blit(x, y, w, h, &rgba);
+            return;
+        }
+        for &(rx, ry, rw, rh) in rects {
+            if rx >= w || ry >= h {
+                continue;
+            }
+            let cw = rw.min(w - rx) as usize;
+            let ch = rh.min(h - ry) as usize;
+            if cw == 0 || ch == 0 {
+                continue;
+            }
+            let mut cropped = Vec::with_capacity(cw * ch * 4);
+            for row in 0..ch {
+                let start = ((ry as usize + row) * w as usize + rx as usize) * 4;
+                cropped.extend_from_slice(&rgba[start..start + cw * 4]);
+            }
+            self.blit(x + rx, y + ry, cw as u16, ch as u16, &cropped);
         }
     }
-    /// Blit a GPU NV12 texture (zero-copy DXVA decode) at (`x`,`y`). Default:
-    /// drop it (a sink without a GPU can't use a GPU texture); the windowed
-    /// driver color-converts it on the GPU.
+    /// Blit a GPU NV12 texture (zero-copy DXVA decode) at (`x`,`y`), painting
+    /// only the dirty `rects`. Default: drop it (a sink without a GPU can't use
+    /// a GPU texture); the windowed driver color-converts it on the GPU.
     #[cfg(windows)]
     fn blit_texture(
         &mut self,
@@ -1126,6 +1395,7 @@ pub trait FrameSink {
         _w: u16,
         _h: u16,
         _texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        _rects: &[(u16, u16, u16, u16)],
     ) {
     }
     /// Copy a framebuffer rectangle (`sx`,`sy`,`w`,`h`) to (`dx`,`dy`) on the GPU
@@ -1153,11 +1423,6 @@ pub trait FrameSink {
     /// Only the Windows graphics loop drives this.
     #[cfg(windows)]
     fn resize(&mut self, _w: u16, _h: u16) {}
-    /// Request the renderer's adaptive pacing mode: `true` for allow-tearing low
-    /// latency (sustained motion — video/gaming), `false` for vsync (calm
-    /// desktop). Default: ignore. A user-forced low-latency mode overrides this.
-    #[cfg(windows)]
-    fn set_low_latency(&mut self, _on: bool) {}
 }
 
 /// A microphone capture device for audio-input redirection (MS-RDPEAI). The
@@ -1198,6 +1463,9 @@ pub fn pump_once<S: Read + Write, F: FrameSink>(
     if take_clipboard_changed() {
         session.announce_clipboard(stream)?;
     }
+    // ...and start staging the session's clipboard files if a paste wants them.
+    #[cfg(windows)]
+    session.pump_clipboard_files(stream)?;
 
     let pdu = read_tpkt_pdu(stream)?;
     let (channel, payload) = mcs::parse_send_data_indication(&pdu)?;
@@ -1384,20 +1652,26 @@ pub enum GfxBlit {
         rgba: Vec<u8>,
     },
     /// NV12: a `w*h` Y plane then a `w*(h/2)` interleaved UV plane (stride `w`).
+    /// `rects` are the frame-relative dirty regions (MS-RDPEGFX `regionRects`);
+    /// only they are painted — outside them the decoded picture holds encoder
+    /// reference content that may be stale. Empty = paint the whole frame.
     Nv12 {
         x: u16,
         y: u16,
         w: u16,
         h: u16,
         nv12: Vec<u8>,
+        rects: Vec<(u16, u16, u16, u16)>,
     },
     /// A GPU NV12 texture (zero-copy DXVA decode) to color-convert on the GPU.
+    /// `rects` as in [`GfxBlit::Nv12`].
     Texture {
         x: u16,
         y: u16,
         w: u16,
         h: u16,
         texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        rects: Vec<(u16, u16, u16, u16)>,
     },
     /// Copy a `w`x`h` framebuffer rectangle from (`sx`,`sy`) to (`dx`,`dy`)
     /// entirely on the GPU (EGFX SurfaceToSurface). Reads the live framebuffer,
@@ -1453,8 +1727,11 @@ fn take_buffered_tpkt(buf: &mut Vec<u8>) -> std::io::Result<Option<Vec<u8>>> {
     if buf.len() < total {
         return Ok(None);
     }
-    let pdu = buf[..total].to_vec();
-    buf.drain(..total);
+    // Hand the accumulated buffer over as the PDU (no copy) and keep only the
+    // tail — usually empty or a small partial next PDU. The common one-PDU
+    // case is a pure pointer swap.
+    let rest = buf.split_off(total);
+    let pdu = std::mem::replace(buf, rest);
     Ok(Some(pdu))
 }
 
@@ -1470,15 +1747,21 @@ fn poll_tpkt_pdu<R: Read>(stream: &mut R, buf: &mut Vec<u8>) -> std::io::Result<
         if let Some(pdu) = take_buffered_tpkt(buf)? {
             return Ok(Some(pdu));
         }
-        let mut tmp = [0u8; 8192];
-        match stream.read(&mut tmp) {
+        // 64 KiB per read: an 8 KiB buffer costs ~8x the syscalls (and, on the
+        // TLS path, ~8x the SChannel DecryptMessage calls) for the same bytes.
+        // At gigabit that is the difference between ~2k and ~15k reads a second.
+        // Read directly into `buf`'s tail — no intermediate stack buffer copy.
+        let old = buf.len();
+        buf.resize(old + 64 * 1024, 0);
+        match stream.read(&mut buf[old..]) {
             Ok(0) => {
+                buf.truncate(old);
                 return Err(std::io::Error::new(
                     ErrorKind::UnexpectedEof,
                     "server closed the connection",
                 ));
             }
-            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Ok(n) => buf.truncate(old + n),
             // Windows can report a raced read timeout as a transient overlapped-I/O
             // status (ERROR_IO_PENDING 997 / WSA_IO_INCOMPLETE 996 /
             // ERROR_OPERATION_ABORTED 995) rather than TimedOut; treat all of them
@@ -1488,9 +1771,13 @@ fn poll_tpkt_pdu<R: Read>(stream: &mut R, buf: &mut Vec<u8>) -> std::io::Result<
                     || e.kind() == ErrorKind::TimedOut
                     || matches!(e.raw_os_error(), Some(995 | 996 | 997)) =>
             {
+                buf.truncate(old);
                 return Ok(None);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                buf.truncate(old);
+                return Err(e);
+            }
         }
     }
 }
@@ -1523,10 +1810,7 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
     use rdp_pdu::gfx::GfxCommand;
     use std::sync::atomic::Ordering;
 
-    let mut motion_window_start = std::time::Instant::now();
-    let mut motion_frames = 0u32;
-    let mut low_latency_on = false;
-    // Separate, slower window for surfacing the achieved decode fps at info.
+    // Window for surfacing the achieved decode fps at info.
     let mut fps_log_start = std::time::Instant::now();
     let mut fps_log_frames = 0u32;
 
@@ -1563,7 +1847,6 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
                     GfxCommand::StartFrame { .. } => in_frame = true,
                     GfxCommand::EndFrame { .. } => {
                         in_frame = false;
-                        motion_frames += 1;
                         fps_log_frames += 1;
                     }
                     GfxCommand::WireToSurface1 { .. } => tiles += 1,
@@ -1572,9 +1855,11 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
                 for blit in renderer.render(command) {
                     match blit {
                         GfxBlit::Rgba { x, y, w, h, rgba } => sink.blit_owned(x, y, w, h, rgba),
-                        GfxBlit::Nv12 { x, y, w, h, nv12 } => sink.blit_nv12(x, y, w, h, &nv12),
-                        GfxBlit::Texture { x, y, w, h, texture } => {
-                            sink.blit_texture(x, y, w, h, &texture)
+                        GfxBlit::Nv12 { x, y, w, h, nv12, rects } => {
+                            sink.blit_nv12(x, y, w, h, &nv12, &rects)
+                        }
+                        GfxBlit::Texture { x, y, w, h, texture, rects } => {
+                            sink.blit_texture(x, y, w, h, &texture, &rects)
                         }
                         GfxBlit::CopyRect { sx, sy, w, h, dx, dy } => {
                             sink.copy_rect(sx, sy, w, h, dx, dy)
@@ -1613,20 +1898,6 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
                 decode_us,
                 "decode burst"
             );
-        }
-
-        // Adaptive pacing, driven by the rate we actually DECODE frames at.
-        let elapsed = motion_window_start.elapsed();
-        if elapsed >= std::time::Duration::from_millis(500) {
-            let fps = motion_frames as f32 / elapsed.as_secs_f32();
-            let desired = if low_latency_on { fps >= 8.0 } else { fps >= 24.0 };
-            if desired != low_latency_on {
-                low_latency_on = desired;
-                sink.set_low_latency(desired);
-                tracing::debug!(fps, low_latency = desired, "adaptive pacing");
-            }
-            motion_window_start = std::time::Instant::now();
-            motion_frames = 0;
         }
 
         // Surface the achieved decode rate at info so host-side frame-rate tweaks
@@ -1668,17 +1939,27 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
     stop: &std::sync::atomic::AtomicBool,
     redirector: Option<Box<dyn rdp_graphics::redirect::DvcRedirector>>,
+    wait: Option<crate::net_wait::SocketWait>,
 ) -> Result<(), ActivateError> {
     use rdp_graphics::channel::GraphicsChannel;
     use rdp_pdu::gfx::GfxCommand;
 
     let io_channel = session.info.io_channel_id;
     let dvc_channel = session.info.channel_ids.first().copied();
-    tracing::info!(io_channel, ?dvc_channel, ?gfx_caps, "graphics session loop started");
+    tracing::info!(
+        io_channel,
+        ?dvc_channel,
+        ?gfx_caps,
+        event_driven = wait.is_some(),
+        "graphics session loop started"
+    );
 
     let mut graphics = GraphicsChannel::with_caps(gfx_caps.clone());
     // Optional DVC redirector (e.g. the Teams WebRTC add-in host) that bridges
     // channels — like `com.microsoft.rdc.dvc.webrtc.1` — the mux would decline.
+    // It produces data asynchronously on its own threads, so while one is wired
+    // in the event wait below must keep a short tick to flush its queue.
+    let redirector_active = redirector.is_some();
     if let Some(redirector) = redirector {
         graphics.set_redirector(redirector);
     }
@@ -1692,8 +1973,13 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     let mut mic_started = false;
     // Camera redirection (MS-RDPECAM): enumerate local webcams and advertise
     // them. Empty (no webcam) → nothing announced, feature stays off.
-    let mut camera =
-        rdp_channels::camera::CameraEnumerator::new(crate::mf_camera::MfCamera::enumerate());
+    let cameras = crate::mf_camera::MfCamera::enumerate();
+    tracing::info!(
+        count = cameras.len(),
+        names = ?cameras.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        "local cameras available for redirection"
+    );
+    let mut camera = rdp_channels::camera::CameraEnumerator::new(cameras);
     // Per-device camera channels (keyed by DVC channel id) and the active
     // capture, started when the server begins a stream.
     let mut cam_devices: std::collections::HashMap<
@@ -1709,10 +1995,9 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     let mut last_ack = std::time::Instant::now();
     // Continuous network auto-detect (MS-RDPBCGR 2.2.14): we advertised
     // NETCHAR_AUTODETECT, so the server probes RTT/bandwidth during the session.
-    // Answering keeps it on the fast-LAN profile. `bw_meter` accumulates the
-    // bytes of an in-flight bandwidth measurement; `bw_start` is its clock.
-    let mut bw_meter = rdp_pdu::autodetect::BandwidthMeter::default();
-    let mut bw_start = std::time::Instant::now();
+    // Answering keeps it on the fast-LAN profile. (Connect-time probes were
+    // already answered during activation by `recv_demand_active`/`recv_until`.)
+    let mut autodetect = AutoDetect::new();
     // Experimental UDP side-band transport (--udp). `udp` holds the tunnel once
     // the server requests multitransport and the dial succeeds; `udp_graphics`
     // is its own RDPGFX demuxer (the tunnel carries an independent DVC). All
@@ -1758,6 +2043,9 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         if take_clipboard_changed() {
             session.announce_clipboard(stream)?;
         }
+        // ...and start staging the session's clipboard files if a paste is
+        // waiting on them (the lazy half of file redirection).
+        session.pump_clipboard_files(stream)?;
 
         // Forward a pending window-resize as a Display Control request, but only
         // after the size has been stable for RESIZE_SETTLE (drag-end), so one
@@ -1840,12 +2128,28 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         // complete frame over the tunnel immediately, then hand the commands to
         // the decode thread (same renderer as the TCP path). A read timeout (no
         // UDP data) is normal — fall through to the TCP read.
+        let mut tunnel_dead = false;
         if let Some(tunnel) = udp.as_mut() {
             let mut drained = 0u32;
             while drained < UDP_DRAIN_BUDGET {
                 let payload = match tunnel.recv() {
                     Ok(p) => p,
-                    Err(_) => break, // idle tunnel (read timeout) → service TCP
+                    // Idle tunnel (read timeout) → service TCP this pass.
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::TimedOut
+                            || e.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        break;
+                    }
+                    // A real failure (EOF, TLS desync, socket error): the
+                    // server may have soft-synced channels onto this tunnel,
+                    // so a silently-dead one stalls them forever. Drop it
+                    // loudly; graphics continue/fall back on TCP.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "UDP tunnel failed; dropping side-band, staying on TCP");
+                        tunnel_dead = true;
+                        break;
+                    }
                 };
                 drained += 1;
                 if !payload.is_empty() {
@@ -1910,6 +2214,9 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                 }
             }
         }
+        if tunnel_dead {
+            udp = None;
+        }
 
         // Flush anything the hosted DVC redirector (Teams WebRTC add-in)
         // produced asynchronously on its own threads out to the server over the
@@ -1921,11 +2228,36 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
             }
         }
 
-        // Next server PDU, or `None` if the read timed out — in which case we
-        // simply loop back to service input again. Partial bytes stay in `rx_buf`.
+        // Next server PDU. `None` = nothing buffered anywhere (`poll_tpkt_pdu`
+        // reads until `WouldBlock`, and the TLS layer holds at most a partial
+        // record then) — so it is safe to block until the socket has data, a
+        // producer signals the worker, or the nearest timed chore is due.
+        // Without an event wait (WebSocket paths), the socket's read timeout
+        // paces the loop exactly as before. Partial bytes stay in `rx_buf`.
         let pdu = match poll_tpkt_pdu(stream, &mut rx_buf)? {
             Some(p) => p,
-            None => continue,
+            None => {
+                if let Some(w) = wait.as_ref() {
+                    let idle = if mic_started || cam_capture.is_some() {
+                        // Audio/camera capture: poll at the device cadence.
+                        std::time::Duration::from_millis(10)
+                    } else if udp.is_some() || redirector_active {
+                        // Tunnel pump (retransmit RTO floor is 15 ms) and the
+                        // redirector's async output queue.
+                        std::time::Duration::from_millis(15)
+                    } else if let Some((_, since)) = pending_resize.as_ref() {
+                        RESIZE_SETTLE
+                            .saturating_sub(since.elapsed())
+                            .max(std::time::Duration::from_millis(1))
+                    } else {
+                        // Pure safety tick (background chores); every latency-
+                        // sensitive source wakes the worker via its event.
+                        std::time::Duration::from_millis(500)
+                    };
+                    w.wait(idle);
+                }
+                continue;
+            }
         };
         let (channel, payload) = mcs::parse_send_data_indication(&pdu)?;
         let plaintext = unwrap_inbound(session.inbound.as_mut(), &payload);
@@ -1944,46 +2276,10 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
             // share-PDU handling — these carry a Basic Security Header (present on
             // the TLS path), so they are not Share PDUs. Best-effort: a send error
             // is logged, never fatal, and an unrecognised PDU falls through.
-            if let Some(req) = rdp_pdu::autodetect::parse_request(&plaintext) {
-                use rdp_pdu::autodetect::AutoDetectRequest as Ad;
-                let resp = match req {
-                    Ad::RttMeasure { sequence } => {
-                        // Reply instantly — the server times this round trip as the RTT.
-                        Some(rdp_pdu::autodetect::rtt_response(sequence))
-                    }
-                    Ad::BandwidthStart { .. } => {
-                        bw_meter.start();
-                        bw_start = std::time::Instant::now();
-                        None
-                    }
-                    Ad::BandwidthPayload { payload_len, .. } => {
-                        bw_meter.add(payload_len);
-                        None
-                    }
-                    Ad::BandwidthStop { sequence, payload_len, connect_time } => {
-                        bw_meter.stop(payload_len).map(|byte_count| {
-                            let delta = bw_start.elapsed().as_millis().min(u32::MAX as u128) as u32;
-                            rdp_pdu::autodetect::bandwidth_results(
-                                sequence,
-                                connect_time,
-                                delta,
-                                byte_count,
-                            )
-                        })
-                    }
-                    Ad::NetCharResult {
-                        average_rtt_us: Some(rtt),
-                        ..
-                    } => {
-                        if let Some(m) = metrics.as_ref() {
-                            m.record_rtt_us(rtt as u64);
-                        }
-                        None // server's verdict; no reply
-                    }
-                    Ad::NetCharResult { .. } => None, // server's verdict; no reply
-                };
-                tracing::debug!(target: "perf", ?req, "auto-detect request");
-                if let Some(resp) = resp {
+            match autodetect.classify(&plaintext, metrics.as_deref()) {
+                AutoDetectOutcome::NotAutoDetect => {}
+                AutoDetectOutcome::Consumed => continue,
+                AutoDetectOutcome::Reply(resp) => {
                     if let Err(e) = send_payload(
                         stream,
                         session.info.user_channel_id,
@@ -1992,8 +2288,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                     ) {
                         tracing::debug!(error = %e, "auto-detect response send failed");
                     }
+                    continue;
                 }
-                continue;
             }
             note_session_events(&plaintext);
             capture_reconnect_cookie(&plaintext, sink);
@@ -2012,6 +2308,37 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                         has_dial = udp_dial.is_some(),
                         "Initiate Multitransport Request received"
                     );
+                    // Whatever happens next, the server is now waiting on our
+                    // Initiate Multitransport Response (2.2.15.2). Declining
+                    // promptly matters: with no response the server waits out
+                    // its own multitransport timeout before settling the
+                    // session onto TCP at full rate. (An `S_OK` on success is
+                    // only defined once Soft-Sync is negotiated — the in-band
+                    // RDPEMT tunnel create is what signals success here.)
+                    let mut decline = |reason: &str| {
+                        tracing::info!(reason, "declining multitransport request");
+                        let resp = rdp_pdu::multitransport::response(
+                            req.request_id,
+                            rdp_pdu::multitransport::HR_E_ABORT,
+                        );
+                        if let Err(e) = send_payload(
+                            stream,
+                            session.info.user_channel_id,
+                            session.info.io_channel_id,
+                            &resp,
+                        ) {
+                            tracing::debug!(error = %e, "multitransport response send failed");
+                        }
+                    };
+                    // The lossy (FEC) channel is declined: its sender never
+                    // retransmits, so a single dropped datagram would leave a
+                    // permanent hole in the TLS byte stream the tunnel runs
+                    // over. Until DTLS + FEC recovery exist, only the reliable
+                    // channel (whose holes retransmission repairs) is sound.
+                    if req.is_lossy() {
+                        decline("lossy FEC channel not supported (no DTLS/FEC recovery)");
+                        continue;
+                    }
                     if let Some(dial) = udp_dial.as_ref() {
                         match crate::udp::UdpTunnel::connect(
                             &dial.server,
@@ -2028,6 +2355,7 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "UDP side-band failed; staying on TCP");
+                                decline("UDP dial failed");
                             }
                         }
                     } else {
@@ -2035,6 +2363,7 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                             "no direct UDP address (W365 Reverse Connect) — this request_id/cookie \
                              feeds the Shortpath TURN/rendezvous tunnel (next step)"
                         );
+                        decline("no direct UDP address");
                     }
                     continue;
                 }
@@ -2134,7 +2463,11 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
             if cam_capture.is_none() {
                 if let Some(media) = dev.streaming() {
                     cam_capture = Some(crate::mf_camera::MfCamera::start(0, media));
-                    tracing::info!("camera capture started");
+                    tracing::info!(
+                        channel_id = *chan_id,
+                        ?media,
+                        "camera capture started; streaming frames to the session"
+                    );
                 }
             }
         }
@@ -2205,24 +2538,132 @@ fn send_share<S: Write>(
     send_payload(stream, user_id, channel_id, &payload)
 }
 
+/// Network auto-detect responder state (MS-RDPBCGR 2.2.14): the in-flight
+/// bandwidth meter and its clock. One instance serves the connect-time probes
+/// (interleaved with licensing/activation) and another the continuous probes in
+/// the steady-state graphics loop — the wire handling is identical.
+struct AutoDetect {
+    meter: rdp_pdu::autodetect::BandwidthMeter,
+    bw_start: std::time::Instant,
+}
+
+/// What an inbound I/O-channel PDU turned out to be, for [`AutoDetect`].
+enum AutoDetectOutcome {
+    /// Not an auto-detect request — process the PDU normally.
+    NotAutoDetect,
+    /// An auto-detect request that needs no reply (start / payload / verdict).
+    Consumed,
+    /// An auto-detect request whose reply must go out on the I/O channel —
+    /// immediately, because the server times RTT from it.
+    Reply(Vec<u8>),
+}
+
+impl AutoDetect {
+    fn new() -> Self {
+        Self {
+            meter: rdp_pdu::autodetect::BandwidthMeter::default(),
+            bw_start: std::time::Instant::now(),
+        }
+    }
+
+    /// Classify `plaintext` (which must still carry its Basic Security Header,
+    /// i.e. the TLS path — legacy RC4 strips it during decryption) and update
+    /// the bandwidth meter.
+    fn classify(
+        &mut self,
+        plaintext: &[u8],
+        metrics: Option<&crate::metrics::Metrics>,
+    ) -> AutoDetectOutcome {
+        use rdp_pdu::autodetect::AutoDetectRequest as Ad;
+        let Some(req) = rdp_pdu::autodetect::parse_request(plaintext) else {
+            return AutoDetectOutcome::NotAutoDetect;
+        };
+        tracing::debug!(target: "perf", ?req, "auto-detect request");
+        match req {
+            Ad::RttMeasure { sequence } => {
+                // Reply instantly — the server times this round trip as the RTT.
+                AutoDetectOutcome::Reply(rdp_pdu::autodetect::rtt_response(sequence))
+            }
+            Ad::BandwidthStart { .. } => {
+                self.meter.start();
+                self.bw_start = std::time::Instant::now();
+                AutoDetectOutcome::Consumed
+            }
+            Ad::BandwidthPayload { payload_len, .. } => {
+                self.meter.add(payload_len);
+                AutoDetectOutcome::Consumed
+            }
+            Ad::BandwidthStop { sequence, payload_len, connect_time } => {
+                match self.meter.stop(payload_len) {
+                    Some(byte_count) => {
+                        let delta =
+                            self.bw_start.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        AutoDetectOutcome::Reply(rdp_pdu::autodetect::bandwidth_results(
+                            sequence,
+                            connect_time,
+                            delta,
+                            byte_count,
+                        ))
+                    }
+                    None => AutoDetectOutcome::Consumed, // stray stop — ignore
+                }
+            }
+            Ad::NetCharResult { average_rtt_us, .. } => {
+                if let (Some(rtt), Some(m)) = (average_rtt_us, metrics) {
+                    m.record_rtt_us(rtt as u64);
+                }
+                AutoDetectOutcome::Consumed // server's verdict; no reply
+            }
+        }
+    }
+}
+
 /// Read Send Data Indications (decrypting when a session is active) until `pick`
 /// returns a value, skipping the rest. Bounded to avoid spinning forever.
+///
+/// Connect-time network auto-detect probes (MS-RDPBCGR 2.2.14.1) arrive in this
+/// window because we advertised `RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT`; they are
+/// answered here (TLS path only). Dropping them instead would leave the server's
+/// link characterization to time out into its worst-case network profile — the
+/// session then runs throttled no matter how fast the link is. Auto-detect PDUs
+/// do not count against the wait budget: a bandwidth-measure train is legally
+/// longer than any fixed PDU budget, so only non-probe PDUs decrement it.
 fn recv_until<S, T>(
     stream: &mut S,
     sec: &mut Option<SecuritySession>,
+    user_id: u16,
+    io_channel_id: u16,
     what: &str,
     mut pick: impl FnMut(&[u8]) -> Option<T>,
 ) -> Result<T, ActivateError>
 where
-    S: Read,
+    S: Read + Write,
 {
-    for _ in 0..64 {
+    let mut autodetect = AutoDetect::new();
+    let mut budget = 64u32;
+    // The absolute iteration cap only guards against a hostile endless probe
+    // train; a real bandwidth train is a few hundred PDUs at most.
+    for _ in 0..4096 {
+        if budget == 0 {
+            break;
+        }
         let pdu = read_tpkt_pdu(stream)?;
         let (channel, payload) = mcs::parse_send_data_indication(&pdu)?;
         let plaintext = match sec.as_mut() {
             Some(s) => s.unwrap(&payload),
             None => payload,
         };
+        if sec.is_none() {
+            match autodetect.classify(&plaintext, None) {
+                AutoDetectOutcome::NotAutoDetect => {}
+                AutoDetectOutcome::Consumed => continue,
+                AutoDetectOutcome::Reply(resp) => {
+                    send_payload(stream, user_id, io_channel_id, &resp)?;
+                    continue;
+                }
+            }
+        }
+        budget -= 1;
         // Surface a server Set Error Info (the reason for an activation-time
         // teardown) instead of silently skipping it while hunting for `what`.
         note_error_info(&plaintext);
@@ -2247,18 +2688,40 @@ where
 /// full CAL issuance (`LICENSE_REQUEST` / `PLATFORM_CHALLENGE`) fails fast with a
 /// precise message rather than the previous 64-PDU timeout, because the client
 /// does not perform the licensing key exchange.
-fn recv_demand_active<S: Read>(
+fn recv_demand_active<S: Read + Write>(
     stream: &mut S,
     sec: &mut Option<SecuritySession>,
+    user_id: u16,
+    io_channel_id: u16,
 ) -> Result<u32, ActivateError> {
     use rdp_pdu::license::{parse_license_message, LicenseMessage};
-    for _ in 0..64 {
+    let mut autodetect = AutoDetect::new();
+    let mut budget = 64u32;
+    for _ in 0..4096 {
+        if budget == 0 {
+            break;
+        }
         let pdu = read_tpkt_pdu(stream)?;
         let (_channel, payload) = mcs::parse_send_data_indication(&pdu)?;
         let plaintext = match sec.as_mut() {
             Some(s) => s.unwrap(&payload),
             None => payload,
         };
+
+        // Connect-time auto-detect probes arrive interleaved with licensing;
+        // answer them (see `recv_until`) and don't count them against the
+        // Demand Active wait budget.
+        if sec.is_none() {
+            match autodetect.classify(&plaintext, None) {
+                AutoDetectOutcome::NotAutoDetect => {}
+                AutoDetectOutcome::Consumed => continue,
+                AutoDetectOutcome::Reply(resp) => {
+                    send_payload(stream, user_id, io_channel_id, &resp)?;
+                    continue;
+                }
+            }
+        }
+        budget -= 1;
 
         // A server Set Error Info here explains an activation-time refusal
         // (denied connection, insufficient privileges, license failure, …).
@@ -2589,13 +3052,121 @@ mod tests {
         share.extend_from_slice(&packet);
 
         let mut stream = std::io::Cursor::new(sdi(1003, &share));
-        let err = recv_demand_active(&mut stream, &mut None).unwrap_err();
+        let err = recv_demand_active(&mut stream, &mut None, 1002, 1003).unwrap_err();
         match err {
             ActivateError::Redirect(r) => {
                 assert_eq!(r.session_id, 0xDEAD_BEEF);
                 assert_eq!(r.load_balance_info, cookie);
             }
             other => panic!("expected Redirect, got {other:?}"),
+        }
+    }
+
+    /// A read side fed from a script and a write side that records what the
+    /// client sent — for exercising activation paths that must *reply* (the
+    /// connect-time auto-detect probes).
+    struct Duplex {
+        rx: std::io::Cursor<Vec<u8>>,
+        tx: Vec<u8>,
+    }
+
+    impl Read for Duplex {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.rx.read(buf)
+        }
+    }
+
+    impl Write for Duplex {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.tx.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Connect-time RTT probes arrive before Demand Active; the client must
+    /// answer them (or the server characterizes the link as worst-case and
+    /// throttles) and they must not consume the Demand Active wait budget.
+    #[test]
+    fn recv_demand_active_answers_connect_time_rtt_probe() {
+        // RTT Measure Request 0x1001, sequence 7, wrapped in a Basic Security
+        // Header carrying SEC_AUTODETECT_REQ.
+        let mut probe = Vec::new();
+        probe.extend_from_slice(&security::SEC_AUTODETECT_REQ.to_le_bytes());
+        probe.extend_from_slice(&0u16.to_le_bytes()); // flagsHi
+        probe.push(0x06); // headerLength
+        probe.push(0x00); // headerTypeId = request
+        probe.extend_from_slice(&7u16.to_le_bytes()); // sequenceNumber
+        probe.extend_from_slice(&0x1001u16.to_le_bytes()); // RTT_REQUEST_CONNECTTIME
+
+        let mut script = sdi(1003, &probe);
+        // Then a Demand Active (shareId 0x11223344) so the call succeeds.
+        let s = 0x1122_3344u32.to_le_bytes();
+        script.extend_from_slice(&sdi(
+            1003,
+            &[0x00, 0x00, 0x11, 0x00, 0xea, 0x03, s[0], s[1], s[2], s[3]],
+        ));
+
+        let mut stream = Duplex { rx: std::io::Cursor::new(script), tx: Vec::new() };
+        let share_id = recv_demand_active(&mut stream, &mut None, 1002, 1003).unwrap();
+        assert_eq!(share_id, 0x1122_3344);
+
+        // The reply is a TPKT-framed MCS Send Data Request whose payload is an
+        // RTT Measure Response: SEC_AUTODETECT_RSP header, then the 6-byte
+        // detection header echoing sequence 7 with responseType 0x0000.
+        let expected = rdp_pdu::autodetect::rtt_response(7);
+        assert!(
+            stream
+                .tx
+                .windows(expected.len())
+                .any(|w| w == expected.as_slice()),
+            "activation did not send the RTT response: {:02x?}",
+            stream.tx
+        );
+    }
+}
+
+#[cfg(test)]
+mod crypto_tests {
+    use super::*;
+
+    /// Regression test for the legacy black-screen disconnect: the session
+    /// worker and the [`InputSender`] share ONE outbound RC4 keystream. Before
+    /// the fix, `take_input_sender` moved the cipher away and the worker's
+    /// channel replies (cliprdr/rdpdr) went out unencrypted — an
+    /// encryption-required server answers that with a hard TCP reset right
+    /// after activation. Two handles to the shared cipher must produce one
+    /// continuous keystream that a single server-side cipher can decrypt in
+    /// wire order, with valid MACs.
+    #[test]
+    fn shared_outbound_keystream_is_continuous_across_handles() {
+        let key = vec![0x11u8; 16];
+        let mac_key = vec![0x22u8; 16];
+        let method = 2; // 128-bit RC4
+        let shared: SharedOutbound = std::sync::Arc::new(std::sync::Mutex::new(OutboundCrypto {
+            encrypt: rdp_crypto::SessionCipher::new(key.clone(), method),
+            mac_key: mac_key.clone(),
+        }));
+        let worker = shared.clone(); // stays with the session worker
+        let input = shared; // handed to the InputSender
+
+        let a = b"worker: cliprdr reply".to_vec();
+        let b = b"input: mouse move".to_vec();
+        let wire1 = lock_outbound(&worker).wrap(0, &a);
+        let wire2 = lock_outbound(&input).wrap(0, &b);
+
+        // One server-side decryptor over the wire order must recover both
+        // plaintexts — proving the two handles didn't fork the keystream.
+        let mut decrypt = rdp_crypto::SessionCipher::new(key, method);
+        for (wire, plain) in [(wire1, a), (wire2, b)] {
+            // Layout: 4-byte security header, 8-byte MAC, RC4 body.
+            let mut body = wire[12..].to_vec();
+            decrypt.apply_packet(&mut body);
+            assert_eq!(body, plain);
+            let mac = rdp_crypto::keys::mac_signature(&mac_key, &body);
+            assert_eq!(&wire[4..12], &mac[..]);
         }
     }
 }

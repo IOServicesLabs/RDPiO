@@ -201,10 +201,15 @@ impl GraphicsChannel {
                     // Accept the camera enumerator; the caller drives MS-RDPECAM.
                     self.camera_channel_id = Some(channel_id);
                     out.responses.push(drdynvc::create_response(channel_id, 0));
+                    tracing::info!(
+                        channel_id,
+                        "opened camera enumerator channel (MS-RDPECAM); awaiting version request"
+                    );
                 } else if name.starts_with(names::CAMERA_DEVICE_PREFIX) {
                     // A per-device camera channel for a camera we announced.
                     self.camera_device_ids.push(channel_id);
                     out.responses.push(drdynvc::create_response(channel_id, 0));
+                    tracing::info!(channel_id, %name, "opened per-device camera channel");
                 } else if name == names::RDPINPUT {
                     // Accept multi-touch/pen input channel.
                     self.rdpei_channel_id = Some(channel_id);

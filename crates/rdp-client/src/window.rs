@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{w, BOOL, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, DeleteObject, EnumDisplayMonitors, GetMonitorInfoW,
     BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HBRUSH, HDC, HGDIOBJ, HMONITOR, MONITORINFO,
@@ -28,12 +28,47 @@ use windows::Win32::UI::Input::Touch::{
     CloseTouchInputHandle, GetTouchInputInfo, RegisterTouchWindow, HTOUCHINPUT, TOUCHINPUT,
     TOUCHEVENTF_DOWN, TOUCHEVENTF_MOVE, TOUCHEVENTF_UP,
 };
-use windows::Win32::System::DataExchange::AddClipboardFormatListener;
+use windows::Win32::System::DataExchange::{
+    AddClipboardFormatListener, CloseClipboard, OpenClipboard,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// Auto-reset event the session worker signals when it queues a frame, so the
+/// UI thread can wait for work instead of polling on a timer. `0` until
+/// [`init_wake_event`] runs. See [`Window::wait_for_work`].
+static WAKE_EVENT: AtomicIsize = AtomicIsize::new(0);
+
+/// Create the frame-ready event. Idempotent; called once at startup before the
+/// session worker starts.
+pub fn init_wake_event() {
+    if WAKE_EVENT.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    unsafe {
+        // Auto-reset, initially unsignalled: each wait consumes one signal.
+        match windows::Win32::System::Threading::CreateEventW(None, false, false, None) {
+            Ok(h) => {
+                WAKE_EVENT.store(h.0 as isize, Ordering::Release);
+            }
+            Err(e) => tracing::warn!(error = %e, "no frame-wake event; UI will poll instead"),
+        }
+    }
+}
+
+/// Wake the UI thread — called by the session worker after queueing a frame.
+/// Cheap (a single `SetEvent`) and safe to call from any thread.
+pub fn signal_frame() {
+    let handle = WAKE_EVENT.load(Ordering::Acquire);
+    if handle != 0 {
+        unsafe {
+            let _ = windows::Win32::System::Threading::SetEvent(HANDLE(handle as *mut c_void));
+        }
+    }
+}
 
 /// Packed `width << 16 | height` of a pending resize, or 0 if none.
 static PENDING_RESIZE: AtomicU32 = AtomicU32::new(0);
@@ -347,6 +382,37 @@ impl Window {
 
     /// Drain all pending messages without blocking, returning whether to keep
     /// running and any resize to apply before the next present.
+    /// Block until there is something to do: a frame queued by the session
+    /// worker, a window message (input, resize, clipboard), or `timeout_ms`.
+    ///
+    /// This replaces polling the frame channel on a fixed sleep. A poll adds
+    /// up to its whole interval to *every* frame and *every* keystroke, and
+    /// burns a wakeup per interval whether or not anything happened; waiting on
+    /// the worker's event plus the message queue delivers both the instant they
+    /// arrive and leaves the CPU alone in between. The timeout is only a safety
+    /// net for time-based work (frame pacing, the telemetry tick).
+    pub fn wait_for_work(&self, timeout_ms: u32) {
+        let handle = WAKE_EVENT.load(Ordering::Acquire);
+        unsafe {
+            if handle == 0 {
+                // No event yet (shouldn't happen) — fall back to a short sleep
+                // rather than spinning.
+                std::thread::sleep(std::time::Duration::from_millis(timeout_ms.min(8) as u64));
+                return;
+            }
+            let handles = [HANDLE(handle as *mut c_void)];
+            // MWMO_INPUTAVAILABLE also returns for messages already queued, so a
+            // message that arrived between the pump and this wait can't be
+            // missed and stall us for the whole timeout.
+            MsgWaitForMultipleObjectsEx(
+                Some(&handles),
+                timeout_ms,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            );
+        }
+    }
+
     pub fn pump(&self) -> Frame {
         unsafe {
             let mut msg = MSG::default();
@@ -891,6 +957,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_CLIPBOARDUPDATE => {
             // The local clipboard changed; flag it for the session to re-advertise.
             crate::session::clipboard_changed();
+            LRESULT(0)
+        }
+        WM_RENDERFORMAT | WM_RENDERALLFORMATS => {
+            // Someone is pasting the files the session copied. We advertised
+            // them with delayed rendering (no data), so the bytes are fetched
+            // NOW: ask the session worker to stage them and wait for it. The
+            // worker runs on its own thread and keeps draining the socket, so
+            // this blocks only this paste — bounded, then gives up empty.
+            let format = wparam.0 as u32;
+            if msg == WM_RENDERALLFORMATS || format == crate::clipboard::CF_HDROP {
+                let paths = crate::session::request_clipboard_files(
+                    std::time::Duration::from_secs(180),
+                );
+                if !paths.is_empty() {
+                    // WM_RENDERALLFORMATS renders into a clipboard we must open
+                    // ourselves; WM_RENDERFORMAT is already in that state.
+                    if msg == WM_RENDERALLFORMATS {
+                        if OpenClipboard(Some(hwnd)).is_ok() {
+                            crate::clipboard::render_hdrop(&paths);
+                            let _ = CloseClipboard();
+                        }
+                    } else {
+                        crate::clipboard::render_hdrop(&paths);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_DESTROYCLIPBOARD => {
+            // Our advertised copy was replaced: the staged files are dead
+            // weight, so let the provider drop them.
+            crate::session::clipboard_files_discarded();
             LRESULT(0)
         }
         WM_SETCURSOR => {
