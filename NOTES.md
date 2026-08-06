@@ -14,8 +14,10 @@ edition 2021, rust-version 1.77) of **10 library crates** under `crates/`
 
 - Git branch checked out: `swarm/add-a-nice-ui` (head `08164fd`, "swarm: green
   iteration 1"); `main` also present locally and on `origin`.
-- Go toolchain: **not installed** on the host, **no Go files, no `go.mod`,
-  no `go.sum`** anywhere in the tree (verified with `find`).
+- Go toolchain: **not installed** on the host at inspection time (verified
+  with `find`); a Go 1.22.12 SDK (`/root/go-sdk/go/bin`) was used from
+  iteration 1 onward to author and verify the Go build-out. No Go files,
+  no `go.mod`, no `go.sum` existed in the tree before this work.
 - TODOs: `grep -rn -E 'TODO|FIXME|XXX'` over `README.md`, `PORTING.md`,
   `docs/`, and `crates/**/*.rs` returned **no matches**. The remaining work is
   tracked as *stages* in `PORTING.md` (Stage 4 — W365 on Linux, Stage 5 —
@@ -122,30 +124,62 @@ The Rust workspace (`Cargo.toml`) and the new Go module (`go.mod`) coexist at
 the repo root; `cargo` ignores `.go` files and the Go toolchain ignores
 `Cargo.toml`/`crates/`, so there is no interference.
 
-## 4. Missing components (relative to the Go build-out plan)
+## 4. Component status (Go build-out plan)
+
+All components of the Go build-out are now **complete** (steps 1–7):
 
 | # | Component | Status | Notes |
 | --- | --- | --- | --- |
-| 1 | `go.mod` / `go.sum` | **DONE** — created (step-2) | module `github.com/IOServicesLabs/RDPiO`, `go 1.22.12`; logrus v1.9.4, testify v1.11.1 (+ `golang.org/x/sys` v0.13.0 transitive); `go build ./...` exits 0 |
-| 2 | `config` package (`Config` struct + `Load()`, env vars `RDP_PROXY_PORT`/`RDP_TARGET_HOST`/`RDP_TARGET_PORT`, `config_test.go`) | MISSING | step-3 |
-| 3 | `proxy` package (`Proxy`, `NewProxy`, `HandleConnection`, `Run`, `proxy_test.go` with in-process TCP echo server) | MISSING | step-4 |
-| 4 | `main.go` (TCP listener on `:ProxyPort`, proxy run loop, HTTP `/healthz` → `{"status":"ok"}` on `HEALTH_PORT`/8080, SIGINT/SIGTERM graceful shutdown, logrus logging) | MISSING | step-5 |
-| 5 | Integration tests (`main_test.go` / `integration` package, end-to-end health + forwarding) | MISSING | step-6 |
-| 6 | Final quality pass (`go mod tidy`, `go build`, `go vet`, `gofmt -l`, `go test ./...`) | MISSING | step-7 |
-| 7 | `NOTES.md` | created here | this file |
+| 1 | `go.mod` / `go.sum` | **DONE** (step-2) | module `github.com/IOServicesLabs/RDPiO`, `go 1.22.12`; logrus v1.9.4, testify v1.11.1 (+ `golang.org/x/sys` v0.13.0 transitive); `go build ./...` exits 0 |
+| 2 | `config` package (`Config` struct + `Load()`, env vars `RDP_PROXY_PORT`/`RDP_TARGET_HOST`/`RDP_TARGET_PORT`, `config_test.go`) | **DONE** (step-3) | defaults 3389 / 127.0.0.1 / 3389; invalid/empty env falls back to defaults; 6 unit tests |
+| 3 | `proxy` package (`Proxy`, `NewProxy`, `HandleConnection`, `Run`, `Wait`, `proxy_test.go` with in-process TCP echo server) | **DONE** (step-4) | bidirectional piping with clean half-close and connection shutdown; `Wait()` (added step-5) tracks in-flight connections via `sync.WaitGroup`; 6 unit tests |
+| 4 | `main.go` + `health` package (TCP listener on `:ProxyPort`, proxy run loop, HTTP `/healthz` → `{"status":"ok"}` on `HEALTH_PORT`/8080, SIGINT/SIGTERM graceful shutdown, logrus logging) | **DONE** (step-5) | `startServers()`/`service.Shutdown()` factored out for testability; live smoke test passed: both servers start, `curl /healthz` returns `{"status":"ok"}`, SIGINT exits 0 cleanly; 4 health unit tests |
+| 5 | Integration tests (`main_test.go`, end-to-end health + forwarding) | **DONE** (step-6) | 6 integration tests in `package main`: healthz over real HTTP, end-to-end TCP forwarding through a temporary echo target, shutdown closes both listeners, shutdown waits for in-flight connections, `HEALTH_PORT` parsing, health-port conflict; race-detector clean |
+| 6 | Final quality pass (`go mod tidy`, `go build`, `go vet`, `gofmt -l`, `go test ./...`) | **DONE** (step-7) | all green, see §6 |
+| 7 | `NOTES.md` | this file | final state recorded here |
 
-## 5. Planned file layout (Go additions, at repo root)
+## 5. Final Go file layout (at repo root)
 
 ```
 go.mod                          # module github.com/IOServicesLabs/RDPiO (go 1.22)
 go.sum
 NOTES.md                        # this file
+main.go                         # wiring, health server, graceful shutdown
+main_test.go                    # integration tests (package main)
 config/
     config.go                   # Config{ProxyPort, TargetHost, TargetPort}; Load()
     config_test.go
 proxy/
-    proxy.go                    # Proxy, NewProxy, HandleConnection, Run
+    proxy.go                    # Proxy, NewProxy, HandleConnection, Run, Wait
     proxy_test.go
-main.go                         # wiring, health server, graceful shutdown
-main_test.go                    # integration tests (or integration/ package)
+health/
+    health.go                   # Handler(): GET /healthz -> {"status":"ok"}
+    health_test.go
 ```
+
+The Rust workspace (`Cargo.toml` + `crates/`) and the Go module coexist at the
+repo root; neither toolchain interferes with the other.
+
+## 6. Final verification (step-7)
+
+Run with Go `1.22.12` (`/root/go-sdk/go/bin`); cargo gates run with the
+workspace toolchain from `rust-toolchain.toml`.
+
+- `go mod tidy` — no changes required (dependency set already minimal:
+  logrus + testify, both direct).
+- `go build ./...` — OK, no errors.
+- `go vet ./...` — OK, no findings.
+- `gofmt -l .` — no files listed (all Go sources gofmt-clean).
+- `go test ./...` — all pass: `main` (6 tests + 5 subtests), `config` (6),
+  `health` (4), `proxy` (6).
+- `go test -race -count=1 ./...` — all pass (no data races, including the
+  proxy `WaitGroup` shutdown path).
+- `cargo check --workspace --all-targets` — exit 0 (pre-existing dead-code
+  warnings only, unrelated to the Go work).
+- `cargo test` — all crates pass (440+ tests, 0 failures).
+- Live smoke test (step-5 acceptance): service starts both listeners;
+  `curl localhost:8080/healthz` → `HTTP/1.1 200 OK`, body `{"status":"ok"}`;
+  SIGINT terminates the process with exit code 0 after graceful shutdown
+  ("shutdown signal received" → "listener closed" → "shutdown complete").
+
+**Repository is ready for commit.**
