@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/sirupsen/logrus"
 )
@@ -14,6 +15,10 @@ import (
 // given as "host:port".
 type Proxy struct {
 	target string
+
+	// wg tracks every connection handled through Run so callers can wait
+	// for in-flight connections to finish during graceful shutdown.
+	wg sync.WaitGroup
 }
 
 // NewProxy returns a Proxy that forwards client connections to target
@@ -86,6 +91,14 @@ func (p *Proxy) HandleConnection(client net.Conn) {
 	}).Debug("proxy: connection closed")
 }
 
+// Wait blocks until every connection accepted by Run has been fully
+// handled and closed. It is intended to be called after the listener has
+// been closed (which makes Run return), so the caller can shut down the
+// process without cutting in-flight connections short.
+func (p *Proxy) Wait() {
+	p.wg.Wait()
+}
+
 // Run accepts connections on listener and handles each one in its own
 // goroutine. It blocks until the listener is closed (or fails), at which
 // point it returns so the caller can shut down.
@@ -106,6 +119,13 @@ func (p *Proxy) Run(listener net.Listener) {
 			logrus.WithError(err).Error("proxy: accept failed, stopping accept loop")
 			return
 		}
-		go p.HandleConnection(conn)
+		// Register the connection with the WaitGroup before spawning the
+		// goroutine so that Wait() can never miss a connection that was
+		// already accepted.
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			p.HandleConnection(conn)
+		}()
 	}
 }
