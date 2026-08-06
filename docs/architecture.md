@@ -4,6 +4,16 @@ Short write-up of how the repo is laid out, what the crate targets are, and the
 exact code paths that establish an RDP connection. Written as the reference for
 adding a session-manager GUI on top of the existing client.
 
+> **TL;DR** — RDPiO is **both** a library workspace and a binary project: a
+> Cargo workspace of **10 library crates** (`rdp-asn1`, `rdp-crypto`,
+> `rdp-pdu`, `rdp-core`, `rdp-nla`, `rdp-channels`, `rdp-graphics`, `rdp-gpu`,
+> `rdp-webrtc`) plus **one binary — `rdpio` — which already exists** in
+> `crates/rdp-client` (`[[bin]] name = "rdpio", path = "src/main.rs"`).
+> The connection is established through `rdp_core::ClientConfig` +
+> `rdp_core::Connector` (protocol state machine), `transport::connect`
+> (TCP + X.224 negotiation), and `connect::establish_reconnect` /
+> `session::activate` (TLS/NLA + activation) — details below.
+
 ## Repo layout and crate targets
 
 The repo is a Cargo **workspace** (resolver `2`, edition `2021`, rust-version
