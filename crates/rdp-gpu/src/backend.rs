@@ -9,9 +9,9 @@
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
 
-use crate::Upscaler;
 use crate::d3d11::D3D11Renderer;
 use crate::d3d12::D3D12Renderer;
+use crate::Upscaler;
 
 /// Which GPU backend to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -32,7 +32,12 @@ pub enum Renderer {
 
 impl Renderer {
     /// Create a renderer for `hwnd` with the requested backend.
-    pub fn new(hwnd_raw: isize, width: u32, height: u32, backend: Backend) -> windows::core::Result<Self> {
+    pub fn new(
+        hwnd_raw: isize,
+        width: u32,
+        height: u32,
+        backend: Backend,
+    ) -> windows::core::Result<Self> {
         let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
         match backend {
             Backend::D3D11 => Ok(Self::D3D11(D3D11Renderer::new(hwnd_raw, width, height)?)),
@@ -246,10 +251,7 @@ impl Renderer {
 
     /// Install a callback that receives `(label, microseconds)` for completed
     /// GPU timing queries.
-    pub fn set_gpu_timing_callback(
-        &mut self,
-        cb: Option<Box<dyn Fn(&str, u64) + Send + Sync>>,
-    ) {
+    pub fn set_gpu_timing_callback(&mut self, cb: Option<Box<dyn Fn(&str, u64) + Send + Sync>>) {
         match self {
             Self::D3D11(r) => r.set_gpu_timing_callback(cb),
             Self::D3D12(r) => r.set_gpu_timing_callback(cb),

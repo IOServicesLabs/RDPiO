@@ -56,11 +56,9 @@ pub mod iface {
 pub const NANO_INIT_VERSION: u16 = 0x7B08;
 
 /// IID QueryInterface'd by `CreateRdpNanoClientSideTransport` — {3174AAFB-94C2-4BD0-95FE-100A1FCA0E45}.
-pub const IID_CLIENT_SIDE_TRANSPORT: GUID =
-    GUID::from_u128(0x3174AAFB_94C2_4BD0_95FE_100A1FCA0E45);
+pub const IID_CLIENT_SIDE_TRANSPORT: GUID = GUID::from_u128(0x3174AAFB_94C2_4BD0_95FE_100A1FCA0E45);
 /// IID QueryInterface'd by `CreateRdpNanoTransportConnector` — {ABAB65C5-812B-4EBC-9B10-BF3AD274A02F}.
-pub const IID_TRANSPORT_CONNECTOR: GUID =
-    GUID::from_u128(0xABAB65C5_812B_4EBC_9B10_BF3AD274A02F);
+pub const IID_TRANSPORT_CONNECTOR: GUID = GUID::from_u128(0xABAB65C5_812B_4EBC_9B10_BF3AD274A02F);
 
 /// `HRESULT Create*(u32 ifaceVersion, void** out)` — the shared factory ABI.
 type CreateFn = unsafe extern "system" fn(u32, *mut *mut c_void) -> HRESULT;
@@ -144,9 +142,8 @@ impl NanoLib {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let module = unsafe {
-            LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_WITH_ALTERED_SEARCH_PATH)?
-        };
+        let module =
+            unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_WITH_ALTERED_SEARCH_PATH)? };
 
         // Resolve exports; any missing one is a version mismatch we must not paper over.
         unsafe fn proc<T>(m: HMODULE, name: &[u8]) -> windows::core::Result<T> {
@@ -162,7 +159,10 @@ impl NanoLib {
             NanoLib {
                 create_client_side_transport: proc(module, b"CreateRdpNanoClientSideTransport\0")?,
                 create_transport_connector: proc(module, b"CreateRdpNanoTransportConnector\0")?,
-                create_websocket_stream_wrapper: proc(module, b"CreateRdpWebSocketStreamWrapper\0")?,
+                create_websocket_stream_wrapper: proc(
+                    module,
+                    b"CreateRdpWebSocketStreamWrapper\0",
+                )?,
                 create_udp_stream_wrapper: proc(module, b"CreateRdpUdpStreamWrapper\0")?,
                 initialize2: proc(module, b"RdpNanoInitialize2\0")?,
                 free_task_memory: proc(module, b"RdpNanoFreeTaskMemory\0")?,
@@ -186,13 +186,19 @@ impl NanoLib {
     }
 
     pub fn create_client_side_transport(&self) -> windows::core::Result<NanoObject> {
-        self.create(self.create_client_side_transport, iface::CLIENT_SIDE_TRANSPORT)
+        self.create(
+            self.create_client_side_transport,
+            iface::CLIENT_SIDE_TRANSPORT,
+        )
     }
     pub fn create_transport_connector(&self) -> windows::core::Result<NanoObject> {
         self.create(self.create_transport_connector, iface::TRANSPORT_CONNECTOR)
     }
     pub fn create_websocket_stream_wrapper(&self) -> windows::core::Result<NanoObject> {
-        self.create(self.create_websocket_stream_wrapper, iface::WEBSOCKET_STREAM_WRAPPER)
+        self.create(
+            self.create_websocket_stream_wrapper,
+            iface::WEBSOCKET_STREAM_WRAPPER,
+        )
     }
     pub fn create_udp_stream_wrapper(&self) -> windows::core::Result<NanoObject> {
         self.create(self.create_udp_stream_wrapper, iface::UDP_STREAM_WRAPPER)

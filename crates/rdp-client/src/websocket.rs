@@ -61,9 +61,7 @@ impl WebSocketStream {
         let host = url_parsed
             .host_str()
             .ok_or_else(|| io::Error::other("WebSocket URL has no host"))?;
-        let port = url_parsed
-            .port_or_known_default()
-            .unwrap_or(443);
+        let port = url_parsed.port_or_known_default().unwrap_or(443);
 
         let tcp = TcpStream::connect((host, port))?;
         tcp.set_nodelay(true).ok();
@@ -370,7 +368,9 @@ impl Write for WebSocketStream {
         self.ws
             .send(Message::Binary(payload))
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-        self.ws.flush().map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+        self.ws
+            .flush()
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
         Ok(())
     }
 }
@@ -393,4 +393,3 @@ mod tests {
         assert!(true);
     }
 }
-

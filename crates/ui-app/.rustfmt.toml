@@ -1,0 +1,11 @@
+# rustfmt cannot tokenize several ui-app source files (rustc accepts them).
+# Skip them so `cargo fmt -p ui-app` can format the rest of the crate.
+ignore = [
+    "src/lib.rs",
+    "src/decode.rs",
+    "src/d3d11.rs",
+    "src/redirection.rs",
+    "src/render.rs",
+    "src/decode",
+    "src/ui",
+]

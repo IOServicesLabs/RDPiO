@@ -29,38 +29,58 @@
 //! decoded bitmap rectangles are painted to the window via D3D11; elsewhere they
 //! are logged (headless), which keeps the whole protocol stack runnable in CI.
 
+#[cfg_attr(not(windows), allow(dead_code))]
 mod arm_broker;
+// UDP congestion control: consumed only by the Windows GPU session loop
+// (`run_graphics_session`) and the cfg(windows) `udp` module, so it is dead
+// code on headless Linux builds until the Windows session path is ported.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod congestion;
+mod connect;
+mod connections;
+// RDWeb/W365 feed parsing: consumed only by `w365` (below) and the Windows
+// `win::run_connected` / cloud-PC-picker paths, not by the headless runner.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod feed;
-mod prompt;
+// Gateway config parsing: consumed only by the Windows UI/connect paths.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod gateway;
+// Session performance telemetry: sampled by the Windows session loop and
+// reported by the Windows UI; nothing on the headless path records it.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod metrics;
+// Console password prompt: only the Windows DPAPI credential path calls it.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod prompt;
 mod rng;
 mod session;
 mod transport;
+// W365/AVD OAuth + feed auth: consumed by the Windows WebView2/device-code
+// sign-in paths and `arm_broker`; unused by the headless `--host` runner.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod w365;
 // W365/AVD Reverse Connect (RDSTLS over a TLS WebSocket) + its Windows-only UI
 // (WebView2 sign-in / Cloud PC picker) and platform bits. These depend on the
 // SChannel `tls` module and Windows COM, so they are Windows-only until the
 // Linux TLS/auth backends land (see PORTING.md, Stages 2–3).
 #[cfg(windows)]
+mod cloud_pc_picker;
+#[cfg(windows)]
+mod net_listener;
+#[cfg(windows)]
+mod password_cache;
+#[cfg(windows)]
 mod rdstls_auth;
 #[cfg(windows)]
 mod rdstls_v3;
 #[cfg(windows)]
-mod net_listener;
-#[cfg(windows)]
 mod reverse_connect;
 #[cfg(windows)]
-mod cloud_pc_picker;
+mod token_cache;
 #[cfg(windows)]
 mod websocket;
 #[cfg(windows)]
 mod webview_auth;
-#[cfg(windows)]
-mod token_cache;
-#[cfg(windows)]
-mod password_cache;
 
 /// Resolve the account password the AVD/W365 RDSTLS v3 credential encrypts.
 /// Precedence: explicit `--password` (cached for next time) → DPAPI-cached
@@ -76,7 +96,9 @@ fn resolve_rdstls_password(account: &str, explicit: Option<&str>) -> String {
         tracing::info!("using cached Cloud PC password (DPAPI-encrypted)");
         return p;
     }
-    match prompt::read_password(&format!("Password for {account} (hidden, cached securely): ")) {
+    match prompt::read_password(&format!(
+        "Password for {account} (hidden, cached securely): "
+    )) {
         Ok(p) => {
             if !p.is_empty() {
                 password_cache::store(account, &p);
@@ -91,16 +113,20 @@ fn resolve_rdstls_password(account: &str, explicit: Option<&str>) -> String {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)] // signature parity with the Windows DPAPI path; no caller on headless builds
 fn resolve_rdstls_password(_account: &str, explicit: Option<&str>) -> String {
     explicit.map(str::to_string).unwrap_or_default()
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 mod allocator;
 
 #[global_allocator]
 static GLOBAL_ALLOC: allocator::TrackingAllocator = allocator::TrackingAllocator;
 
 use rdp_core::{ClientConfig, Credentials};
+
+use crate::connections::ConnectionProfile;
 
 fn main() {
     // Must precede any window/monitor API so Win32 reports true physical geometry
@@ -136,7 +162,31 @@ fn main() {
         return;
     }
 
-    if args.host.is_some() || args.w365 || args.feed.is_some() {
+    // The classic direct-connection flow: `--host` builds a ConnectionProfile
+    // from the CLI flags and starts the session through the shared entry point
+    // (connect::connect_with_profile) that the saved-connection UI also uses.
+    if args.host.is_some() && !args.w365 && args.feed.is_none() {
+        let mut profile = ConnectionProfile::from_cli(
+            args.host.clone(),
+            args.user.clone(),
+            args.password.clone(),
+            args.insecure,
+        )
+        .expect("--host is present");
+        // `--port` still applies on top of the profile's default (3389).
+        profile.port = args.port;
+
+        let result = connect::connect_with_profile(&profile).map_err(|e| e.to_string());
+        if let Err(err) = result {
+            tracing::error!(error = %err, "connection attempt failed");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // W365/AVD modern auth + feed discovery, plus `--host` combined with either,
+    // keep using the full Args-driven path (they need the extra flags).
+    if args.w365 || args.feed.is_some() {
         // Windows opens a window and paints the live desktop. Other platforms
         // run the same protocol stack headless, logging decoded rectangles.
         #[cfg(windows)]
@@ -182,12 +232,10 @@ fn main() {
 #[cfg(windows)]
 fn gfx_caps_for(
     args: &Args,
-    device: Option<
-        &(
-            windows::Win32::Graphics::Direct3D11::ID3D11Device,
-            windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
-        ),
-    >,
+    device: Option<&(
+        windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    )>,
 ) -> Vec<(u32, u32)> {
     let gpu_h264 = || {
         let Some((dev, ctx)) = device else {
@@ -211,6 +259,7 @@ fn gfx_caps_for(
 /// Pure caps-selection policy, factored out of [`gfx_caps_for`] so it's testable
 /// without a GPU device. `gpu_h264` is evaluated lazily — only the final
 /// (non-gaming, no explicit override) branch probes the local decoder.
+#[allow(dead_code)] // used by the Windows GPU caps path and unit tests
 fn caps_from_flags(
     no_avc: bool,
     force_avc444: bool,
@@ -260,6 +309,7 @@ fn caps_from_flags(
 /// size scaled by `scale`, rounded to even (RDP needs even dimensions) and
 /// clamped to RDP's 200..=8192 per-axis range. The window stays native; the
 /// client GPU upscales this smaller desktop on present.
+#[allow(dead_code)] // used by the Windows window-sizing path and unit tests
 fn scaled_desktop_dims(win_w: u32, win_h: u32, scale: f32) -> (u32, u32) {
     let scale = scale.clamp(0.4, 1.0);
     let one = |v: u32| -> u32 {
@@ -274,6 +324,7 @@ fn scaled_desktop_dims(win_w: u32, win_h: u32, scale: f32) -> (u32, u32) {
 /// per-monitor windows emit input in), and the framebuffer slice it presents
 /// (the scaled monitor rectangle under render-scale; the native one otherwise).
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // used by the Windows multi-monitor layout path
 struct MonitorPlacement {
     /// Window position on the physical screen (virtual-screen coordinates).
     screen: (i32, i32),
@@ -300,14 +351,17 @@ struct MonitorPlacement {
 /// translating the bounding-box origin to desktop (0,0), which is exactly the
 /// subtraction used for the slice origins here, so EGFX surface offsets land
 /// on the same coordinates.
-fn scale_monitor_layout(
-    rects: &[rdp_pdu::gcc::VirtualScreenRect],
-    scale: f32,
-) -> (
+/// Scaled multi-monitor layout: the monitor defs to advertise, the scaled
+/// desktop size, and each monitor's framebuffer slice ((origin), (size)).
+#[cfg_attr(not(windows), allow(dead_code))] // used by the Windows multi-monitor layout path
+type MonitorLayout = (
     Vec<rdp_pdu::gcc::MonitorDef>,
     (u32, u32),
     Vec<((u32, u32), (u32, u32))>,
-) {
+);
+
+#[allow(dead_code)] // used by the Windows multi-monitor layout path and unit tests
+fn scale_monitor_layout(rects: &[rdp_pdu::gcc::VirtualScreenRect], scale: f32) -> MonitorLayout {
     let scale = scale.clamp(0.4, 1.0) as f64;
     let e = |v: i32| -> i32 { (((v as f64) * scale / 2.0).round() as i32) * 2 };
     let scaled: Vec<(i32, i32, i32, i32, bool)> = rects
@@ -343,6 +397,7 @@ fn scale_monitor_layout(
 
 /// Exponential backoff with jitter for auto-reconnect retries.
 /// attempt 1 = ~500 ms, attempt 2 = ~1 s, doubling up to a 30 s cap.
+#[allow(dead_code)] // reconnect backoff used by the Windows reconnection path
 fn reconnect_delay(attempt: u32) -> std::time::Duration {
     const MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
     const BASE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -361,6 +416,7 @@ fn reconnect_delay(attempt: u32) -> std::time::Duration {
 /// Path to the persisted reconnect cookie for a given hostname. The cookie is
 /// host-specific so a new connection to a different host doesn't accidentally
 /// reuse stale state.
+#[allow(dead_code)] // used by the Windows reconnection path
 fn reconnect_cookie_path(hostname: &str) -> std::path::PathBuf {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -376,6 +432,7 @@ fn reconnect_cookie_path(hostname: &str) -> std::path::PathBuf {
     }
 }
 
+#[allow(dead_code)] // used by the Windows reconnection path
 fn save_reconnect_cookie(
     hostname: &str,
     cookie: &rdp_pdu::logon::ReconnectCookie,
@@ -387,6 +444,7 @@ fn save_reconnect_cookie(
     std::fs::write(path, buf)
 }
 
+#[allow(dead_code)] // used by the Windows reconnection path
 fn load_reconnect_cookie(hostname: &str) -> Option<rdp_pdu::logon::ReconnectCookie> {
     let path = reconnect_cookie_path(hostname);
     let data = std::fs::read(path).ok()?;
@@ -440,133 +498,14 @@ fn config_from_args(args: &Args) -> ClientConfig {
 }
 
 /// Headless connect path (non-Windows): negotiate, activate, and log decoded
-/// bitmap rectangles. Exercises the entire protocol stack without a GPU.
+/// bitmap rectangles. Exercises the entire protocol stack without a GPU. Used
+/// by the W365/feed paths; the direct `--host` path goes through
+/// [`crate::connect::connect_with_profile`] instead, and the shared headless
+/// run itself lives in [`crate::connect::run_headless`].
 #[cfg(not(windows))]
 fn run_connect(args: &Args) -> Result<(), transport::NegotiateError> {
-    use rdp_pdu::x224::SecurityProtocol;
-
     let config = config_from_args(args);
-
-    tracing::info!(host = %config.hostname, port = config.port, "connecting over TCP");
-    let (mut stream, _connector, protocol) = transport::connect(&config)?;
-    tracing::info!(?protocol, "X.224 negotiation complete");
-
-    // A read timeout prevents hangs against a silent server (set before the TLS
-    // handshake, which also does I/O; it persists on the moved socket).
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-        .ok();
-
-    // Enhanced RDP Security (SSL) and NLA (HYBRID) both run inside a TLS tunnel;
-    // Standard RDP Security runs directly over the socket.
-    if protocol.contains(SecurityProtocol::SSL) || protocol.contains(SecurityProtocol::HYBRID) {
-        let mut tls =
-            match tls::TlsStream::connect(stream, &config.hostname, config.allow_invalid_certificate)
-            {
-                Ok(tls) => {
-                    tracing::info!("TLS established (rustls)");
-                    tls
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "TLS handshake failed");
-                    return Ok(());
-                }
-            };
-
-        if protocol.contains(SecurityProtocol::HYBRID) {
-            // NLA/CredSSP (MS-CSSP) authenticates over the TLS channel — binding to
-            // the server certificate's public key — before the MCS connection.
-            let cert = match tls.remote_cert_der() {
-                Some(cert) => cert,
-                None => {
-                    tracing::error!("no server certificate available for NLA channel binding");
-                    return Ok(());
-                }
-            };
-            let spn = format!("TERMSRV/{}", config.hostname);
-            let creds = &config.credentials;
-            match rdp_nla::credssp::authenticate(
-                &mut tls,
-                &spn,
-                &cert,
-                &creds.domain,
-                &creds.username,
-                &creds.password,
-            ) {
-                Ok(()) => tracing::info!("NLA/CredSSP complete"),
-                Err(err) => {
-                    tracing::error!(error = %err, "NLA/CredSSP failed");
-                    return Ok(());
-                }
-            }
-        }
-
-        headless_run(&mut tls, &config, protocol);
-    } else {
-        // Standard RDP Security (no TLS): run directly over the socket.
-        headless_run(&mut stream, &config, protocol);
-    }
-    Ok(())
-}
-
-/// Activate and run a headless session over any `Read + Write` transport, logging
-/// decoded rectangles. Shared by the plaintext and rustls-TLS paths.
-#[cfg(not(windows))]
-fn headless_run<S: std::io::Read + std::io::Write>(
-    stream: &mut S,
-    config: &rdp_core::ClientConfig,
-    protocol: rdp_pdu::x224::SecurityProtocol,
-) {
-    match session::activate(stream, config, protocol, None) {
-        Ok(mut active) => {
-            tracing::info!(info = ?active.info(), "RDP session ACTIVE");
-            let mut sink = LogSink::default();
-            if let Err(err) = session::run_session(stream, &mut active, &mut sink) {
-                tracing::info!(error = %err, "session ended");
-            }
-        }
-        Err(err) => tracing::warn!(error = %err, "activation stopped"),
-    }
-}
-
-/// Headless frame sink: logs decoded bitmap rectangles (non-Windows builds).
-#[cfg(not(windows))]
-#[derive(Default)]
-struct LogSink {
-    rects: u64,
-}
-
-#[cfg(not(windows))]
-impl session::FrameSink for LogSink {
-    fn blit(&mut self, x: u16, y: u16, w: u16, h: u16, rgba: &[u8]) {
-        self.rects += 1;
-        tracing::debug!(x, y, w, h, bytes = rgba.len(), "paint rect");
-    }
-
-    fn present(&mut self) {
-        tracing::info!(painted_rects = self.rects, "frame presented");
-    }
-
-    fn cursor(&mut self, update: session::CursorUpdate) {
-        match update {
-            session::CursorUpdate::Hide => tracing::debug!("cursor update: hide"),
-            session::CursorUpdate::Default => tracing::debug!("cursor update: default arrow"),
-            session::CursorUpdate::Shape {
-                width,
-                height,
-                hot_x,
-                hot_y,
-                rgba,
-            } => tracing::debug!(
-                width,
-                height,
-                hot_x,
-                hot_y,
-                bytes = rgba.len(),
-                "cursor update: shape"
-            ),
-        }
-    }
+    crate::connect::run_headless(&config)
 }
 
 /// Quality preset for the latency/clarity trade-offs the client controls.
@@ -578,20 +517,15 @@ impl session::FrameSink for LogSink {
 /// bicubic upscaler; gaming permits render-scale and motion-first choices.
 /// Full 4:4:4 remains available explicitly via `--force-avc444`, whose chroma
 /// reconstruction runs on the CPU decode path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum QualityPreset {
     /// Motion-first: render-scale friendly, upscaler tuned for game imagery.
     Gaming,
     /// Clarity-first: no render-scale, smooth vsync, bicubic.
     Office,
     /// The defaults (identical codec caps; see the enum docs).
+    #[default]
     Balanced,
-}
-
-impl Default for QualityPreset {
-    fn default() -> Self {
-        QualityPreset::Balanced
-    }
 }
 
 /// Minimal command-line arguments (no external arg-parsing dependency).
@@ -738,7 +672,72 @@ struct Args {
     teams_native: bool,
 }
 
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            host: None,
+            port: 3389,
+            user: None,
+            domain: None,
+            password: None,
+            insecure: false,
+            drive: Vec::new(),
+            multimon: false,
+            fullscreen: false,
+            cpu_yuv: false,
+            udp: false,
+            shortpath: false,
+            printer: false,
+            udp_debug: false,
+            clipboard_dir: None,
+            width: None,
+            height: None,
+            legacy: false,
+            keyboard_layout: None,
+            bpp: None,
+            low_latency: false,
+            quality: QualityPreset::default(),
+            force_avc444: false,
+            no_avc: false,
+            render_scale: 1.0,
+            per_monitor: false,
+            no_seed: false,
+            pace: 0,
+            upscale: rdp_gpu::Upscaler::default(),
+            sharpen: None,
+            backend: rdp_gpu::Backend::default(),
+            replay_gfx: None,
+            log_file: None,
+            feed: None,
+            w365: false,
+            w365_device_code: false,
+            w365_relogin: false,
+            forget_password: false,
+            tenant: None,
+            client_id: None,
+            rdp_file: None,
+            teams: false,
+            teams_native: false,
+        }
+    }
+}
+
 impl Args {
+    /// Build a default `Args` from a [`ConnectionProfile`] for the windowed
+    /// connect path (`win::run_connected` still consumes `Args`). Only the
+    /// profile-carried fields are set; every extended display flag stays at
+    /// its default, because the profile is the source of truth.
+    #[cfg(windows)]
+    fn from_profile(profile: &ConnectionProfile) -> Self {
+        let mut args = Args::default();
+        args.host = Some(profile.host.clone());
+        args.port = profile.port;
+        args.user = Some(profile.username.clone());
+        args.password = profile.password.clone();
+        args.insecure = profile.insecure;
+        args
+    }
+
     fn from_env() -> Self {
         let mut args = Args {
             host: None,
@@ -1076,12 +1075,12 @@ Requires a CPU with AVX2 (Intel Haswell / AMD Excavator, 2013 or newer)."#,
 }
 
 fn parse_backend(v: &str) -> rdp_gpu::Backend {
-    match v.trim().to_ascii_lowercase().as_str() {
+    let v = v.trim().to_ascii_lowercase();
+    match v.as_str() {
         "d3d12" | "dx12" | "12" => rdp_gpu::Backend::D3D12,
-        "d3d11" | "dx11" | "11" | _ => {
-            if !matches!(v.trim().to_ascii_lowercase().as_str(), "d3d11" | "dx11" | "11") {
-                tracing::warn!("unknown --backend mode {v:?}; using d3d11");
-            }
+        "d3d11" | "dx11" | "11" => rdp_gpu::Backend::D3D11,
+        _ => {
+            tracing::warn!("unknown --backend mode {v:?}; using d3d11");
             rdp_gpu::Backend::D3D11
         }
     }
@@ -1129,6 +1128,7 @@ fn expand_drive_args(drives: &[String]) -> Vec<String> {
 /// The effective RCAS sharpen strength: an explicit `--sharpen` wins; otherwise
 /// FSR defaults to 0.9 (≈ AMD's recommended 0.2-stop RCAS attenuation — FSR 1.0
 /// is designed as the EASU+RCAS pair) and every other upscaler to off.
+#[allow(dead_code)] // used by the Windows present path and unit tests
 fn effective_sharpen(sharpen: Option<f32>, upscale: rdp_gpu::Upscaler) -> f32 {
     match sharpen {
         Some(s) => s.clamp(0.0, 1.0),
@@ -1167,7 +1167,7 @@ fn init_tracing(log_file: Option<&str>) {
 }
 
 #[cfg(windows)]
-mod connect;
+mod connect_windows;
 
 #[cfg(windows)]
 mod iocp;
@@ -1229,6 +1229,12 @@ mod crash;
 #[cfg(windows)]
 mod window;
 
+// Client UI: the native Windows top-level window (`ui::UiWindow`) plus the
+// platform-neutral run-loop event types. The window itself is `#[cfg(windows)]`
+// inside the module, so Linux keeps building headless while the pure event/size
+// logic stays unit-testable everywhere.
+mod ui;
+
 #[cfg(windows)]
 mod connbar;
 
@@ -1261,7 +1267,7 @@ mod win {
 
     use crate::window::{Frame, RawInput, Window};
     use crate::{
-        config_from_args, connect, feed, gateway, net_listener, reconnect_delay,
+        config_from_args, connect_windows, feed, gateway, net_listener, reconnect_delay,
         save_reconnect_cookie, session, w365, Args,
     };
     use rdp_pdu::input as inpdu;
@@ -1398,7 +1404,14 @@ mod win {
             });
         }
         fn copy_rect(&mut self, sx: u16, sy: u16, w: u16, h: u16, dx: u16, dy: u16) {
-            let _ = self.tx.send(FrameMsg::CopyRect { sx, sy, w, h, dx, dy });
+            let _ = self.tx.send(FrameMsg::CopyRect {
+                sx,
+                sy,
+                w,
+                h,
+                dx,
+                dy,
+            });
         }
         fn cache_rect(&mut self, slot: u16, sx: u16, sy: u16, w: u16, h: u16) {
             let _ = self.tx.send(FrameMsg::CacheRect { slot, sx, sy, w, h });
@@ -1491,8 +1504,7 @@ mod win {
         }
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let slot = n % 24;
-        let path =
-            std::path::Path::new(&dir).join(format!("tile_{slot:02}_{x}_{y}_{w}x{h}.bmp"));
+        let path = std::path::Path::new(&dir).join(format!("tile_{slot:02}_{x}_{y}_{w}x{h}.bmp"));
         write_bmp(&path, w as usize, h as usize, rgba);
     }
 
@@ -1513,7 +1525,9 @@ mod win {
             let dir = std::env::var("RDPIO_DUMP_CC_RAW").ok()?;
             let _ = std::fs::create_dir_all(&dir);
             let path = std::path::Path::new(&dir).join(format!("cc_{}.bin", std::process::id()));
-            Some(Mutex::new(std::io::BufWriter::new(std::fs::File::create(path).ok()?)))
+            Some(Mutex::new(std::io::BufWriter::new(
+                std::fs::File::create(path).ok()?,
+            )))
         });
         let Some(m) = writer else { return };
         if N.fetch_add(1, Ordering::Relaxed) >= 40000 {
@@ -1587,9 +1601,7 @@ mod win {
     fn diag_enabled() -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| {
-            std::env::var_os("RDPIO_DIAG").is_some() || diag_overlay_enabled()
-        })
+        *ON.get_or_init(|| std::env::var_os("RDPIO_DIAG").is_some() || diag_overlay_enabled())
     }
 
     /// Blend a per-codec tint 50/50 into an RGBA region (overlay mode).
@@ -1602,7 +1614,14 @@ mod win {
     }
 
     /// Rate-limited anomaly warning (first 12, then every 256th) with a total.
-    fn diag_anomaly(counter: &std::sync::atomic::AtomicU64, kind: &str, x: u32, y: u32, w: u32, h: u32) {
+    fn diag_anomaly(
+        counter: &std::sync::atomic::AtomicU64,
+        kind: &str,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) {
         use std::sync::atomic::Ordering;
         let n = counter.fetch_add(1, Ordering::Relaxed);
         if n < 12 || n % 256 == 0 {
@@ -1626,9 +1645,18 @@ mod win {
                 if let Some(bc) = black {
                     if diag_enabled()
                         && !rgba.is_empty()
-                        && rgba.chunks_exact(4).all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
+                        && rgba
+                            .chunks_exact(4)
+                            .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
                     {
-                        diag_anomaly(bc, "all-black-tile", *x as u32, *y as u32, *w as u32, *h as u32);
+                        diag_anomaly(
+                            bc,
+                            "all-black-tile",
+                            *x as u32,
+                            *y as u32,
+                            *w as u32,
+                            *h as u32,
+                        );
                     }
                 }
                 if overlay {
@@ -1746,7 +1774,8 @@ mod win {
         /// H.264 decoders these are stateful — a progressive context's per-tile
         /// coefficient state accumulates across frames — and scoped to one surface
         /// stream, so each surface gets its own. Keyed by surface id, created lazily.
-        progressive_decoders: std::collections::HashMap<u16, rdp_graphics::progressive::ProgressiveDecoder>,
+        progressive_decoders:
+            std::collections::HashMap<u16, rdp_graphics::progressive::ProgressiveDecoder>,
         /// CPU shadow of the output desktop (RGBA). Kept in sync with every RGBA
         /// blit so SurfaceToSurface/CacheToSurface can read prior pixels back —
         /// without it those copy/cache commands (which carry no pixels) can't be
@@ -1957,8 +1986,7 @@ mod win {
             label: &str,
             h264: &[u8],
         ) -> Vec<rdp_gpu::h264::DecodedFrame> {
-            let Some(decoder) = Self::ensure_cpu_decoder(decoders, surface_id, w, h, label)
-            else {
+            let Some(decoder) = Self::ensure_cpu_decoder(decoders, surface_id, w, h, label) else {
                 return Vec::new();
             };
             match decoder.decode(h264) {
@@ -2228,7 +2256,12 @@ mod win {
                 let (dev, ctx) = self.device.clone()?;
                 match rdp_gpu::h264::H264GpuDecoder::new(w, h, &dev, &ctx) {
                     Ok(d) => {
-                        tracing::info!(surface_id, w, h, "DXVA GPU H.264 decoder created (zero-copy)");
+                        tracing::info!(
+                            surface_id,
+                            w,
+                            h,
+                            "DXVA GPU H.264 decoder created (zero-copy)"
+                        );
                         self.gpu_decoders.insert(surface_id, d);
                     }
                     Err(e) => {
@@ -2347,8 +2380,14 @@ mod win {
             // CPU fallback: full 4:4:4 reconstruction from the main + aux
             // sub-streams (now stride-correct after the NV12 extraction fix).
             let rects = stream.stream1.rects.clone();
-            let main_frames =
-                Self::decode_stream(&mut self.cpu_decoders, surface_id, sw, sh, "main", &main_h264);
+            let main_frames = Self::decode_stream(
+                &mut self.cpu_decoders,
+                surface_id,
+                sw,
+                sh,
+                "main",
+                &main_h264,
+            );
 
             // The auxiliary (chroma) stream is decoded only for a "Both" frame
             // on the ChromaV1-capable codec; otherwise we render luma-only.
@@ -2374,7 +2413,9 @@ mod win {
                 let (my, muv) = mf.planes();
                 // Full 4:4:4 when a matching aux frame reconstructs cleanly,
                 // else the main view's 4:2:0.
-                let rgba = match aux_frames.get(i).and_then(|af| Self::reconstruct_yuv444_rgba(mf, af))
+                let rgba = match aux_frames
+                    .get(i)
+                    .and_then(|af| Self::reconstruct_yuv444_rgba(mf, af))
                 {
                     Some(rgba) => {
                         full += 1;
@@ -2383,7 +2424,15 @@ mod win {
                     None => rdp_graphics::yuv::nv12_to_rgba(my, muv, fw, fh, fw),
                 };
                 let Some(rgba) = rgba else { continue };
-                Self::blits_for_regions(&rgba, fw, fh, &rects, dest, (origin_x, origin_y), &mut blits);
+                Self::blits_for_regions(
+                    &rgba,
+                    fw,
+                    fh,
+                    &rects,
+                    dest,
+                    (origin_x, origin_y),
+                    &mut blits,
+                );
             }
             tracing::debug!(
                 main = main_frames.len(),
@@ -2644,7 +2693,8 @@ mod win {
                 let (ox, oy) = self.surfaces.output_origin(*surface_id).unwrap_or((0, 0));
                 let mut blits = Vec::new();
                 if let Some((w, h, px)) = self.gfx_cache.get(slot).cloned() {
-                    D_CACHE_BLIT.fetch_add(dest_pts.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    D_CACHE_BLIT
+                        .fetch_add(dest_pts.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
                     for p in dest_pts {
                         let dx = ox + p.x as u32;
@@ -2741,8 +2791,7 @@ mod win {
                             for row in 0..h {
                                 let dst = (row * run_w + xoff) * 4;
                                 let src = row * tw * 4;
-                                band[dst..dst + tw * 4]
-                                    .copy_from_slice(&t.rgba[src..src + tw * 4]);
+                                band[dst..dst + tw * 4].copy_from_slice(&t.rgba[src..src + tw * 4]);
                             }
                             xoff += tw;
                         }
@@ -2819,7 +2868,13 @@ mod win {
                     let w = dest.right.saturating_sub(dest.left);
                     let h = dest.bottom.saturating_sub(dest.top);
                     // Capture the raw input stream (ordered) for offline replay.
-                    dump_cc_raw(bitmap, origin_x + dest.left as u32, origin_y + dest.top as u32, w, h);
+                    dump_cc_raw(
+                        bitmap,
+                        origin_x + dest.left as u32,
+                        origin_y + dest.top as u32,
+                        w,
+                        h,
+                    );
                     // Seed the decode with the desktop's current pixels at this
                     // rect: ClearCodec is a persistent-surface codec, so a stream
                     // with no residual layer only re-codes the changed pixels and
@@ -2843,11 +2898,20 @@ mod win {
                     // One channel-global decoder: its glyph/vBar caches are shared
                     // across all surfaces (MS-RDPEGFX/FreeRDP parity) and persist
                     // across resize + surface delete/recreate.
-                    match self.clear_decoder.decode_seeded(bitmap, w, h, seed.as_deref()) {
+                    match self
+                        .clear_decoder
+                        .decode_seeded(bitmap, w, h, seed.as_deref())
+                    {
                         Some(rgba) if rgba.len() == w as usize * h as usize * 4 => {
                             // Diagnostic: dump decoded image tiles to BMP (tagged
                             // with their on-desktop position) for visual inspection.
-                            dump_tile_bmp(&rgba, origin_x + dest.left as u32, origin_y + dest.top as u32, w, h);
+                            dump_tile_bmp(
+                                &rgba,
+                                origin_x + dest.left as u32,
+                                origin_y + dest.top as u32,
+                                w,
+                                h,
+                            );
                             let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
                             vec![session::GfxBlit::Rgba {
                                 x: clamp(origin_x + dest.left as u32),
@@ -2920,8 +2984,7 @@ mod win {
         let mut p = 0usize;
         let mut n = 0usize;
         while p + 4 <= data.len() {
-            let len =
-                u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) as usize;
+            let len = u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) as usize;
             p += 4;
             if p + len > data.len() {
                 break;
@@ -2933,7 +2996,12 @@ mod win {
             n += 1;
             if n % 1500 == 0 {
                 let snap = out_dir.join(format!("gfxrep_{n:06}.bmp"));
-                write_bmp(&snap, renderer.fb_w as usize, renderer.fb_h as usize, &renderer.fb);
+                write_bmp(
+                    &snap,
+                    renderer.fb_w as usize,
+                    renderer.fb_h as usize,
+                    &renderer.fb,
+                );
             }
         }
         let final_path = out_dir.join("gfxrep_final.bmp");
@@ -2953,20 +3021,20 @@ mod win {
     }
 
     /// The no-host demo window (slate background): launched without `--host`.
+    /// The window is created through the client's `ui` module, which owns the
+    /// Win32 top-level window and its D3D11 swapchain.
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let (width, height) = (1280u32, 720u32);
-        let window = Window::new("RDPiO", width, height)?;
-        let mut renderer = Renderer::new(window.hwnd_raw(), width, height, rdp_gpu::Backend::default())?;
+        let mut ui = crate::ui::UiWindow::new("RDPiO", width, height)?;
         tracing::info!("M0 window + D3D11 swapchain up; entering message loop");
 
         loop {
-            match window.pump() {
-                Frame::Quit => break,
-                Frame::Continue { resize } => {
-                    if let Some((w, h)) = resize {
-                        renderer.resize(w, h)?;
-                    }
-                    renderer.present_clear(SLATE)?;
+            match ui.handle_events()? {
+                crate::ui::UiEvent::Quit => break,
+                crate::ui::UiEvent::Continue { .. } => {
+                    // `handle_events` already applied any pending resize to the
+                    // swapchain; just repaint the idle slate.
+                    ui.present_clear(SLATE)?;
                 }
             }
         }
@@ -3070,18 +3138,11 @@ mod win {
             {
                 cached
             } else if args.w365_device_code {
-                let t = w365::authenticate_device_code(
-                    tenant,
-                    args.client_id.as_deref(),
-                    None,
-                )?;
+                let t = w365::authenticate_device_code(tenant, args.client_id.as_deref(), None)?;
                 crate::token_cache::store(tenant, args.client_id.as_deref(), &t);
                 t
             } else {
-                let t = crate::webview_auth::authenticate(
-                    tenant,
-                    args.client_id.as_deref(),
-                )?;
+                let t = crate::webview_auth::authenticate(tenant, args.client_id.as_deref())?;
                 crate::token_cache::store(tenant, args.client_id.as_deref(), &t);
                 t
             };
@@ -3112,108 +3173,118 @@ mod win {
                 }
                 config.credentials.password = token.token;
             } else {
-
-            // Prefer the Windows App's local resource cache: one signed ARM
-            // `.rdp` per subscribed Cloud PC, which drives the validated ARM
-            // broker path with no live-feed parsing. Fall back to live ARM feed
-            // discovery if the cache is absent (or `--feed` was given explicitly).
-            let entries = if args.feed.is_some() {
-                w365::fetch_feed(&token, tenant, args.client_id.as_deref(), args.feed.as_deref())?
-            } else {
-                let cached = w365::discover_cached_cloud_pcs();
-                if cached.is_empty() {
-                    tracing::info!("no cached Cloud PCs found; querying live W365 ARM feed");
-                    w365::fetch_feed(&token, tenant, args.client_id.as_deref(), None)?
+                // Prefer the Windows App's local resource cache: one signed ARM
+                // `.rdp` per subscribed Cloud PC, which drives the validated ARM
+                // broker path with no live-feed parsing. Fall back to live ARM feed
+                // discovery if the cache is absent (or `--feed` was given explicitly).
+                let entries = if args.feed.is_some() {
+                    w365::fetch_feed(
+                        &token,
+                        tenant,
+                        args.client_id.as_deref(),
+                        args.feed.as_deref(),
+                    )?
                 } else {
-                    tracing::info!(
-                        count = cached.len(),
-                        "discovered Cloud PCs from Windows App cache"
+                    let cached = w365::discover_cached_cloud_pcs();
+                    if cached.is_empty() {
+                        tracing::info!("no cached Cloud PCs found; querying live W365 ARM feed");
+                        w365::fetch_feed(&token, tenant, args.client_id.as_deref(), None)?
+                    } else {
+                        tracing::info!(
+                            count = cached.len(),
+                            "discovered Cloud PCs from Windows App cache"
+                        );
+                        cached
+                    }
+                };
+                if entries.is_empty() {
+                    return Err(
+                        "W365: no Cloud PCs found (resource cache empty and feed returned none)"
+                            .into(),
                     );
-                    cached
                 }
-            };
-            if entries.is_empty() {
-                return Err("W365: no Cloud PCs found (resource cache empty and feed returned none)".into());
-            }
-            tracing::info!(count = entries.len(), "discovered hosts for W365 selection");
-            for e in &entries {
+                tracing::info!(count = entries.len(), "discovered hosts for W365 selection");
+                for e in &entries {
+                    tracing::info!(
+                        id = %e.id,
+                        name = %e.display_name,
+                        gateway = %e.gateway_fqdn,
+                        "W365 feed entry"
+                    );
+                }
+
+                // With more than one Cloud PC, let the user pick in a WebView panel.
+                // A single resource (or a picker that can't open) connects directly.
+                let choice = if entries.len() > 1 {
+                    match crate::cloud_pc_picker::choose_cloud_pc(&entries) {
+                        Ok(i) => i.min(entries.len() - 1),
+                        Err(crate::cloud_pc_picker::PickerError::Cancelled) => {
+                            return Err("Cloud PC selection cancelled".into());
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Cloud PC picker unavailable; using first entry");
+                            0
+                        }
+                    }
+                } else {
+                    0
+                };
+                let chosen = &entries[choice];
                 tracing::info!(
-                    id = %e.id,
-                    name = %e.display_name,
-                    gateway = %e.gateway_fqdn,
-                    "W365 feed entry"
+                    id = %chosen.id,
+                    name = %chosen.display_name,
+                    "selected Cloud PC"
                 );
-            }
 
-            // With more than one Cloud PC, let the user pick in a WebView panel.
-            // A single resource (or a picker that can't open) connects directly.
-            let choice = if entries.len() > 1 {
-                match crate::cloud_pc_picker::choose_cloud_pc(&entries) {
-                    Ok(i) => i.min(entries.len() - 1),
-                    Err(crate::cloud_pc_picker::PickerError::Cancelled) => {
-                        return Err("Cloud PC selection cancelled".into());
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Cloud PC picker unavailable; using first entry");
-                        0
-                    }
+                // The Reverse Connect gateway is the connection target; the Cloud PC
+                // itself is reached through the gateway using the resource id.
+                if !chosen.gateway_fqdn.is_empty() {
+                    config.reverse_connect = Some(rdp_core::ReverseConnectConfig {
+                        gateway_fqdn: chosen.gateway_fqdn.clone(),
+                        resource_id: chosen.resource_id.clone(),
+                        tenant_id: chosen.tenant_id.clone(),
+                        session_id: chosen.session_id.clone(),
+                        access_token: token.token.clone(),
+                        load_balance_info: chosen
+                            .load_balance_info
+                            .as_ref()
+                            .map(|b| String::from_utf8_lossy(b).into_owned())
+                            .unwrap_or_default(),
+                        application_name: "Windows365NativeClient".to_string(),
+                        // For cached Cloud PCs this is overwritten by apply_rdp_file
+                        // below (from the .rdp's remoteapplicationprogram); for a live
+                        // feed entry the resource id is the best available value.
+                        remote_application: chosen.resource_id.clone(),
+                        // The user's real logon password for the RDSTLS v3 credential
+                        // (`--password`). The OAuth token overwrites `credentials`, so
+                        // capture the account password separately here.
+                        rdstls_password: args.password.clone().unwrap_or_default(),
+                        // Resolved centrally below (default "AzureAD" unless --domain).
+                        rdstls_domain: String::new(),
+                    });
+                } else if !chosen.hostname.is_empty() {
+                    // Fallback for feeds that still expose a direct address.
+                    config.hostname = chosen.hostname.clone();
+                    config.port = chosen.port;
+                } else {
+                    return Err("W365 feed entry has no gateway FQDN or hostname".into());
                 }
-            } else {
-                0
-            };
-            let chosen = &entries[choice];
-            tracing::info!(
-                id = %chosen.id,
-                name = %chosen.display_name,
-                "selected Cloud PC"
-            );
 
-            // The Reverse Connect gateway is the connection target; the Cloud PC
-            // itself is reached through the gateway using the resource id.
-            if !chosen.gateway_fqdn.is_empty() {
-                config.reverse_connect = Some(rdp_core::ReverseConnectConfig {
-                    gateway_fqdn: chosen.gateway_fqdn.clone(),
-                    resource_id: chosen.resource_id.clone(),
-                    tenant_id: chosen.tenant_id.clone(),
-                    session_id: chosen.session_id.clone(),
-                    access_token: token.token.clone(),
-                    load_balance_info: chosen
-                        .load_balance_info
-                        .as_ref()
-                        .map(|b| String::from_utf8_lossy(b).into_owned())
-                        .unwrap_or_default(),
-                    application_name: "Windows365NativeClient".to_string(),
-                    // For cached Cloud PCs this is overwritten by apply_rdp_file
-                    // below (from the .rdp's remoteapplicationprogram); for a live
-                    // feed entry the resource id is the best available value.
-                    remote_application: chosen.resource_id.clone(),
-                    // The user's real logon password for the RDSTLS v3 credential
-                    // (`--password`). The OAuth token overwrites `credentials`, so
-                    // capture the account password separately here.
-                    rdstls_password: args.password.clone().unwrap_or_default(),
-                    // Resolved centrally below (default "AzureAD" unless --domain).
-                    rdstls_domain: String::new(),
-                });
-            } else if !chosen.hostname.is_empty() {
-                // Fallback for feeds that still expose a direct address.
-                config.hostname = chosen.hostname.clone();
-                config.port = chosen.port;
-            } else {
-                return Err("W365 feed entry has no gateway FQDN or hostname".into());
-            }
-
-            config.load_balance_info = chosen.load_balance_info.clone();
-            if let Some(file) = &chosen.rdp_file {
-                feed::apply_rdp_file(&mut config, file);
-            }
-            config.credentials.password = token.token;
+                config.load_balance_info = chosen.load_balance_info.clone();
+                if let Some(file) = &chosen.rdp_file {
+                    feed::apply_rdp_file(&mut config, file);
+                }
+                config.credentials.password = token.token;
             }
 
             // Default the RDSTLS logon username from the signed-in identity
             // (the id_token UPN) so the user need not also pass `--user`.
             if config.credentials.username.is_empty() {
                 if let Some(upn) = token.username.as_ref() {
-                    tracing::info!(upn, "defaulting W365 logon username from signed-in identity");
+                    tracing::info!(
+                        upn,
+                        "defaulting W365 logon username from signed-in identity"
+                    );
                     config.credentials.username = upn.clone();
                 }
             }
@@ -3464,9 +3535,7 @@ mod win {
                 tracing::info!("found persisted reconnect cookie; will try to resume session");
             }
             loop {
-                match connect::establish_reconnect(&mut config,
-                    persisted_cookie.as_ref()
-                ) {
+                match connect_windows::establish_reconnect(&mut config, persisted_cookie.as_ref()) {
                     Ok(c) => break c,
                     Err(e) if attempt < INITIAL_RETRIES => {
                         attempt += 1;
@@ -3567,7 +3636,9 @@ mod win {
         };
         if span_origin.is_some() {
             tracing::info!("borderless mode — press Ctrl+Shift+Q to close the client");
-            tracing::info!("Ctrl+Shift+M toggles mouse capture (confine cursor; relative aim for FPS games)");
+            tracing::info!(
+                "Ctrl+Shift+M toggles mouse capture (confine cursor; relative aim for FPS games)"
+            );
         }
 
         // Decide the RDPGFX caps to advertise once (the device persists across
@@ -3583,8 +3654,8 @@ mod win {
         let mut client = (width, height); // current window client size, for scaling
         let mut desktop = (desktop_w, desktop_h); // current remote desktop size (resizable)
         let mut last_pos = (0u16, 0u16); // last pointer position (desktop pixels)
-        // Windows digitizer contact ids (TOUCHINPUT.dwID) are arbitrary u32
-        // driver cursor ids; RDPEI contact ids must be stable 0-255 slots.
+                                         // Windows digitizer contact ids (TOUCHINPUT.dwID) are arbitrary u32
+                                         // driver cursor ids; RDPEI contact ids must be stable 0-255 slots.
         let mut touch_slots: std::collections::HashMap<u32, u8> = std::collections::HashMap::new();
 
         // Performance telemetry: shared across the UI, network, and decode threads.
@@ -3671,7 +3742,7 @@ mod win {
                     attempts = 0;
                     c
                 }
-                None => match connect::establish_reconnect(&mut config, cookie.as_ref()) {
+                None => match connect_windows::establish_reconnect(&mut config, cookie.as_ref()) {
                     Ok(c) => {
                         attempts = 0;
                         c
@@ -3687,7 +3758,9 @@ mod win {
                                 "reconnect failed; retrying"
                             );
                             if net_listener::wait_with_network_wake(delay, &net_change_rx) {
-                                tracing::info!("network change detected; retrying reconnect immediately");
+                                tracing::info!(
+                                    "network change detected; retrying reconnect immediately"
+                                );
                             }
                             window.set_title("Reconnecting… — RDPiO");
                             continue 'session;
@@ -3700,7 +3773,7 @@ mod win {
                 },
             };
 
-            let connect::Established {
+            let connect_windows::Established {
                 transport,
                 mut session,
                 control,
@@ -3718,7 +3791,7 @@ mod win {
             // never decodes and the screen stays black.
             let graphics_path = matches!(
                 transport,
-                connect::Transport::Tls(_) | connect::Transport::WebSocketTls(_)
+                connect_windows::Transport::Tls(_) | connect_windows::Transport::WebSocketTls(_)
             );
             // Dial info for the UDP side-band, captured by the worker. Gated on
             // `config.multitransport` — the exact condition under which we
@@ -3726,7 +3799,7 @@ mod win {
             // side-band we told the server we'd bring up. It is restricted to the
             // direct TLS host (a real `host:port`); the Reverse Connect / WebSocket
             // transports have no direct address to dial, so they never bring up UDP.
-            let direct_tls = matches!(transport, connect::Transport::Tls(_));
+            let direct_tls = matches!(transport, connect_windows::Transport::Tls(_));
             let udp_dial = (config.multitransport && direct_tls).then(|| crate::udp::UdpDial {
                 server: format!("{}:{}", config.hostname, config.port),
                 hostname: config.hostname.clone(),
@@ -3782,8 +3855,9 @@ mod win {
             // (the old 1 ms poll, a steady battery cost) to ~2/s. Input still
             // ships instantly: every producer signals the worker's wake event.
             let sock_wait = if graphics_path {
-                transport.raw_socket().and_then(|s| {
-                    match crate::net_wait::SocketWait::new(s) {
+                transport
+                    .raw_socket()
+                    .and_then(|s| match crate::net_wait::SocketWait::new(s) {
                         Ok(w) => Some(w),
                         Err(e) => {
                             tracing::warn!(
@@ -3792,8 +3866,7 @@ mod win {
                             );
                             None
                         }
-                    }
-                })
+                    })
             } else {
                 None
             };
@@ -3805,9 +3878,7 @@ mod win {
                         // No waitable socket (WebSocket paths): fall back to the
                         // 1 ms read-timeout poll so queued input still ships
                         // promptly between reads.
-                        if let Err(e) =
-                            transport.set_read_timeout(Some(Duration::from_millis(1)))
-                        {
+                        if let Err(e) = transport.set_read_timeout(Some(Duration::from_millis(1))) {
                             tracing::warn!(error = %e, "could not set input poll timeout; input may lag");
                         }
                     }
@@ -3818,8 +3889,7 @@ mod win {
                     // hands EGFX command batches over `decode_tx`. `backlog` is the
                     // decode queue depth, reported to the server as the frame-ack
                     // queueDepth for flow control.
-                    let (decode_tx, decode_rx) =
-                        mpsc::channel::<Vec<rdp_pdu::gfx::GfxCommand>>();
+                    let (decode_tx, decode_rx) = mpsc::channel::<Vec<rdp_pdu::gfx::GfxCommand>>();
                     let backlog = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                     let decode_backlog = backlog.clone();
                     let decode_sink_tx = tx.clone();
@@ -3850,9 +3920,7 @@ mod win {
                     // capture device is available, run without one (the server
                     // simply gets no mic).
                     let mut mic = crate::mic::Win32Mic::new();
-                    let mic_ref = mic
-                        .as_mut()
-                        .map(|m| m as &mut dyn session::MicSource);
+                    let mic_ref = mic.as_mut().map(|m| m as &mut dyn session::MicSource);
                     // Teams "Optimized": bridge the `com.microsoft.rdc.dvc.webrtc.1`
                     // channel client-side instead of declining it. Two backends:
                     //   --teams-native → rdpio's own webrtc-rs engine (no MS binary;
@@ -3862,14 +3930,24 @@ mod win {
                     // requested or the chosen backend fails to come up.
                     let redirector: Option<Box<dyn rdp_graphics::redirect::DvcRedirector>> =
                         if teams_native {
-                            tracing::info!("--teams-native: bringing up rdpio's native WebRTC engine");
+                            tracing::info!(
+                                "--teams-native: bringing up rdpio's native WebRTC engine"
+                            );
                             let r = crate::webrtc_native::NativeWebRtcRedirector::new();
-                            tracing::info!(active = r.is_some(), "native Teams WebRTC engine status");
+                            tracing::info!(
+                                active = r.is_some(),
+                                "native Teams WebRTC engine status"
+                            );
                             r.map(|r| Box::new(r) as Box<dyn rdp_graphics::redirect::DvcRedirector>)
                         } else if teams {
-                            tracing::info!("--teams: bringing up the Teams WebRTC redirector bridge");
+                            tracing::info!(
+                                "--teams: bringing up the Teams WebRTC redirector bridge"
+                            );
                             let r = crate::webrtc_addin::WebRtcRedirector::new();
-                            tracing::info!(active = r.is_some(), "Teams WebRTC redirector bridge status");
+                            tracing::info!(
+                                active = r.is_some(),
+                                "Teams WebRTC redirector bridge status"
+                            );
                             r.map(|r| Box::new(r) as Box<dyn rdp_graphics::redirect::DvcRedirector>)
                         } else {
                             tracing::info!(
@@ -3932,8 +4010,8 @@ mod win {
             let mut pending: Vec<FrameMsg> = Vec::new();
             // Opt-in frame pacing (--pace <fps>): present on an even cadence,
             // always the newest frame, to smooth uneven arrival. Off → present ASAP.
-            let pace_interval = (args.pace > 0)
-                .then(|| std::time::Duration::from_secs_f32(1.0 / args.pace as f32));
+            let pace_interval =
+                (args.pace > 0).then(|| std::time::Duration::from_secs_f32(1.0 / args.pace as f32));
             let mut last_present = std::time::Instant::now();
             let mut pending_present = false;
             let mut metrics_report_start = std::time::Instant::now();
@@ -4008,7 +4086,9 @@ mod win {
                                 .filter_map(|raw| {
                                     if let RawInput::Touch { id, x, y, phase } = raw {
                                         let slot = touch_slot(&mut touch_slots, id, phase);
-                                        touches.push(touch_to_contact(slot, x, y, phase, desktop, client));
+                                        touches.push(touch_to_contact(
+                                            slot, x, y, phase, desktop, client,
+                                        ));
                                         return None;
                                     }
                                     map_input(raw, desktop, client, &mut last_pos, rel_capture)
@@ -4043,11 +4123,12 @@ mod win {
                                 match rx.try_recv() {
                                     Ok(FrameMsg::Cursor(update)) => window.set_cursor(update),
                                     Ok(FrameMsg::Cookie(c)) => {
-                                    cookie = Some(c);
-                                    if let Err(e) = save_reconnect_cookie(&config.hostname, &c) {
-                                        tracing::warn!(error = %e, "failed to persist reconnect cookie");
+                                        cookie = Some(c);
+                                        if let Err(e) = save_reconnect_cookie(&config.hostname, &c)
+                                        {
+                                            tracing::warn!(error = %e, "failed to persist reconnect cookie");
+                                        }
                                     }
-                                }
                                     Ok(msg) => pending.push(msg),
                                     Err(TryRecvError::Empty) => break,
                                     Err(TryRecvError::Disconnected) => {
@@ -4064,16 +4145,22 @@ mod win {
                             // (Present / Resize). Blits after it belong to a frame
                             // still arriving, so they stay in `pending` until their
                             // EndFrame — we never present a torn, half-updated frame.
-                            if let Some(boundary) = pending
-                                .iter()
-                                .rposition(|m| matches!(m, FrameMsg::Present | FrameMsg::Resize(..)))
-                            {
+                            if let Some(boundary) = pending.iter().rposition(|m| {
+                                matches!(m, FrameMsg::Present | FrameMsg::Resize(..))
+                            }) {
                                 for msg in pending.drain(..=boundary) {
                                     match msg {
                                         FrameMsg::Blit { x, y, w, h, rgba } => {
                                             renderer.update_rect(x, y, w, h, &rgba);
                                         }
-                                        FrameMsg::BlitNv12 { x, y, w, h, nv12, rects } => {
+                                        FrameMsg::BlitNv12 {
+                                            x,
+                                            y,
+                                            w,
+                                            h,
+                                            nv12,
+                                            rects,
+                                        } => {
                                             // GPU color-convert; fall back to CPU so
                                             // the frame is never dropped. Only the
                                             // dirty region rects are painted.
@@ -4088,12 +4175,25 @@ mod win {
                                                     yp, uv, w as usize, h as usize, w as usize,
                                                 ) {
                                                     blit_rgba_regions(
-                                                        &mut renderer, x, y, w, h, &rgba, &rects,
+                                                        &mut renderer,
+                                                        x,
+                                                        y,
+                                                        w,
+                                                        h,
+                                                        &rgba,
+                                                        &rects,
                                                     );
                                                 }
                                             }
                                         }
-                                        FrameMsg::BlitTexture { x, y, w, h, texture, rects } => {
+                                        FrameMsg::BlitTexture {
+                                            x,
+                                            y,
+                                            w,
+                                            h,
+                                            texture,
+                                            rects,
+                                        } => {
                                             // Zero-copy GPU NV12 texture color-convert.
                                             let regions = region_tuples_u32(&rects);
                                             if !renderer.blit_texture(
@@ -4113,17 +4213,33 @@ mod win {
                                                 {
                                                     let (yp, uv) =
                                                         nv12.split_at((w as usize) * (h as usize));
-                                                    if let Some(rgba) = rdp_graphics::yuv::nv12_to_rgba(
-                                                        yp, uv, w as usize, h as usize, w as usize,
-                                                    ) {
+                                                    if let Some(rgba) =
+                                                        rdp_graphics::yuv::nv12_to_rgba(
+                                                            yp, uv, w as usize, h as usize,
+                                                            w as usize,
+                                                        )
+                                                    {
                                                         blit_rgba_regions(
-                                                            &mut renderer, x, y, w, h, &rgba, &rects,
+                                                            &mut renderer,
+                                                            x,
+                                                            y,
+                                                            w,
+                                                            h,
+                                                            &rgba,
+                                                            &rects,
                                                         );
                                                     }
                                                 }
                                             }
                                         }
-                                        FrameMsg::CopyRect { sx, sy, w, h, dx, dy } => {
+                                        FrameMsg::CopyRect {
+                                            sx,
+                                            sy,
+                                            w,
+                                            h,
+                                            dx,
+                                            dy,
+                                        } => {
                                             renderer.copy_rect(sx, sy, w, h, dx, dy);
                                         }
                                         FrameMsg::CacheRect { slot, sx, sy, w, h } => {
@@ -4136,8 +4252,7 @@ mod win {
                                         FrameMsg::Resize(w, h) => {
                                             // Remote desktop resized; match the
                                             // framebuffer + input scaling to it.
-                                            let _ =
-                                                renderer.ensure_framebuffer(w as u32, h as u32);
+                                            let _ = renderer.ensure_framebuffer(w as u32, h as u32);
                                             desktop = (w as u32, h as u32);
                                             dirty = true;
                                         }
@@ -4381,8 +4496,8 @@ mod win {
         client: (u32, u32),
     ) -> rdp_channels::rdpei::RdpInputContact {
         use rdp_channels::rdpei::{
-            CONTACT_FLAG_DOWN, CONTACT_FLAG_INCONTACT, CONTACT_FLAG_INRANGE,
-            CONTACT_FLAG_UP, CONTACT_FLAG_UPDATE,
+            CONTACT_FLAG_DOWN, CONTACT_FLAG_INCONTACT, CONTACT_FLAG_INRANGE, CONTACT_FLAG_UP,
+            CONTACT_FLAG_UPDATE,
         };
         let cw = client.0.max(1);
         let ch = client.1.max(1);
@@ -4500,11 +4615,19 @@ mod win {
                 // down-scroll" bug); up-scroll happened to be correct because its
                 // magnitude was used directly.
                 let units = (delta.clamp(-255, 255) as u16) & inpdu::PTRFLAGS_WHEEL_ROTATION_MASK;
-                Some(inpdu::mouse_event(inpdu::PTRFLAGS_WHEEL | units, last_pos.0, last_pos.1))
+                Some(inpdu::mouse_event(
+                    inpdu::PTRFLAGS_WHEEL | units,
+                    last_pos.0,
+                    last_pos.1,
+                ))
             }
             RawInput::MouseHWheel { delta } => {
                 let units = (delta.clamp(-255, 255) as u16) & inpdu::PTRFLAGS_WHEEL_ROTATION_MASK;
-                Some(inpdu::mouse_event(inpdu::PTRFLAGS_HWHEEL | units, last_pos.0, last_pos.1))
+                Some(inpdu::mouse_event(
+                    inpdu::PTRFLAGS_HWHEEL | units,
+                    last_pos.0,
+                    last_pos.1,
+                ))
             }
             RawInput::Char { code, down } => {
                 // Unicode keyboard event (IME-composed text); release flag on up.
@@ -4531,7 +4654,9 @@ mod policy_tests {
     fn gaming_advertises_avc420_only_even_with_a_gpu() {
         // --gaming wins over the GPU probe: a CPU-only host then encodes one H.264
         // stream, not AVC444's two. The probe must not even be consulted.
-        let caps = caps_from_flags(false, false, QualityPreset::Gaming, || panic!("probe should be skipped"));
+        let caps = caps_from_flags(false, false, QualityPreset::Gaming, || {
+            panic!("probe should be skipped")
+        });
         assert_eq!(caps, egfx::CAPS_AVC420_ONLY.to_vec());
     }
 
@@ -4556,7 +4681,9 @@ mod policy_tests {
 
     #[test]
     fn force_avc444_opts_back_into_full_caps() {
-        let caps = caps_from_flags(false, true, QualityPreset::Gaming, || panic!("probe should be skipped"));
+        let caps = caps_from_flags(false, true, QualityPreset::Gaming, || {
+            panic!("probe should be skipped")
+        });
         assert_eq!(caps, egfx::CAPS_FULL.to_vec());
     }
 
@@ -4641,7 +4768,10 @@ mod policy_tests {
     #[test]
     fn scale_monitor_layout_keeps_seams_origin_and_even_dims() {
         // Two 2560x1440 monitors side by side, primary first.
-        let rects = [rect(0, 0, 2560, 1440, true), rect(2560, 0, 5120, 1440, false)];
+        let rects = [
+            rect(0, 0, 2560, 1440, true),
+            rect(2560, 0, 5120, 1440, false),
+        ];
         let (defs, size, slices) = scale_monitor_layout(&rects, 0.66);
         // The shared seam at x=2560 maps to one coordinate on both sides:
         // monitor 0's right edge == monitor 1's left edge (inclusive defs are
@@ -4678,7 +4808,10 @@ mod policy_tests {
 
     #[test]
     fn scale_monitor_layout_is_identity_at_one() {
-        let rects = [rect(0, 0, 1920, 1080, true), rect(1920, 0, 3840, 1080, false)];
+        let rects = [
+            rect(0, 0, 1920, 1080, true),
+            rect(1920, 0, 3840, 1080, false),
+        ];
         let (defs, size, slices) = scale_monitor_layout(&rects, 1.0);
         assert_eq!(size, (3840, 1080));
         assert_eq!((defs[0].left, defs[0].right), (0, 1919));

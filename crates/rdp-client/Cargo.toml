@@ -13,16 +13,24 @@ path = "src/main.rs"
 [dependencies]
 rdp-core.workspace = true
 rdp-pdu.workspace = true
+rdp-asn1.workspace = true
 rdp-crypto.workspace = true
 rdp-channels.workspace = true
 rdp-graphics.workspace = true
 rdp-gpu.workspace = true
 rdp-nla.workspace = true
+# The in-workspace wire transport (TPKT framing + Standard RDP Security
+# connection sequence), re-exported by the library facade below.
+wire-main.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ureq.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+eframe.workspace = true
+egui.workspace = true
+directories.workspace = true
 tungstenite.workspace = true
 url.workspace = true
 http.workspace = true

@@ -26,7 +26,9 @@ const CACHE_FILE: &str = "w365_token.bin";
 const EXPIRY_MARGIN: u64 = 300;
 
 fn cache_path() -> Option<PathBuf> {
-    let local = std::env::var("LOCALAPPDATA").ok().filter(|s| !s.is_empty())?;
+    let local = std::env::var("LOCALAPPDATA")
+        .ok()
+        .filter(|s| !s.is_empty())?;
     let dir = PathBuf::from(local).join("rdpio");
     let _ = std::fs::create_dir_all(&dir);
     Some(dir.join(CACHE_FILE))
@@ -49,8 +51,7 @@ pub(crate) fn dpapi_protect(plain: &[u8]) -> io::Result<Vec<u8>> {
         let mut out_blob = CRYPT_INTEGER_BLOB::default();
         CryptProtectData(&in_blob, PCWSTR::null(), None, None, None, 0, &mut out_blob)
             .map_err(|e| io::Error::other(format!("CryptProtectData: {e}")))?;
-        let out =
-            std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
+        let out = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
         let _ = LocalFree(Some(HLOCAL(out_blob.pbData as *mut c_void)));
         Ok(out)
     }
@@ -66,8 +67,7 @@ pub(crate) fn dpapi_unprotect(blob: &[u8]) -> io::Result<Vec<u8>> {
         let mut out_blob = CRYPT_INTEGER_BLOB::default();
         CryptUnprotectData(&in_blob, None, None, None, None, 0, &mut out_blob)
             .map_err(|e| io::Error::other(format!("CryptUnprotectData: {e}")))?;
-        let out =
-            std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
+        let out = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
         let _ = LocalFree(Some(HLOCAL(out_blob.pbData as *mut c_void)));
         Ok(out)
     }

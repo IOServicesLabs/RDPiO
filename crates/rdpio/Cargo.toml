@@ -1,0 +1,28 @@
+[package]
+name = "rdpio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RDPiO client assembly: re-exports and constructor glue for the full RDP client"
+
+[dependencies]
+# Every library crate in the workspace: protocol (pdu/core/nla/channels),
+# codec (asn1/pdu), transport (wire-main), platform (gpu/graphics/webrtc), and
+# the client facade (rdp-client). The `rdpio` binary crate lives in
+# `crates/rdp-client`; this crate is the assembly point that depends on the
+# whole set and adds the glue a test or tool needs to drive a connection from
+# the individual pieces.
+rdp-asn1.workspace = true
+rdp-crypto.workspace = true
+rdp-pdu.workspace = true
+rdp-core.workspace = true
+rdp-nla.workspace = true
+rdp-channels.workspace = true
+rdp-graphics.workspace = true
+rdp-gpu.workspace = true
+rdp-client.workspace = true
+rdp-webrtc.workspace = true
+wire-main.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

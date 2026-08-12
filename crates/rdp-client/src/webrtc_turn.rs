@@ -28,7 +28,10 @@ impl TurnResolver for WinTurnResolver {
     fn resolve_alternate(&self, host: &str, port: u16) -> Option<SocketAddr> {
         // Resolve to an IPv4 address (webrtc-rs gathers UDP4; the backend we hand
         // back must match).
-        let server = (host, port).to_socket_addrs().ok()?.find(SocketAddr::is_ipv4)?;
+        let server = (host, port)
+            .to_socket_addrs()
+            .ok()?
+            .find(SocketAddr::is_ipv4)?;
         let socket = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
         // No credentials needed: the redirect is issued before authentication.
         let mut client = TurnClient::new(socket, server, "", "", "");

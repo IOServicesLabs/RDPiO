@@ -13,27 +13,28 @@ use std::sync::Mutex;
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateDIBSection, DeleteObject, EnumDisplayMonitors, GetMonitorInfoW,
-    BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HBRUSH, HDC, HGDIOBJ, HMONITOR, MONITORINFO,
+    CreateBitmap, CreateDIBSection, DeleteObject, EnumDisplayMonitors, GetMonitorInfoW, BITMAPINFO,
+    BITMAPINFOHEADER, DIB_RGB_COLORS, HBRUSH, HDC, HGDIOBJ, HMONITOR, MONITORINFO,
 };
 // `MONITORINFOF_PRIMARY` lives under WindowsAndMessaging (glob-imported below).
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetFocus, GetKeyState, VK_CAPITAL, VK_CONTROL, VK_NUMLOCK, VK_SCROLL, VK_SHIFT,
-};
-use windows::Win32::UI::Input::{
-    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
-    RAWINPUTDEVICE, RAWINPUTDEVICE_FLAGS, RAWINPUTHEADER, RID_INPUT, RIM_TYPEMOUSE,
-};
-use windows::Win32::UI::Input::Touch::{
-    CloseTouchInputHandle, GetTouchInputInfo, RegisterTouchWindow, HTOUCHINPUT, TOUCHINPUT,
-    TOUCHEVENTF_DOWN, TOUCHEVENTF_MOVE, TOUCHEVENTF_UP,
-};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, OpenClipboard,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetFocus, GetKeyState, VK_CAPITAL, VK_CONTROL, VK_NUMLOCK, VK_SCROLL,
+    VK_SHIFT,
+};
+use windows::Win32::UI::Input::Touch::{
+    CloseTouchInputHandle, GetTouchInputInfo, RegisterTouchWindow, HTOUCHINPUT, TOUCHEVENTF_DOWN,
+    TOUCHEVENTF_MOVE, TOUCHEVENTF_UP, TOUCHINPUT,
+};
+use windows::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
+    RAWINPUTDEVICE, RAWINPUTDEVICE_FLAGS, RAWINPUTHEADER, RID_INPUT, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -198,7 +199,12 @@ pub fn install_keyboard_hook() {
     }
     unsafe {
         let hmod = GetModuleHandleW(None).unwrap_or_default();
-        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), Some(HINSTANCE(hmod.0)), 0) {
+        match SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(ll_keyboard_proc),
+            Some(HINSTANCE(hmod.0)),
+            0,
+        ) {
             Ok(h) => {
                 KEYBOARD_HOOK.store(h.0 as isize, Ordering::SeqCst);
                 tracing::info!("low-level keyboard hook installed (system keys → remote)");
@@ -281,7 +287,15 @@ impl Window {
     ) -> windows::core::Result<Self> {
         // Topmost so the borderless surface covers the local always-on-top taskbar;
         // otherwise the remote desktop's own taskbar/Start is hidden behind it.
-        Self::create(title, WS_EX_TOPMOST, WS_POPUP, x, y, width as i32, height as i32)
+        Self::create(
+            title,
+            WS_EX_TOPMOST,
+            WS_POPUP,
+            x,
+            y,
+            width as i32,
+            height as i32,
+        )
     }
 
     /// A borderless window for one physical monitor at screen position
@@ -298,7 +312,15 @@ impl Window {
         height: u32,
         offset: (i32, i32),
     ) -> windows::core::Result<Self> {
-        let win = Self::create(title, WS_EX_TOPMOST, WS_POPUP, x, y, width as i32, height as i32)?;
+        let win = Self::create(
+            title,
+            WS_EX_TOPMOST,
+            WS_POPUP,
+            x,
+            y,
+            width as i32,
+            height as i32,
+        )?;
         unsafe {
             // Pack the non-negative framebuffer offset (each component < 2^31)
             // into the single isize GWLP_USERDATA slot: high 32 bits = x, low = y.
@@ -362,7 +384,10 @@ impl Window {
             // re-advertise it to the remote session (clipboard redirection).
             let _ = AddClipboardFormatListener(hwnd);
             // Register for WM_TOUCH so the client can forward multi-touch input.
-            let _ = RegisterTouchWindow(hwnd, windows::Win32::UI::Input::Touch::REGISTER_TOUCH_WINDOW_FLAGS(0));
+            let _ = RegisterTouchWindow(
+                hwnd,
+                windows::Win32::UI::Input::Touch::REGISTER_TOUCH_WINDOW_FLAGS(0),
+            );
             Ok(Self { hwnd })
         }
     }
@@ -377,6 +402,35 @@ impl Window {
         let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
             let _ = SetWindowTextW(self.hwnd, PCWSTR(title_w.as_ptr()));
+        }
+    }
+
+    /// Resize the window to `width`×`height` pixels, keeping the top-left
+    /// corner where it is. The swapchain resize is the caller's job (see
+    /// [`crate::ui::UiWindow::set_size`]); this only moves the native window.
+    pub fn set_size(&self, width: u32, height: u32) -> windows::core::Result<()> {
+        unsafe {
+            // SWP_NOMOVE keeps the current position, SWP_NOZORDER keeps the
+            // z-order, SWP_NOACTIVATE avoids stealing focus on a resize.
+            SetWindowPos(
+                self.hwnd,
+                None,
+                0,
+                0,
+                width.max(1) as i32,
+                height.max(1) as i32,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Ask the window to close: post `WM_CLOSE`, which the default window
+    /// procedure answers with `DestroyWindow` → `WM_DESTROY` →
+    /// `PostQuitMessage`, so the next [`Window::pump`] reports `Frame::Quit`.
+    pub fn request_close(&self) {
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
     }
 
@@ -577,7 +631,13 @@ pub fn enumerate_monitors() -> VirtualDesktop {
 /// hotspot. Uses a 32-bpp top-down DIB section for the colour plane (alpha
 /// preserved) plus an all-zero monochrome AND mask. Returns `None` on bad
 /// dimensions or any GDI failure.
-unsafe fn build_cursor(width: u16, height: u16, hot_x: u16, hot_y: u16, rgba: &[u8]) -> Option<HCURSOR> {
+unsafe fn build_cursor(
+    width: u16,
+    height: u16,
+    hot_x: u16,
+    hot_y: u16,
+    rgba: &[u8],
+) -> Option<HCURSOR> {
     let (w, h) = (width as usize, height as usize);
     if w == 0 || h == 0 || rgba.len() < w * h * 4 {
         return None;
@@ -667,11 +727,22 @@ unsafe fn client_rect_on_screen(hwnd: HWND) -> Option<RECT> {
     if GetClientRect(hwnd, &mut rc).is_err() || rc.right <= rc.left || rc.bottom <= rc.top {
         return None;
     }
-    let mut tl = windows::Win32::Foundation::POINT { x: rc.left, y: rc.top };
-    let mut br = windows::Win32::Foundation::POINT { x: rc.right, y: rc.bottom };
+    let mut tl = windows::Win32::Foundation::POINT {
+        x: rc.left,
+        y: rc.top,
+    };
+    let mut br = windows::Win32::Foundation::POINT {
+        x: rc.right,
+        y: rc.bottom,
+    };
     let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut tl);
     let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut br);
-    Some(RECT { left: tl.x, top: tl.y, right: br.x, bottom: br.y })
+    Some(RECT {
+        left: tl.x,
+        top: tl.y,
+        right: br.x,
+        bottom: br.y,
+    })
 }
 
 /// Confine the cursor to the window's client area (capture mode, focused).
@@ -702,9 +773,11 @@ unsafe fn ensure_raw_mouse(hwnd: HWND) {
         dwFlags: RAWINPUTDEVICE_FLAGS(0),
         hwndTarget: hwnd,
     };
-    if let Err(e) = RegisterRawInputDevices(&[rid], std::mem::size_of::<RAWINPUTDEVICE>() as u32)
-    {
-        tracing::warn!(?e, "raw mouse registration failed; capture falls back to clip-only");
+    if let Err(e) = RegisterRawInputDevices(&[rid], std::mem::size_of::<RAWINPUTDEVICE>() as u32) {
+        tracing::warn!(
+            ?e,
+            "raw mouse registration failed; capture falls back to clip-only"
+        );
     }
 }
 
@@ -768,7 +841,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = ClipCursor(None);
                 }
                 // Re-evaluate cursor visibility immediately.
-                let _ = PostMessageW(Some(hwnd), WM_SETCURSOR, WPARAM(hwnd.0 as usize), LPARAM(HTCLIENT as isize));
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    WM_SETCURSOR,
+                    WPARAM(hwnd.0 as usize),
+                    LPARAM(HTCLIENT as isize),
+                );
                 tracing::info!(
                     on,
                     relative = crate::session::rel_mouse_supported(),
@@ -813,8 +891,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 );
                 if got != u32::MAX && raw.header.dwType == RIM_TYPEMOUSE.0 {
                     let m = raw.data.mouse;
-                    if m.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 == 0
-                        && (m.lLastX != 0 || m.lLastY != 0)
+                    if m.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 == 0 && (m.lLastX != 0 || m.lLastY != 0)
                     {
                         push_input(RawInput::MouseRel {
                             dx: m.lLastX,
@@ -986,7 +1063,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if GetKeyState(VK_SCROLL.0 as i32) & 1 != 0 {
                 flags |= TS_SYNC_SCROLL_LOCK;
             }
-            push_input(RawInput::SyncLockKeys { toggle_flags: flags });
+            push_input(RawInput::SyncLockKeys {
+                toggle_flags: flags,
+            });
             LRESULT(0)
         }
         WM_CLIPBOARDUPDATE => {
@@ -1002,9 +1081,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // this blocks only this paste — bounded, then gives up empty.
             let format = wparam.0 as u32;
             if msg == WM_RENDERALLFORMATS || format == crate::clipboard::CF_HDROP {
-                let paths = crate::session::request_clipboard_files(
-                    std::time::Duration::from_secs(180),
-                );
+                let paths =
+                    crate::session::request_clipboard_files(std::time::Duration::from_secs(180));
                 if !paths.is_empty() {
                     // WM_RENDERALLFORMATS renders into a clipboard we must open
                     // ourselves; WM_RENDERFORMAT is already in that state.

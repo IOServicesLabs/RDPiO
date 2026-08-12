@@ -48,8 +48,7 @@ pub mod worker_wake {
         if h != 0 {
             return h;
         }
-        match unsafe { windows::Win32::System::Threading::CreateEventW(None, false, false, None) }
-        {
+        match unsafe { windows::Win32::System::Threading::CreateEventW(None, false, false, None) } {
             Ok(ev) => {
                 let raw = ev.0 as isize;
                 match HANDLE_RAW.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire) {
@@ -76,8 +75,7 @@ pub mod worker_wake {
         let h = HANDLE_RAW.load(Ordering::Acquire);
         if h != 0 {
             unsafe {
-                let _ =
-                    windows::Win32::System::Threading::SetEvent(HANDLE(h as *mut c_void));
+                let _ = windows::Win32::System::Threading::SetEvent(HANDLE(h as *mut c_void));
             }
         }
     }

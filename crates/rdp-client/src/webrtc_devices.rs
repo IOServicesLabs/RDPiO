@@ -126,10 +126,20 @@ impl DeviceProvider for WinDeviceProvider {
         }
 
         for (id, label) in outputs {
-            devices.push(MediaDevice::new(DeviceKind::AudioOutput, id, label, NO_GROUP));
+            devices.push(MediaDevice::new(
+                DeviceKind::AudioOutput,
+                id,
+                label,
+                NO_GROUP,
+            ));
         }
         for (id, label) in inputs {
-            devices.push(MediaDevice::new(DeviceKind::AudioInput, id, label, NO_GROUP));
+            devices.push(MediaDevice::new(
+                DeviceKind::AudioInput,
+                id,
+                label,
+                NO_GROUP,
+            ));
         }
         for (i, cam) in MfCamera::enumerate().into_iter().enumerate() {
             devices.push(MediaDevice::new(
@@ -141,8 +151,14 @@ impl DeviceProvider for WinDeviceProvider {
         }
 
         let (mics, cams) = (
-            devices.iter().filter(|d| d.kind == DeviceKind::AudioInput).count(),
-            devices.iter().filter(|d| d.kind == DeviceKind::VideoInput).count(),
+            devices
+                .iter()
+                .filter(|d| d.kind == DeviceKind::AudioInput)
+                .count(),
+            devices
+                .iter()
+                .filter(|d| d.kind == DeviceKind::VideoInput)
+                .count(),
         );
         if mics == 0 && cams == 0 {
             tracing::warn!(

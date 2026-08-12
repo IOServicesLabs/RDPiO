@@ -45,9 +45,7 @@ impl ReverseConnectStream {
         path_override: Option<&str>,
         accept_invalid_cert: bool,
     ) -> Result<Self, ReverseConnectError> {
-        let gateway = rc
-            .gateway_fqdn
-            .trim();
+        let gateway = rc.gateway_fqdn.trim();
         if gateway.is_empty() {
             return Err(ReverseConnectError::MissingConfig("gateway_fqdn"));
         }
@@ -126,7 +124,10 @@ impl ReverseConnectStream {
             .header("Accept", "*/*")
             .header("Cache-Control", "no-cache")
             .header("Pragma", "no-cache")
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RdClient")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RdClient",
+            )
             .header("X-Ms-User-Agent", "Windows365NativeClient/2.0.1193.0");
 
         // A brokered URL is already authenticated by the `RDmiGatewayToken` it
@@ -247,7 +248,10 @@ mod tests {
         assert!(ws.starts_with("wss://rdgateway-host-blue-c221-eus2-r1.wvd.microsoft.com/"));
         let uri: http::Uri = ws.parse().expect("brokered URL must parse");
         assert_eq!(uri.scheme_str(), Some("wss"));
-        assert_eq!(uri.host(), Some("rdgateway-host-blue-c221-eus2-r1.wvd.microsoft.com"));
+        assert_eq!(
+            uri.host(),
+            Some("rdgateway-host-blue-c221-eus2-r1.wvd.microsoft.com")
+        );
     }
 
     #[test]
@@ -259,4 +263,3 @@ mod tests {
         assert!(!is_brokered_url("/reverseconnect/v1/primary"));
     }
 }
-

@@ -629,7 +629,12 @@ mod tests {
         s2c.extend_from_slice(&7u16.to_le_bytes());
         s2c.extend_from_slice(&[0, 0, 0, 0, 64, 0, 64, 0]); // rect 0,0,64,64
         match parse_one(CMDID_SURFACE_TO_CACHE, &s2c) {
-            GfxCommand::SurfaceToCache { surface_id, slot, rect_src, .. } => {
+            GfxCommand::SurfaceToCache {
+                surface_id,
+                slot,
+                rect_src,
+                ..
+            } => {
                 assert_eq!(surface_id, 1);
                 assert_eq!(slot, 7);
                 assert_eq!((rect_src.right, rect_src.bottom), (64, 64));
@@ -643,7 +648,11 @@ mod tests {
         c2s.extend_from_slice(&1u16.to_le_bytes()); // count
         c2s.extend_from_slice(&[10, 0, 20, 0]); // point (10,20)
         match parse_one(CMDID_CACHE_TO_SURFACE, &c2s) {
-            GfxCommand::CacheToSurface { slot, surface_id, dest_pts } => {
+            GfxCommand::CacheToSurface {
+                slot,
+                surface_id,
+                dest_pts,
+            } => {
                 assert_eq!((slot, surface_id), (7, 1));
                 assert_eq!(dest_pts.len(), 1);
                 assert_eq!((dest_pts[0].x, dest_pts[0].y), (10, 20));

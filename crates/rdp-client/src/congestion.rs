@@ -145,7 +145,11 @@ impl Congestion {
                     None => us,
                 };
                 self.baseline_us = Some(base);
-                if base > 0.0 { us / base } else { 1.0 }
+                if base > 0.0 {
+                    us / base
+                } else {
+                    1.0
+                }
             }
             (None, _) => 1.0,
         };
@@ -269,13 +273,20 @@ mod tests {
         for _ in 0..3 {
             c.update(500, 0, Some(Duration::from_millis(20)));
         }
-        assert!(c.pressure() > 0, "RTT inflation alone should apply back-pressure");
+        assert!(
+            c.pressure() > 0,
+            "RTT inflation alone should apply back-pressure"
+        );
     }
 
     #[test]
     fn pressure_moves_one_level_at_a_time() {
         let mut c = Congestion::new();
         c.update(50, 50, Some(Duration::from_millis(5))); // 50% loss, one window
-        assert_eq!(c.pressure(), 1, "a single bad window should not slam to max");
+        assert_eq!(
+            c.pressure(),
+            1,
+            "a single bad window should not slam to max"
+        );
     }
 }

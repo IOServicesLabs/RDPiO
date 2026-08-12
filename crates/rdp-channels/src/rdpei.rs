@@ -166,9 +166,9 @@ fn touch_frame(contacts: &[RdpInputContact], frame_offset: u64) -> Vec<u8> {
     for c in contacts {
         frame.push(c.id);
         frame.extend_from_slice(&write_vu16(0)); // fieldsPresent: no rect/orientation/pressure
-        // x/y are FOUR_BYTE_SIGNED_INTEGER on the wire: the sign bit lives in
-        // bit 5 of the first byte and the first byte carries only 5 value
-        // bits, so the unsigned encoding diverges from coordinate 0x2000 up.
+                                                 // x/y are FOUR_BYTE_SIGNED_INTEGER on the wire: the sign bit lives in
+                                                 // bit 5 of the first byte and the first byte carries only 5 value
+                                                 // bits, so the unsigned encoding diverges from coordinate 0x2000 up.
         frame.extend_from_slice(&write_vi32(c.x));
         frame.extend_from_slice(&write_vi32(c.y));
         frame.extend_from_slice(&write_vu32(c.flags));
@@ -302,7 +302,10 @@ mod tests {
     fn client_ready_well_formed() {
         let pdu = client_ready_pdu();
         assert_eq!(u16::from_le_bytes([pdu[0], pdu[1]]), EVENTID_CS_READY);
-        assert_eq!(u32::from_le_bytes([pdu[2], pdu[3], pdu[4], pdu[5]]) as usize, pdu.len());
+        assert_eq!(
+            u32::from_le_bytes([pdu[2], pdu[3], pdu[4], pdu[5]]) as usize,
+            pdu.len()
+        );
         assert_eq!(pdu.len(), 16);
         // DISABLE_TIMESTAMP_INJECTION is only defined from V101 on; the pair
         // must stay consistent or servers may junk the whole client-ready.
@@ -364,14 +367,17 @@ mod tests {
         let pdu = ch.touch_event(&[down, mv]).unwrap();
         assert_eq!(pdu[6], 0); // encodeTime
         assert_eq!(pdu[7], 2); // frameCount == 2
-        // Frame 1: contactCount=1, frameOffset=0, then the down contact.
+                               // Frame 1: contactCount=1, frameOffset=0, then the down contact.
         assert_eq!(pdu[8], 1);
         assert_eq!(pdu[9], 0);
         // Frame 2 begins after frame 1 (1+1+1+1+1+1+1 = 7 bytes for small
         // coords): contactCount=1, frameOffset=10 (1 ms).
         assert_eq!(pdu[15], 1);
         assert_eq!(pdu[16], 10);
-        assert_eq!(u32::from_le_bytes([pdu[2], pdu[3], pdu[4], pdu[5]]) as usize, pdu.len());
+        assert_eq!(
+            u32::from_le_bytes([pdu[2], pdu[3], pdu[4], pdu[5]]) as usize,
+            pdu.len()
+        );
     }
 
     #[test]
@@ -411,7 +417,10 @@ mod tests {
         }];
         let pdu = ch.touch_event(&contacts).unwrap();
         assert_eq!(u16::from_le_bytes([pdu[0], pdu[1]]), EVENTID_TOUCH);
-        assert_eq!(u32::from_le_bytes([pdu[2], pdu[3], pdu[4], pdu[5]]) as usize, pdu.len());
+        assert_eq!(
+            u32::from_le_bytes([pdu[2], pdu[3], pdu[4], pdu[5]]) as usize,
+            pdu.len()
+        );
         // After the 6-byte header: encodeTime (vu32) == 0, frameCount (vu16) == 1.
         assert_eq!(pdu[6], 0);
         assert_eq!(pdu[7], 1);

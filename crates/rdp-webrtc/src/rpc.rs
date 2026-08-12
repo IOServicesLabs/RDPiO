@@ -104,8 +104,10 @@ mod tests {
 
     #[test]
     fn classifies_a_result() {
-        let m = RpcMessage::parse(br#"{"result":{"desc":{"type":"offer","sdp":"v=0"}},"rpcCallId":79}"#)
-            .unwrap();
+        let m = RpcMessage::parse(
+            br#"{"result":{"desc":{"type":"offer","sdp":"v=0"}},"rpcCallId":79}"#,
+        )
+        .unwrap();
         assert_eq!(m.kind(), RpcMessageKind::Result);
         assert_eq!(m.call_id, Some(79));
         assert!(m.result.is_some());

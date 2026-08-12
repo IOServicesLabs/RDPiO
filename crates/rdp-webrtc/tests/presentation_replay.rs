@@ -25,12 +25,22 @@ fn reconstructs_the_media_surfaces() {
     let model = build();
 
     // The call presented several video elements (self-view + participants).
-    let video_elements = model.elements.values().filter(|e| e.kind == "video").count();
-    assert!(video_elements >= 3, "expected multiple video elements, got {video_elements}");
+    let video_elements = model
+        .elements
+        .values()
+        .filter(|e| e.kind == "video")
+        .count();
+    assert!(
+        video_elements >= 3,
+        "expected multiple video elements, got {video_elements}"
+    );
 
     // Every video element is bound to a source stream.
     for (id, e) in model.elements.iter().filter(|(_, e)| e.kind == "video") {
-        assert!(e.src_stream_id.is_some(), "video element {id} has no srcObject stream");
+        assert!(
+            e.src_stream_id.is_some(),
+            "video element {id} has no srcObject stream"
+        );
     }
 
     // Streams carry tracks.
@@ -54,7 +64,10 @@ fn identifies_self_view_by_mirror_transform() {
     );
     // object-fit was captured for presented elements.
     assert!(
-        model.elements.values().any(|e| e.object_fit.as_deref() == Some("contain")),
+        model
+            .elements
+            .values()
+            .any(|e| e.object_fit.as_deref() == Some("contain")),
         "expected an object-fit:contain element"
     );
 }
@@ -66,7 +79,11 @@ fn print_presentation_summary() {
     eprintln!(
         "elements: {} ({} video)  streams: {}  clip: {:?} visible={}",
         model.elements.len(),
-        model.elements.values().filter(|e| e.kind == "video").count(),
+        model
+            .elements
+            .values()
+            .filter(|e| e.kind == "video")
+            .count(),
         model.streams.len(),
         model.clip_rect,
         model.clip_visible,

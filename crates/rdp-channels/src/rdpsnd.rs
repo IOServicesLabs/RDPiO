@@ -216,12 +216,15 @@ impl RdpsndChannel {
 
     /// The Client Quality Mode PDU (sent right after the formats reply).
     fn quality_mode() -> Vec<u8> {
-        message(SNDC_QUALITYMODE, &[
-            SNDQUALITY_DYNAMIC as u8,
-            (SNDQUALITY_DYNAMIC >> 8) as u8,
-            0,
-            0,
-        ])
+        message(
+            SNDC_QUALITYMODE,
+            &[
+                SNDQUALITY_DYNAMIC as u8,
+                (SNDQUALITY_DYNAMIC >> 8) as u8,
+                0,
+                0,
+            ],
+        )
     }
 
     /// Initial PDUs to send after the dynamic audio channel opens. Modern Windows
@@ -267,12 +270,15 @@ impl RdpsndChannel {
     }
 
     fn wave_confirm(timestamp: u16, block_no: u8) -> Vec<u8> {
-        message(SNDC_WAVECONFIRM, &[
-            timestamp as u8,
-            (timestamp >> 8) as u8,
-            block_no,
-            0, // bPad
-        ])
+        message(
+            SNDC_WAVECONFIRM,
+            &[
+                timestamp as u8,
+                (timestamp >> 8) as u8,
+                block_no,
+                0, // bPad
+            ],
+        )
     }
 
     /// Play a complete wave and return its confirm PDU.
@@ -557,7 +563,7 @@ mod tests {
         info.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // first 4 data bytes
         let out = snd.process(&message(SNDC_WAVE, &info), &mut sink);
         assert!(out.is_empty()); // no confirm yet
-        // Headerless data body: 4 pad bytes + the rest.
+                                 // Headerless data body: 4 pad bytes + the rest.
         let data = [0, 0, 0, 0, 0x11, 0x22];
         let out = snd.process(&data, &mut sink);
         assert_eq!(sink.format, Some((2, 22_050, 16)));

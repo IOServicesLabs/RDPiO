@@ -12,7 +12,7 @@ default = []
 # The real WebRTC engine (webrtc-rs). Kept behind a feature so the protocol
 # layers (framing/capture/rpc/objects/session) stay pure and quick to build; the
 # heavy async/media tree is only pulled when you want a live engine.
-engine = ["dep:webrtc", "dep:tokio", "dep:bytes"]
+engine = ["dep:webrtc", "dep:tokio", "dep:bytes", "dep:rustls"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -32,6 +32,12 @@ tokio = { version = "1", features = [
     "net",
 ], optional = true }
 bytes = { version = "1", optional = true }
+# rustls 0.23 needs an explicitly installed process-level CryptoProvider when
+# BOTH provider features are compiled in (aws-lc-rs via rdp-client's
+# default-features rustls dep, ring via webrtc's dtls) — see
+# `WebrtcEngine::create_peer_connection`, which installs ring's provider before
+# any DTLS handshake. `ring` matches what webrtc-rs/dtls already use.
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
 
 [dev-dependencies]
 # For the async engine tests (#[tokio::test]); always available to tests.

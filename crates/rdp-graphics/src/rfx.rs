@@ -277,16 +277,16 @@ pub fn dequantize(coeffs: &mut [i32; TILE_AREA], quants: &[u8; 10]) {
 /// The 10 RFX subbands as (x, y, w, h) regions within the 64×64 coefficient
 /// buffer (LL3 at the origin, then the detail bands at each level).
 const SUBBANDS: [(usize, usize, usize, usize); 10] = [
-    (0, 0, 8, 8),    // LL3
-    (8, 0, 8, 8),    // HL3
-    (0, 8, 8, 8),    // LH3
-    (8, 8, 8, 8),    // HH3
-    (16, 0, 16, 16), // HL2
-    (0, 16, 16, 16), // LH2
-    (16, 16, 16, 16),// HH2
-    (32, 0, 32, 32), // HL1
-    (0, 32, 32, 32), // LH1
-    (32, 32, 32, 32),// HH1
+    (0, 0, 8, 8),     // LL3
+    (8, 0, 8, 8),     // HL3
+    (0, 8, 8, 8),     // LH3
+    (8, 8, 8, 8),     // HH3
+    (16, 0, 16, 16),  // HL2
+    (0, 16, 16, 16),  // LH2
+    (16, 16, 16, 16), // HH2
+    (32, 0, 32, 32),  // HL1
+    (0, 32, 32, 32),  // LH1
+    (32, 32, 32, 32), // HH1
 ];
 
 /// One level of 1D inverse DWT (5/3 reversible lifting) over `n` samples in
@@ -302,7 +302,11 @@ fn idwt_1d(buf: &mut [i32], n: usize, tmp: &mut [i32]) {
     }
     for i in 0..half {
         let el = tmp[2 * i];
-        let er = if i + 1 < half { tmp[2 * i + 2] } else { tmp[2 * i] };
+        let er = if i + 1 < half {
+            tmp[2 * i + 2]
+        } else {
+            tmp[2 * i]
+        };
         tmp[2 * i + 1] = buf[half + i] + ((el + er) >> 1);
     }
     buf[..n].copy_from_slice(&tmp[..n]);
@@ -524,9 +528,7 @@ fn decode_tileset(block: &[u8], mode: RlgrMode, out: &mut Vec<RfxTile>) {
     if quant_table.is_empty() {
         return;
     }
-    let qget = |idx: u8| -> &[u8; 10] {
-        quant_table.get(idx as usize).unwrap_or(&quant_table[0])
-    };
+    let qget = |idx: u8| -> &[u8; 10] { quant_table.get(idx as usize).unwrap_or(&quant_table[0]) };
 
     // Walk the tile blocks.
     let mut off = quants_off + quants_len;
@@ -559,7 +561,15 @@ fn decode_tileset(block: &[u8], mode: RlgrMode, out: &mut Vec<RfxTile>) {
         let y_data = &t[data_off..data_off + y_len];
         let cb_data = &t[data_off + y_len..data_off + y_len + cb_len];
         let cr_data = &t[data_off + y_len + cb_len..data_off + y_len + cb_len + cr_len];
-        let rgba = decode_tile(y_data, cb_data, cr_data, qget(qy), qget(qcb), qget(qcr), mode);
+        let rgba = decode_tile(
+            y_data,
+            cb_data,
+            cr_data,
+            qget(qy),
+            qget(qcb),
+            qget(qcr),
+            mode,
+        );
         out.push(RfxTile {
             x: x_idx * TILE as u32,
             y: y_idx * TILE as u32,
@@ -616,7 +626,10 @@ mod tests {
         // The reconstruction should be (near) constant across the tile.
         let first = c[0];
         let max_dev = c.iter().map(|&v| (v - first).abs()).max().unwrap();
-        assert!(max_dev <= 1, "flat LL should reconstruct flat (dev {max_dev})");
+        assert!(
+            max_dev <= 1,
+            "flat LL should reconstruct flat (dev {max_dev})"
+        );
     }
 
     #[test]
@@ -649,7 +662,9 @@ mod tests {
             &[0xFF; 7],
             &[0x00; 64],
             &[0xCC, 0xC7, 0xFF, 0xFF, 0xFF, 0x7F], // TILESET header with absurd len
-            &[0xCC, 0xC7, 0x14, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            &[
+                0xCC, 0xC7, 0x14, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            ],
         ];
         for p in patterns {
             let _ = rlgr_decode(p, RlgrMode::Rlgr1, 4096);
@@ -708,7 +723,7 @@ mod tests {
         ctx.push(0); // channelId
         ctx.push(0); // ctxId
         ctx.extend_from_slice(&64u16.to_le_bytes()); // tileSize
-        // properties: entropy bits at [3..5] → 2 = RLGR3, 1 = RLGR1.
+                                                     // properties: entropy bits at [3..5] → 2 = RLGR3, 1 = RLGR1.
         let props: u16 = if rlgr3 { 2 << 3 } else { 1 << 3 };
         ctx.extend_from_slice(&props.to_le_bytes());
         ctx

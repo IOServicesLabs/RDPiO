@@ -59,13 +59,19 @@ impl Default for FeedEntry {
 #[derive(Debug, thiserror::Error)]
 pub enum FeedError {
     #[error("network error fetching feed: {0}")]
-    Network(#[from] ureq::Error),
+    Network(Box<ureq::Error>),
     #[error("I/O error reading feed response: {0}")]
     Io(#[from] std::io::Error),
     #[error("feed parse error: {0}")]
     Parse(String),
     #[error("no hosts found in feed")]
     Empty,
+}
+
+impl From<ureq::Error> for FeedError {
+    fn from(e: ureq::Error) -> Self {
+        FeedError::Network(Box::new(e))
+    }
 }
 
 /// Fetch a feed from `url` and parse every host entry it contains.
@@ -95,25 +101,25 @@ pub fn parse(body: &str) -> Result<Vec<FeedEntry>, FeedError> {
 fn parse_xml(xml: &str) -> Result<Vec<FeedEntry>, FeedError> {
     let mut entries = Vec::new();
     for resource in split_elements(xml, "Resource") {
-        let mut entry = FeedEntry::default();
-        entry.id = text_of(&resource, "ID").unwrap_or_default();
-        entry.display_name = text_of(&resource, "Name").unwrap_or_default();
-        entry.address = text_of(&resource, "HostName")
-            .or_else(|| text_of(&resource, "Address"))
-            .unwrap_or_default();
-        entry.gateway = text_of(&resource, "Gateway");
-        entry.load_balance_info = text_of(&resource, "LoadBalanceInfo").map(|s| s.into_bytes());
-        entry.use_redirection_gateway =
-            text_of(&resource, "UseRedirectionServer").as_deref() == Some("true");
-        entry.rdp_file = text_of(&resource, "RdpFile");
-
-        // W365 / AVD fields may appear in XML feeds too.
-        entry.resource_id = text_of(&resource, "ResourceId").unwrap_or_default();
-        entry.tenant_id = text_of(&resource, "TenantId").unwrap_or_default();
-        entry.session_id = text_of(&resource, "SessionId").unwrap_or_default();
-        entry.gateway_fqdn = text_of(&resource, "GatewayFqdn").unwrap_or_default();
-        entry.use_reverse_connect =
-            text_of(&resource, "UseReverseConnect").as_deref() == Some("true");
+        let mut entry = FeedEntry {
+            id: text_of(&resource, "ID").unwrap_or_default(),
+            display_name: text_of(&resource, "Name").unwrap_or_default(),
+            address: text_of(&resource, "HostName")
+                .or_else(|| text_of(&resource, "Address"))
+                .unwrap_or_default(),
+            gateway: text_of(&resource, "Gateway"),
+            load_balance_info: text_of(&resource, "LoadBalanceInfo").map(|s| s.into_bytes()),
+            use_redirection_gateway: text_of(&resource, "UseRedirectionServer").as_deref()
+                == Some("true"),
+            rdp_file: text_of(&resource, "RdpFile"),
+            // W365 / AVD fields may appear in XML feeds too.
+            resource_id: text_of(&resource, "ResourceId").unwrap_or_default(),
+            tenant_id: text_of(&resource, "TenantId").unwrap_or_default(),
+            session_id: text_of(&resource, "SessionId").unwrap_or_default(),
+            gateway_fqdn: text_of(&resource, "GatewayFqdn").unwrap_or_default(),
+            use_reverse_connect: text_of(&resource, "UseReverseConnect").as_deref() == Some("true"),
+            ..FeedEntry::default()
+        };
 
         let (host, port) = split_host_port(&entry.address, 3389);
         entry.hostname = host;
@@ -145,15 +151,22 @@ fn parse_json(json: &str) -> Result<Vec<FeedEntry>, FeedError> {
         _ => return Err(FeedError::Parse("expected array or object".into())),
     };
     for item in array {
-        let obj = item.as_object().ok_or_else(|| FeedError::Parse("expected object".into()))?;
-        let mut entry = FeedEntry::default();
-        entry.id = string_field(obj, "id");
-        entry.display_name = string_field(obj, "displayName");
-        entry.address = string_field(obj, "address");
+        let obj = item
+            .as_object()
+            .ok_or_else(|| FeedError::Parse("expected object".into()))?;
+        let mut entry = FeedEntry {
+            id: string_field(obj, "id"),
+            display_name: string_field(obj, "displayName"),
+            address: string_field(obj, "address"),
+            ..FeedEntry::default()
+        };
         if entry.address.is_empty() {
             entry.address = string_field(obj, "hostname");
         }
-        entry.gateway = obj.get("gateway").and_then(|v| v.as_str()).map(String::from);
+        entry.gateway = obj
+            .get("gateway")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         entry.load_balance_info = obj
             .get("loadBalanceInfo")
             .and_then(|v| v.as_str())
@@ -162,7 +175,10 @@ fn parse_json(json: &str) -> Result<Vec<FeedEntry>, FeedError> {
             .get("useRedirectionServer")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        entry.rdp_file = obj.get("rdpFile").and_then(|v| v.as_str()).map(String::from);
+        entry.rdp_file = obj
+            .get("rdpFile")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         // W365 / AVD specific fields.
         entry.resource_id = string_field(obj, "resourceId");

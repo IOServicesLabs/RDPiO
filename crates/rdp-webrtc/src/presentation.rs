@@ -60,7 +60,9 @@ pub struct MediaElement {
 impl MediaElement {
     /// A self-view is mirrored (`scaleX(-1)`); remote participants are not.
     pub fn is_mirrored(&self) -> bool {
-        self.transform.as_deref().is_some_and(|t| t.contains("scaleX(-1)"))
+        self.transform
+            .as_deref()
+            .is_some_and(|t| t.contains("scaleX(-1)"))
     }
 }
 
@@ -122,7 +124,9 @@ impl PresentationModel {
             }
             "setAttribute" => {
                 if let (Some(id), Some("srcObject")) = (oid, arg(0).and_then(Value::as_str)) {
-                    if let Some(sid) = arg(1).and_then(|v| v.get("rpcObjectId")).and_then(Value::as_u64)
+                    if let Some(sid) = arg(1)
+                        .and_then(|v| v.get("rpcObjectId"))
+                        .and_then(Value::as_u64)
                     {
                         self.elements.entry(id).or_default().src_stream_id = Some(sid);
                     }
@@ -158,10 +162,15 @@ impl PresentationModel {
             }
             "createMediaStreamTrack" => {
                 if let Some(track_id) = oid {
-                    if let Some(stream_id) =
-                        arg(0).and_then(|v| v.get("mediaStreamRpcObjectId")).and_then(Value::as_u64)
+                    if let Some(stream_id) = arg(0)
+                        .and_then(|v| v.get("mediaStreamRpcObjectId"))
+                        .and_then(Value::as_u64)
                     {
-                        self.streams.entry(stream_id).or_default().tracks.push(track_id);
+                        self.streams
+                            .entry(stream_id)
+                            .or_default()
+                            .tracks
+                            .push(track_id);
                     }
                 }
             }

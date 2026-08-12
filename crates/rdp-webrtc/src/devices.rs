@@ -91,7 +91,10 @@ mod tests {
         let j = d.to_json();
         assert_eq!(j.get("kind").and_then(Value::as_str), Some("audioinput"));
         assert_eq!(j.get("deviceId").and_then(Value::as_str), Some("default"));
-        assert_eq!(j.get("label").and_then(Value::as_str), Some("Default - Mic"));
+        assert_eq!(
+            j.get("label").and_then(Value::as_str),
+            Some("Default - Mic")
+        );
         assert!(j.get("groupId").is_some());
     }
 

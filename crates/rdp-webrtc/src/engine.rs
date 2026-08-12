@@ -175,6 +175,17 @@ impl WebrtcEngine {
     /// `RTCPeerConnection.createPeerConnection` — build the peer connection with
     /// default codecs/interceptors and the session's ICE servers.
     pub async fn create_peer_connection(&mut self, config: &Value) -> Result<()> {
+        // rustls 0.23 needs a process-level CryptoProvider before any DTLS
+        // handshake (webrtc-rs's `dtls` crate builds its rustls configs from the
+        // process default). The workspace compiles BOTH rustls providers —
+        // `aws_lc_rs` via rdp-client's default-features rustls dependency, `ring`
+        // via dtls — so rustls cannot auto-select one and would panic at the
+        // first handshake unless we install one explicitly here. ring is what
+        // webrtc-rs/dtls already use, so it's the natural default. `install_default`
+        // only succeeds once per process; a later Err just means it's already set,
+        // which is exactly what we want.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         // A session may build several peer connections in turn (Teams tears one
         // down and retries). Start each from clean state so stale transceivers /
         // data channels / candidates from the previous one can't leak into it.
@@ -231,24 +242,26 @@ impl WebrtcEngine {
         // Deliver inbound remote media to the sink: on each new track, read its
         // RTP in a background task and forward payloads.
         if let Some(sink) = self.sink.clone() {
-            pc.on_track(Box::new(move |track: Arc<TrackRemote>, _receiver, _transceiver| {
-                let sink = sink.clone();
-                Box::pin(async move {
-                    let id = track.id();
-                    let kind = match track.kind() {
-                        RTPCodecType::Audio => "audio",
-                        RTPCodecType::Video => "video",
-                        _ => "unknown",
-                    };
-                    let codec = track.codec().capability.mime_type;
-                    sink.on_track(&id, kind, &codec);
-                    tokio::spawn(async move {
-                        while let Ok((packet, _)) = track.read_rtp().await {
-                            sink.on_rtp(&id, &packet.payload);
-                        }
-                    });
-                })
-            }));
+            pc.on_track(Box::new(
+                move |track: Arc<TrackRemote>, _receiver, _transceiver| {
+                    let sink = sink.clone();
+                    Box::pin(async move {
+                        let id = track.id();
+                        let kind = match track.kind() {
+                            RTPCodecType::Audio => "audio",
+                            RTPCodecType::Video => "video",
+                            _ => "unknown",
+                        };
+                        let codec = track.codec().capability.mime_type;
+                        sink.on_track(&id, kind, &codec);
+                        tokio::spawn(async move {
+                            while let Ok((packet, _)) = track.read_rtp().await {
+                                sink.on_rtp(&id, &packet.payload);
+                            }
+                        });
+                    })
+                },
+            ));
         }
 
         self.pc = Some(pc);
@@ -368,8 +381,9 @@ impl WebrtcEngine {
             RTCRtpCodecCapability {
                 mime_type: MIME_TYPE_H264.to_owned(),
                 clock_rate: 90000,
-                sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f"
-                    .to_owned(),
+                sdp_fmtp_line:
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f"
+                        .to_owned(),
                 ..Default::default()
             },
             format!("video{sender_id}"),
@@ -411,7 +425,11 @@ impl WebrtcEngine {
             }
             source.stop();
         });
-        tracing::info!(sender_id, source_id, "attached H.264 camera send track to a video sender");
+        tracing::info!(
+            sender_id,
+            source_id,
+            "attached H.264 camera send track to a video sender"
+        );
         Ok(())
     }
 
@@ -457,7 +475,11 @@ impl WebrtcEngine {
         let mut gather_done = pc.gathering_complete_promise().await;
         pc.set_local_description(offer).await?;
         let _ = tokio::time::timeout(Duration::from_secs(4), gather_done.recv()).await;
-        let gathered = pc.local_description().await.map(|d| d.sdp).unwrap_or(offer_sdp);
+        let gathered = pc
+            .local_description()
+            .await
+            .map(|d| d.sdp)
+            .unwrap_or(offer_sdp);
         Ok(gathered)
     }
 
@@ -529,13 +551,19 @@ impl WebrtcEngine {
 
     /// The ICE candidates gathered so far (each a trickle `candidate` object).
     pub fn local_candidates(&self) -> Vec<Value> {
-        self.candidates.lock().map(|c| c.clone()).unwrap_or_default()
+        self.candidates
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default()
     }
 
     /// Take and clear the ICE candidates gathered since the last drain — the
     /// dispatcher turns each into a trickle `icecandidate` event.
     pub fn take_candidates(&mut self) -> Vec<Value> {
-        self.candidates.lock().map(|mut c| std::mem::take(&mut *c)).unwrap_or_default()
+        self.candidates
+            .lock()
+            .map(|mut c| std::mem::take(&mut *c))
+            .unwrap_or_default()
     }
 
     /// The transceivers' post-`setLocalDescription` state: each `rpcObjectId` (as
@@ -552,7 +580,10 @@ impl WebrtcEngine {
                 let mid = t.mid().map(|m| m.to_string());
                 // Order by numeric mid so the list matches the m-line order; a
                 // not-yet-assigned mid sorts last.
-                let order = mid.as_deref().and_then(|m| m.parse::<i64>().ok()).unwrap_or(i64::MAX);
+                let order = mid
+                    .as_deref()
+                    .and_then(|m| m.parse::<i64>().ok())
+                    .unwrap_or(i64::MAX);
                 (
                     order,
                     serde_json::json!({
@@ -627,11 +658,15 @@ impl WebrtcEngine {
 /// register on all directions (`None`) so the recv-only video m-lines carry it too.
 fn register_teams_header_extensions(media: &mut MediaEngine) -> Result<()> {
     use webrtc::rtp_transceiver::rtp_codec::RTCRtpHeaderExtensionCapability;
-    use webrtc::sdp::extmap::{ABS_SEND_TIME_URI, AUDIO_LEVEL_URI, SDES_MID_URI, VIDEO_ORIENTATION_URI};
+    use webrtc::sdp::extmap::{
+        ABS_SEND_TIME_URI, AUDIO_LEVEL_URI, SDES_MID_URI, VIDEO_ORIENTATION_URI,
+    };
 
     let mut register = |uri: &str, typ: RTPCodecType| -> Result<()> {
         media.register_header_extension(
-            RTCRtpHeaderExtensionCapability { uri: uri.to_owned() },
+            RTCRtpHeaderExtensionCapability {
+                uri: uri.to_owned(),
+            },
             typ,
             None,
         )?;
@@ -800,11 +835,22 @@ fn parse_ice_servers(config: &Value) -> Vec<RTCIceServer> {
             urls: s
                 .get("urls")
                 .and_then(|u| u.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
-            username: s.get("username").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            credential: s.get("credential").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            ..Default::default()
+            username: s
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            credential: s
+                .get("credential")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
         })
         .collect()
 }
@@ -827,8 +873,14 @@ mod tests {
             .create_peer_connection(&serde_json::json!({ "iceServers": [] }))
             .await
             .expect("create pc");
-        engine.add_transceiver("audio", "sendrecv", 1, 101, false).await.expect("audio");
-        engine.add_transceiver("video", "sendrecv", 2, 102, false).await.expect("video");
+        engine
+            .add_transceiver("audio", "sendrecv", 1, 101, false)
+            .await
+            .expect("audio");
+        engine
+            .add_transceiver("video", "sendrecv", 2, 102, false)
+            .await
+            .expect("video");
         let offer = engine.create_offer().await.expect("offer");
         assert!(offer.starts_with("v=0"), "not SDP");
         assert!(offer.contains("m=audio"), "no audio m-line");
@@ -850,20 +902,32 @@ mod tests {
             .create_peer_connection(&serde_json::json!({ "iceServers": [] }))
             .await
             .expect("create pc");
-        engine.add_transceiver("audio", "sendrecv", 1, 101, false).await.expect("audio");
-        engine.add_transceiver("video", "sendrecv", 2, 102, false).await.expect("video");
+        engine
+            .add_transceiver("audio", "sendrecv", 1, 101, false)
+            .await
+            .expect("audio");
+        engine
+            .add_transceiver("video", "sendrecv", 2, 102, false)
+            .await
+            .expect("video");
         let offer = engine.create_offer().await.expect("offer");
 
         // Direction honored: the audio m-line is sendrecv (not downgraded).
         let audio_block = offer.split("m=video").next().unwrap_or(&offer);
-        assert!(audio_block.contains("a=sendrecv"), "audio m-line lost its sendrecv direction:\n{offer}");
-        // But no send track was attached, so there is no outbound ssrc/msid anywhere.
-        assert!(!offer.contains("a=ssrc:"), "offer has a phantom send track (a=ssrc):\n{offer}");
         assert!(
-            engine.transceiver_states().iter().any(|t| t
-                .get("direction")
-                .and_then(Value::as_str)
-                == Some("sendrecv")),
+            audio_block.contains("a=sendrecv"),
+            "audio m-line lost its sendrecv direction:\n{offer}"
+        );
+        // But no send track was attached, so there is no outbound ssrc/msid anywhere.
+        assert!(
+            !offer.contains("a=ssrc:"),
+            "offer has a phantom send track (a=ssrc):\n{offer}"
+        );
+        assert!(
+            engine
+                .transceiver_states()
+                .iter()
+                .any(|t| t.get("direction").and_then(Value::as_str) == Some("sendrecv")),
             "no sendrecv transceiver reported"
         );
     }
@@ -881,9 +945,18 @@ mod tests {
             .create_peer_connection(&serde_json::json!({ "iceServers": [] }))
             .await
             .expect("create pc");
-        engine.add_transceiver("audio", "sendrecv", 1, 101, false).await.expect("audio");
-        engine.add_transceiver("video", "sendrecv", 2, 102, false).await.expect("video");
-        engine.add_transceiver("video", "recvonly", 3, 103, false).await.expect("video recvonly");
+        engine
+            .add_transceiver("audio", "sendrecv", 1, 101, false)
+            .await
+            .expect("audio");
+        engine
+            .add_transceiver("video", "sendrecv", 2, 102, false)
+            .await
+            .expect("video");
+        engine
+            .add_transceiver("video", "recvonly", 3, 103, false)
+            .await
+            .expect("video recvonly");
         let offer = engine.create_offer().await.expect("offer");
 
         let mid_lines = offer
@@ -891,7 +964,10 @@ mod tests {
             .filter(|l| l.contains("urn:ietf:params:rtp-hdrext:sdes:mid"))
             .count();
         // One per m-line (audio + 2 video) — the recv-only line needs it too.
-        assert!(mid_lines >= 3, "sdes:mid not advertised on every m-line: {mid_lines} lines\n{offer}");
+        assert!(
+            mid_lines >= 3,
+            "sdes:mid not advertised on every m-line: {mid_lines} lines\n{offer}"
+        );
 
         // The video header extensions Plaza gates acceptance on (see
         // register_teams_header_extensions): each appears on both video m-lines.
@@ -900,7 +976,10 @@ mod tests {
             "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id",
         ] {
             let n = offer.lines().filter(|l| l.contains(uri)).count();
-            assert!(n >= 2, "{uri} not advertised on every video m-line: {n}\n{offer}");
+            assert!(
+                n >= 2,
+                "{uri} not advertised on every video m-line: {n}\n{offer}"
+            );
         }
     }
 
@@ -917,13 +996,28 @@ mod tests {
             .await
             .expect("create pc");
         // Same order Teams uses: data channel first, then the media transceivers.
-        engine.create_data_channel("main-channel", 12).await.expect("data channel");
-        engine.add_transceiver("audio", "sendrecv", 1, 101, false).await.expect("audio");
-        engine.add_transceiver("video", "recvonly", 2, 102, false).await.expect("video");
+        engine
+            .create_data_channel("main-channel", 12)
+            .await
+            .expect("data channel");
+        engine
+            .add_transceiver("audio", "sendrecv", 1, 101, false)
+            .await
+            .expect("audio");
+        engine
+            .add_transceiver("video", "recvonly", 2, 102, false)
+            .await
+            .expect("video");
 
         let offer = engine.create_offer().await.expect("offer");
-        assert!(offer.contains("m=application"), "offer lacks the data-channel m-line");
-        assert!(offer.contains("webrtc-datachannel"), "offer lacks webrtc-datachannel");
+        assert!(
+            offer.contains("m=application"),
+            "offer lacks the data-channel m-line"
+        );
+        assert!(
+            offer.contains("webrtc-datachannel"),
+            "offer lacks webrtc-datachannel"
+        );
         assert!(offer.contains("m=audio"), "offer lacks audio");
         assert!(offer.contains("m=video"), "offer lacks video");
     }
@@ -937,13 +1031,16 @@ mod tests {
     }
     impl VideoCaptureSource for TestCamera {
         fn start(&self, _source_id: &str) -> bool {
-            self.started.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             true
         }
         fn poll_frame(&self) -> Option<Vec<u8>> {
             // Start code + a tiny NAL so webrtc-rs's H.264 payloader has something to
             // packetize.
-            Some(vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f, 0xab, 0xcd])
+            Some(vec![
+                0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f, 0xab, 0xcd,
+            ])
         }
         fn stop(&self) {}
     }
@@ -968,29 +1065,50 @@ mod tests {
             .create_peer_connection(&serde_json::json!({ "iceServers": [] }))
             .await
             .expect("create pc");
-        engine.add_transceiver("audio", "sendrecv", 1, 101, false).await.expect("audio");
+        engine
+            .add_transceiver("audio", "sendrecv", 1, 101, false)
+            .await
+            .expect("audio");
         // Even with `sendEncodings` (wants_send = true), the camera transceiver is
         // created receive-only.
-        engine.add_transceiver("video", "sendrecv", 2, 102, true).await.expect("video");
+        engine
+            .add_transceiver("video", "sendrecv", 2, 102, true)
+            .await
+            .expect("video");
         // Teams also flips it via setDirection — which must stay clamped to recvonly.
-        engine.set_transceiver_direction(2, "sendrecv").await.expect("setDirection");
+        engine
+            .set_transceiver_direction(2, "sendrecv")
+            .await
+            .expect("setDirection");
 
-        engine.replace_track(102, "rdpio-videoinput-0").await.expect("replaceTrack");
+        engine
+            .replace_track(102, "rdpio-videoinput-0")
+            .await
+            .expect("replaceTrack");
         assert!(
             !cam.started.load(std::sync::atomic::Ordering::SeqCst),
             "camera source must NOT start — camera send is disabled"
         );
 
-        let after = engine.create_offer().await.expect("offer after replaceTrack");
+        let after = engine
+            .create_offer()
+            .await
+            .expect("offer after replaceTrack");
         // Video stays receive-only: no send stream (`a=ssrc`) on the video m-line.
         let video_block = after.split("m=video").nth(1).unwrap_or("");
         assert!(
             !video_block.contains("a=ssrc:"),
             "video m-line must have no send config (camera send disabled):\n{after}"
         );
-        assert!(video_block.contains("a=recvonly"), "video m-line must be recvonly:\n{after}");
+        assert!(
+            video_block.contains("a=recvonly"),
+            "video m-line must be recvonly:\n{after}"
+        );
         // Audio is unaffected — it still honors Teams' sendrecv request.
-        assert!(after.contains("H264"), "offer lost H264 (recv codecs):\n{after}");
+        assert!(
+            after.contains("H264"),
+            "offer lost H264 (recv codecs):\n{after}"
+        );
     }
 
     /// A `replaceTrack` on an unknown sender, or with no camera source configured, must
@@ -1003,13 +1121,22 @@ mod tests {
             .create_peer_connection(&serde_json::json!({ "iceServers": [] }))
             .await
             .expect("create pc");
-        engine.add_transceiver("video", "sendrecv", 2, 102, false).await.expect("video");
+        engine
+            .add_transceiver("video", "sendrecv", 2, 102, false)
+            .await
+            .expect("video");
         // No source configured → Ok, no send config appears.
         engine.replace_track(102, "cam").await.expect("noop ok");
         // Unknown sender id → Ok.
-        engine.replace_track(999, "cam").await.expect("unknown sender ok");
+        engine
+            .replace_track(999, "cam")
+            .await
+            .expect("unknown sender ok");
         let offer = engine.create_offer().await.expect("offer");
-        assert!(!offer.contains("a=ssrc:"), "send config appeared without a source:\n{offer}");
+        assert!(
+            !offer.contains("a=ssrc:"),
+            "send config appeared without a source:\n{offer}"
+        );
     }
 
     /// End-to-end media path: a raw webrtc-rs peer sends a VP8 track to our
@@ -1062,9 +1189,16 @@ mod tests {
             .with_media_engine(media)
             .with_interceptor_registry(registry)
             .build();
-        let send_pc = Arc::new(api.new_peer_connection(RTCConfiguration::default()).await.unwrap());
+        let send_pc = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
         let track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability { mime_type: MIME_TYPE_VP8.to_owned(), ..Default::default() },
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_VP8.to_owned(),
+                ..Default::default()
+            },
             "video".to_owned(),
             "loopback".to_owned(),
         ));
@@ -1082,7 +1216,9 @@ mod tests {
         }
         let offer_sdp = send_pc.local_description().await.unwrap().sdp;
 
-        recv.set_remote_offer(&offer_sdp).await.expect("recv accepts offer");
+        recv.set_remote_offer(&offer_sdp)
+            .await
+            .expect("recv accepts offer");
         recv.create_and_set_answer().await.expect("answer");
         recv.wait_ice_gathering().await.unwrap();
         let answer_sdp = recv.local_description().await.expect("recv local desc");
@@ -1119,7 +1255,10 @@ mod tests {
         }
         writer.abort();
 
-        assert!(sink.tracks.load(Ordering::SeqCst) >= 1, "on_track never fired");
+        assert!(
+            sink.tracks.load(Ordering::SeqCst) >= 1,
+            "on_track never fired"
+        );
         assert!(got_media, "no RTP packets reached the sink");
     }
 }

@@ -123,7 +123,10 @@ mod tests {
         );
         // Key longer than the 64-byte block (hashed down first).
         assert_eq!(
-            hex(&hmac_md5(&[0xaa; 80], b"Test Using Larger Than Block-Size Key - Hash Key First")),
+            hex(&hmac_md5(
+                &[0xaa; 80],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
             "6b1ab7fe4bd7bf8f0b62e6ce61b9d0cd"
         );
     }

@@ -51,10 +51,8 @@ fn yuv_to_rgba_4x(y: i32x4, u: i32x4, v: i32x4) -> [u8; 16] {
     let [g0, g1, g2, g3] = g.to_array();
     let [b0, b1, b2, b3] = b.to_array();
     [
-        r0 as u8, g0 as u8, b0 as u8, 0xFF,
-        r1 as u8, g1 as u8, b1 as u8, 0xFF,
-        r2 as u8, g2 as u8, b2 as u8, 0xFF,
-        r3 as u8, g3 as u8, b3 as u8, 0xFF,
+        r0 as u8, g0 as u8, b0 as u8, 0xFF, r1 as u8, g1 as u8, b1 as u8, 0xFF, r2 as u8, g2 as u8,
+        b2 as u8, 0xFF, r3 as u8, g3 as u8, b3 as u8, 0xFF,
     ]
 }
 

@@ -128,7 +128,12 @@ mod tests {
         let parsed = parse(&pdu).unwrap();
         assert_eq!(parsed.action, ACTION_CREATE_REQUEST);
         assert_eq!(
-            u32::from_le_bytes([parsed.payload[0], parsed.payload[1], parsed.payload[2], parsed.payload[3]]),
+            u32::from_le_bytes([
+                parsed.payload[0],
+                parsed.payload[1],
+                parsed.payload[2],
+                parsed.payload[3]
+            ]),
             0xDEAD_BEEF
         );
         assert_eq!(&parsed.payload[4..20], &cookie);

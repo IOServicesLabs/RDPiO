@@ -61,13 +61,7 @@ fn nonce32() -> [u8; 32] {
     let mut out = [0u8; 32];
     // windows 0.62 takes the algorithm handle as `Option`; `None` selects the
     // system-preferred RNG (paired with BCRYPT_USE_SYSTEM_PREFERRED_RNG).
-    let status = unsafe {
-        BCryptGenRandom(
-            None,
-            &mut out,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
+    let status = unsafe { BCryptGenRandom(None, &mut out, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
     if status.0 == 0 {
         return out;
     }
@@ -253,7 +247,11 @@ pub fn authenticate<S: Read + Write>(
     password: &str,
 ) -> Result<(), NlaError> {
     let public_key = crate::x509::extract_public_key(server_cert_der)?;
-    tracing::info!(spn, public_key_len = public_key.len(), "starting CredSSP/NLA");
+    tracing::info!(
+        spn,
+        public_key_len = public_key.len(),
+        "starting CredSSP/NLA"
+    );
 
     unsafe {
         // 1) Negotiate credentials carrying the user's identity.

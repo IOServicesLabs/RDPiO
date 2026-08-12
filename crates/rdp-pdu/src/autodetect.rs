@@ -55,7 +55,11 @@ pub enum AutoDetectRequest {
     BandwidthPayload { sequence: u16, payload_len: u16 },
     /// Bandwidth measurement stop: add the trailing payload, then report results.
     /// `connect_time` selects the response's `responseType`.
-    BandwidthStop { sequence: u16, payload_len: u16, connect_time: bool },
+    BandwidthStop {
+        sequence: u16,
+        payload_len: u16,
+        connect_time: bool,
+    },
     /// Network characteristics result (server's verdict): informational, no reply.
     /// `average_rtt_us` and `bandwidth` are present only when the corresponding
     /// bits are set in the requestType (BASE_AVG, BW_AVG, ALL).
@@ -115,13 +119,22 @@ pub fn parse_request(pdu: &[u8]) -> Option<AutoDetectRequest> {
         BW_START_CONNECTTIME | BW_START_CONTINUOUS | BW_START_TUNNEL => {
             AutoDetectRequest::BandwidthStart { sequence }
         }
-        BW_PAYLOAD => AutoDetectRequest::BandwidthPayload { sequence, payload_len },
-        BW_STOP_CONNECTTIME => {
-            AutoDetectRequest::BandwidthStop { sequence, payload_len, connect_time: true }
-        }
+        BW_PAYLOAD => AutoDetectRequest::BandwidthPayload {
+            sequence,
+            payload_len,
+        },
+        BW_STOP_CONNECTTIME => AutoDetectRequest::BandwidthStop {
+            sequence,
+            payload_len,
+            connect_time: true,
+        },
         BW_STOP_CONTINUOUS | BW_STOP_TUNNEL => {
             // Continuous/tunnel stop carries no trailing payload.
-            AutoDetectRequest::BandwidthStop { sequence, payload_len: 0, connect_time: false }
+            AutoDetectRequest::BandwidthStop {
+                sequence,
+                payload_len: 0,
+                connect_time: false,
+            }
         }
         NETCHAR_RESULT_BASE_AVG | NETCHAR_RESULT_BW_AVG | NETCHAR_RESULT_ALL => {
             // Payload follows the 6-byte detection header (offset 10 from the start
@@ -193,8 +206,17 @@ pub fn rtt_response(sequence: u16) -> Vec<u8> {
 /// `time_delta_ms` elapsed and `byte_count` bytes received between the matching
 /// Start and Stop. `connect_time` selects the `responseType` (it must mirror the
 /// Stop request that triggered it). Returns the full I/O-channel payload.
-pub fn bandwidth_results(sequence: u16, connect_time: bool, time_delta_ms: u32, byte_count: u32) -> Vec<u8> {
-    let response_type = if connect_time { BW_RESULTS_CONNECTTIME } else { BW_RESULTS_CONTINUOUS };
+pub fn bandwidth_results(
+    sequence: u16,
+    connect_time: bool,
+    time_delta_ms: u32,
+    byte_count: u32,
+) -> Vec<u8> {
+    let response_type = if connect_time {
+        BW_RESULTS_CONNECTTIME
+    } else {
+        BW_RESULTS_CONTINUOUS
+    };
     let mut out = Vec::with_capacity(18);
     response_header(&mut out);
     out.push(0x0E); // headerLength
@@ -279,32 +301,42 @@ mod tests {
         // payloadLength = 512 at offset 10.
         assert_eq!(
             parse_request(&req(BW_PAYLOAD, 2, &512u16.to_le_bytes())),
-            Some(AutoDetectRequest::BandwidthPayload { sequence: 2, payload_len: 512 })
+            Some(AutoDetectRequest::BandwidthPayload {
+                sequence: 2,
+                payload_len: 512
+            })
         );
         // Connect-time stop carries a trailing payloadLength; continuous does not.
         assert_eq!(
             parse_request(&req(BW_STOP_CONNECTTIME, 3, &16u16.to_le_bytes())),
-            Some(AutoDetectRequest::BandwidthStop { sequence: 3, payload_len: 16, connect_time: true })
+            Some(AutoDetectRequest::BandwidthStop {
+                sequence: 3,
+                payload_len: 16,
+                connect_time: true
+            })
         );
         assert_eq!(
             parse_request(&req(BW_STOP_CONTINUOUS, 4, &[])),
-            Some(AutoDetectRequest::BandwidthStop { sequence: 4, payload_len: 0, connect_time: false })
+            Some(AutoDetectRequest::BandwidthStop {
+                sequence: 4,
+                payload_len: 0,
+                connect_time: false
+            })
         );
     }
 
     #[test]
     fn parses_netchar_result() {
         assert_eq!(
-            parse_request(&req(NETCHAR_RESULT_ALL, 9, &[0u8; 12]))
-                .and_then(|r| match r {
-                    AutoDetectRequest::NetCharResult {
-                        sequence,
-                        base_rtt_us,
-                        bandwidth,
-                        average_rtt_us,
-                    } => Some((sequence, base_rtt_us, bandwidth, average_rtt_us)),
-                    _ => None,
-                }),
+            parse_request(&req(NETCHAR_RESULT_ALL, 9, &[0u8; 12])).and_then(|r| match r {
+                AutoDetectRequest::NetCharResult {
+                    sequence,
+                    base_rtt_us,
+                    bandwidth,
+                    average_rtt_us,
+                } => Some((sequence, base_rtt_us, bandwidth, average_rtt_us)),
+                _ => None,
+            }),
             Some((9, Some(0), Some(0), Some(0)))
         );
     }
@@ -313,7 +345,9 @@ mod tests {
     fn rejects_non_autodetect() {
         // A Share Control Header for a Data PDU: totalLength then pduType=0x17.
         // flagsHi (bytes 2..4) would be the non-zero pduType → rejected.
-        let share = [0x1C, 0x10, 0x17, 0x00, 0xEA, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let share = [
+            0x1C, 0x10, 0x17, 0x00, 0xEA, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
         assert_eq!(parse_request(&share), None);
         // Missing the autodetect flag.
         let mut no_flag = req(RTT_REQUEST_CONTINUOUS, 1, &[]);

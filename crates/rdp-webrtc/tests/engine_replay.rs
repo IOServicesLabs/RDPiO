@@ -65,14 +65,20 @@ fn extract() -> Inputs {
                             .and_then(Value::as_str)
                             .unwrap_or("inactive")
                             .to_string();
-                        let id = a0.get("transceiverRpcObjectId").and_then(Value::as_u64).unwrap_or(0);
+                        let id = a0
+                            .get("transceiverRpcObjectId")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
                         transceivers.push((kind.to_string(), dir, id));
                     }
                 }
             }
             "setDirection" => {
                 let id = v.get("rpcObjectId").and_then(Value::as_u64).unwrap_or(0);
-                if let Some(d) = arg0.and_then(|a| a.get("direction")).and_then(Value::as_str) {
+                if let Some(d) = arg0
+                    .and_then(|a| a.get("direction"))
+                    .and_then(Value::as_str)
+                {
                     directions.push((id, d.to_string()));
                 }
             }
@@ -94,14 +100,24 @@ fn extract() -> Inputs {
             (v.get("result"), v.get("rpcCallId").and_then(Value::as_u64))
         {
             if offer_call_ids.contains(&cid) {
-                if let Some(sdp) = result.get("desc").and_then(|d| d.get("sdp")).and_then(Value::as_str) {
+                if let Some(sdp) = result
+                    .get("desc")
+                    .and_then(|d| d.get("sdp"))
+                    .and_then(Value::as_str)
+                {
                     offer_sdp = Some(sdp.to_string());
                 }
             }
         }
     }
 
-    Inputs { config, transceivers, directions, offer_sdp, answer_sdp }
+    Inputs {
+        config,
+        transceivers,
+        directions,
+        offer_sdp,
+        answer_sdp,
+    }
 }
 
 fn mline_count(sdp: &str) -> usize {
@@ -111,10 +127,16 @@ fn mline_count(sdp: &str) -> usize {
 #[tokio::test]
 async fn engine_regenerates_a_teams_style_offer() {
     let inp = extract();
-    assert!(!inp.transceivers.is_empty(), "no transceivers extracted from capture");
+    assert!(
+        !inp.transceivers.is_empty(),
+        "no transceivers extracted from capture"
+    );
 
     let mut engine = WebrtcEngine::new();
-    engine.create_peer_connection(&inp.config).await.expect("create pc with Teams ICE config");
+    engine
+        .create_peer_connection(&inp.config)
+        .await
+        .expect("create pc with Teams ICE config");
     for (kind, dir, id) in &inp.transceivers {
         // Synthesize a distinct sender object id (the replay only exercises the offer
         // shape, not `replaceTrack`, so the exact value is irrelevant as long as it's
@@ -122,7 +144,9 @@ async fn engine_regenerates_a_teams_style_offer() {
         engine
             .add_transceiver(kind, dir, *id, *id + 100_000, false)
             .await
-            .unwrap_or_else(|e| panic!("add_transceiver(kind={kind}, dir={dir}, id={id}) failed: {e:?}"));
+            .unwrap_or_else(|e| {
+                panic!("add_transceiver(kind={kind}, dir={dir}, id={id}) failed: {e:?}")
+            });
     }
     for (id, dir) in &inp.directions {
         let _ = engine.set_transceiver_direction(*id, dir).await;
@@ -140,13 +164,19 @@ async fn engine_regenerates_a_teams_style_offer() {
     assert!(offer.contains("m=video"), "no video m-line");
     let low = offer.to_lowercase();
     for codec in ["opus", "vp8", "h264"] {
-        assert!(low.contains(codec), "offer is missing {codec} (Teams needs it)");
+        assert!(
+            low.contains(codec),
+            "offer is missing {codec} (Teams needs it)"
+        );
     }
     assert!(offer.contains("a=ice-ufrag:"), "no ICE ufrag");
     assert!(offer.contains("a=fingerprint:"), "no DTLS fingerprint");
 
     // The offer applies cleanly to our own peer connection.
-    engine.set_local_offer(&offer).await.expect("set local offer");
+    engine
+        .set_local_offer(&offer)
+        .await
+        .expect("set local offer");
 }
 
 #[tokio::test]
@@ -158,7 +188,10 @@ async fn engine_answers_teams_real_offer() {
     assert!(teams_offer.len() > 10_000, "expected the large real offer");
 
     let mut engine = WebrtcEngine::new();
-    engine.create_peer_connection(&inp.config).await.expect("create pc");
+    engine
+        .create_peer_connection(&inp.config)
+        .await
+        .expect("create pc");
     engine
         .set_remote_offer(&teams_offer)
         .await
@@ -171,7 +204,13 @@ async fn engine_answers_teams_real_offer() {
         mline_count(&teams_offer),
         "answer must mirror the offer's m-lines"
     );
-    assert!(answer.to_lowercase().contains("opus"), "answer negotiated no opus");
+    assert!(
+        answer.to_lowercase().contains("opus"),
+        "answer negotiated no opus"
+    );
     // The captured answer exists too — sanity that we parsed the pair.
-    assert!(inp.answer_sdp.is_some(), "capture also contained Teams' answer");
+    assert!(
+        inp.answer_sdp.is_some(),
+        "capture also contained Teams' answer"
+    );
 }

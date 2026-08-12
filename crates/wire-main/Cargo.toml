@@ -1,0 +1,14 @@
+[package]
+name = "wire-main"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RDP wire transport, from-scratch PDU codec, and connection sequence"
+
+[dependencies]
+# In-workspace crates only: crypto primitives for Standard RDP Security.
+# The PDU codec and connection sequence are implemented from scratch here.
+rdp-crypto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

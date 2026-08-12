@@ -581,8 +581,8 @@ mod tests {
     fn data_is_delivered_and_acked() {
         let (mut conn, _) = Connection::connect(1, 64, false);
         conn.on_receive(&syn_ack(10)); // establish
-        // A realistic DATA datagram: FEC header (DATA only, no ACK) + source
-        // payload header (snCoded, snSourceStart) + the payload.
+                                       // A realistic DATA datagram: FEC header (DATA only, no ACK) + source
+                                       // payload header (snCoded, snSourceStart) + the payload.
         let mut dg = Vec::new();
         FecHeader {
             sn_source_ack: 1,
@@ -621,7 +621,7 @@ mod tests {
     fn unacked_data_is_buffered_then_pruned_by_ack() {
         let (mut conn, _) = Connection::connect(100, 64, false);
         conn.on_receive(&syn_ack(10)); // establish; send_seq=100
-        // Send three DATA datagrams → seqs 101,102,103 buffered.
+                                       // Send three DATA datagrams → seqs 101,102,103 buffered.
         conn.build_data(&[1]);
         conn.build_data(&[2]);
         conn.build_data(&[3]);
@@ -707,7 +707,7 @@ mod tests {
         let (received, lost) = conn.loss_stats();
         assert_eq!(received, 3);
         assert_eq!(lost, 1); // the gap at seq 13
-        // The retransmitted 13 arrives: 13 and the held 14 deliver in order.
+                             // The retransmitted 13 arrives: 13 and the held 14 deliver in order.
         let d = conn.on_receive(&data_datagram(13, &[0xCC]));
         assert_eq!(delivered(&d), vec![vec![0xCC], vec![0xDD]]);
         assert_eq!(ack_point(&d), Some(14));

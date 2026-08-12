@@ -121,7 +121,11 @@ fn build_temp(timestamp: &[u8; 8], client_challenge: &[u8; 8], target_info: &[u8
 
 /// From `NTOWFv2`, the 8-byte server challenge and the `temp` blob, derive the
 /// NTProofStr and the NTLMv2 session base key (MS-NLMP 3.3.2 / 3.4).
-fn ntlmv2_response(ntowf: &[u8; 16], server_challenge: &[u8; 8], temp: &[u8]) -> ([u8; 16], [u8; 16]) {
+fn ntlmv2_response(
+    ntowf: &[u8; 16],
+    server_challenge: &[u8; 8],
+    temp: &[u8],
+) -> ([u8; 16], [u8; 16]) {
     let mut buf = Vec::with_capacity(8 + temp.len());
     buf.extend_from_slice(server_challenge);
     buf.extend_from_slice(temp);
@@ -142,7 +146,12 @@ fn derive_key(exported_session_key: &[u8; 16], magic: &[u8]) -> [u8; 16] {
 /// Seal `plaintext` into the CredSSP wire layout `[signature(16)][ciphertext]`.
 /// `seal_rc4` is the *persistent* RC4 handle for this direction (its stream must
 /// continue across successive messages); `seq` is the message sequence number.
-fn ntlm_seal(signing_key: &[u8; 16], seal_rc4: &mut Rc4, plaintext: &[u8], seq_num: u32) -> Vec<u8> {
+fn ntlm_seal(
+    signing_key: &[u8; 16],
+    seal_rc4: &mut Rc4,
+    plaintext: &[u8],
+    seq_num: u32,
+) -> Vec<u8> {
     // checksum = HMAC-MD5(SigningKey, seq || plaintext)[0..8]  (over the plaintext)
     let mut to_sign = Vec::with_capacity(4 + plaintext.len());
     to_sign.extend_from_slice(&seq_num.to_le_bytes());
@@ -216,7 +225,12 @@ impl MessageCrypto {
     }
 
     fn seal(&mut self, plaintext: &[u8], seq_num: u32) -> Vec<u8> {
-        ntlm_seal(&self.client_signing, &mut self.client_seal, plaintext, seq_num)
+        ntlm_seal(
+            &self.client_signing,
+            &mut self.client_seal,
+            plaintext,
+            seq_num,
+        )
     }
 
     fn unseal(&mut self, blob: &[u8], seq_num: u32) -> Result<Vec<u8>, NlaError> {
@@ -333,7 +347,10 @@ fn response_target_info(server_target_info: &[u8]) -> (Vec<u8>, [u8; 8]) {
         flags |= MSV_AV_FLAGS_MIC_PRESENT;
         *val = flags.to_le_bytes().to_vec();
     } else {
-        pairs.push((MSV_AV_FLAGS, MSV_AV_FLAGS_MIC_PRESENT.to_le_bytes().to_vec()));
+        pairs.push((
+            MSV_AV_FLAGS,
+            MSV_AV_FLAGS_MIC_PRESENT.to_le_bytes().to_vec(),
+        ));
     }
 
     (serialize_av_pairs(&pairs), timestamp)
@@ -494,8 +511,7 @@ pub fn authenticate<S: Read + Write>(
     let mut client_challenge = [0u8; 8];
     os_random(&mut client_challenge)?;
     let temp = build_temp(&timestamp, &client_challenge, &response_ti);
-    let (nt_proof, session_base_key) =
-        ntlmv2_response(&ntowf, &challenge.server_challenge, &temp);
+    let (nt_proof, session_base_key) = ntlmv2_response(&ntowf, &challenge.server_challenge, &temp);
 
     let mut nt_response = Vec::with_capacity(16 + temp.len());
     nt_response.extend_from_slice(&nt_proof);

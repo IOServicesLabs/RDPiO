@@ -23,32 +23,31 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_DESCRIPTOR_RANGE, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
     D3D12_FENCE_FLAG_NONE, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
     D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-    D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DESC,
+    D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
-    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
-    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_GENERIC_READ,
-    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_TRANSITION_BARRIER,
-    D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER,
-    D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR_TABLE,
+    D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
     D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, D3D12_ROOT_SIGNATURE_DESC,
     D3D12_ROOT_SIGNATURE_FLAG_NONE, D3D12_SHADER_BYTECODE, D3D12_SHADER_RESOURCE_VIEW_DESC,
     D3D12_SHADER_RESOURCE_VIEW_DESC_0, D3D12_SRV_DIMENSION_BUFFER, D3D12_SUBRESOURCE_FOOTPRINT,
     D3D12_TEX2D_UAV, D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
     D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-    D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_TEXTURE_LAYOUT_UNKNOWN,
-    D3D12_UNORDERED_ACCESS_VIEW_DESC, D3D12_UNORDERED_ACCESS_VIEW_DESC_0,
-    D3D12_UAV_DIMENSION_BUFFER, D3D12_UAV_DIMENSION_TEXTURE2D, D3D12_VIEWPORT,
+    D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_UAV_DIMENSION_BUFFER,
+    D3D12_UAV_DIMENSION_TEXTURE2D, D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    D3D12_UNORDERED_ACCESS_VIEW_DESC_0, D3D12_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_UNSPECIFIED, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM,
     DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory2, IDXGISwapChain3,
-    DXGI_CREATE_FACTORY_FLAGS, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, DXGI_PRESENT,
-    DXGI_PRESENT_ALLOW_TEARING, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory2, IDXGISwapChain3, DXGI_CREATE_FACTORY_FLAGS,
+    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING,
+    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
     DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
@@ -476,7 +475,10 @@ impl D3D12Renderer {
                     Height: height,
                     Format: DXGI_FORMAT_R8G8B8A8_UNORM,
                     Stereo: false.into(),
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
                     BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                     BufferCount: 2,
                     Scaling: DXGI_SCALING_STRETCH,
@@ -484,12 +486,7 @@ impl D3D12Renderer {
                     AlphaMode: DXGI_ALPHA_MODE_UNSPECIFIED,
                     Flags: flags,
                 };
-                factory.CreateSwapChainForHwnd(&queue,
-                    hwnd,
-                    &desc,
-                    None,
-                    None,
-                )
+                factory.CreateSwapChainForHwnd(&queue, hwnd, &desc, None, None)
             };
             let (swap_chain1, sc_flags, tearing) = match make(waitable | tearing_flag) {
                 Ok(s) => (s, waitable | tearing_flag, true),
@@ -509,12 +506,8 @@ impl D3D12Renderer {
             }
 
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-            let fence_event = windows::Win32::System::Threading::CreateEventA(
-                None,
-                false,
-                false,
-                None,
-            )?;
+            let fence_event =
+                windows::Win32::System::Threading::CreateEventA(None, false, false, None)?;
 
             let (root_signature, pso) = Self::create_compute_pipeline(&device)?;
             let (descriptor_heap, descriptor_size) = Self::create_descriptor_heap(&device)?;
@@ -580,7 +573,9 @@ impl D3D12Renderer {
 
     fn high_performance_adapter(factory: &IDXGIFactory2) -> Option<IDXGIAdapter1> {
         unsafe {
-            let factory6 = factory.cast::<windows::Win32::Graphics::Dxgi::IDXGIFactory6>().ok()?;
+            let factory6 = factory
+                .cast::<windows::Win32::Graphics::Dxgi::IDXGIFactory6>()
+                .ok()?;
             let adapter: IDXGIAdapter1 = factory6
                 .EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
                 .ok()?;
@@ -597,20 +592,24 @@ impl D3D12Renderer {
         }
     }
 
-    fn create_compute_pipeline(device: &ID3D12Device) -> WinResult<(ID3D12RootSignature, ID3D12PipelineState)> {
+    fn create_compute_pipeline(
+        device: &ID3D12Device,
+    ) -> WinResult<(ID3D12RootSignature, ID3D12PipelineState)> {
         unsafe {
             // Root signature: constants (b0), SRV descriptor table (t0), UAV
             // descriptor table (u0).
             let ranges = [
                 windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_RANGE {
-                    RangeType: windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                    RangeType:
+                        windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
                     NumDescriptors: 1,
                     BaseShaderRegister: 0,
                     RegisterSpace: 0,
                     OffsetInDescriptorsFromTableStart: 0,
                 },
                 windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_RANGE {
-                    RangeType: windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                    RangeType:
+                        windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
                     NumDescriptors: 1,
                     BaseShaderRegister: 0,
                     RegisterSpace: 0,
@@ -627,17 +626,20 @@ impl D3D12Renderer {
                             Num32BitValues: 10,
                         },
                     },
-                    ShaderVisibility: windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_ALL,
+                    ShaderVisibility:
+                        windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_ALL,
                 },
                 D3D12_ROOT_PARAMETER {
                     ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
                     Anonymous: windows::Win32::Graphics::Direct3D12::D3D12_ROOT_PARAMETER_0 {
-                        DescriptorTable: windows::Win32::Graphics::Direct3D12::D3D12_ROOT_DESCRIPTOR_TABLE {
-                            NumDescriptorRanges: ranges.len() as u32,
-                            pDescriptorRanges: ranges.as_ptr(),
-                        },
+                        DescriptorTable:
+                            windows::Win32::Graphics::Direct3D12::D3D12_ROOT_DESCRIPTOR_TABLE {
+                                NumDescriptorRanges: ranges.len() as u32,
+                                pDescriptorRanges: ranges.as_ptr(),
+                            },
                     },
-                    ShaderVisibility: windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_ALL,
+                    ShaderVisibility:
+                        windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_ALL,
                 },
             ];
             let desc = D3D12_ROOT_SIGNATURE_DESC {
@@ -675,14 +677,15 @@ impl D3D12Renderer {
                 cs_blob.GetBufferPointer() as *const u8,
                 cs_blob.GetBufferSize(),
             );
-            let pso_desc = windows::Win32::Graphics::Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: core::mem::ManuallyDrop::new(Some(root_signature.clone())),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: cs_bytes.as_ptr() as *const _,
-                    BytecodeLength: cs_bytes.len(),
-                },
-                ..Default::default()
-            };
+            let pso_desc =
+                windows::Win32::Graphics::Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: core::mem::ManuallyDrop::new(Some(root_signature.clone())),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: cs_bytes.as_ptr() as *const _,
+                        BytecodeLength: cs_bytes.len(),
+                    },
+                    ..Default::default()
+                };
             let pso: ID3D12PipelineState = device.CreateComputePipelineState(&pso_desc)?;
             Ok((root_signature, pso))
         }
@@ -695,7 +698,8 @@ impl D3D12Renderer {
                 // 0/1: NV12 conversion. 2..: rotating SRV/UAV pairs for the
                 // scale/sharpen passes (up to two per present surface per frame).
                 NumDescriptors: 64,
-                Flags: windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                Flags:
+                    windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             };
             let heap: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&desc)?;
@@ -716,7 +720,10 @@ impl D3D12Renderer {
                 DepthOrArraySize: 1,
                 MipLevels: 1,
                 Format: DXGI_FORMAT_UNKNOWN,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Layout: windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                 Flags: D3D12_RESOURCE_FLAG_NONE,
             };
@@ -767,10 +774,8 @@ impl D3D12Renderer {
                     .SetEventOnCompletion(self.fence_value, self.fence_event)
                     .is_ok()
             {
-                let _ = windows::Win32::System::Threading::WaitForSingleObject(
-                    self.fence_event,
-                    5000,
-                );
+                let _ =
+                    windows::Win32::System::Threading::WaitForSingleObject(self.fence_event, 5000);
             }
         }
     }
@@ -803,16 +808,17 @@ impl D3D12Renderer {
                 None => return Ok(()),
             };
             list.Close()?;
-            let lists = [Some(list.cast::<windows::Win32::Graphics::Direct3D12::ID3D12CommandList>()?)];
+            let lists = [Some(
+                list.cast::<windows::Win32::Graphics::Direct3D12::ID3D12CommandList>()?,
+            )];
             self.queue.ExecuteCommandLists(&lists);
             self.fence_value += 1;
             self.queue.Signal(&self.fence, self.fence_value)?;
             if self.fence.GetCompletedValue() < self.fence_value {
-                self.fence.SetEventOnCompletion(self.fence_value, self.fence_event)?;
-                let _ = windows::Win32::System::Threading::WaitForSingleObject(
-                    self.fence_event,
-                    5000,
-                );
+                self.fence
+                    .SetEventOnCompletion(self.fence_value, self.fence_event)?;
+                let _ =
+                    windows::Win32::System::Threading::WaitForSingleObject(self.fence_event, 5000);
             }
             Ok(())
         }
@@ -926,7 +932,10 @@ impl D3D12Renderer {
                 DepthOrArraySize: 1,
                 MipLevels: 1,
                 Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Layout: windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_LAYOUT_UNKNOWN,
                 Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             };
@@ -979,16 +988,10 @@ impl D3D12Renderer {
     }
 
     /// Upload an RGBA rectangle into the framebuffer.
-    pub fn update_rect(
-        &mut self,
-        x: u16,
-        y: u16,
-        w: u16,
-        h: u16,
-        rgba: &[u8],
-    ) {
+    pub fn update_rect(&mut self, x: u16, y: u16, w: u16, h: u16, rgba: &[u8]) {
         if self.framebuffer.is_none() {
-            let _ = self.ensure_framebuffer((x as u32 + w as u32).max(1), (y as u32 + h as u32).max(1));
+            let _ =
+                self.ensure_framebuffer((x as u32 + w as u32).max(1), (y as u32 + h as u32).max(1));
         }
         let (x, y, w, h) = (x as u32, y as u32, w as u32, h as u32);
         if w == 0 || h == 0 || x >= self.fb_width || y >= self.fb_height {
@@ -997,7 +1000,11 @@ impl D3D12Renderer {
         let row_pitch = w * 4;
         let need = (row_pitch * h) as usize;
         if rgba.len() < need {
-            tracing::warn!(have = rgba.len(), need, "D3D12 short bitmap buffer; dropping rect");
+            tracing::warn!(
+                have = rgba.len(),
+                need,
+                "D3D12 short bitmap buffer; dropping rect"
+            );
             return;
         }
         let cw = w.min(self.fb_width - x);
@@ -1009,8 +1016,12 @@ impl D3D12Renderer {
             tracing::warn!(error = %e, "D3D12 upload buffer allocation failed");
             return;
         }
-        let Some(fb) = self.framebuffer.clone() else { return };
-        let Some(upload) = self.upload_buffer.clone() else { return };
+        let Some(fb) = self.framebuffer.clone() else {
+            return;
+        };
+        let Some(upload) = self.upload_buffer.clone() else {
+            return;
+        };
         unsafe {
             for row in 0..ch {
                 let src = (row * w * 4) as usize;
@@ -1035,13 +1046,14 @@ impl D3D12Renderer {
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                     PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                         Offset: 0,
-                        Footprint: windows::Win32::Graphics::Direct3D12::D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                            Width: cw,
-                            Height: ch,
-                            Depth: 1,
-                            RowPitch: cw * 4,
-                        },
+                        Footprint:
+                            windows::Win32::Graphics::Direct3D12::D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: cw,
+                                Height: ch,
+                                Depth: 1,
+                                RowPitch: cw * 4,
+                            },
                     },
                 },
             };
@@ -1065,8 +1077,7 @@ impl D3D12Renderer {
                     right: cw,
                     bottom: ch,
                     back: 1,
-                },
-                ),
+                }),
             );
             Self::transition(
                 list,
@@ -1112,9 +1123,15 @@ impl D3D12Renderer {
             tracing::warn!(error = %e, "D3D12 NV12 buffer allocation failed");
             return false;
         }
-        let Some(fb) = self.framebuffer.clone() else { return false };
-        let Some(nv12_buf) = self.nv12_input.clone() else { return false };
-        let Some(upload) = self.upload_buffer.clone() else { return false };
+        let Some(fb) = self.framebuffer.clone() else {
+            return false;
+        };
+        let Some(nv12_buf) = self.nv12_input.clone() else {
+            return false;
+        };
+        let Some(upload) = self.upload_buffer.clone() else {
+            return false;
+        };
         let cb_addr = self.cb_addr;
         let descriptor_heap = self.descriptor_heap.clone();
         let descriptor_size = self.descriptor_size;
@@ -1139,13 +1156,14 @@ impl D3D12Renderer {
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                     PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                         Offset: 0,
-                        Footprint: windows::Win32::Graphics::Direct3D12::D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: DXGI_FORMAT_UNKNOWN,
-                            Width: need as u32,
-                            Height: 1,
-                            Depth: 1,
-                            RowPitch: need as u32,
-                        },
+                        Footprint:
+                            windows::Win32::Graphics::Direct3D12::D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_UNKNOWN,
+                                Width: need as u32,
+                                Height: 1,
+                                Depth: 1,
+                                RowPitch: need as u32,
+                            },
                     },
                 },
             };
@@ -1156,14 +1174,7 @@ impl D3D12Renderer {
                     SubresourceIndex: 0,
                 },
             };
-            list.CopyTextureRegion(
-                &dst_location,
-                0,
-                0,
-                0,
-                &src_location,
-                None,
-            );
+            list.CopyTextureRegion(&dst_location, 0, 0, 0, &src_location, None);
             Self::transition(
                 list,
                 &nv12_buf,
@@ -1208,8 +1219,7 @@ impl D3D12Renderer {
             device.CreateUnorderedAccessView(
                 &fb,
                 None,
-                Some(
-                &D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
                     Format: DXGI_FORMAT_R8G8B8A8_UNORM,
                     ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
                     Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
@@ -1218,8 +1228,7 @@ impl D3D12Renderer {
                             PlaneSlice: 0,
                         },
                     },
-                },
-                ),
+                }),
                 uav_handle,
             );
             let gpu_start = descriptor_heap.GetGPUDescriptorHandleForHeapStart();
@@ -1232,7 +1241,11 @@ impl D3D12Renderer {
             // painting only the region rects keeps out-of-region reference
             // content from stomping fresher pixels other codecs painted.
             let whole = [(0u32, 0u32, cw, ch)];
-            let regions = if regions.is_empty() { &whole[..] } else { regions };
+            let regions = if regions.is_empty() {
+                &whole[..]
+            } else {
+                regions
+            };
             for &(rx, ry, rw, rh) in regions {
                 if rx >= cw || ry >= ch {
                     continue;
@@ -1287,7 +1300,10 @@ impl D3D12Renderer {
                 DepthOrArraySize: 1,
                 MipLevels: 1,
                 Format: DXGI_FORMAT_UNKNOWN,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Layout: windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                 Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             };
@@ -1333,22 +1349,17 @@ impl D3D12Renderer {
     }
 
     /// Copy a rectangle on the GPU, using a scratch texture for overlapping copies.
-    pub fn copy_rect(
-        &mut self,
-        sx: u16,
-        sy: u16,
-        w: u16,
-        h: u16,
-        dx: u16,
-        dy: u16,
-    ) {
+    pub fn copy_rect(&mut self, sx: u16, sy: u16, w: u16, h: u16, dx: u16, dy: u16) {
         let (sx, sy, dx, dy, w, h) = (
             sx as u32, sy as u32, dx as u32, dy as u32, w as u32, h as u32,
         );
         if w == 0 || h == 0 {
             return;
         }
-        if sx >= self.fb_width || sy >= self.fb_height || dx >= self.fb_width || dy >= self.fb_height
+        if sx >= self.fb_width
+            || sy >= self.fb_height
+            || dx >= self.fb_width
+            || dy >= self.fb_height
         {
             return;
         }
@@ -1364,9 +1375,12 @@ impl D3D12Renderer {
                 self.fb_width,
                 self.fb_height,
                 DXGI_FORMAT_R8G8B8A8_UNORM,
-            ).ok();
+            )
+            .ok();
         }
-        let Some(fb) = self.framebuffer.clone() else { return };
+        let Some(fb) = self.framebuffer.clone() else {
+            return;
+        };
         let scratch = self.copy_scratch.clone();
         let _ = self.begin_list();
         let list = self.list.as_ref().unwrap();
@@ -1392,8 +1406,18 @@ impl D3D12Renderer {
         h: u32,
     ) {
         unsafe {
-            Self::transition(list, src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            Self::transition(list, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            Self::transition(
+                list,
+                src,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            );
+            Self::transition(
+                list,
+                dst,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
             let src_loc = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: core::mem::ManuallyDrop::new(Some(src.clone())),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -1416,16 +1440,19 @@ impl D3D12Renderer {
                 bottom: sy + h,
                 back: 1,
             };
-            list.CopyTextureRegion(
-                &dst_loc,
-                dx,
-                dy,
-                0,
-                &src_loc,
-                Some(&src_box),
+            list.CopyTextureRegion(&dst_loc, dx, dy, 0, &src_loc, Some(&src_box));
+            Self::transition(
+                list,
+                src,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
             );
-            Self::transition(list, src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-            Self::transition(list, dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+            Self::transition(
+                list,
+                dst,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
         }
     }
 
@@ -1444,7 +1471,10 @@ impl D3D12Renderer {
                 DepthOrArraySize: 1,
                 MipLevels: 1,
                 Format: format,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Layout: windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_LAYOUT_UNKNOWN,
                 Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             };
@@ -1465,14 +1495,7 @@ impl D3D12Renderer {
         }
     }
 
-    pub fn cache_rect(
-        &mut self,
-        slot: u16,
-        sx: u16,
-        sy: u16,
-        w: u16,
-        h: u16,
-    ) {
+    pub fn cache_rect(&mut self, slot: u16, sx: u16, sy: u16, w: u16, h: u16) {
         let (sx, sy, w, h) = (sx as u32, sy as u32, w as u32, h as u32);
         if w == 0 || h == 0 || sx >= self.fb_width || sy >= self.fb_height {
             return;
@@ -1482,28 +1505,26 @@ impl D3D12Renderer {
         if cw == 0 || ch == 0 {
             return;
         }
-        let Ok(tex) = Self::create_default_texture(
-            &self.device,
-            cw,
-            ch,
-            DXGI_FORMAT_R8G8B8A8_UNORM,
-        ) else {
+        let Ok(tex) =
+            Self::create_default_texture(&self.device, cw, ch, DXGI_FORMAT_R8G8B8A8_UNORM)
+        else {
             return;
         };
-        let Some(fb) = self.framebuffer.clone() else { return };
+        let Some(fb) = self.framebuffer.clone() else {
+            return;
+        };
         let _ = self.begin_list();
         let list = self.list.as_ref().unwrap();
         Self::copy_region(list, &fb, sx, sy, &tex, 0, 0, cw, ch);
         self.gfx_cache.insert(slot, (cw, ch, tex));
     }
 
-    pub fn cache_blit(
-        &mut self,
-        slot: u16,
-        dx: u16,
-        dy: u16,
-    ) {
-        let Some((cw, ch, tex)) = self.gfx_cache.get(&slot).map(|(w, h, t)| (*w, *h, t.clone())) else {
+    pub fn cache_blit(&mut self, slot: u16, dx: u16, dy: u16) {
+        let Some((cw, ch, tex)) = self
+            .gfx_cache
+            .get(&slot)
+            .map(|(w, h, t)| (*w, *h, t.clone()))
+        else {
             return;
         };
         let (dx, dy) = (dx as u32, dy as u32);
@@ -1515,7 +1536,9 @@ impl D3D12Renderer {
         if cw == 0 || ch == 0 {
             return;
         }
-        let Some(fb) = self.framebuffer.clone() else { return };
+        let Some(fb) = self.framebuffer.clone() else {
+            return;
+        };
         let _ = self.begin_list();
         let list = self.list.as_ref().unwrap();
         Self::copy_region(list, &tex, 0, 0, &fb, dx, dy, cw, ch);
@@ -1548,41 +1571,49 @@ impl D3D12Renderer {
             return self.present_internal();
         };
         unsafe {
-            for chunk in std::slice::from_raw_parts_mut(self.upload_addr, size).chunks_exact_mut(4) {
+            for chunk in std::slice::from_raw_parts_mut(self.upload_addr, size).chunks_exact_mut(4)
+            {
                 chunk.copy_from_slice(&color);
             }
             let _ = self.begin_list();
             let list = self.list.as_ref().unwrap();
-            Self::transition(list, &fb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            Self::transition(
+                list,
+                &fb,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
             let src_loc = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: core::mem::ManuallyDrop::new(Some(upload)),
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                     PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                         Offset: 0,
-                        Footprint: windows::Win32::Graphics::Direct3D12::D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                            Width: self.sc_width,
-                            Height: self.sc_height,
-                            Depth: 1,
-                            RowPitch: self.sc_width * 4,
-                        },
+                        Footprint:
+                            windows::Win32::Graphics::Direct3D12::D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: self.sc_width,
+                                Height: self.sc_height,
+                                Depth: 1,
+                                RowPitch: self.sc_width * 4,
+                            },
                     },
                 },
             };
             let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: core::mem::ManuallyDrop::new(Some(fb.clone())),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
             };
-            list.CopyTextureRegion(&dst_loc,
-                0,
-                0,
-                0,
-                &src_loc,
-                None,
+            list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+            Self::transition(
+                list,
+                &fb,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
             );
-            Self::transition(list, &fb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         }
         self.present_frame()
     }
@@ -1596,12 +1627,16 @@ impl D3D12Renderer {
             let src_loc = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: core::mem::ManuallyDrop::new(Some(src.clone())),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
             };
             let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: core::mem::ManuallyDrop::new(Some(dst.clone())),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
             };
             list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
         }
@@ -1710,8 +1745,7 @@ impl D3D12Renderer {
     ) -> WinResult<()> {
         let fb_size = (self.fb_width, self.fb_height);
         let src_rect = (src.0, src.1, src_size.0, src_size.1);
-        let in_bounds =
-            src.0 + src_size.0 <= fb_size.0 && src.1 + src_size.1 <= fb_size.1;
+        let in_bounds = src.0 + src_size.0 <= fb_size.0 && src.1 + src_size.1 <= fb_size.1;
         let needs_scale = src_size != dst_size;
         let sharpen_on = self.sharpen > 0.0;
         if (needs_scale || sharpen_on)
@@ -1735,8 +1769,14 @@ impl D3D12Renderer {
         // Crop/1:1 copy fallback, clipped to the framebuffer.
         self.begin_list()?;
         let list = self.list.clone().unwrap();
-        let cw = src_size.0.min(dst_size.0).min(fb_size.0.saturating_sub(src.0));
-        let ch = src_size.1.min(dst_size.1).min(fb_size.1.saturating_sub(src.1));
+        let cw = src_size
+            .0
+            .min(dst_size.0)
+            .min(fb_size.0.saturating_sub(src.0));
+        let ch = src_size
+            .1
+            .min(dst_size.1)
+            .min(fb_size.1.saturating_sub(src.1));
         if cw > 0 && ch > 0 {
             Self::transition(
                 &list,
@@ -2079,7 +2119,11 @@ impl D3D12Renderer {
     /// The cached intermediate UAV texture for this size (`first` = the upscale
     /// output `mid_a`; otherwise the sharpen output `mid_b`).
     fn ensure_mid(&mut self, first: bool, size: (u32, u32)) -> WinResult<ID3D12Resource> {
-        let map = if first { &mut self.mid_a } else { &mut self.mid_b };
+        let map = if first {
+            &mut self.mid_a
+        } else {
+            &mut self.mid_b
+        };
         if let Some(t) = map.get(&size) {
             return Ok(t.clone());
         }
@@ -2163,13 +2207,22 @@ impl D3D12Renderer {
             return None;
         }
         let row_pitch = (w * 4) as usize;
-        let readback = Self::create_readback_texture(&self.device, w, h, row_pitch,
-        ).ok()?;
+        let readback = Self::create_readback_texture(&self.device, w, h, row_pitch).ok()?;
         let _ = self.begin_list();
         let list = self.list.as_ref().unwrap();
-        Self::transition(list, &fb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Self::transition(
+            list,
+            &fb,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
         Self::copy_whole_texture(list, &fb, &readback);
-        Self::transition(list, &fb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Self::transition(
+            list,
+            &fb,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
         self.submit_and_wait().ok()?;
         unsafe {
             let mut ptr: *mut core::ffi::c_void = std::ptr::null_mut();
@@ -2198,7 +2251,10 @@ impl D3D12Renderer {
                 DepthOrArraySize: 1,
                 MipLevels: 1,
                 Format: DXGI_FORMAT_UNKNOWN,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Layout: windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                 Flags: D3D12_RESOURCE_FLAG_NONE,
             };
@@ -2232,9 +2288,7 @@ impl D3D12Renderer {
     ) -> WinResult<()> {
         unsafe {
             let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
-            let factory: IDXGIFactory2 = self
-                .swap_chain
-                .GetParent::<IDXGIFactory2>()?;
+            let factory: IDXGIFactory2 = self.swap_chain.GetParent::<IDXGIFactory2>()?;
             let waitable = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32;
             let tearing_flag = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32;
             let make = |flags: u32| {
@@ -2243,7 +2297,10 @@ impl D3D12Renderer {
                     Height: height,
                     Format: DXGI_FORMAT_R8G8B8A8_UNORM,
                     Stereo: false.into(),
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
                     BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                     BufferCount: 2,
                     Scaling: DXGI_SCALING_STRETCH,
@@ -2251,12 +2308,7 @@ impl D3D12Renderer {
                     AlphaMode: DXGI_ALPHA_MODE_UNSPECIFIED,
                     Flags: flags,
                 };
-                factory.CreateSwapChainForHwnd(&self.queue,
-                    hwnd,
-                    &desc,
-                    None,
-                    None,
-                )
+                factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
             };
             let (sc1, flags) = match make(waitable | tearing_flag) {
                 Ok(s) => (s, waitable | tearing_flag),
@@ -2301,10 +2353,7 @@ impl D3D12Renderer {
         }
     }
 
-    pub fn set_gpu_timing_callback(
-        &mut self,
-        _cb: Option<Box<dyn Fn(&str, u64) + Send + Sync>>,
-    ) {
+    pub fn set_gpu_timing_callback(&mut self, _cb: Option<Box<dyn Fn(&str, u64) + Send + Sync>>) {
         // D3D12 timestamp queries are not wired yet; ignore silently.
         self.gpu_timing_cb = _cb;
     }
@@ -2401,8 +2450,7 @@ mod shader_tests {
             ScaleKernel::Rcas,
         ] {
             unsafe {
-                compile_scale_kernel(kernel)
-                    .unwrap_or_else(|e| panic!("{}: {e}", kernel.label()));
+                compile_scale_kernel(kernel).unwrap_or_else(|e| panic!("{}: {e}", kernel.label()));
             }
         }
     }

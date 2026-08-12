@@ -144,13 +144,7 @@ fn parse_color_pointer(buf: &[u8], xor_bpp: u16) -> Option<(u16, CursorShape)> {
 }
 
 /// Decode bottom-up AND/XOR masks into top-down RGBA8.
-fn decode_masks(
-    xor: &[u8],
-    and: &[u8],
-    width: usize,
-    height: usize,
-    bpp: u16,
-) -> Option<Vec<u8>> {
+fn decode_masks(xor: &[u8], and: &[u8], width: usize, height: usize, bpp: u16) -> Option<Vec<u8>> {
     let xor_stride = padded_stride(width * bpp as usize);
     let and_stride = padded_stride(width);
 
@@ -232,15 +226,16 @@ fn xor_color(xor: &[u8], row_start: usize, x: usize, bpp: u16) -> (u8, u8, u8) {
         }
         16 => {
             let o = row_start + x * 2;
-            let v = u16::from_le_bytes([
-                *xor.get(o).unwrap_or(&0),
-                *xor.get(o + 1).unwrap_or(&0),
-            ]);
+            let v = u16::from_le_bytes([*xor.get(o).unwrap_or(&0), *xor.get(o + 1).unwrap_or(&0)]);
             // RGB565.
             let r = ((v >> 11) & 0x1F) as u8;
             let g = ((v >> 5) & 0x3F) as u8;
             let b = (v & 0x1F) as u8;
-            ((r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2))
+            (
+                (r << 3) | (r >> 2),
+                (g << 2) | (g >> 4),
+                (b << 3) | (b >> 2),
+            )
         }
         _ => {
             // 1bpp monochrome: bit set → white, clear → black.
@@ -331,14 +326,13 @@ mod tests {
         xor.extend_from_slice(&zero); // bottom row
         xor.extend_from_slice(&red);
         xor.extend_from_slice(&zero); // top row
-        // AND mask: 1 bit/px, stride padded to 2 bytes per row. Row = bits
-        // [px0,px1,...] MSB-first. transparent=1, opaque=0.
-        // bottom row: both transparent → bits 1,1 → 0b11000000 = 0xC0, pad byte 0
-        // top row: opaque,transparent → 0,1 → 0b01000000 = 0x40, pad byte 0
+                                      // AND mask: 1 bit/px, stride padded to 2 bytes per row. Row = bits
+                                      // [px0,px1,...] MSB-first. transparent=1, opaque=0.
+                                      // bottom row: both transparent → bits 1,1 → 0b11000000 = 0xC0, pad byte 0
+                                      // top row: opaque,transparent → 0,1 → 0b01000000 = 0x40, pad byte 0
         let and = vec![0xC0, 0x00, 0x40, 0x00];
         let pdu = color_pointer_pdu(0x0006, 5, 2, 2, &xor, &and, None);
-        let PointerUpdate::Shape { cache_index, shape } =
-            parse_pointer_update(&pdu).unwrap()
+        let PointerUpdate::Shape { cache_index, shape } = parse_pointer_update(&pdu).unwrap()
         else {
             panic!("expected shape");
         };

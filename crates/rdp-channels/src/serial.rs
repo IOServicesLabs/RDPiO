@@ -27,9 +27,15 @@ pub trait SerialPort {
 /// A no-op backend used in tests and when no COM port is configured.
 pub struct NullSerialPort;
 impl SerialPort for NullSerialPort {
-    fn open(&mut self) -> bool { false }
-    fn read(&mut self, _len: usize) -> Vec<u8> { Vec::new() }
-    fn write(&mut self, _data: &[u8]) -> u32 { 0 }
+    fn open(&mut self) -> bool {
+        false
+    }
+    fn read(&mut self, _len: usize) -> Vec<u8> {
+        Vec::new()
+    }
+    fn write(&mut self, _data: &[u8]) -> u32 {
+        0
+    }
     fn close(&mut self) {}
 }
 
@@ -48,6 +54,8 @@ enum State {
     /// Waiting to send our client announce.
     Idle,
     /// Sent client announce, waiting for server announce.
+    #[allow(dead_code)]
+    // state reached after a server announce; not yet wired into the serial flow
     AwaitingServerAnnounce,
     /// Handshake complete; processing device announces and I/O.
     Ready,
@@ -89,9 +97,7 @@ impl SerialChannel {
     }
 
     /// Process one complete inbound PDU, returning any outbound PDUs.
-    pub fn process(&mut self,
-        pdu: &[u8],
-    ) -> Vec<Vec<u8>> {
+    pub fn process(&mut self, pdu: &[u8]) -> Vec<Vec<u8>> {
         if pdu.len() < 2 {
             return Vec::new();
         }
@@ -108,14 +114,16 @@ impl SerialChannel {
                 }
                 let device_id = u32::from_le_bytes([pdu[2], pdu[3], pdu[4], pdu[5]]);
                 let _port_type = u32::from_le_bytes([pdu[6], pdu[7], pdu[8], pdu[9]]);
-                let name = String::from_utf8_lossy(&pdu.get(10..).unwrap_or(&[]),
-                );
+                let name = String::from_utf8_lossy(pdu.get(10..).unwrap_or(&[]));
                 let name = name.trim_end_matches('\0');
                 tracing::info!(device_id, name, "serial: device announced");
                 // Attach the default port (the platform supplies one per
                 // configured `--serial` path). A production client would map
                 // device names to distinct OS handles.
-                let mut port = self.default_port.take().unwrap_or_else(|| Box::new(NullSerialPort));
+                let mut port = self
+                    .default_port
+                    .take()
+                    .unwrap_or_else(|| Box::new(NullSerialPort));
                 let opened = port.open();
                 self.ports.insert(device_id, port);
                 vec![Self::device_completion(device_id, opened)]
@@ -152,12 +160,7 @@ impl SerialChannel {
         v
     }
 
-    fn handle_io_request(
-        &mut self,
-        device_id: u32,
-        major_func: u32,
-        data: &[u8],
-    ) -> Vec<Vec<u8>> {
+    fn handle_io_request(&mut self, device_id: u32, major_func: u32, data: &[u8]) -> Vec<Vec<u8>> {
         // Major function codes mirror the IRP_MJ_* constants. We support read,
         // write, and cleanup/close.
         const IRP_MJ_READ: u32 = 0x04;
@@ -169,7 +172,7 @@ impl SerialChannel {
         let result = match major_func {
             IRP_MJ_READ => {
                 let len = u32::from_le_bytes([
-                    *data.get(0).unwrap_or(&0),
+                    *data.first().unwrap_or(&0),
                     *data.get(1).unwrap_or(&0),
                     *data.get(2).unwrap_or(&0),
                     *data.get(3).unwrap_or(&0),
@@ -183,7 +186,7 @@ impl SerialChannel {
             }
             IRP_MJ_WRITE => {
                 if let Some(port) = self.ports.get_mut(&device_id) {
-                    port.write(data) as u32
+                    port.write(data)
                 } else {
                     0
                 }
@@ -226,7 +229,9 @@ mod tests {
         buf: Vec<u8>,
     }
     impl SerialPort for EchoPort {
-        fn open(&mut self) -> bool { true }
+        fn open(&mut self) -> bool {
+            true
+        }
         fn read(&mut self, len: usize) -> Vec<u8> {
             let n = len.min(self.buf.len());
             self.buf.drain(..n).collect()
@@ -241,8 +246,14 @@ mod tests {
     #[test]
     fn initial_announce_has_version() {
         let pdu = SerialChannel::initial_announce();
-        assert_eq!(u16::from_le_bytes([pdu[0], pdu[1]]), CLIENT_ANNOUNCE_REQUEST);
-        assert_eq!(u32::from_le_bytes([pdu[2], pdu[3], pdu[4], pdu[5]]), RDPESP_VERSION);
+        assert_eq!(
+            u16::from_le_bytes([pdu[0], pdu[1]]),
+            CLIENT_ANNOUNCE_REQUEST
+        );
+        assert_eq!(
+            u32::from_le_bytes([pdu[2], pdu[3], pdu[4], pdu[5]]),
+            RDPESP_VERSION
+        );
     }
 
     #[test]
@@ -252,11 +263,17 @@ mod tests {
         let server = [
             SERVER_ANNOUNCE_REQUEST as u8,
             (SERVER_ANNOUNCE_REQUEST >> 8) as u8,
-            0x01, 0x00, 0x00, 0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
         ];
         let out = ch.process(&server);
         assert_eq!(out.len(), 1);
-        assert_eq!(u16::from_le_bytes([out[0][0], out[0][1]]), CLIENT_ANNOUNCE_REPLY);
+        assert_eq!(
+            u16::from_le_bytes([out[0][0], out[0][1]]),
+            CLIENT_ANNOUNCE_REPLY
+        );
     }
 
     #[test]
@@ -270,7 +287,10 @@ mod tests {
         announce.extend_from_slice(b"COM1\0");
         let out = ch.process(&announce);
         assert_eq!(out.len(), 1);
-        assert_eq!(u16::from_le_bytes([out[0][0], out[0][1]]), DEVICE_COMPLETION);
+        assert_eq!(
+            u16::from_le_bytes([out[0][0], out[0][1]]),
+            DEVICE_COMPLETION
+        );
     }
 
     #[test]
@@ -281,7 +301,10 @@ mod tests {
         let server = [
             SERVER_ANNOUNCE_REQUEST as u8,
             (SERVER_ANNOUNCE_REQUEST >> 8) as u8,
-            0x01, 0x00, 0x00, 0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
         ];
         ch.process(&server);
         let mut announce = Vec::new();
@@ -311,8 +334,6 @@ mod tests {
         read.extend_from_slice(&4u32.to_le_bytes()); // length
         let out = ch.process(&read);
         assert_eq!(out.len(), 1);
-        assert_eq!(&out[0][out[0].len() - 4..],
-            &[1, 2, 3, 4]
-        );
+        assert_eq!(&out[0][out[0].len() - 4..], &[1, 2, 3, 4]);
     }
 }

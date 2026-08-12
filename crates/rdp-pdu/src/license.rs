@@ -216,7 +216,10 @@ mod tests {
     fn skips_a_basic_security_header() {
         // SEC_LICENSE_PKT (0x0080) flags + flagsHi, then the preamble.
         let mut wire = vec![0x80, 0x00, 0x00, 0x00];
-        wire.extend_from_slice(&pdu(ERROR_ALERT, &error_alert_body(STATUS_VALID_CLIENT, 0x02)));
+        wire.extend_from_slice(&pdu(
+            ERROR_ALERT,
+            &error_alert_body(STATUS_VALID_CLIENT, 0x02),
+        ));
         assert!(parse_license_message(&wire).unwrap().is_complete());
     }
 

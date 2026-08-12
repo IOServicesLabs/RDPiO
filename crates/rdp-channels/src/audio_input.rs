@@ -230,7 +230,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&960u32.to_le_bytes()); // FramesPerPacket
         body.extend_from_slice(&1u32.to_le_bytes()); // initialFormat = index 1
-        // (a WAVEFORMATEX would follow; we key off the index)
+                                                     // (a WAVEFORMATEX would follow; we key off the index)
         let out = ch.process(&message(MSG_OPEN, &body));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0][0], MSG_OPEN_REPLY);

@@ -109,11 +109,11 @@ fn order_caps() -> Vec<u8> {
     put_u16(0, &mut p); // pad2
     put_u16(1, &mut p); // maximumOrderLevel
     put_u16(0, &mut p); // numberFonts
-    // orderFlags: both NEGOTIATEORDERSUPPORT (0x02) and ZEROBOUNDSDELTASSUPPORT
-    // (0x08) are mandatory per MS-RDPBCGR 2.2.7.1.3 ("MUST be set"); omitting
-    // ZEROBOUNDSDELTASSUPPORT makes the server reject the Confirm Active with
-    // ERRINFO_BADCAPABILITIES (0x10EA). (The previous 0x22 set COLORINDEXSUPPORT
-    // by mistake instead — 0x08 was misread as 0x20.)
+                        // orderFlags: both NEGOTIATEORDERSUPPORT (0x02) and ZEROBOUNDSDELTASSUPPORT
+                        // (0x08) are mandatory per MS-RDPBCGR 2.2.7.1.3 ("MUST be set"); omitting
+                        // ZEROBOUNDSDELTASSUPPORT makes the server reject the Confirm Active with
+                        // ERRINFO_BADCAPABILITIES (0x10EA). (The previous 0x22 set COLORINDEXSUPPORT
+                        // by mistake instead — 0x08 was misread as 0x20.)
     const NEGOTIATEORDERSUPPORT: u16 = 0x0002;
     const ZEROBOUNDSDELTASSUPPORT: u16 = 0x0008;
     put_u16(NEGOTIATEORDERSUPPORT | ZEROBOUNDSDELTASSUPPORT, &mut p); // orderFlags = 0x000A
@@ -251,12 +251,7 @@ fn bitmap_codecs_caps() -> Vec<u8> {
 /// The client capability sets (concatenated) and their count. When `rfx` is set
 /// the RemoteFX-enabling sets (Surface Commands + Bitmap Codecs) are appended
 /// and fast-path output is requested in the General set.
-fn client_capabilities(
-    width: u16,
-    height: u16,
-    keyboard_layout: u32,
-    rfx: bool,
-) -> (Vec<u8>, u16) {
+fn client_capabilities(width: u16, height: u16, keyboard_layout: u32, rfx: bool) -> (Vec<u8>, u16) {
     let mut sets = vec![
         general_caps(rfx),
         bitmap_caps(width, height, 0x18),
@@ -314,14 +309,12 @@ pub fn parse_server_input_flags(share_pdu: &[u8]) -> Option<u16> {
     }
     let len_src = u16::from_le_bytes([share_pdu[10], share_pdu[11]]) as usize;
     let mut off = 14usize + len_src;
-    let num = u16::from_le_bytes([
-        *share_pdu.get(off)?,
-        *share_pdu.get(off + 1)?,
-    ]) as usize;
+    let num = u16::from_le_bytes([*share_pdu.get(off)?, *share_pdu.get(off + 1)?]) as usize;
     off += 4; // numberCapabilities + pad2Octets
     for _ in 0..num {
         let set_type = u16::from_le_bytes([*share_pdu.get(off)?, *share_pdu.get(off + 1)?]);
-        let set_len = u16::from_le_bytes([*share_pdu.get(off + 2)?, *share_pdu.get(off + 3)?]) as usize;
+        let set_len =
+            u16::from_le_bytes([*share_pdu.get(off + 2)?, *share_pdu.get(off + 3)?]) as usize;
         if set_len < 4 || off + set_len > share_pdu.len() {
             return None;
         }

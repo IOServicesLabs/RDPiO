@@ -162,16 +162,31 @@ impl NativeRedirector {
         let thread = std::thread::Builder::new()
             .name("webrtc-native".into())
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                {
                     Ok(rt) => rt,
                     Err(e) => {
                         tracing::error!(error = %e, "webrtc-native: failed to build tokio runtime");
                         return;
                     }
                 };
-                rt.block_on(run(rx, out_thread, cap_thread, devices, turn_resolver, video_source));
+                rt.block_on(run(
+                    rx,
+                    out_thread,
+                    cap_thread,
+                    devices,
+                    turn_resolver,
+                    video_source,
+                ));
             })?;
-        Ok(Self { tx, outbound, capture, thread: Some(thread) })
+        Ok(Self {
+            tx,
+            outbound,
+            capture,
+            thread: Some(thread),
+        })
     }
 
     /// A create-request for a webrtc.1 channel arrived; begin a fresh call on it.
@@ -184,7 +199,10 @@ impl NativeRedirector {
         if let Some(cap) = &self.capture {
             cap.record(CAP_DIR_INBOUND, channel_id, message);
         }
-        let _ = self.tx.send(Inbound::Data { channel_id, bytes: message.to_vec() });
+        let _ = self.tx.send(Inbound::Data {
+            channel_id,
+            bytes: message.to_vec(),
+        });
     }
 
     /// The server closed the channel.
@@ -227,7 +245,9 @@ fn push_framed(outbound: &Outbound, capture: &Option<Capture>, channel_id: u32, 
                 }
                 q.push_back((channel_id, framed));
             }
-            Err(e) => tracing::warn!(error = %e, "webrtc-native: failed to serialize outbound message"),
+            Err(e) => {
+                tracing::warn!(error = %e, "webrtc-native: failed to serialize outbound message")
+            }
         }
     }
 }

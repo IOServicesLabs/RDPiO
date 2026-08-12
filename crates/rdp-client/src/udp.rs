@@ -163,7 +163,9 @@ impl UdpReliable {
                 self.publish();
                 Ok(true)
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
                 Ok(false)
             }
             Err(e) => Err(e),
@@ -176,7 +178,10 @@ impl Read for UdpReliable {
         // Block (within the socket timeout) until we have delivered bytes.
         while self.inbox.is_empty() {
             if !self.pump()? {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "rdp-udp read timeout"));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "rdp-udp read timeout",
+                ));
             }
         }
         let n = buf.len().min(self.inbox.len());

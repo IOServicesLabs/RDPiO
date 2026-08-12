@@ -44,7 +44,11 @@ impl ConnBar {
     /// Create the bar centred at the top of the monitor whose screen rectangle is
     /// `(left, top)`..`(left + width, ..)`. Shown initially (so it's discoverable);
     /// it auto-hides on the first `tick` once the cursor moves away (unless pinned).
-    pub fn new(primary_left: i32, primary_top: i32, primary_width: i32) -> windows::core::Result<Self> {
+    pub fn new(
+        primary_left: i32,
+        primary_top: i32,
+        primary_width: i32,
+    ) -> windows::core::Result<Self> {
         unsafe {
             let module = GetModuleHandleW(None)?;
             let hinstance = HINSTANCE(module.0);

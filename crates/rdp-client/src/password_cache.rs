@@ -14,7 +14,9 @@ use crate::token_cache::{dpapi_protect, dpapi_unprotect};
 const CACHE_FILE: &str = "w365_password.bin";
 
 fn cache_path() -> Option<PathBuf> {
-    let local = std::env::var("LOCALAPPDATA").ok().filter(|s| !s.is_empty())?;
+    let local = std::env::var("LOCALAPPDATA")
+        .ok()
+        .filter(|s| !s.is_empty())?;
     let dir = PathBuf::from(local).join("rdpio");
     let _ = std::fs::create_dir_all(&dir);
     Some(dir.join(CACHE_FILE))
@@ -26,7 +28,9 @@ pub fn store(account: &str, password: &str) {
     let Some(path) = cache_path() else { return };
     let doc = serde_json::json!({ "v": 1, "account": account, "password": password });
     match dpapi_protect(doc.to_string().as_bytes()).and_then(|blob| std::fs::write(&path, blob)) {
-        Ok(()) => tracing::info!(path = %path.display(), "cached Cloud PC password (DPAPI-encrypted)"),
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "cached Cloud PC password (DPAPI-encrypted)")
+        }
         Err(e) => tracing::warn!(error = %e, "could not cache Cloud PC password"),
     }
 }
@@ -49,7 +53,9 @@ pub fn load(account: &str) -> Option<String> {
 /// Remove the cached password (e.g. `--w365-relogin`). A missing cache is not an
 /// error.
 pub fn clear() -> io::Result<()> {
-    let Some(path) = cache_path() else { return Ok(()) };
+    let Some(path) = cache_path() else {
+        return Ok(());
+    };
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),

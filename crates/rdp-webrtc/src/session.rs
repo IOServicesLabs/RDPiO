@@ -146,14 +146,23 @@ impl RedirectorModel {
         }
         // Correlate the eventual Result by call id.
         if let Some(cid) = msg.call_id {
-            self.calls.insert(cid, CallInfo { object_type, method: method.clone() });
+            self.calls.insert(
+                cid,
+                CallInfo {
+                    object_type,
+                    method: method.clone(),
+                },
+            );
         }
 
         // Signaling extraction from the Call arguments.
         let args = msg.args.clone().unwrap_or(Value::Null);
         match method.as_str() {
             "createPeerConnection" => {
-                if let Some(servers) = arg0(&args).and_then(|a| a.get("iceServers")).and_then(|s| s.as_array()) {
+                if let Some(servers) = arg0(&args)
+                    .and_then(|a| a.get("iceServers"))
+                    .and_then(|s| s.as_array())
+                {
                     for s in servers {
                         if let Some(urls) = s.get("urls").and_then(|u| u.as_array()) {
                             for u in urls {
@@ -167,7 +176,10 @@ impl RedirectorModel {
             }
             "addTransceiver" => self.signaling.transceivers += 1,
             "setRemoteDescription" => {
-                if let Some(sdp) = arg0(&args).and_then(|a| a.get("sdp")).and_then(|s| s.as_str()) {
+                if let Some(sdp) = arg0(&args)
+                    .and_then(|a| a.get("sdp"))
+                    .and_then(|s| s.as_str())
+                {
                     self.signaling.answer_sdp = Some(sdp.to_string());
                 }
             }
@@ -197,7 +209,8 @@ impl RedirectorModel {
         // candidates; track the peak candidate count.
         if let Some(ev) = &msg.event_args {
             if let Some(sdp) = dig(ev, &["desc", "sdp"]).and_then(|s| s.as_str()) {
-                self.signaling.local_candidates = self.signaling.local_candidates.max(count_candidates(sdp));
+                self.signaling.local_candidates =
+                    self.signaling.local_candidates.max(count_candidates(sdp));
             }
         }
     }
@@ -247,7 +260,12 @@ mod tests {
         assert_eq!(m.signaling.transceivers, 2);
         assert!(m.signaling.offer_sdp.as_deref().unwrap().starts_with("v=0"));
         assert_eq!(m.signaling.local_candidates, 2);
-        assert!(m.signaling.answer_sdp.as_deref().unwrap().contains("answer"));
+        assert!(m
+            .signaling
+            .answer_sdp
+            .as_deref()
+            .unwrap()
+            .contains("answer"));
         assert_eq!(m.results_matched, 1);
         assert!(m.unknown_types.is_empty());
     }

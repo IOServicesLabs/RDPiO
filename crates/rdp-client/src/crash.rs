@@ -12,9 +12,7 @@
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::System::Diagnostics::Debug::{
-    SetUnhandledExceptionFilter, EXCEPTION_POINTERS,
-};
+use windows::Win32::System::Diagnostics::Debug::{SetUnhandledExceptionFilter, EXCEPTION_POINTERS};
 use windows::Win32::System::LibraryLoader::{
     GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,

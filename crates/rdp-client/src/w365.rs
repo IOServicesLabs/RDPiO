@@ -139,7 +139,7 @@ impl DeviceCodeFlow {
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("network error during authentication: {0}")]
-    Network(#[from] ureq::Error),
+    Network(Box<ureq::Error>),
     #[error("I/O error reading authentication response: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -151,6 +151,12 @@ pub enum AuthError {
     #[allow(dead_code)]
     #[error("authorization pending; user has not completed the prompt")]
     Pending,
+}
+
+impl From<ureq::Error> for AuthError {
+    fn from(e: ureq::Error) -> Self {
+        AuthError::Network(Box::new(e))
+    }
 }
 
 /// Authenticate via OAuth2 device-code flow.
@@ -188,9 +194,7 @@ pub fn start_device_code_flow(
     let client_id = client_id.unwrap_or(DEFAULT_CLIENT_ID).to_string();
     let scope = scope.unwrap_or(DEFAULT_SCOPE).to_string();
 
-    let device_url = format!(
-        "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/devicecode"
-    );
+    let device_url = format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/devicecode");
 
     tracing::info!(%device_url, %client_id, %scope, "requesting OAuth2 device code");
 
@@ -273,9 +277,7 @@ pub fn refresh_token(
     refresh: &str,
 ) -> Result<AccessToken, AuthError> {
     let client_id = client_id.unwrap_or(DEFAULT_CLIENT_ID);
-    let token_url = format!(
-        "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
-    );
+    let token_url = format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token");
 
     let mut body = HashMap::new();
     body.insert("grant_type", "refresh_token");
@@ -284,11 +286,13 @@ pub fn refresh_token(
 
     let resp: serde_json::Value = ureq::post(&token_url)
         .set("Content-Type", "application/x-www-form-urlencoded")
-        .send_string(&body
-            .iter()
-            .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
-            .collect::<Vec<_>>()
-            .join("&"))?
+        .send_string(
+            &body
+                .iter()
+                .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
+                .collect::<Vec<_>>()
+                .join("&"),
+        )?
         .into_json()?;
 
     if let Some(err) = resp.get("error") {
@@ -351,8 +355,7 @@ pub fn exchange_auth_code(
 ) -> Result<AccessToken, AuthError> {
     let client_id = client_id.unwrap_or(DEFAULT_CLIENT_ID);
     let scope = scope.unwrap_or(AUTH_CODE_SCOPE);
-    let token_url =
-        format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token");
+    let token_url = format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token");
 
     tracing::info!(%token_url, "exchanging authorization code for token");
 
@@ -506,7 +509,9 @@ pub fn discover_cached_cloud_pcs() -> Vec<crate::feed::FeedEntry> {
             Err(_) if raw.contains("resourceprovider") => Some(raw.clone()),
             Err(_) => None,
         };
-        let Some(rdp_contents) = rdp_contents else { continue };
+        let Some(rdp_contents) = rdp_contents else {
+            continue;
+        };
 
         let settings = crate::feed::parse_rdp_file(&rdp_contents);
         // Only ARM Reverse-Connect resources can be brokered by rdpio.
@@ -521,22 +526,25 @@ pub fn discover_cached_cloud_pcs() -> Vec<crate::feed::FeedEntry> {
             continue; // same Cloud PC under a different cache id
         }
 
-        let mut entry = crate::feed::FeedEntry::default();
-        entry.display_name = settings
-            .get("remotedesktopname")
-            .filter(|s| !s.is_empty())
-            .cloned()
-            .unwrap_or_else(|| "Cloud PC".to_string());
-        // `remoteapplicationprogram` is `||<resourceId>`; the GUID distinguishes
-        // Cloud PCs that share a SKU display name. Used only as a picker label.
-        entry.resource_id = settings
-            .get("remoteapplicationprogram")
-            .map(|s| s.trim_start_matches('|').to_string())
-            .unwrap_or_default();
-        entry.tenant_id = settings.get("aadtenantid").cloned().unwrap_or_default();
-        entry.gateway_fqdn = settings.get("gatewayhostname").cloned().unwrap_or_default();
-        entry.load_balance_info = Some(lbi.into_bytes());
-        entry.rdp_file = Some(rdp_contents);
+        let entry = crate::feed::FeedEntry {
+            display_name: settings
+                .get("remotedesktopname")
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "Cloud PC".to_string()),
+            // `remoteapplicationprogram` is `||<resourceId>`; the GUID
+            // distinguishes Cloud PCs that share a SKU display name. Used only
+            // as a picker label.
+            resource_id: settings
+                .get("remoteapplicationprogram")
+                .map(|s| s.trim_start_matches('|').to_string())
+                .unwrap_or_default(),
+            tenant_id: settings.get("aadtenantid").cloned().unwrap_or_default(),
+            gateway_fqdn: settings.get("gatewayhostname").cloned().unwrap_or_default(),
+            load_balance_info: Some(lbi.into_bytes()),
+            rdp_file: Some(rdp_contents),
+            ..crate::feed::FeedEntry::default()
+        };
         entries.push(entry);
     }
 
@@ -568,13 +576,13 @@ mod tests {
     #[test]
     fn authorize_url_uses_code_flow_and_native_redirect() {
         let url = build_authorize_url("common", None, None);
-        assert!(url.starts_with(
-            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?"
-        ));
+        assert!(url.starts_with("https://login.microsoftonline.com/common/oauth2/v2.0/authorize?"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains(&format!("client_id={DEFAULT_CLIENT_ID}")));
         // redirect_uri is URL-encoded.
-        assert!(url.contains("redirect_uri=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fnativeclient"));
+        assert!(url.contains(
+            "redirect_uri=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fnativeclient"
+        ));
         // wvd scope present (encoded).
         assert!(url.contains("www.wvd.microsoft.com"));
     }
@@ -585,6 +593,9 @@ mod tests {
         // of {"preferred_username":"nick@contoso.com"} (no padding).
         let payload = "eyJwcmVmZXJyZWRfdXNlcm5hbWUiOiJuaWNrQGNvbnRvc28uY29tIn0";
         let jwt = format!("aaa.{payload}.bbb");
-        assert_eq!(parse_id_token_upn(&jwt).as_deref(), Some("nick@contoso.com"));
+        assert_eq!(
+            parse_id_token_upn(&jwt).as_deref(),
+            Some("nick@contoso.com")
+        );
     }
 }

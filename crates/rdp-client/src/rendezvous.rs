@@ -76,9 +76,17 @@ fn gather_candidates(shortpath: &ShortpathConfig) -> io::Result<Vec<Candidate>> 
 
     let mut cands = Vec::new();
     if let Some(srflx) = alloc.mapped {
-        cands.push(Candidate { kind: "srflx", addr: srflx, base });
+        cands.push(Candidate {
+            kind: "srflx",
+            addr: srflx,
+            base,
+        });
     }
-    cands.push(Candidate { kind: "relay", addr: alloc.relayed, base });
+    cands.push(Candidate {
+        kind: "relay",
+        addr: alloc.relayed,
+        base,
+    });
     tracing::info!(
         srflx = ?alloc.mapped,
         relay = %alloc.relayed,
@@ -295,7 +303,11 @@ pub fn probe(
             }
         }
     }
-    tracing::info!(frames, elapsed_ms = start.elapsed().as_millis() as u64, "Shortpath rendezvous probe finished");
+    tracing::info!(
+        frames,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "Shortpath rendezvous probe finished"
+    );
 }
 
 /// Log one rendezvous frame secret-safely: total length plus a short hex + ASCII
@@ -307,7 +319,13 @@ fn log_frame(idx: usize, msg: &[u8]) {
     let hex: String = head.iter().map(|b| format!("{b:02x}")).collect();
     let ascii: String = head
         .iter()
-        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
         .collect();
     tracing::info!(
         idx,
@@ -347,7 +365,11 @@ mod tests {
         // The shape of a real clientRendezvousLocation (host must parse for SNI).
         let u = "https://afdfp-rdgateway-r1.wvd.microsoft.com/api/arm/v2/connections/rendezvousclient/b475fad8-6b/corr/EUS2/RDGatewayRoleZrRedisCache?RDmiGatewayToken=abc";
         let ws = to_ws_scheme(u);
-        let host = url::Url::parse(&ws).unwrap().host_str().unwrap().to_string();
+        let host = url::Url::parse(&ws)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
         assert_eq!(host, "afdfp-rdgateway-r1.wvd.microsoft.com");
     }
 }

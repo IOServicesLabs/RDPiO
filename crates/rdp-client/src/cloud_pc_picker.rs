@@ -13,12 +13,12 @@ use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
 use webview2_com::{
+    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
     Microsoft::Web::WebView2::Win32::{
         CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2Controller,
         ICoreWebView2Environment,
     },
-    CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, NavigationStartingEventHandler,
+    NavigationStartingEventHandler,
 };
 use windows::core::{Error as WindowsError, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -272,9 +272,15 @@ fn init_webview(
                     }
                 };
                 tracing::info!("Cloud PC picker WebView2 environment created");
-                if let Err(e) =
-                    init_controller(env, hwnd, &html, entry_count, select_tx, ready_tx, ready_event)
-                {
+                if let Err(e) = init_controller(
+                    env,
+                    hwnd,
+                    &html,
+                    entry_count,
+                    select_tx,
+                    ready_tx,
+                    ready_event,
+                ) {
                     tracing::error!(error = %e, "failed to create Cloud PC picker controller");
                 }
                 Ok(())
@@ -319,12 +325,7 @@ fn pump_init_messages(
 
         let timeout = (deadline - now).as_millis().min(100) as u32;
         unsafe {
-            MsgWaitForMultipleObjectsEx(
-                Some(&handles),
-                timeout,
-                QS_ALLINPUT,
-                MWMO_INPUTAVAILABLE,
-            );
+            MsgWaitForMultipleObjectsEx(Some(&handles), timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
 
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -511,7 +512,10 @@ mod tests {
     #[test]
     fn parse_selection_rejects_out_of_range_and_non_marker() {
         assert_eq!(parse_selection("rdpio://select/5", 3), None);
-        assert_eq!(parse_selection("https://login.microsoftonline.com/", 3), None);
+        assert_eq!(
+            parse_selection("https://login.microsoftonline.com/", 3),
+            None
+        );
         assert_eq!(parse_selection("about:blank", 3), None);
     }
 

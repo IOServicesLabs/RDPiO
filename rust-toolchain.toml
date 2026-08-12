@@ -1,5 +1,5 @@
 [toolchain]
-channel = "stable"
+channel = "1.97.1"
 profile = "minimal"
+components = ["rustfmt", "clippy"]
 # On Windows the MSVC target is the host target and is picked up automatically.
-# Developers who want lints/formatting: rustup component add clippy rustfmt

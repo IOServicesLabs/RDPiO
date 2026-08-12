@@ -104,6 +104,7 @@ const DQ_GR: u32 = 3;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RlgrMode {
     Rlgr1,
+    #[allow(dead_code)] // third-generation RLGR not yet selectable; kept for parity with the spec
     Rlgr3,
 }
 
@@ -181,7 +182,13 @@ fn rlgr_decode(mode: RlgrMode, data: &[u8], out: &mut [i16]) {
     // Consumes the prefix and its terminating bit; returns the prefix length (vk).
     // Returns None if the stream ran out before the terminator.
     let count_unary = |bs: &mut BitStream, ones: bool| -> Option<u32> {
-        let lead = |acc: u32| if ones { (!acc).leading_zeros() } else { acc.leading_zeros() };
+        let lead = |acc: u32| {
+            if ones {
+                (!acc).leading_zeros()
+            } else {
+                acc.leading_zeros()
+            }
+        };
         let mut cnt = lead(bs.accumulator()).min(bs.remaining() as u32);
         let mut vk = cnt;
         while cnt == 32 && bs.remaining() > 0 {
@@ -518,10 +525,12 @@ fn dwt_block(buf: &mut [i16], base: usize, idwt: &mut [i16], sw: usize) {
         idwt[h_dst] = clampi16(buf[lh] as i32 - ((buf[hh] as i32 + buf[hh] as i32 + 1) >> 1));
         for n in 1..sw {
             let x = n << 1;
-            idwt[l_dst + x] =
-                clampi16(buf[ll + n] as i32 - ((buf[hl + n - 1] as i32 + buf[hl + n] as i32 + 1) >> 1));
-            idwt[h_dst + x] =
-                clampi16(buf[lh + n] as i32 - ((buf[hh + n - 1] as i32 + buf[hh + n] as i32 + 1) >> 1));
+            idwt[l_dst + x] = clampi16(
+                buf[ll + n] as i32 - ((buf[hl + n - 1] as i32 + buf[hl + n] as i32 + 1) >> 1),
+            );
+            idwt[h_dst + x] = clampi16(
+                buf[lh + n] as i32 - ((buf[hh + n - 1] as i32 + buf[hh + n] as i32 + 1) >> 1),
+            );
         }
         // Odd coefficients.
         for n in 0..sw - 1 {
@@ -727,7 +736,19 @@ fn dwt_extrapolate_block(buf: &mut [i16], base: usize, temp: &mut [i16], level: 
     // horizontal (LH + HH -> H)
     idwt_x(buf, lh, hh, temp, h, n_l, n_h, dst_step, n_l, n_h, n_h);
     // vertical (L + H -> LL, written back to buf at `base`)
-    idwt_y(temp, l, h, buf, base, dst_step, dst_step, dst_step, n_l, n_h, n_l + n_h);
+    idwt_y(
+        temp,
+        l,
+        h,
+        buf,
+        base,
+        dst_step,
+        dst_step,
+        dst_step,
+        n_l,
+        n_h,
+        n_l + n_h,
+    );
 }
 
 /// 3-level extrapolate inverse DWT (`rfx_dwt_2d_extrapolate_decode`).
@@ -947,7 +968,7 @@ fn srl_read(state: &mut UpgradeState, num_bits: u32) -> i16 {
         }
     }
     state.mode = false; // zero encoding next
-    // unary encoding: sign bit then a unary magnitude capped by num_bits.
+                        // unary encoding: sign bit then a unary magnitude capped by num_bits.
     let sign = (state.srl.accumulator() & 0x8000_0000) != 0;
     state.srl.shift(1);
     state.kp = state.kp.saturating_sub(6);
@@ -1134,16 +1155,34 @@ struct RegionRect {
 /// Emit `rgba` (a full 64×64 tile at `(x, y)`) clipped to the region rects. With
 /// no rects (defensive; the spec always sends them) the tile passes through
 /// whole. A tile fully inside one rect moves the buffer without copying.
-fn emit_clipped(out: &mut Vec<ProgressiveTile>, x: u32, y: u32, rgba: Vec<u8>, rects: &[RegionRect]) {
+fn emit_clipped(
+    out: &mut Vec<ProgressiveTile>,
+    x: u32,
+    y: u32,
+    rgba: Vec<u8>,
+    rects: &[RegionRect],
+) {
     let t = TILE as u32;
     if rects.is_empty() {
-        out.push(ProgressiveTile { x, y, w: t, h: t, rgba });
+        out.push(ProgressiveTile {
+            x,
+            y,
+            w: t,
+            h: t,
+            rgba,
+        });
         return;
     }
     for r in rects {
         let (rx, ry) = (r.x as u32, r.y as u32);
         if x >= rx && y >= ry && x + t <= rx + r.w as u32 && y + t <= ry + r.h as u32 {
-            out.push(ProgressiveTile { x, y, w: t, h: t, rgba });
+            out.push(ProgressiveTile {
+                x,
+                y,
+                w: t,
+                h: t,
+                rgba,
+            });
             return;
         }
     }
@@ -1231,11 +1270,7 @@ struct WorkerScratch {
 impl WorkerScratch {
     fn new() -> Self {
         Self {
-            planes: [
-                vec![0i16; COEFFS],
-                vec![0i16; COEFFS],
-                vec![0i16; COEFFS],
-            ],
+            planes: [vec![0i16; COEFFS], vec![0i16; COEFFS], vec![0i16; COEFFS]],
             temp: vec![0i16; COEFFS],
             pool: BufferPool::new(),
         }
@@ -1246,11 +1281,7 @@ impl Default for ProgressiveDecoder {
     fn default() -> Self {
         Self {
             tiles: std::collections::HashMap::new(),
-            planes: [
-                vec![0i16; COEFFS],
-                vec![0i16; COEFFS],
-                vec![0i16; COEFFS],
-            ],
+            planes: [vec![0i16; COEFFS], vec![0i16; COEFFS], vec![0i16; COEFFS]],
             temp: vec![0i16; COEFFS],
             stats: FrameStats::default(),
             perf: PerfTotals::default(),
@@ -1443,7 +1474,15 @@ impl ProgressiveDecoder {
         // Tile blocks.
         let end = (off + tile_data_size).min(b.len());
         let tile_data = &b[off..end];
-        self.decode_tiles(tile_data, num_tiles, &quants, &prog_quants, &rects, extrapolate, out);
+        self.decode_tiles(
+            tile_data,
+            num_tiles,
+            &quants,
+            &prog_quants,
+            &rects,
+            extrapolate,
+            out,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1556,11 +1595,16 @@ impl ProgressiveDecoder {
     /// to the map by [`Self::flush_batch`] after decode.
     fn bind<'a>(&mut self, parsed: ParsedTile<'a>) -> Result<Slot<'a>, &'static str> {
         match &parsed {
-            ParsedTile::First { x_idx, y_idx, bitpos, .. } => {
+            ParsedTile::First {
+                x_idx,
+                y_idx,
+                bitpos,
+                ..
+            } => {
                 let entry = self.tiles.entry((*x_idx, *y_idx)).or_default();
                 let mut state = std::mem::take(entry);
-                for ci in 0..3 {
-                    state.comps[ci].bit_pos = bitpos[ci];
+                for (comp, &bp) in state.comps.iter_mut().zip(bitpos.iter()) {
+                    comp.bit_pos = bp;
                 }
                 Ok(Slot {
                     parsed,
@@ -1590,8 +1634,8 @@ impl ProgressiveDecoder {
                     entry.comps[2].bit_pos.sub(&new_bitpos[2]).ok_or(nb)?,
                 ];
                 let mut state = std::mem::take(entry);
-                for ci in 0..3 {
-                    state.comps[ci].bit_pos = new_bitpos[ci];
+                for (comp, &bp) in state.comps.iter_mut().zip(new_bitpos.iter()) {
+                    comp.bit_pos = bp;
                 }
                 Ok(Slot {
                     parsed,
@@ -1706,7 +1750,6 @@ impl ProgressiveDecoder {
             }
         }
     }
-
 }
 
 /// A fully parsed tile block, holding resolved quant values and slices into the
@@ -1755,7 +1798,6 @@ struct Slot<'a> {
     state: TileState,
     rgba: Option<Vec<u8>>,
 }
-
 
 /// Decode one slot: run the component transforms against the slot's own state
 /// and produce the tile's RGBA. Pure with respect to everything but the slot and
@@ -1811,11 +1853,7 @@ fn decode_slot(
         }
     }
     let t0 = std::time::Instant::now();
-    slot.rgba = Some(ycbcr_to_rgba(&planes[0],
-        &planes[1],
-        &planes[2],
-        pool,
-    ));
+    slot.rgba = Some(ycbcr_to_rgba(&planes[0], &planes[1], &planes[2], pool));
     perf.ycbcr += t0.elapsed();
     perf.tiles += 1;
 }
@@ -2030,7 +2068,9 @@ mod tests {
     fn strips_4byte_length_prefix_before_sync() {
         // Real wire form: [u32 len][WBT_SYNC ...]. The stream after stripping must
         // begin at the SYNC block; a stream already at a block is left untouched.
-        let blocks = [0xC0u8, 0xCC, 0x0C, 0x00, 0x00, 0x00, 0xCA, 0xAC, 0xCC, 0xCA, 0x00, 0x01];
+        let blocks = [
+            0xC0u8, 0xCC, 0x0C, 0x00, 0x00, 0x00, 0xCA, 0xAC, 0xCC, 0xCA, 0x00, 0x01,
+        ];
         let mut prefixed = (blocks.len() as u32).to_le_bytes().to_vec();
         prefixed.extend_from_slice(&blocks);
         assert_eq!(strip_length_prefix(&prefixed), &blocks);
@@ -2084,7 +2124,7 @@ mod tests {
         region.push(0); // flags (non-extrapolate)
         region.extend_from_slice(&1u16.to_le_bytes()); // numTiles
         region.extend_from_slice(&(tile.len() as u32).to_le_bytes()); // tileDataSize
-        // One quant set: every nibble = 1 so `lsub(1)` succeeds (shift 0 = no-op).
+                                                                      // One quant set: every nibble = 1 so `lsub(1)` succeeds (shift 0 = no-op).
         region.extend_from_slice(&[0x11u8, 0x11, 0x11, 0x11, 0x11]);
         region.extend_from_slice(&tile);
 

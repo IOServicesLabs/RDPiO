@@ -165,7 +165,6 @@ pub fn auto_reconnect_cookie(logon_id: u32, security_verifier: &[u8; 16]) -> [u8
 }
 
 /// A `TS_EXTENDED_INFO_PACKET` (the part that follows the `TS_INFO_PACKET`)
-
 /// carrying `performance_flags` and, optionally, the auto-reconnect `cookie`.
 /// With `cookie = None`, `cbAutoReconnectCookie` is 0 and no cookie follows. On
 /// the encrypted legacy path the caller appends this to the `TS_INFO_PACKET`
@@ -217,9 +216,18 @@ mod tests {
     #[test]
     fn reconnect_cookie_and_extended_info() {
         let cookie = auto_reconnect_cookie(0xABCD, &[9u8; 16]);
-        assert_eq!(u32::from_le_bytes([cookie[0], cookie[1], cookie[2], cookie[3]]), 28);
-        assert_eq!(u32::from_le_bytes([cookie[4], cookie[5], cookie[6], cookie[7]]), 1);
-        assert_eq!(u32::from_le_bytes([cookie[8], cookie[9], cookie[10], cookie[11]]), 0xABCD);
+        assert_eq!(
+            u32::from_le_bytes([cookie[0], cookie[1], cookie[2], cookie[3]]),
+            28
+        );
+        assert_eq!(
+            u32::from_le_bytes([cookie[4], cookie[5], cookie[6], cookie[7]]),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes([cookie[8], cookie[9], cookie[10], cookie[11]]),
+            0xABCD
+        );
         assert_eq!(&cookie[12..28], &[9u8; 16]);
 
         let info = ClientInfo {
@@ -242,7 +250,12 @@ mod tests {
         let payload = client_info_payload(&ClientInfo::default());
         // The extended info ends with performanceFlags(4) + cbAutoReconnectCookie(2).
         let n = payload.len();
-        let perf = u32::from_le_bytes([payload[n - 6], payload[n - 5], payload[n - 4], payload[n - 3]]);
+        let perf = u32::from_le_bytes([
+            payload[n - 6],
+            payload[n - 5],
+            payload[n - 4],
+            payload[n - 3],
+        ]);
         assert_eq!(perf, PERF_BALANCED);
         // wallpaper|menuanim|font_smoothing — full-window-drag stays ENABLED so
         // dragging shows window contents (not just an outline), like mstsc.

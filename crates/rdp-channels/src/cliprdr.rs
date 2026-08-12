@@ -212,7 +212,7 @@ fn file_group_descriptor(files: &[ClipFile]) -> Vec<u8> {
         d.extend_from_slice(&0u64.to_le_bytes()); // lastWriteTime
         d.extend_from_slice(&((f.size >> 32) as u32).to_le_bytes()); // fileSizeHigh
         d.extend_from_slice(&(f.size as u32).to_le_bytes()); // fileSizeLow
-        // fileName: 260 UTF-16 code units (520 bytes), NUL-padded.
+                                                             // fileName: 260 UTF-16 code units (520 bytes), NUL-padded.
         let mut name = [0u16; 260];
         for (i, u) in f.name.encode_utf16().take(259).enumerate() {
             name[i] = u;
@@ -267,7 +267,10 @@ fn parse_format_list(data: &[u8]) -> Vec<(u32, String)> {
 /// entries, carrying the directory flag so a copied folder can be rebuilt.
 fn parse_file_descriptors(data: &[u8]) -> Vec<ClipFile> {
     let mut out = Vec::new();
-    let Some(count) = data.get(0..4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])) else {
+    let Some(count) = data
+        .get(0..4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    else {
         return out;
     };
     const REC: usize = 592;
@@ -567,10 +570,7 @@ impl ClipboardChannel {
                     _ => self.paste_text = Some(decode_unicode(data)),
                 }
                 if self.pending_formats.is_empty() {
-                    provider.set_contents(
-                        self.paste_text.as_deref(),
-                        self.paste_image.as_deref(),
-                    );
+                    provider.set_contents(self.paste_text.as_deref(), self.paste_image.as_deref());
                     self.paste_text = None;
                     self.paste_image = None;
                 }
@@ -645,7 +645,11 @@ impl ClipboardChannel {
                         )],
                     }
                 } else {
-                    vec![message(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_FAIL, &stream_id.to_le_bytes())]
+                    vec![message(
+                        CB_FILECONTENTS_RESPONSE,
+                        CB_RESPONSE_FAIL,
+                        &stream_id.to_le_bytes(),
+                    )]
                 }
             }
             // CB_CLIP_CAPS, CB_FORMAT_LIST_RESPONSE, others: nothing to send.
@@ -661,7 +665,8 @@ impl ClipboardChannel {
         has_files: bool,
         has_image: bool,
     ) -> Option<Vec<u8>> {
-        self.ready.then(|| format_list(has_text, has_files, has_image))
+        self.ready
+            .then(|| format_list(has_text, has_files, has_image))
     }
 
     /// The data request for the next queued format, if any remain.
@@ -751,10 +756,7 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert_eq!(msg_type(&out[0]), CB_FORMAT_DATA_RESPONSE);
-        assert_eq!(
-            u16::from_le_bytes([out[0][2], out[0][3]]),
-            CB_RESPONSE_OK
-        );
+        assert_eq!(u16::from_le_bytes([out[0][2], out[0][3]]), CB_RESPONSE_OK);
         assert_eq!(decode_unicode(&out[0][8..]), "copy me");
     }
 
@@ -854,7 +856,11 @@ mod tests {
         // Answer the text; the channel then asks for the image. Nothing is
         // applied yet — the paste is held until every format has answered.
         let out = clip.process(
-            &message(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, &unicode_response("hi")),
+            &message(
+                CB_FORMAT_DATA_RESPONSE,
+                CB_RESPONSE_OK,
+                &unicode_response("hi"),
+            ),
             &mut prov,
         );
         assert_eq!(prov.set_contents_calls, 0);
@@ -884,7 +890,11 @@ mod tests {
         list.extend_from_slice(&[0, 0]);
         clip.process(&message(CB_FORMAT_LIST, 0, &list), &mut prov);
         clip.process(
-            &message(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, &unicode_response("solo")),
+            &message(
+                CB_FORMAT_DATA_RESPONSE,
+                CB_RESPONSE_OK,
+                &unicode_response("solo"),
+            ),
             &mut prov,
         );
         assert_eq!(prov.pasted_text.as_deref(), Some("solo"));
@@ -919,23 +929,37 @@ mod tests {
     fn file_clipboard_announces_and_serves_contents() {
         let mut clip = ClipboardChannel::new();
         let mut prov = FileClipboard {
-            files: vec![ClipFile { name: "report.pdf".into(), size: 1234, is_dir: false }],
+            files: vec![ClipFile {
+                name: "report.pdf".into(),
+                size: 1234,
+                is_dir: false,
+            }],
             ..Default::default()
         };
         // Monitor Ready → caps + a format list that includes FileGroupDescriptorW.
         let out = clip.process(&message(CB_MONITOR_READY, 0, &[]), &mut prov);
         let fl = &out[1];
         assert_eq!(u16::from_le_bytes([fl[0], fl[1]]), CB_FORMAT_LIST);
-        assert_eq!(u32::from_le_bytes([fl[8], fl[9], fl[10], fl[11]]), CF_FILEGROUPDESCRIPTORW);
+        assert_eq!(
+            u32::from_le_bytes([fl[8], fl[9], fl[10], fl[11]]),
+            CF_FILEGROUPDESCRIPTORW
+        );
 
         // Server requests the file group descriptor → packed FILEDESCRIPTORW.
         let out = clip.process(
-            &message(CB_FORMAT_DATA_REQUEST, 0, &CF_FILEGROUPDESCRIPTORW.to_le_bytes()),
+            &message(
+                CB_FORMAT_DATA_REQUEST,
+                0,
+                &CF_FILEGROUPDESCRIPTORW.to_le_bytes(),
+            ),
             &mut prov,
         );
         assert_eq!(u16::from_le_bytes([out[0][2], out[0][3]]), CB_RESPONSE_OK);
         // cItems = 1, then the 592-byte descriptor; fileSizeLow = 1234.
-        assert_eq!(u32::from_le_bytes([out[0][8], out[0][9], out[0][10], out[0][11]]), 1);
+        assert_eq!(
+            u32::from_le_bytes([out[0][8], out[0][9], out[0][10], out[0][11]]),
+            1
+        );
 
         // File Contents Request (SIZE) → 8-byte size.
         let mut req = Vec::new();
@@ -944,10 +968,17 @@ mod tests {
         req.extend_from_slice(&FILECONTENTS_SIZE.to_le_bytes());
         req.extend_from_slice(&[0u8; 12]); // pos + cbRequested
         let out = clip.process(&message(CB_FILECONTENTS_REQUEST, 0, &req), &mut prov);
-        assert_eq!(u16::from_le_bytes([out[0][0], out[0][1]]), CB_FILECONTENTS_RESPONSE);
-        assert_eq!(u32::from_le_bytes([out[0][8], out[0][9], out[0][10], out[0][11]]), 7); // streamId echoed
+        assert_eq!(
+            u16::from_le_bytes([out[0][0], out[0][1]]),
+            CB_FILECONTENTS_RESPONSE
+        );
+        assert_eq!(
+            u32::from_le_bytes([out[0][8], out[0][9], out[0][10], out[0][11]]),
+            7
+        ); // streamId echoed
         let size = u64::from_le_bytes([
-            out[0][12], out[0][13], out[0][14], out[0][15], out[0][16], out[0][17], out[0][18], out[0][19],
+            out[0][12], out[0][13], out[0][14], out[0][15], out[0][16], out[0][17], out[0][18],
+            out[0][19],
         ]);
         assert_eq!(size, 1234);
 
@@ -973,16 +1004,36 @@ mod tests {
         let mut clip = ClipboardChannel::new();
         let mut prov = FileClipboard {
             files: vec![
-                ClipFile { name: "docs".into(), size: 0, is_dir: true },
-                ClipFile { name: "docs\\a.txt".into(), size: 3, is_dir: false },
-                ClipFile { name: "docs\\sub".into(), size: 0, is_dir: true },
-                ClipFile { name: "docs\\sub\\b.bin".into(), size: 9, is_dir: false },
+                ClipFile {
+                    name: "docs".into(),
+                    size: 0,
+                    is_dir: true,
+                },
+                ClipFile {
+                    name: "docs\\a.txt".into(),
+                    size: 3,
+                    is_dir: false,
+                },
+                ClipFile {
+                    name: "docs\\sub".into(),
+                    size: 0,
+                    is_dir: true,
+                },
+                ClipFile {
+                    name: "docs\\sub\\b.bin".into(),
+                    size: 9,
+                    is_dir: false,
+                },
             ],
             ..Default::default()
         };
         clip.process(&message(CB_MONITOR_READY, 0, &[]), &mut prov);
         clip.process(
-            &message(CB_FORMAT_DATA_REQUEST, 0, &CF_FILEGROUPDESCRIPTORW.to_le_bytes()),
+            &message(
+                CB_FORMAT_DATA_REQUEST,
+                0,
+                &CF_FILEGROUPDESCRIPTORW.to_le_bytes(),
+            ),
             &mut prov,
         );
         let after_descriptors = prov.walks;
@@ -1090,7 +1141,10 @@ mod tests {
         let out = clip.process(&message(CB_FORMAT_LIST, 0, &fl), prov);
         assert_eq!(msg_type(&out[1]), CB_FORMAT_DATA_REQUEST);
         assert_eq!(&out[1][8..12], &CF_FILEGROUPDESCRIPTORW.to_le_bytes());
-        let out = clip.process(&message(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, desc), prov);
+        let out = clip.process(
+            &message(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, desc),
+            prov,
+        );
         // Nothing is transferred yet — the descriptors only advertise.
         assert!(out.is_empty(), "descriptors must not trigger a transfer");
     }
@@ -1114,7 +1168,10 @@ mod tests {
 
         let mut resp = 1u32.to_le_bytes().to_vec(); // streamId
         resp.extend_from_slice(b"hello");
-        let out = clip.process(&message(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, &resp), &mut prov);
+        let out = clip.process(
+            &message(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, &resp),
+            &mut prov,
+        );
         assert_eq!(prov.saved.len(), 1);
         assert_eq!(prov.saved[0].0, "a.txt");
         assert_eq!(prov.saved[0].1, b"hello");
@@ -1128,7 +1185,11 @@ mod tests {
         let mut prov = DownloadClipboard::default();
         // Two chunks' worth plus a tail, so the request/response loop repeats.
         let total = FILE_CHUNK as u64 * 2 + 7;
-        offer(&mut clip, &mut prov, &descriptors(&[("big.bin", total, false)]));
+        offer(
+            &mut clip,
+            &mut prov,
+            &descriptors(&[("big.bin", total, false)]),
+        );
 
         let out = clip.begin_file_fetch(&mut prov);
         // First request asks for a full chunk from offset 0.
@@ -1139,18 +1200,27 @@ mod tests {
         // Answer chunk 1 → the next request continues at the chunk boundary.
         let mut r = 1u32.to_le_bytes().to_vec();
         r.extend_from_slice(&vec![0xAB; FILE_CHUNK as usize]);
-        let out = clip.process(&message(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, &r), &mut prov);
+        let out = clip.process(
+            &message(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, &r),
+            &mut prov,
+        );
         assert_eq!(&out[0][20..24], &FILE_CHUNK.to_le_bytes()); // resumes at 8 MiB
         assert!(prov.saved.is_empty(), "file is not complete yet");
 
         // Answer chunk 2, then the 7-byte tail.
         let mut r = 2u32.to_le_bytes().to_vec();
         r.extend_from_slice(&vec![0xCD; FILE_CHUNK as usize]);
-        let out = clip.process(&message(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, &r), &mut prov);
+        let out = clip.process(
+            &message(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, &r),
+            &mut prov,
+        );
         assert_eq!(&out[0][28..32], &7u32.to_le_bytes()); // only the remainder
         let mut r = 3u32.to_le_bytes().to_vec();
         r.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7]);
-        let out = clip.process(&message(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, &r), &mut prov);
+        let out = clip.process(
+            &message(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, &r),
+            &mut prov,
+        );
 
         assert_eq!(prov.saved.len(), 1);
         assert_eq!(prov.saved[0].1.len() as u64, total);
@@ -1184,7 +1254,10 @@ mod tests {
 
         let mut r = 1u32.to_le_bytes().to_vec();
         r.extend_from_slice(b"abcd");
-        let out = clip.process(&message(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, &r), &mut prov);
+        let out = clip.process(
+            &message(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, &r),
+            &mut prov,
+        );
         assert!(out.is_empty());
         // Tree rebuilt in order, with the relative path preserved.
         let names: Vec<&str> = prov.saved.iter().map(|e| e.0.as_str()).collect();
@@ -1201,7 +1274,11 @@ mod tests {
         offer(&mut clip, &mut prov, &descriptors(&[("a.bin", 9, false)]));
         clip.begin_file_fetch(&mut prov);
         let out = clip.process(
-            &message(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_FAIL, &1u32.to_le_bytes()),
+            &message(
+                CB_FILECONTENTS_RESPONSE,
+                CB_RESPONSE_FAIL,
+                &1u32.to_le_bytes(),
+            ),
             &mut prov,
         );
         assert!(prov.aborted, "partial state must be dropped");

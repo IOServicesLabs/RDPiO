@@ -46,7 +46,11 @@ fn main() {
     println!(
         "replaying {} payloads from {dir} (fps={})",
         files.len(),
-        if fps == 0 { "max".to_string() } else { fps.to_string() }
+        if fps == 0 {
+            "max".to_string()
+        } else {
+            fps.to_string()
+        }
     );
 
     let mut dec = ProgressiveDecoder::new();

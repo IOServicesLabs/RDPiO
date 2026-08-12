@@ -58,7 +58,7 @@ use windows::core::{
     implement, interface, s, IUnknown, IUnknown_Vtbl, Interface, Ref, Result, BOOL, BSTR, GUID,
     HRESULT, PCWSTR,
 };
-use windows::Win32::Foundation::{E_FAIL, E_NOINTERFACE, E_NOTIMPL, FreeLibrary, HMODULE, S_OK};
+use windows::Win32::Foundation::{FreeLibrary, E_FAIL, E_NOINTERFACE, E_NOTIMPL, HMODULE, S_OK};
 use windows::Win32::System::Com::StructuredStorage::IPropertyBag;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::{
@@ -75,8 +75,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 /// `HRESULT VirtualChannelGetInstance(REFIID, ULONG* pNumObjs, VOID** ppObjArray)`.
-type GetInstanceFn =
-    unsafe extern "system" fn(*const GUID, *mut u32, *mut *mut c_void) -> HRESULT;
+type GetInstanceFn = unsafe extern "system" fn(*const GUID, *mut u32, *mut *mut c_void) -> HRESULT;
 
 /// Control messages from the mux (any thread) to the COM host thread.
 enum HostMsg {
@@ -153,13 +152,8 @@ struct HostServiceVtbl {
     add_ref: unsafe extern "system" fn(*mut HostService) -> u32,
     release: unsafe extern "system" fn(*mut HostService) -> u32,
     /// Every unknown method: a no-op returning `E_NOTIMPL`.
-    methods: [unsafe extern "system" fn(
-        *mut HostService,
-        usize,
-        usize,
-        usize,
-        usize,
-    ) -> HRESULT; STUB_METHOD_SLOTS],
+    methods: [unsafe extern "system" fn(*mut HostService, usize, usize, usize, usize) -> HRESULT;
+        STUB_METHOD_SLOTS],
 }
 
 #[repr(C)]
@@ -184,7 +178,11 @@ unsafe extern "system" fn stub_query_interface(
     ppv: *mut *mut c_void,
 ) -> HRESULT {
     static QI_LOGS: AtomicU32 = AtomicU32::new(0);
-    let iid = if riid.is_null() { GUID::from_u128(0) } else { unsafe { *riid } };
+    let iid = if riid.is_null() {
+        GUID::from_u128(0)
+    } else {
+        unsafe { *riid }
+    };
     // Hand back the object for IUnknown only; refuse every typed interface so the
     // add-in keeps using its own fallback media path (no behaviour change to the
     // running call) while still holding a valid non-null pointer for teardown.
@@ -432,11 +430,18 @@ impl IWTSVirtualChannel_Impl for VirtualChannel_Impl {
         } else {
             unsafe { std::slice::from_raw_parts(pbuffer, cbsize as usize) }.to_vec()
         };
-        tracing::debug!(channel_id = self.channel_id, len = bytes.len(), "WebRTC add-in → server");
+        tracing::debug!(
+            channel_id = self.channel_id,
+            len = bytes.len(),
+            "WebRTC add-in → server"
+        );
         if let Some(cap) = &self.capture {
             cap.record(CAP_DIR_OUTBOUND, self.channel_id, &bytes);
         }
-        self.outbound.lock().unwrap().push_back((self.channel_id, bytes));
+        self.outbound
+            .lock()
+            .unwrap()
+            .push_back((self.channel_id, bytes));
         Ok(())
     }
 
@@ -451,7 +456,11 @@ impl IWTSVirtualChannel_Impl for VirtualChannel_Impl {
 // ---------------------------------------------------------------------------
 
 unsafe fn load_addin(path: &Path) -> Result<HMODULE> {
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_WITH_ALTERED_SEARCH_PATH) }
 }
 
@@ -539,48 +548,50 @@ fn run_host(
         while running {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
-                HostMsg::NewChannel { channel_id, name } => {
-                    let lcb = listeners
-                        .borrow()
-                        .iter()
-                        .find(|(n, _)| *n == name)
-                        .map(|(_, c)| c.clone());
-                    let Some(lcb) = lcb else { continue };
-                    let vc: IWTSVirtualChannel = VirtualChannel {
-                        channel_id,
-                        outbound: outbound.clone(),
-                        capture: capture.clone(),
-                    }
-                    .into();
-                    let mut accept = BOOL(0);
-                    let mut cb: Option<IWTSVirtualChannelCallback> = None;
-                    let empty = BSTR::default();
-                    match lcb.OnNewChannelConnection(&vc, &empty, &mut accept, &mut cb) {
-                        Ok(()) => {
-                            tracing::info!(channel_id, %name, accept = accept.as_bool(), "WebRTC add-in bound new channel");
-                            if let Some(cb) = cb {
-                                channels.insert(channel_id, cb);
+                    HostMsg::NewChannel { channel_id, name } => {
+                        let lcb = listeners
+                            .borrow()
+                            .iter()
+                            .find(|(n, _)| *n == name)
+                            .map(|(_, c)| c.clone());
+                        let Some(lcb) = lcb else { continue };
+                        let vc: IWTSVirtualChannel = VirtualChannel {
+                            channel_id,
+                            outbound: outbound.clone(),
+                            capture: capture.clone(),
+                        }
+                        .into();
+                        let mut accept = BOOL(0);
+                        let mut cb: Option<IWTSVirtualChannelCallback> = None;
+                        let empty = BSTR::default();
+                        match lcb.OnNewChannelConnection(&vc, &empty, &mut accept, &mut cb) {
+                            Ok(()) => {
+                                tracing::info!(channel_id, %name, accept = accept.as_bool(), "WebRTC add-in bound new channel");
+                                if let Some(cb) = cb {
+                                    channels.insert(channel_id, cb);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(channel_id, error = %e, "OnNewChannelConnection failed")
                             }
                         }
-                        Err(e) => tracing::warn!(channel_id, error = %e, "OnNewChannelConnection failed"),
                     }
-                }
-                HostMsg::Data { channel_id, data } => {
-                    if let Some(cb) = channels.get(&channel_id) {
-                        if let Err(e) = cb.OnDataReceived(&data) {
-                            tracing::warn!(channel_id, error = %e, "OnDataReceived failed");
+                    HostMsg::Data { channel_id, data } => {
+                        if let Some(cb) = channels.get(&channel_id) {
+                            if let Err(e) = cb.OnDataReceived(&data) {
+                                tracing::warn!(channel_id, error = %e, "OnDataReceived failed");
+                            }
                         }
                     }
-                }
-                HostMsg::Close { channel_id } => {
-                    if let Some(cb) = channels.remove(&channel_id) {
-                        let _ = cb.OnClose();
+                    HostMsg::Close { channel_id } => {
+                        if let Some(cb) = channels.remove(&channel_id) {
+                            let _ = cb.OnClose();
+                        }
                     }
-                }
-                HostMsg::Shutdown => {
-                    running = false;
-                    break;
-                }
+                    HostMsg::Shutdown => {
+                        running = false;
+                        break;
+                    }
                 }
             }
             if !running {
@@ -652,7 +663,10 @@ impl WebRtcRedirector {
                 thread: Some(thread),
             }),
             other => {
-                tracing::warn!(?other, "Teams WebRTC add-in did not initialize; staying on decline");
+                tracing::warn!(
+                    ?other,
+                    "Teams WebRTC add-in did not initialize; staying on decline"
+                );
                 None
             }
         }
@@ -773,8 +787,12 @@ fn resolve_addin_dll() -> Option<PathBuf> {
         }
     }
     match &best {
-        Some((pkg, path)) => tracing::info!(package = %pkg, path = %path.display(), "found Teams WebRTC add-in"),
-        None => tracing::warn!("no MsRdcWebRTCAddIn.dll found in any WindowsApps package or next to rdpio.exe"),
+        Some((pkg, path)) => {
+            tracing::info!(package = %pkg, path = %path.display(), "found Teams WebRTC add-in")
+        }
+        None => tracing::warn!(
+            "no MsRdcWebRTCAddIn.dll found in any WindowsApps package or next to rdpio.exe"
+        ),
     }
     best.map(|(_, p)| p)
 }

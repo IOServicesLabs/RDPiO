@@ -19,11 +19,11 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFMediaType, IMFSample, IMFTransform, MFCreateMediaType, MFCreateMemoryBuffer,
-    MFCreateSample, MFInitMediaTypeFromWaveFormatEx, MFStartup, MFT_CATEGORY_AUDIO_DECODER,
-    MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_FLUSH,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-    MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STATUS_SAMPLE_READY, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_VERSION, MFSTARTUP_LITE,
+    MFCreateSample, MFInitMediaTypeFromWaveFormatEx, MFStartup, MFSTARTUP_LITE,
+    MFT_CATEGORY_AUDIO_DECODER, MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STATUS_SAMPLE_READY,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_VERSION,
 };
 
 /// `MMSYSERR_NOERROR` — a `waveOut*` call succeeded.
@@ -109,7 +109,9 @@ impl AacDecoder {
         if !format.extra.is_empty() {
             std::ptr::copy_nonoverlapping(
                 format.extra.as_ptr(),
-                wfx_buf.as_mut_ptr().add(std::mem::size_of::<WAVEFORMATEX>()),
+                wfx_buf
+                    .as_mut_ptr()
+                    .add(std::mem::size_of::<WAVEFORMATEX>()),
                 format.extra.len(),
             );
         }
@@ -144,7 +146,9 @@ impl AacDecoder {
         .ok()?;
         transform.SetOutputType(0, &output_type, 0).ok()?;
 
-        transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0).ok()?;
+        transform
+            .ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)
+            .ok()?;
         transform
             .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
             .ok()?;
@@ -190,9 +194,11 @@ impl AacDecoder {
                 dwStatus: 0,
                 pEvents: std::mem::ManuallyDrop::new(None),
             };
-            let hr = self
-                .transform
-                .ProcessOutput(0, std::slice::from_mut(&mut output_data), &mut status);
+            let hr = self.transform.ProcessOutput(
+                0,
+                std::slice::from_mut(&mut output_data),
+                &mut status,
+            );
             if let Err(e) = hr {
                 let code = e.code().0;
                 let _ = output_data.pSample.take();
@@ -213,7 +219,8 @@ impl AacDecoder {
                 let mut ptr = std::ptr::null_mut();
                 let mut len = 0u32;
                 let mut max_len = 0u32;
-                out_buf.Lock(&mut ptr, Some(&mut max_len), Some(&mut len))
+                out_buf
+                    .Lock(&mut ptr, Some(&mut max_len), Some(&mut len))
                     .ok()?;
                 let slice = std::slice::from_raw_parts(ptr as *const u8, len as usize);
                 pcm.extend_from_slice(slice);
@@ -295,7 +302,11 @@ impl Win32Audio {
         if bps == 0 {
             return 0;
         }
-        let queued: u64 = self.pending.iter().map(|(h, _)| h.dwBufferLength as u64).sum();
+        let queued: u64 = self
+            .pending
+            .iter()
+            .map(|(h, _)| h.dwBufferLength as u64)
+            .sum();
         queued * 1000 / bps
     }
 
@@ -316,7 +327,10 @@ impl Win32Audio {
         for (mut hdr, _data) in self.pending.drain(..) {
             let _ = waveOutUnprepareHeader(h, &mut *hdr, Self::HDR_SIZE);
         }
-        tracing::debug!(behind_ms = behind, "audio: backlog exceeded cap; flushed to resync with video");
+        tracing::debug!(
+            behind_ms = behind,
+            "audio: backlog exceeded cap; flushed to resync with video"
+        );
     }
 
     /// Reset, drain, and close the device (if open).
@@ -337,7 +351,8 @@ impl AudioSink for Win32Audio {
     fn set_format(&mut self, channels: u16, samples_per_sec: u32, bits_per_sample: u16) {
         // Switching back to PCM from compressed: drop any AAC decoder.
         self.aac_decoder = None;
-        if self.handle.is_some() && self.format == Some((channels, samples_per_sec, bits_per_sample))
+        if self.handle.is_some()
+            && self.format == Some((channels, samples_per_sec, bits_per_sample))
         {
             return;
         }

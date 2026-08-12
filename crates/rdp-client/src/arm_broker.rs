@@ -140,7 +140,10 @@ pub fn build_connection_request(
             Value::String(shortpath_protocol_config()),
         );
         obj.insert("geo".into(), Value::String("US__False".into()));
-        obj.insert("wcioProtectionSessionNonce".into(), Value::String(String::new()));
+        obj.insert(
+            "wcioProtectionSessionNonce".into(),
+            Value::String(String::new()),
+        );
         obj.insert("clientCapabilities".into(), serde_json::json!({}));
     }
     req.to_string()
@@ -219,8 +222,14 @@ fn parse_shortpath(v: &Value) -> ShortpathConfig {
         ..Default::default()
     };
     if let Some(ice) = ice {
-        cfg.stun_enabled = ice.get("stunEnabled").and_then(Value::as_bool).unwrap_or(false);
-        cfg.turn_enabled = ice.get("turnEnabled").and_then(Value::as_bool).unwrap_or(false);
+        cfg.stun_enabled = ice
+            .get("stunEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        cfg.turn_enabled = ice
+            .get("turnEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if let Some(arr) = ice.get("stunServers").and_then(Value::as_array) {
             for s in arr {
                 if let Some(url) = s.get("url") {
@@ -252,9 +261,21 @@ fn parse_shortpath(v: &Value) -> ShortpathConfig {
                 cfg.turn_servers.push(TurnServer {
                     host,
                     port,
-                    username: t.get("username").and_then(Value::as_str).unwrap_or_default().to_string(),
-                    password: t.get("password").and_then(Value::as_str).unwrap_or_default().to_string(),
-                    realm: t.get("realm").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    username: t
+                        .get("username")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    password: t
+                        .get("password")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    realm: t
+                        .get("realm")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                     secure: url
                         .and_then(|u| u.get("secure"))
                         .and_then(Value::as_bool)
@@ -492,8 +513,13 @@ mod tests {
         // The stringified protocol config must be present and declare RendezvousMode 4.
         let pc = v["protocolConfigRequestAsJson"].as_str().expect("present");
         let pcv: Value = serde_json::from_str(pc).unwrap();
-        assert_eq!(pcv["TransportCapabilities"]["RDPLegacy"]["RendezvousMode"], 4);
-        assert!(pcv["TransportCapabilities"].get("NanoTransportStackPrototype").is_some());
+        assert_eq!(
+            pcv["TransportCapabilities"]["RDPLegacy"]["RendezvousMode"],
+            4
+        );
+        assert!(pcv["TransportCapabilities"]
+            .get("NanoTransportStackPrototype")
+            .is_some());
         // Core routing fields still carried verbatim.
         assert_eq!(v["application"], "||app");
         assert_eq!(v["loadBalanceInfo"], "mth://x");
@@ -513,7 +539,10 @@ mod tests {
             conn.websocket_url(),
             Some("wss://rdgateway-r1.wvd.microsoft.com/api/arm/v2/connect?ConnectionId=abc")
         );
-        assert_eq!(conn.redirected_server_name.as_deref(), Some("host.pool.local"));
+        assert_eq!(
+            conn.redirected_server_name.as_deref(),
+            Some("host.pool.local")
+        );
         assert_eq!(conn.redirected_auth_blob.as_deref(), Some("QkxPQg=="));
         assert!(conn.redirected_auth_guid.is_some());
     }

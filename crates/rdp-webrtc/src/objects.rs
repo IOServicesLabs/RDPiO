@@ -79,8 +79,14 @@ mod tests {
 
     #[test]
     fn maps_known_types() {
-        assert_eq!(ObjectType::from_name("RTCPeerConnection"), ObjectType::PeerConnection);
-        assert_eq!(ObjectType::from_name("RDWebRTCRedirector"), ObjectType::Redirector);
+        assert_eq!(
+            ObjectType::from_name("RTCPeerConnection"),
+            ObjectType::PeerConnection
+        );
+        assert_eq!(
+            ObjectType::from_name("RDWebRTCRedirector"),
+            ObjectType::Redirector
+        );
         assert_eq!(ObjectType::from_name("nope"), ObjectType::Unknown);
     }
 

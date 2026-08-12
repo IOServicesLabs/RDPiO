@@ -231,7 +231,10 @@ impl CameraDeviceChannel {
         match id {
             msg::STREAM_LIST_REQUEST => {
                 // Advertise a single video stream (index 0).
-                vec![message(msg::STREAM_LIST_RESPONSE, &[1u8 /* stream count */, 0])]
+                vec![message(
+                    msg::STREAM_LIST_RESPONSE,
+                    &[1u8 /* stream count */, 0],
+                )]
             }
             msg::MEDIA_TYPE_LIST_REQUEST => {
                 let mut body = Vec::new();
@@ -347,7 +350,10 @@ mod tests {
         assert_eq!(&out[0][4..8], b"NV12");
 
         // StartStreams selecting index 1 (640x480) → SuccessResponse + streaming.
-        let out = dev.process(&message(msg::START_STREAMS_REQUEST, &[0 /*stream*/, 1 /*mt idx*/]));
+        let out = dev.process(&message(
+            msg::START_STREAMS_REQUEST,
+            &[0 /*stream*/, 1 /*mt idx*/],
+        ));
         assert_eq!(message_id(&out[0]), Some(msg::SUCCESS_RESPONSE));
         assert_eq!(dev.streaming(), Some(nv12(640, 480)));
 

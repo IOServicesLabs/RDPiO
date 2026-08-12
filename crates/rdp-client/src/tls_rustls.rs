@@ -56,6 +56,7 @@ impl<S: Read + Write> TlsStream<S> {
     }
 
     /// The inner stream (e.g. to set a socket read timeout).
+    #[allow(dead_code)] // accessor for callers that need the underlying transport
     pub fn get_ref(&self) -> &S {
         self.inner.get_ref()
     }

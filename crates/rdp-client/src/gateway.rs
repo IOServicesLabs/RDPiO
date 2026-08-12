@@ -52,13 +52,17 @@ pub enum GatewayError {
 
 /// Parse RD Gateway keys from an `.rdp` file settings map (the output of
 /// [`feed::parse_rdp_file`](crate::feed::parse_rdp_file)).
-pub fn parse_rdp_settings(settings: &std::collections::HashMap<String, String>) -> Option<GatewayConfig> {
+pub fn parse_rdp_settings(
+    settings: &std::collections::HashMap<String, String>,
+) -> Option<GatewayConfig> {
     let hostname = settings.get("gatewayhostname")?;
     if hostname.is_empty() {
         return None;
     }
-    let mut cfg = GatewayConfig::default();
-    cfg.hostname = hostname.clone();
+    let mut cfg = GatewayConfig {
+        hostname: hostname.clone(),
+        ..GatewayConfig::default()
+    };
     if let Some(p) = settings.get("gatewayport").and_then(|s| s.parse().ok()) {
         cfg.port = p;
     }
@@ -79,7 +83,12 @@ pub fn parse_rdp_settings(settings: &std::collections::HashMap<String, String>) 
 pub fn apply_to_config(config: &mut ClientConfig, cfg: &GatewayConfig) {
     // Store the gateway cookie/hostname in load_balance_info so it survives
     // into the connection layer. The real tunnel will read it from here.
-    if !config.load_balance_info.as_ref().map(|v| v.is_empty()).unwrap_or(true) {
+    if !config
+        .load_balance_info
+        .as_ref()
+        .map(|v| v.is_empty())
+        .unwrap_or(true)
+    {
         return;
     }
     let cookie = format!("GatewayHostName:{}", cfg.hostname);
@@ -94,7 +103,10 @@ pub fn apply_to_config(config: &mut ClientConfig, cfg: &GatewayConfig) {
 /// 2. Build an RPC-over-HTTP IN/OUT channel pair.
 /// 3. Return a socket-like object the rest of the RDP stack can read/write.
 #[allow(dead_code)]
-pub fn connect(_cfg: &GatewayConfig, _target: &ClientConfig) -> Result<std::net::TcpStream, GatewayError> {
+pub fn connect(
+    _cfg: &GatewayConfig,
+    _target: &ClientConfig,
+) -> Result<std::net::TcpStream, GatewayError> {
     Err(GatewayError::NotImplemented)
 }
 

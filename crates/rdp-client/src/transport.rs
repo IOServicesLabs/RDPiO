@@ -66,7 +66,7 @@ fn read_exact_riding_timeouts<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Re
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock
                     || e.kind() == io::ErrorKind::TimedOut
-                    || matches!(e.raw_os_error(), Some(995 | 996 | 997)) =>
+                    || matches!(e.raw_os_error(), Some(995..=997)) =>
             {
                 if std::time::Instant::now() >= deadline {
                     return Err(io::Error::new(

@@ -343,9 +343,15 @@ mod tests {
     fn data_message_fragments_and_reassembles() {
         // A payload larger than one chunk must split into DATA_FIRST + DATA and
         // reassemble byte-identically through the peer's Reassembler.
-        let payload: Vec<u8> = (0..(MAX_DATA_CHUNK * 2 + 7) as u32).map(|i| i as u8).collect();
+        let payload: Vec<u8> = (0..(MAX_DATA_CHUNK * 2 + 7) as u32)
+            .map(|i| i as u8)
+            .collect();
         let pdus = data_message(9, &payload);
-        assert!(pdus.len() >= 3, "expected fragmentation, got {}", pdus.len());
+        assert!(
+            pdus.len() >= 3,
+            "expected fragmentation, got {}",
+            pdus.len()
+        );
         assert_eq!(pdus[0][0] >> 4, CMD_DATA_FIRST);
         let mut r = Reassembler::new();
         let mut done = None;

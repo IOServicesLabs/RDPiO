@@ -1,0 +1,13 @@
+# rustfmt cannot tokenize several ui-app source files that rustc accepts fine
+# (a rustfmt parser limitation, not a code defect — cargo check/test build them
+# without issue). Skip those files/directories so `cargo fmt` can process the
+# rest of the workspace; their formatting is left as-is.
+ignore = [
+    "crates/ui-app/src/lib.rs",
+    "crates/ui-app/src/decode.rs",
+    "crates/ui-app/src/d3d11.rs",
+    "crates/ui-app/src/redirection.rs",
+    "crates/ui-app/src/render.rs",
+    "crates/ui-app/src/decode",
+    "crates/ui-app/src/ui",
+]

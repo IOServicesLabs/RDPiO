@@ -44,7 +44,10 @@ impl Win32Printer {
             }
             name_buf.truncate(len as usize); // includes the NUL
             let print_name = String::from_utf16_lossy(
-                &name_buf[..name_buf.iter().position(|&c| c == 0).unwrap_or(name_buf.len())],
+                &name_buf[..name_buf
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(name_buf.len())],
             );
 
             // The driver name (PRINTER_INFO_2W) so the server renders to it.

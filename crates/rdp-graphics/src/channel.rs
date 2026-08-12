@@ -140,7 +140,12 @@ impl GraphicsChannel {
 
     /// Offer an otherwise-unhandled create-request to the redirector. Returns
     /// `true` (and pushes an accept response) if the redirector took the channel.
-    fn try_redirect_create(&mut self, channel_id: u32, name: &str, out: &mut GraphicsOutput) -> bool {
+    fn try_redirect_create(
+        &mut self,
+        channel_id: u32,
+        name: &str,
+        out: &mut GraphicsOutput,
+    ) -> bool {
         let accepted = match self.redirector.as_mut() {
             Some(r) if r.claims(name) => r.on_create(channel_id, name),
             _ => return false,
@@ -171,7 +176,11 @@ impl GraphicsChannel {
                     out.responses.push(drdynvc::create_response(channel_id, 0));
                     // Advertise our RDPGFX capabilities on the freshly-opened channel.
                     let caps = self.pipeline.caps_advertise();
-                    tracing::info!(channel_id, caps_len = caps.len(), "opened RDPGFX channel; advertising caps");
+                    tracing::info!(
+                        channel_id,
+                        caps_len = caps.len(),
+                        "opened RDPGFX channel; advertising caps"
+                    );
                     out.responses.push(drdynvc::data(channel_id, &caps));
                 } else if name == disp::DISPLAYCONTROL_CHANNEL {
                     // Accept Display Control so we can request desktop resizes.
@@ -299,7 +308,9 @@ impl GraphicsChannel {
                     // RDPEI is a single-frame protocol; route the payload to the
                     // state machine and send any response (client-ready) back.
                     if let DvcPdu::Data { payload, .. } = data {
-                        if let Some(response) = self.rdpei.process_server_payload(channel_id, &payload) {
+                        if let Some(response) =
+                            self.rdpei.process_server_payload(channel_id, &payload)
+                        {
                             out.responses.push(drdynvc::data(channel_id, &response));
                         }
                     }
@@ -356,9 +367,7 @@ impl GraphicsChannel {
     /// Build a Display Control monitor-layout PDU requesting a desktop resize to
     /// the supplied `monitors` layout (wrapped as DRDYNVC data), or `None` if the
     /// Display Control channel isn't open.
-    pub fn request_resize(&self,
-        monitors: &[rdp_pdu::gcc::MonitorDef],
-    ) -> Option<Vec<u8>> {
+    pub fn request_resize(&self, monitors: &[rdp_pdu::gcc::MonitorDef]) -> Option<Vec<u8>> {
         self.disp_channel_id
             .map(|id| drdynvc::data(id, &disp::monitor_layout(monitors)))
     }
@@ -412,7 +421,8 @@ impl GraphicsChannel {
 
     /// Whether the RDPEI multi-touch/pen input channel is open and ready.
     pub fn rdpei_ready(&self) -> bool {
-        self.rdpei_channel_id.is_some() && matches!(self.rdpei.state(), rdpei::RdpInputState::Ready(_))
+        self.rdpei_channel_id.is_some()
+            && matches!(self.rdpei.state(), rdpei::RdpInputState::Ready(_))
     }
 
     /// Wrap a touch-event PDU as DRDYNVC data for the RDPEI channel, or `None`
@@ -523,7 +533,10 @@ mod tests {
             create.push(0);
             let out = gc.process(&create);
             assert_eq!(gc.channel_id(), None);
-            assert_eq!(out.responses, vec![drdynvc::create_response(7, STATUS_DECLINE)]);
+            assert_eq!(
+                out.responses,
+                vec![drdynvc::create_response(7, STATUS_DECLINE)]
+            );
         }
     }
 
@@ -645,7 +658,9 @@ mod tests {
 
     #[test]
     fn opens_rdpei_and_routes_server_ready() {
-        use rdp_channels::rdpei::{CONTACT_FLAG_DOWN, CONTACT_FLAG_INCONTACT, CONTACT_FLAG_INRANGE, RdpInputContact};
+        use rdp_channels::rdpei::{
+            RdpInputContact, CONTACT_FLAG_DOWN, CONTACT_FLAG_INCONTACT, CONTACT_FLAG_INRANGE,
+        };
         let mut gc = GraphicsChannel::new();
         assert!(!gc.rdpei_ready());
         assert!(gc.wrap_touch_event(&[]).is_none());

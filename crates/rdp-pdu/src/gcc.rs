@@ -673,7 +673,10 @@ mod tests {
         // connectionType (1), pad1octet (1), serverSelectedProtocol (4).
         // earlyCapabilityFlags sits 64 + 1 + 1 + 4 = 70 bytes before the end.
         let flags = u16::from_le_bytes([out[out.len() - 72], out[out.len() - 71]]);
-        assert_eq!(flags & RNS_UD_CS_VALID_CONNECTION_TYPE, RNS_UD_CS_VALID_CONNECTION_TYPE);
+        assert_eq!(
+            flags & RNS_UD_CS_VALID_CONNECTION_TYPE,
+            RNS_UD_CS_VALID_CONNECTION_TYPE
+        );
         assert_eq!(
             flags & RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT,
             RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT
@@ -703,7 +706,13 @@ mod tests {
         // Single monitor (or none) → block omitted.
         let mut single = Vec::new();
         ClientMonitorData {
-            monitors: vec![MonitorDef { left: 0, top: 0, right: 1919, bottom: 1079, primary: true }],
+            monitors: vec![MonitorDef {
+                left: 0,
+                top: 0,
+                right: 1919,
+                bottom: 1079,
+                primary: true,
+            }],
         }
         .encode(&mut single);
         assert!(single.is_empty());
@@ -712,18 +721,33 @@ mod tests {
         let mut out = Vec::new();
         ClientMonitorData {
             monitors: vec![
-                MonitorDef { left: 0, top: 0, right: 1919, bottom: 1079, primary: true },
-                MonitorDef { left: 1920, top: 0, right: 3839, bottom: 1079, primary: false },
+                MonitorDef {
+                    left: 0,
+                    top: 0,
+                    right: 1919,
+                    bottom: 1079,
+                    primary: true,
+                },
+                MonitorDef {
+                    left: 1920,
+                    top: 0,
+                    right: 3839,
+                    bottom: 1079,
+                    primary: false,
+                },
             ],
         }
         .encode(&mut out);
         assert_eq!(&out[0..2], &[0x05, 0xC0]); // CS_MONITOR
         assert_eq!(block_len(&out), 4 + 4 + 4 + 2 * 20);
         assert_eq!(u32::from_le_bytes([out[8], out[9], out[10], out[11]]), 2); // monitorCount
-        // First monitor is primary (flags=1 at end of its 20-byte def).
+                                                                               // First monitor is primary (flags=1 at end of its 20-byte def).
         assert_eq!(u32::from_le_bytes([out[28], out[29], out[30], out[31]]), 1);
         // Second monitor left = 1920.
-        assert_eq!(u32::from_le_bytes([out[32], out[33], out[34], out[35]]), 1920);
+        assert_eq!(
+            u32::from_le_bytes([out[32], out[33], out[34], out[35]]),
+            1920
+        );
     }
 
     #[test]
@@ -731,18 +755,42 @@ mod tests {
         // Primary 1920x1080 at virtual (0,0); a second monitor to the LEFT at
         // (-1920,0) — the layout Windows reports when the primary is on the right.
         let rects = [
-            VirtualScreenRect { left: 0, top: 0, right: 1920, bottom: 1080, primary: true },
-            VirtualScreenRect { left: -1920, top: 0, right: 0, bottom: 1080, primary: false },
+            VirtualScreenRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+                primary: true,
+            },
+            VirtualScreenRect {
+                left: -1920,
+                top: 0,
+                right: 0,
+                bottom: 1080,
+                primary: false,
+            },
         ];
         let defs = normalize_monitor_layout(&rects);
         // Primary stays at (0,0); the left monitor keeps its negative coordinate.
         assert_eq!(
             defs[0],
-            MonitorDef { left: 0, top: 0, right: 1919, bottom: 1079, primary: true }
+            MonitorDef {
+                left: 0,
+                top: 0,
+                right: 1919,
+                bottom: 1079,
+                primary: true
+            }
         );
         assert_eq!(
             defs[1],
-            MonitorDef { left: -1920, top: 0, right: -1, bottom: 1079, primary: false }
+            MonitorDef {
+                left: -1920,
+                top: 0,
+                right: -1,
+                bottom: 1079,
+                primary: false
+            }
         );
     }
 

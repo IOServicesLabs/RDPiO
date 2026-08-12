@@ -22,10 +22,18 @@ fn build_model() -> RedirectorModel {
 #[test]
 fn capture_parses_into_many_records() {
     let records = parse_capture(FIXTURE).expect("capture parses");
-    assert!(records.len() > 300, "expected a substantial call, got {}", records.len());
+    assert!(
+        records.len() > 300,
+        "expected a substantial call, got {}",
+        records.len()
+    );
     // Both directions must be represented.
-    assert!(records.iter().any(|r| r.dir == rdp_webrtc::Direction::Inbound));
-    assert!(records.iter().any(|r| r.dir == rdp_webrtc::Direction::Outbound));
+    assert!(records
+        .iter()
+        .any(|r| r.dir == rdp_webrtc::Direction::Inbound));
+    assert!(records
+        .iter()
+        .any(|r| r.dir == rdp_webrtc::Direction::Outbound));
 }
 
 #[test]
@@ -70,7 +78,10 @@ fn reconstructs_the_object_model() {
     }
     // A peer connection object was created and tracked by id.
     assert!(
-        model.objects.values().any(|&t| t == rdp_webrtc::ObjectType::PeerConnection),
+        model
+            .objects
+            .values()
+            .any(|&t| t == rdp_webrtc::ObjectType::PeerConnection),
         "no RTCPeerConnection object was registered"
     );
 }
@@ -93,7 +104,11 @@ fn reconstructs_the_signaling_exchange() {
 
     // The client produced an SDP offer (createOffer result) that looks real.
     let offer = s.offer_sdp.as_deref().expect("no offer SDP captured");
-    assert!(offer.starts_with("v=0"), "offer isn't SDP: {:?}", &offer[..offer.len().min(40)]);
+    assert!(
+        offer.starts_with("v=0"),
+        "offer isn't SDP: {:?}",
+        &offer[..offer.len().min(40)]
+    );
     assert!(offer.contains("m=audio"), "offer has no audio m-line");
     assert!(offer.contains("a=ice-ufrag:"), "offer has no ICE ufrag");
 
@@ -117,8 +132,12 @@ fn print_capture_summary() {
     eprintln!("\n=== webrtc.1 capture reconstruction ===");
     eprintln!(
         "messages: {}  calls: {}  results: {} (matched {})  events: {}  parse_errors: {}",
-        model.total, model.calls_seen, model.results_seen, model.results_matched,
-        model.events_seen, model.parse_errors
+        model.total,
+        model.calls_seen,
+        model.results_seen,
+        model.results_matched,
+        model.events_seen,
+        model.parse_errors
     );
     eprintln!("objects tracked: {}", model.objects.len());
     eprintln!("object types: {:?}", model.object_type_counts);

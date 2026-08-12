@@ -57,7 +57,9 @@ fn u32le(b: &[u8]) -> u32 {
 pub fn parse_capture(data: &[u8]) -> Result<Vec<CaptureRecord>, CaptureError> {
     if data.len() < MAGIC.len() || &data[..MAGIC.len()] != MAGIC {
         return Err(CaptureError::BadMagic(
-            data.get(..MAGIC.len().min(data.len())).unwrap_or(data).to_vec(),
+            data.get(..MAGIC.len().min(data.len()))
+                .unwrap_or(data)
+                .to_vec(),
         ));
     }
     let mut off = MAGIC.len();

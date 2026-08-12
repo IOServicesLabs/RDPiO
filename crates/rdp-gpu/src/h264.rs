@@ -23,16 +23,15 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
-    ICodecAPI, IMFActivate, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFSample, IMFTransform,
-    MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
-    MFMediaType_Video, MFStartup, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
-    CODECAPI_AVLowLatencyMode, MFSTARTUP_LITE, MFT_CATEGORY_VIDEO_DECODER,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
-    MF_VERSION,
+    CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFDXGIBuffer, IMFDXGIDeviceManager,
+    IMFSample, IMFTransform, MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer,
+    MFCreateSample, MFMediaType_Video, MFStartup, MFTEnumEx, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFSTARTUP_LITE, MFT_CATEGORY_VIDEO_DECODER, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+    MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
+    MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 
@@ -61,8 +60,7 @@ unsafe fn enable_low_latency(transform: &IMFTransform, label: &str) {
         // `ManuallyDrop` union field won't auto-deref, hence `deref_mut`.
         let mut on = windows::Win32::System::Variant::VARIANT::default();
         (*on.Anonymous.Anonymous).vt = windows::Win32::System::Variant::VT_BOOL;
-        (*on.Anonymous.Anonymous).Anonymous.boolVal =
-            windows::Win32::Foundation::VARIANT_BOOL(-1);
+        (*on.Anonymous.Anonymous).Anonymous.boolVal = windows::Win32::Foundation::VARIANT_BOOL(-1);
         if codec.SetValue(&CODECAPI_AVLowLatencyMode, &on).is_ok() {
             set = true;
         }
@@ -70,7 +68,10 @@ unsafe fn enable_low_latency(transform: &IMFTransform, label: &str) {
     if set {
         tracing::debug!(mft = label, "low-latency mode enabled");
     } else {
-        tracing::debug!(mft = label, "low-latency mode unsupported; using default buffering");
+        tracing::debug!(
+            mft = label,
+            "low-latency mode unsupported; using default buffering"
+        );
     }
 }
 
@@ -92,6 +93,16 @@ impl DecodedFrame {
     /// The Y and UV plane slices, for [`rdp_graphics::yuv::nv12_to_rgba`].
     pub fn planes(&self) -> (&[u8], &[u8]) {
         self.nv12.split_at((self.width * self.height) as usize)
+    }
+
+    /// Convert into the decode→UI handoff frame ([`crate::frame::DecodedFrame`])
+    /// carrying this CPU NV12 payload. Infallible here: the decoder's output is
+    /// already repacked to tightly packed display-size NV12 (see
+    /// `rdp_graphics::yuv::nv12_repack_tight`), which is exactly the layout
+    /// the handoff frame validates.
+    pub fn into_frame(self) -> crate::frame::DecodedFrame {
+        crate::frame::DecodedFrame::from_nv12(self.nv12, self.width, self.height, self.unit_id)
+            .expect("decoder NV12 output is tightly packed and display-sized")
     }
 }
 
@@ -313,8 +324,7 @@ impl H264Decoder {
     unsafe fn reset_output_type(&mut self) -> WinResult<()> {
         adopt_nv12_output_type(&self.transform, self.width, self.height)?;
         let info = self.transform.GetOutputStreamInfo(0)?;
-        self.out_buf_size =
-            (info.cbSize as usize).max((self.width * self.height * 3 / 2) as usize);
+        self.out_buf_size = (info.cbSize as usize).max((self.width * self.height * 3 / 2) as usize);
         Ok(())
     }
 
@@ -528,7 +538,8 @@ impl H264Encoder {
                         let mut len = 0u32;
                         buffer.Lock(&mut ptr, None, Some(&mut len))?;
                         if !ptr.is_null() && len > 0 {
-                            encoded.extend_from_slice(std::slice::from_raw_parts(ptr, len as usize));
+                            encoded
+                                .extend_from_slice(std::slice::from_raw_parts(ptr, len as usize));
                         }
                         buffer.Unlock()?;
                     }
@@ -554,6 +565,16 @@ pub struct DecodedTexture {
     pub height: u32,
     /// Input-unit tag echoed by the MFT (see [`DecodedFrame::unit_id`]).
     pub unit_id: i64,
+}
+
+impl DecodedTexture {
+    /// Convert into the decode→UI handoff frame ([`crate::frame::DecodedFrame`]),
+    /// *moving* the GPU texture — zero-copy: the pixels never leave the GPU and
+    /// the COM reference just changes hands (the decoder's reuse pool fenced on
+    /// the refcount, so the texture returns to the pool once the UI drops it).
+    pub fn into_frame(self) -> crate::frame::DecodedFrame {
+        crate::frame::DecodedFrame::from_gpu(self.texture, self.width, self.height, self.unit_id)
+    }
 }
 
 /// A DXVA (GPU) H.264 decoder: the system decoder MFT bound to the caller's
@@ -714,11 +735,7 @@ impl H264GpuDecoder {
         // A resolution change retires stale-sized entries; ones still in
         // flight stay alive through the renderer's clone until it drops.
         self.pool.retain(|(w, h, _)| *w == coded_w && *h == coded_h);
-        if let Some((_, _, t)) = self
-            .pool
-            .iter()
-            .find(|(_, _, t)| com_refcount(t) == 1)
-        {
+        if let Some((_, _, t)) = self.pool.iter().find(|(_, _, t)| com_refcount(t) == 1) {
             return Ok(t.clone());
         }
         // SHADER_RESOURCE, because the renderer converts this surface with a
@@ -732,7 +749,10 @@ impl H264GpuDecoder {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_NV12,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
             CPUAccessFlags: 0,

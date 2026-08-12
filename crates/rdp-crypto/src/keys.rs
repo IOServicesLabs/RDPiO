@@ -267,7 +267,7 @@ mod tests {
         assert_eq!(k1, k2); // deterministic
         assert_eq!(k1.len(), 16);
         assert_ne!(k1, initial); // actually rotates the key
-        // Chaining (current advances) keeps producing fresh keys.
+                                 // Chaining (current advances) keeps producing fresh keys.
         let k3 = update_session_key(&initial, &k1, METHOD_128BIT);
         assert_ne!(k3, k1);
     }

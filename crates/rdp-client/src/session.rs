@@ -24,6 +24,7 @@ use crate::transport::read_tpkt_pdu;
 /// Bounds how long a saturated UDP stream can defer TCP input / clipboard service
 /// before the loop cycles back — high enough that several full frames' worth of
 /// PDUs clear per pass, low enough to keep input responsive under a graphics flood.
+#[cfg_attr(not(windows), allow(dead_code))] // drain budget used by the Windows UDP session loop
 const UDP_DRAIN_BUDGET: u32 = 256;
 
 /// Set by the platform when the *local* clipboard changes (so we re-advertise it
@@ -78,12 +79,11 @@ struct ClipFileHandoff {
 }
 
 #[cfg(windows)]
-static CLIP_FILES: std::sync::Mutex<ClipFileHandoff> =
-    std::sync::Mutex::new(ClipFileHandoff {
-        offered: 0,
-        wanted: false,
-        ready: None,
-    });
+static CLIP_FILES: std::sync::Mutex<ClipFileHandoff> = std::sync::Mutex::new(ClipFileHandoff {
+    offered: 0,
+    wanted: false,
+    ready: None,
+});
 #[cfg(windows)]
 static CLIP_FILES_DONE: std::sync::Condvar = std::sync::Condvar::new();
 
@@ -204,7 +204,10 @@ pub(crate) fn queue_touch(contacts: Vec<rdp_channels::rdpei::RdpInputContact>) {
 
 #[cfg(windows)]
 fn take_touch_queue() -> Vec<rdp_channels::rdpei::RdpInputContact> {
-    TOUCH_QUEUE.lock().ok().map_or(Vec::new(), |mut q| std::mem::take(&mut *q))
+    TOUCH_QUEUE
+        .lock()
+        .ok()
+        .map_or(Vec::new(), |mut q| std::mem::take(&mut *q))
 }
 
 /// Whether the RDPEI touch channel is open and past its handshake, i.e.
@@ -231,8 +234,7 @@ fn note_server_input_flags(share_pdu: &[u8]) {
         SERVER_INPUT_FLAGS.store(0x8000_0000 | flags as u32, Ordering::SeqCst);
         tracing::info!(
             input_flags = format!("0x{flags:04x}"),
-            relative_mouse =
-                flags & rdp_pdu::capabilities::INPUT_FLAG_MOUSE_RELATIVE != 0,
+            relative_mouse = flags & rdp_pdu::capabilities::INPUT_FLAG_MOUSE_RELATIVE != 0,
             "server input capabilities"
         );
     }
@@ -240,6 +242,7 @@ fn note_server_input_flags(share_pdu: &[u8]) {
 
 /// Whether the server supports TS_RELPOINTER_EVENT relative mouse input
 /// (INPUT_FLAG_MOUSE_RELATIVE in its Demand Active input caps).
+#[cfg_attr(not(windows), allow(dead_code))] // relative-mouse capability probe used by the Windows input path
 pub(crate) fn rel_mouse_supported() -> bool {
     SERVER_INPUT_FLAGS.load(Ordering::SeqCst)
         & rdp_pdu::capabilities::INPUT_FLAG_MOUSE_RELATIVE as u32
@@ -255,7 +258,7 @@ pub enum ActivateError {
     #[error("activation error: {0}")]
     Protocol(String),
     #[error("server redirection: {0:?}")]
-    Redirect(rdp_pdu::redirection::ServerRedirection),
+    Redirect(Box<rdp_pdu::redirection::ServerRedirection>),
 }
 
 /// Identifiers describing the live session once activation completes.
@@ -745,10 +748,17 @@ pub fn activate<S: Read + Write>(
     tracing::info!("sent Confirm Active + finalization");
 
     // 8) Wait for the server Font Map → Active.
-    recv_until(stream, &mut sec, user_id, server.io_channel_id, "Font Map", |payload| {
-        (finalization::data_pdu_type2(payload) == Some(finalization::PDUTYPE2_FONTMAP))
-            .then_some(())
-    })?;
+    recv_until(
+        stream,
+        &mut sec,
+        user_id,
+        server.io_channel_id,
+        "Font Map",
+        |payload| {
+            (finalization::data_pdu_type2(payload) == Some(finalization::PDUTYPE2_FONTMAP))
+                .then_some(())
+        },
+    )?;
 
     let encrypted = sec.is_some();
     let (inbound, outbound) = match sec {
@@ -862,6 +872,7 @@ struct RdpdrState {
     reasm: rdp_channels::svc::Reassembler,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))] // several methods here are consumed only by the Windows session loop
 impl ActiveSession {
     pub fn info(&self) -> &SessionInfo {
         &self.info
@@ -1026,10 +1037,7 @@ impl ActiveSession {
     /// Install the OS audio sink, replacing the default null sink (so remote
     /// audio actually plays). Platform-supplied.
     #[cfg(windows)]
-    pub fn set_audio_sink(
-        &mut self,
-        sink: Box<dyn rdp_channels::rdpsnd::AudioSink + Send>,
-    ) {
+    pub fn set_audio_sink(&mut self, sink: Box<dyn rdp_channels::rdpsnd::AudioSink + Send>) {
         self.audio.sink = sink;
     }
 
@@ -1043,13 +1051,19 @@ impl ActiveSession {
         driver_name: String,
         sink: Box<dyn rdp_channels::rdpdr::PrinterSink>,
     ) {
-        self.rdpdr.channel.set_printer(print_name, driver_name, sink);
+        self.rdpdr
+            .channel
+            .set_printer(print_name, driver_name, sink);
     }
 
     /// Feed one inbound rdpsnd channel chunk: reassemble, run the RDPSND state
     /// machine against the OS audio sink, and send any responses (format reply,
     /// training echo, wave confirms) back on the rdpsnd channel.
-    fn handle_audio<S: Write>(&mut self, stream: &mut S, chunk: &[u8]) -> Result<(), ActivateError> {
+    fn handle_audio<S: Write>(
+        &mut self,
+        stream: &mut S,
+        chunk: &[u8],
+    ) -> Result<(), ActivateError> {
         let Some(rdpsnd_id) = self.info.channel_id(rdp_pdu::gcc::RDPSND_CHANNEL) else {
             return Ok(());
         };
@@ -1077,7 +1091,11 @@ impl ActiveSession {
     /// Feed one inbound rdpdr channel chunk: reassemble, run the device-
     /// redirection handshake, and send responses on the rdpdr channel. No
     /// devices are shared yet, so this just brings the channel up cleanly.
-    fn handle_rdpdr<S: Write>(&mut self, stream: &mut S, chunk: &[u8]) -> Result<(), ActivateError> {
+    fn handle_rdpdr<S: Write>(
+        &mut self,
+        stream: &mut S,
+        chunk: &[u8],
+    ) -> Result<(), ActivateError> {
         let Some(rdpdr_id) = self.info.channel_id(rdp_pdu::gcc::RDPDR_CHANNEL) else {
             return Ok(());
         };
@@ -1158,9 +1176,7 @@ impl ActiveSession {
         let Some(update) = pointer::parse_pointer_update(body) else {
             // A pointer PDU we could not decode: the cursor silently keeps its
             // previous shape — make that observable instead of invisible.
-            let message_type = body
-                .get(..2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]));
+            let message_type = body.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]]));
             tracing::debug!(
                 ?message_type,
                 len = body.len(),
@@ -1258,7 +1274,10 @@ impl ActiveSession {
             self.enable_rfx,
         );
         self.send_share_outbound(stream, &confirm)?;
-        self.send_share_outbound(stream, &finalization::synchronize_pdu(share_id, user_id, io))?;
+        self.send_share_outbound(
+            stream,
+            &finalization::synchronize_pdu(share_id, user_id, io),
+        )?;
         self.send_share_outbound(
             stream,
             &finalization::control_pdu(share_id, user_id, finalization::CTRLACTION_COOPERATE),
@@ -1308,6 +1327,7 @@ pub struct InputSender<S: Write> {
     share_id: u32,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))] // input batching sender used by the Windows UI thread
 impl<S: Write> InputSender<S> {
     /// Frame and send a batch of input events. A no-op for an empty batch.
     pub fn send(&mut self, events: &[rdp_pdu::input::EventBytes]) -> Result<(), ActivateError> {
@@ -1354,6 +1374,7 @@ pub enum CursorUpdate {
 
 /// A consumer of decoded screen rectangles (implemented by the GPU renderer on
 /// Windows, or a logging/test sink elsewhere).
+#[cfg_attr(not(windows), allow(dead_code))] // blit_owned is used only by the Windows D3D11 sink
 pub trait FrameSink {
     /// Blit a `w`x`h` RGBA8 rectangle to (`x`,`y`) on the framebuffer.
     fn blit(&mut self, x: u16, y: u16, w: u16, h: u16, rgba: &[u8]);
@@ -1370,7 +1391,15 @@ pub trait FrameSink {
     /// sinks without a GPU path still render. The windowed driver overrides
     /// this to convert on the GPU (D3D11 video processor).
     #[cfg(windows)]
-    fn blit_nv12(&mut self, x: u16, y: u16, w: u16, h: u16, nv12: &[u8], rects: &[(u16, u16, u16, u16)]) {
+    fn blit_nv12(
+        &mut self,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        nv12: &[u8],
+        rects: &[(u16, u16, u16, u16)],
+    ) {
         let (yp, uv) = nv12.split_at((w as usize) * (h as usize));
         let Some(rgba) =
             rdp_graphics::yuv::nv12_to_rgba(yp, uv, w as usize, h as usize, w as usize)
@@ -1616,7 +1645,10 @@ fn capture_reconnect_cookie<F: FrameSink>(plaintext: &[u8], sink: &mut F) {
     if let Some(rdp_pdu::logon::SaveSessionInfo::Extended { cookie: Some(c) }) =
         rdp_pdu::logon::parse_save_session_info(plaintext)
     {
-        tracing::info!(logon_id = c.logon_id, "received server auto-reconnect cookie");
+        tracing::info!(
+            logon_id = c.logon_id,
+            "received server auto-reconnect cookie"
+        );
         sink.reconnect_cookie(c);
     }
 }
@@ -1873,15 +1905,30 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
                 for blit in renderer.render(command) {
                     match blit {
                         GfxBlit::Rgba { x, y, w, h, rgba } => sink.blit_owned(x, y, w, h, rgba),
-                        GfxBlit::Nv12 { x, y, w, h, nv12, rects } => {
-                            sink.blit_nv12(x, y, w, h, &nv12, &rects)
-                        }
-                        GfxBlit::Texture { x, y, w, h, texture, rects } => {
-                            sink.blit_texture(x, y, w, h, &texture, &rects)
-                        }
-                        GfxBlit::CopyRect { sx, sy, w, h, dx, dy } => {
-                            sink.copy_rect(sx, sy, w, h, dx, dy)
-                        }
+                        GfxBlit::Nv12 {
+                            x,
+                            y,
+                            w,
+                            h,
+                            nv12,
+                            rects,
+                        } => sink.blit_nv12(x, y, w, h, &nv12, &rects),
+                        GfxBlit::Texture {
+                            x,
+                            y,
+                            w,
+                            h,
+                            texture,
+                            rects,
+                        } => sink.blit_texture(x, y, w, h, &texture, &rects),
+                        GfxBlit::CopyRect {
+                            sx,
+                            sy,
+                            w,
+                            h,
+                            dx,
+                            dy,
+                        } => sink.copy_rect(sx, sy, w, h, dx, dy),
                         GfxBlit::CacheRect { slot, sx, sy, w, h } => {
                             sink.cache_rect(slot, sx, sy, w, h)
                         }
@@ -1925,7 +1972,11 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
         if log_elapsed >= std::time::Duration::from_secs(2) {
             if fps_log_frames > 0 {
                 let fps = fps_log_frames as f32 / log_elapsed.as_secs_f32();
-                tracing::info!(fps = format!("{fps:.1}"), frames = fps_log_frames, "decode fps");
+                tracing::info!(
+                    fps = format!("{fps:.1}"),
+                    frames = fps_log_frames,
+                    "decode fps"
+                );
             }
             fps_log_start = std::time::Instant::now();
             fps_log_frames = 0;
@@ -2000,10 +2051,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     let mut camera = rdp_channels::camera::CameraEnumerator::new(cameras);
     // Per-device camera channels (keyed by DVC channel id) and the active
     // capture, started when the server begins a stream.
-    let mut cam_devices: std::collections::HashMap<
-        u32,
-        rdp_channels::camera::CameraDeviceChannel,
-    > = std::collections::HashMap::new();
+    let mut cam_devices: std::collections::HashMap<u32, rdp_channels::camera::CameraDeviceChannel> =
+        std::collections::HashMap::new();
     let mut cam_capture: Option<crate::mf_camera::MfCamera> = None;
     // Frames acked so far (the RDPGFX ack carries a running total). Acks are sent
     // here, on the network thread, the instant an EndFrame is parsed — BEFORE the
@@ -2073,9 +2122,7 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         }
         if let Some((monitors, since)) = pending_resize.take() {
             if since.elapsed() >= RESIZE_SETTLE {
-                if let (Some(ch), Some(pdu)) =
-                    (dvc_channel, graphics.request_resize(&monitors))
-                {
+                if let (Some(ch), Some(pdu)) = (dvc_channel, graphics.request_resize(&monitors)) {
                     session.send_dvc(stream, ch, &pdu)?;
                     let primary = monitors
                         .iter()
@@ -2111,7 +2158,10 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                 static TOUCH_FLOWING: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !TOUCH_FLOWING.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    tracing::info!(contacts = touches.len(), "touch input active: first RDPEI touch frame sent");
+                    tracing::info!(
+                        contacts = touches.len(),
+                        "touch input active: first RDPEI touch frame sent"
+                    );
                 }
                 tracing::trace!(contacts = touches.len(), "sent RDPEI touch frame");
             } else {
@@ -2238,7 +2288,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                     for command in &out.commands {
                         if let GfxCommand::EndFrame { frame_id } = command {
                             total_frames += 1;
-                            if let Some(ack) = udp_graphics.frame_ack(*frame_id, total_frames, depth)
+                            if let Some(ack) =
+                                udp_graphics.frame_ack(*frame_id, total_frames, depth)
                             {
                                 let _ = tunnel.send(&ack);
                             }
@@ -2632,7 +2683,11 @@ impl AutoDetect {
                 self.meter.add(payload_len);
                 AutoDetectOutcome::Consumed
             }
-            Ad::BandwidthStop { sequence, payload_len, connect_time } => {
+            Ad::BandwidthStop {
+                sequence,
+                payload_len,
+                connect_time,
+            } => {
                 match self.meter.stop(payload_len) {
                     Some(byte_count) => {
                         let delta =
@@ -2768,7 +2823,7 @@ fn recv_demand_active<S: Read + Write>(
 
         // AVD / RDS broker redirection arrives instead of Demand Active.
         if let Some(redir) = rdp_pdu::redirection::parse(&plaintext) {
-            return Err(ActivateError::Redirect(redir));
+            return Err(ActivateError::Redirect(Box::new(redir)));
         }
 
         // Demand Active ends the wait (and the licensing phase).
@@ -3068,7 +3123,7 @@ mod tests {
 
     #[test]
     fn recv_demand_active_detects_server_redirection() {
-        use rdp_pdu::redirection::{SEC_REDIRECTION_PKT, REDIRECT_FLAG_LOAD_BALANCE_INFO};
+        use rdp_pdu::redirection::{REDIRECT_FLAG_LOAD_BALANCE_INFO, SEC_REDIRECTION_PKT};
 
         // Build a minimal Server Redirection PDU.
         let cookie = b"Cookie: msts=broker-token\r\n";
@@ -3148,7 +3203,10 @@ mod tests {
             &[0x00, 0x00, 0x11, 0x00, 0xea, 0x03, s[0], s[1], s[2], s[3]],
         ));
 
-        let mut stream = Duplex { rx: std::io::Cursor::new(script), tx: Vec::new() };
+        let mut stream = Duplex {
+            rx: std::io::Cursor::new(script),
+            tx: Vec::new(),
+        };
         let share_id = recv_demand_active(&mut stream, &mut None, 1002, 1003).unwrap();
         assert_eq!(share_id, 0x1122_3344);
 

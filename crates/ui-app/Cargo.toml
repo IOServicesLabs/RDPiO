@@ -1,0 +1,36 @@
+[package]
+name = "ui-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GPU-accelerated RDP client user interface"
+
+[[bin]]
+name = "ui-app"
+path = "src/main.rs"
+
+[dependencies]
+wire-main = { path = "../wire-main" }
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+raw-window-handle.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Microsoft OS bindings for the D3D11 render path, the Win32 window, and
+# multi-monitor enumeration. Matches the workspace-wide `windows` version so
+# the D3D11/DXGI types unify with what rdp-client/rdp-gpu use.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+] }

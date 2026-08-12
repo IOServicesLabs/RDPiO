@@ -14,12 +14,10 @@ use std::io;
 use windows::core::PSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Networking::WinSock::{
-    closesocket, connect, AF_INET, INVALID_SOCKET, SOCKET, SOCKET_ERROR, SOCKADDR, SOCKADDR_IN,
-    WSABUF, WSADATA, WSAGetLastError, WSASocketW, WSAStartup, WSA_FLAG_OVERLAPPED,
+    closesocket, connect, WSAGetLastError, WSASocketW, WSAStartup, AF_INET, INVALID_SOCKET,
+    SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, WSABUF, WSADATA, WSA_FLAG_OVERLAPPED,
 };
-use windows::Win32::System::IO::{
-    CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
-};
+use windows::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 
 /// A TCP stream backed by an overlapped socket and an I/O Completion Port.
 pub struct IocpStream {
@@ -70,9 +68,7 @@ impl IocpStream {
         Ok(())
     }
 
-    fn wait_completion(&self,
-        bytes: &mut u32,
-    ) -> io::Result<()> {
+    fn wait_completion(&self, bytes: &mut u32) -> io::Result<()> {
         let mut completion_key = 0usize;
         let mut overlapped_ptr = std::ptr::null_mut();
         unsafe {
@@ -260,7 +256,10 @@ mod tests {
         stream.read_exact(&mut read_payload).unwrap();
         let elapsed = start.elapsed();
 
-        assert_eq!(read_payload, (0..BYTES).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+        assert_eq!(
+            read_payload,
+            (0..BYTES).map(|i| (i % 251) as u8).collect::<Vec<_>>()
+        );
         // Loopback should move 8 MiB in well under a second; the real value on a
         // modern desktop is usually tens of GB/s, but be lenient on CI/sandbox.
         let seconds = elapsed.as_secs_f64();

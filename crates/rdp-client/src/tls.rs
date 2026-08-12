@@ -525,8 +525,7 @@ fn write_all_riding_wouldblock<S: Write>(inner: &mut S, mut buf: &[u8]) -> io::R
             Ok(n) => buf = &buf[n..],
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut =>
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
                 if std::time::Instant::now() >= deadline {
                     return Err(io::Error::new(
@@ -551,8 +550,7 @@ fn read_more_riding_wouldblock<S: Read>(inner: &mut S, buf: &mut Vec<u8>) -> io:
     loop {
         match read_more(inner, buf) {
             Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut =>
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
                 if std::time::Instant::now() >= deadline {
                     return Err(io::Error::new(
@@ -584,7 +582,10 @@ fn read_more<S: Read>(inner: &mut S, buf: &mut Vec<u8>) -> io::Result<bool> {
         // of on-screen motion).
         Err(e) if matches!(e.raw_os_error(), Some(995 | 996 | 997)) => {
             buf.truncate(old);
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "socket read timed out"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "socket read timed out",
+            ));
         }
         Err(e) => {
             buf.truncate(old);

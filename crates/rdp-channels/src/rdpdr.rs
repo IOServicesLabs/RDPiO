@@ -112,14 +112,23 @@ fn u16le(b: &[u8], o: usize) -> Option<u16> {
 #[inline]
 fn u32le(b: &[u8], o: usize) -> Option<u32> {
     Some(u32::from_le_bytes([
-        *b.get(o)?, *b.get(o + 1)?, *b.get(o + 2)?, *b.get(o + 3)?,
+        *b.get(o)?,
+        *b.get(o + 1)?,
+        *b.get(o + 2)?,
+        *b.get(o + 3)?,
     ]))
 }
 #[inline]
 fn u64le(b: &[u8], o: usize) -> Option<u64> {
     Some(u64::from_le_bytes([
-        *b.get(o)?, *b.get(o + 1)?, *b.get(o + 2)?, *b.get(o + 3)?,
-        *b.get(o + 4)?, *b.get(o + 5)?, *b.get(o + 6)?, *b.get(o + 7)?,
+        *b.get(o)?,
+        *b.get(o + 1)?,
+        *b.get(o + 2)?,
+        *b.get(o + 3)?,
+        *b.get(o + 4)?,
+        *b.get(o + 5)?,
+        *b.get(o + 6)?,
+        *b.get(o + 7)?,
     ]))
 }
 
@@ -289,7 +298,11 @@ impl DriveDevice {
                 }
                 FILE_OVERWRITE_IF | FILE_SUPERSEDE => {
                     opts.create(true).truncate(true);
-                    information = if exists { FILE_OVERWRITTEN } else { FILE_CREATED };
+                    information = if exists {
+                        FILE_OVERWRITTEN
+                    } else {
+                        FILE_CREATED
+                    };
                 }
                 _ => {
                     opts.create(true);
@@ -303,14 +316,17 @@ impl DriveDevice {
                 Ok(f) => {
                     let id = self.next_file_id;
                     self.next_file_id += 1;
-                    self.files.insert(id, OpenFile {
-                        path,
-                        is_dir: false,
-                        file: Some(f),
-                        dir_entries: None,
-                        dir_pos: 0,
-                        delete_on_close: false,
-                    });
+                    self.files.insert(
+                        id,
+                        OpenFile {
+                            path,
+                            is_dir: false,
+                            file: Some(f),
+                            dir_entries: None,
+                            dir_pos: 0,
+                            delete_on_close: false,
+                        },
+                    );
                     let mut out = id.to_le_bytes().to_vec();
                     out.push(information);
                     return (STATUS_SUCCESS, out);
@@ -322,14 +338,17 @@ impl DriveDevice {
         // Directory handle.
         let id = self.next_file_id;
         self.next_file_id += 1;
-        self.files.insert(id, OpenFile {
-            path,
-            is_dir: true,
-            file: None,
-            dir_entries: None,
-            dir_pos: 0,
-            delete_on_close: false,
-        });
+        self.files.insert(
+            id,
+            OpenFile {
+                path,
+                is_dir: true,
+                file: None,
+                dir_entries: None,
+                dir_pos: 0,
+                delete_on_close: false,
+            },
+        );
         let mut out = id.to_le_bytes().to_vec();
         out.push(information);
         (STATUS_SUCCESS, out)
@@ -724,7 +743,12 @@ struct PrinterDevice {
 }
 
 impl PrinterDevice {
-    fn new(device_id: u32, print_name: String, driver_name: String, sink: Box<dyn PrinterSink>) -> Self {
+    fn new(
+        device_id: u32,
+        print_name: String,
+        driver_name: String,
+        sink: Box<dyn PrinterSink>,
+    ) -> Self {
         Self {
             device_id,
             print_name,
@@ -744,7 +768,11 @@ impl PrinterDevice {
             IRP_MJ_CREATE => {
                 // Start a print job; reply with a FileId (DR_CREATE_RSP).
                 self.job_open = self.sink.start_job();
-                let status = if self.job_open { STATUS_SUCCESS } else { STATUS_NOT_SUPPORTED };
+                let status = if self.job_open {
+                    STATUS_SUCCESS
+                } else {
+                    STATUS_NOT_SUPPORTED
+                };
                 let mut p = Vec::new();
                 p.extend_from_slice(&1u32.to_le_bytes()); // FileId
                 p.push(0); // Information
@@ -806,7 +834,7 @@ impl PrinterDevice {
         data.extend_from_slice(&(driver.len() as u32).to_le_bytes()); // DriverNameLen
         data.extend_from_slice(&(printn.len() as u32).to_le_bytes()); // PrintNameLen
         data.extend_from_slice(&0u32.to_le_bytes()); // CachedFieldsLen
-        // PnPName omitted (len 0), then DriverName, PrintName.
+                                                     // PnPName omitted (len 0), then DriverName, PrintName.
         data.extend_from_slice(&driver);
         data.extend_from_slice(&printn);
 
@@ -845,13 +873,19 @@ impl RdpdrChannel {
     /// device ids starting at 1.
     pub fn add_drive(&mut self, root: PathBuf, dos_name: String) {
         let device_id = self.drives.len() as u32 + 1;
-        self.drives.push(DriveDevice::new(root, device_id, dos_name));
+        self.drives
+            .push(DriveDevice::new(root, device_id, dos_name));
     }
 
     /// Redirect a local printer. `print_name` is shown in the session;
     /// `driver_name` is the driver the server renders with; `sink` spools the
     /// returned job to the local printer.
-    pub fn set_printer(&mut self, print_name: String, driver_name: String, sink: Box<dyn PrinterSink>) {
+    pub fn set_printer(
+        &mut self,
+        print_name: String,
+        driver_name: String,
+        sink: Box<dyn PrinterSink>,
+    ) {
         self.printer = Some(PrinterDevice::new(
             PRINTER_DEVICE_ID,
             print_name,
@@ -871,7 +905,11 @@ impl RdpdrChannel {
         match packet_id {
             PAKID_CORE_SERVER_ANNOUNCE => {
                 self.client_id = u32le(msg, 8).unwrap_or(0);
-                vec![self.announce_reply(), self.client_name(), self.device_list()]
+                vec![
+                    self.announce_reply(),
+                    self.client_name(),
+                    self.device_list(),
+                ]
             }
             PAKID_CORE_SERVER_CAPABILITY => {
                 vec![self.capability_response(), self.device_list()]
@@ -888,7 +926,11 @@ impl RdpdrChannel {
         // the request targets (one of the drives, or the printer).
         let io = if let Some(d) = self.drives.iter_mut().find(|d| d.device_id == device_id) {
             Some(d.io(&msg[4..]))
-        } else if self.printer.as_ref().is_some_and(|p| p.device_id == device_id) {
+        } else if self
+            .printer
+            .as_ref()
+            .is_some_and(|p| p.device_id == device_id)
+        {
             self.printer.as_mut().map(|p| p.io(&msg[4..]))
         } else {
             None
@@ -974,7 +1016,14 @@ mod tests {
         u16::from_le_bytes([m[2], m[3]])
     }
 
-    fn io_request(device_id: u32, file_id: u32, comp: u32, major: u32, minor: u32, params: &[u8]) -> Vec<u8> {
+    fn io_request(
+        device_id: u32,
+        file_id: u32,
+        comp: u32,
+        major: u32,
+        minor: u32,
+        params: &[u8],
+    ) -> Vec<u8> {
         let mut v = header(PAKID_CORE_DEVICE_IOREQUEST);
         v.extend_from_slice(&device_id.to_le_bytes());
         v.extend_from_slice(&file_id.to_le_bytes());
@@ -1035,7 +1084,10 @@ mod tests {
         assert_eq!(dos_name_for(Path::new("C:\\")), "C");
         assert_eq!(dos_name_for(Path::new("z:/")), "Z");
         // Folders use the (squeezed) folder name, 7 chars max.
-        assert_eq!(dos_name_for(Path::new("C:\\Users\\a\\Shared Stuff")), "SHAREDS");
+        assert_eq!(
+            dos_name_for(Path::new("C:\\Users\\a\\Shared Stuff")),
+            "SHAREDS"
+        );
         // Degenerate paths fall back to the classic share name.
         assert_eq!(dos_name_for(Path::new("/")), "RDPIO");
     }
@@ -1093,10 +1145,20 @@ mod tests {
         r.set_drive(dir);
 
         // CREATE (open existing).
-        let out = r.process(&io_request(1, 0, 100, IRP_MJ_CREATE, 0, &create_params(FILE_OPEN, 0, "\\hello.txt")));
+        let out = r.process(&io_request(
+            1,
+            0,
+            100,
+            IRP_MJ_CREATE,
+            0,
+            &create_params(FILE_OPEN, 0, "\\hello.txt"),
+        ));
         let comp = &out[0];
         // header(4) + deviceId(4) + completionId(4) + ioStatus(4) + fileId(4) + info(1)
-        assert_eq!(u32::from_le_bytes([comp[12], comp[13], comp[14], comp[15]]), STATUS_SUCCESS);
+        assert_eq!(
+            u32::from_le_bytes([comp[12], comp[13], comp[14], comp[15]]),
+            STATUS_SUCCESS
+        );
         let file_id = u32::from_le_bytes([comp[16], comp[17], comp[18], comp[19]]);
 
         // READ 11 bytes at offset 0.
@@ -1106,7 +1168,10 @@ mod tests {
         rp.extend_from_slice(&[0u8; 20]); // padding
         let out = r.process(&io_request(1, file_id, 101, IRP_MJ_READ, 0, &rp));
         let comp = &out[0];
-        assert_eq!(u32::from_le_bytes([comp[12], comp[13], comp[14], comp[15]]), STATUS_SUCCESS);
+        assert_eq!(
+            u32::from_le_bytes([comp[12], comp[13], comp[14], comp[15]]),
+            STATUS_SUCCESS
+        );
         let read_len = u32::from_le_bytes([comp[16], comp[17], comp[18], comp[19]]);
         assert_eq!(read_len, 11);
         assert_eq!(&comp[20..31], b"hello rdpio");
@@ -1121,7 +1186,14 @@ mod tests {
         let mut r = RdpdrChannel::new();
         r.set_drive(dir);
         // Open the root directory.
-        let out = r.process(&io_request(1, 0, 1, IRP_MJ_CREATE, 0, &create_params(FILE_OPEN, FILE_DIRECTORY_FILE, "\\")));
+        let out = r.process(&io_request(
+            1,
+            0,
+            1,
+            IRP_MJ_CREATE,
+            0,
+            &create_params(FILE_OPEN, FILE_DIRECTORY_FILE, "\\"),
+        ));
         let file_id = u32::from_le_bytes([out[0][16], out[0][17], out[0][18], out[0][19]]);
         // Query directory: ., .., a.txt → 3 successful entries, then NO_MORE_FILES.
         let mut last_status = 0;
@@ -1132,7 +1204,14 @@ mod tests {
             p.push(if i == 0 { 1 } else { 0 }); // InitialQuery
             p.extend_from_slice(&0u32.to_le_bytes()); // PathLength
             p.extend_from_slice(&[0u8; 23]);
-            let out = r.process(&io_request(1, file_id, 10 + i, IRP_MJ_DIRECTORY_CONTROL, IRP_MN_QUERY_DIRECTORY, &p));
+            let out = r.process(&io_request(
+                1,
+                file_id,
+                10 + i,
+                IRP_MJ_DIRECTORY_CONTROL,
+                IRP_MN_QUERY_DIRECTORY,
+                &p,
+            ));
             last_status = u32::from_le_bytes([out[0][12], out[0][13], out[0][14], out[0][15]]);
             if last_status == STATUS_SUCCESS {
                 entries += 1;
@@ -1158,7 +1237,10 @@ mod tests {
             self.current.extend_from_slice(data);
         }
         fn end_job(&mut self) {
-            self.jobs.lock().unwrap().push(std::mem::take(&mut self.current));
+            self.jobs
+                .lock()
+                .unwrap()
+                .push(std::mem::take(&mut self.current));
         }
     }
 
@@ -1169,13 +1251,19 @@ mod tests {
         r.set_printer(
             "Office Printer".into(),
             "Generic / Text Only".into(),
-            Box::new(MockPrinter { jobs: jobs.clone(), current: Vec::new() }),
+            Box::new(MockPrinter {
+                jobs: jobs.clone(),
+                current: Vec::new(),
+            }),
         );
 
         // The device list announces the printer (device type PRINT).
         let dl = r.device_list();
         assert_eq!(u32::from_le_bytes([dl[4], dl[5], dl[6], dl[7]]), 1); // one device
-        assert_eq!(u32::from_le_bytes([dl[8], dl[9], dl[10], dl[11]]), RDPDR_DTYP_PRINT);
+        assert_eq!(
+            u32::from_le_bytes([dl[8], dl[9], dl[10], dl[11]]),
+            RDPDR_DTYP_PRINT
+        );
 
         // Create (start job) → Write (spool) → Close (finish). The printer's
         // device id sits clear of the (variable) drive ids.
@@ -1185,8 +1273,18 @@ mod tests {
         wparams.extend_from_slice(&0u64.to_le_bytes()); // Offset
         wparams.extend_from_slice(&[0u8; 20]); // Padding
         wparams.extend_from_slice(b"hello"); // WriteData
-        let out = r.process(&io_request(PRINTER_DEVICE_ID, 1, 2, IRP_MJ_WRITE, 0, &wparams));
-        assert_eq!(u32::from_le_bytes([out[0][12], out[0][13], out[0][14], out[0][15]]), STATUS_SUCCESS);
+        let out = r.process(&io_request(
+            PRINTER_DEVICE_ID,
+            1,
+            2,
+            IRP_MJ_WRITE,
+            0,
+            &wparams,
+        ));
+        assert_eq!(
+            u32::from_le_bytes([out[0][12], out[0][13], out[0][14], out[0][15]]),
+            STATUS_SUCCESS
+        );
         r.process(&io_request(PRINTER_DEVICE_ID, 1, 3, IRP_MJ_CLOSE, 0, &[]));
 
         let jobs = jobs.lock().unwrap();

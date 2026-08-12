@@ -145,22 +145,40 @@ mod tests {
     #[test]
     fn monitor_layout_is_well_formed() {
         let pdu = monitor_layout(&[primary(1366, 769)]);
-        assert_eq!(u32::from_le_bytes([pdu[0], pdu[1], pdu[2], pdu[3]]), DISPLAYCONTROL_PDU_TYPE_MONITOR_LAYOUT);
+        assert_eq!(
+            u32::from_le_bytes([pdu[0], pdu[1], pdu[2], pdu[3]]),
+            DISPLAYCONTROL_PDU_TYPE_MONITOR_LAYOUT
+        );
         // Length == buffer length.
-        assert_eq!(u32::from_le_bytes([pdu[4], pdu[5], pdu[6], pdu[7]]) as usize, pdu.len());
+        assert_eq!(
+            u32::from_le_bytes([pdu[4], pdu[5], pdu[6], pdu[7]]) as usize,
+            pdu.len()
+        );
         assert_eq!(pdu.len(), 8 + 8 + 40);
         // NumMonitors = 1.
         assert_eq!(u32::from_le_bytes([pdu[12], pdu[13], pdu[14], pdu[15]]), 1);
         // Width rounded down to even (1366), height floored even (768).
-        assert_eq!(u32::from_le_bytes([pdu[28], pdu[29], pdu[30], pdu[31]]), 1366);
-        assert_eq!(u32::from_le_bytes([pdu[32], pdu[33], pdu[34], pdu[35]]), 768);
+        assert_eq!(
+            u32::from_le_bytes([pdu[28], pdu[29], pdu[30], pdu[31]]),
+            1366
+        );
+        assert_eq!(
+            u32::from_le_bytes([pdu[32], pdu[33], pdu[34], pdu[35]]),
+            768
+        );
     }
 
     #[test]
     fn clamps_tiny_dimensions() {
         let pdu = monitor_layout(&[primary(10, 10)]);
-        assert_eq!(u32::from_le_bytes([pdu[28], pdu[29], pdu[30], pdu[31]]), 200);
-        assert_eq!(u32::from_le_bytes([pdu[32], pdu[33], pdu[34], pdu[35]]), 200);
+        assert_eq!(
+            u32::from_le_bytes([pdu[28], pdu[29], pdu[30], pdu[31]]),
+            200
+        );
+        assert_eq!(
+            u32::from_le_bytes([pdu[32], pdu[33], pdu[34], pdu[35]]),
+            200
+        );
     }
 
     #[test]
@@ -182,13 +200,22 @@ mod tests {
             },
         ];
         let pdu = monitor_layout(&monitors);
-        assert_eq!(u32::from_le_bytes([pdu[0], pdu[1], pdu[2], pdu[3]]), DISPLAYCONTROL_PDU_TYPE_MONITOR_LAYOUT);
+        assert_eq!(
+            u32::from_le_bytes([pdu[0], pdu[1], pdu[2], pdu[3]]),
+            DISPLAYCONTROL_PDU_TYPE_MONITOR_LAYOUT
+        );
         assert_eq!(u32::from_le_bytes([pdu[12], pdu[13], pdu[14], pdu[15]]), 2);
         assert_eq!(pdu.len(), 8 + 8 + 2 * 40);
         // First monitor flags == PRIMARY, second == 0.
-        assert_eq!(u32::from_le_bytes([pdu[16], pdu[17], pdu[18], pdu[19]]), DISPLAYCONTROL_MONITOR_PRIMARY);
+        assert_eq!(
+            u32::from_le_bytes([pdu[16], pdu[17], pdu[18], pdu[19]]),
+            DISPLAYCONTROL_MONITOR_PRIMARY
+        );
         assert_eq!(u32::from_le_bytes([pdu[56], pdu[57], pdu[58], pdu[59]]), 0);
         // Second monitor left offset is 1920.
-        assert_eq!(i32::from_le_bytes([pdu[60], pdu[61], pdu[62], pdu[63]]), 1920);
+        assert_eq!(
+            i32::from_le_bytes([pdu[60], pdu[61], pdu[62], pdu[63]]),
+            1920
+        );
     }
 }

@@ -360,7 +360,9 @@ mod tests {
         let chunks: Vec<Vec<u8>> = vec![
             (0..1000u32).map(|i| (i % 251) as u8).collect(),
             vec![7u8; HISTORY_SIZE - 500],
-            (0..(HISTORY_SIZE as u32 + 12_345)).map(|i| (i % 249) as u8).collect(),
+            (0..(HISTORY_SIZE as u32 + 12_345))
+                .map(|i| (i % 249) as u8)
+                .collect(),
             vec![9u8; 3],
         ];
         for c in &chunks {

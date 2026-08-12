@@ -157,7 +157,7 @@ impl FragmentReassembler {
 /// encrypted (we carry no per-PDU RC4 here — fast-path output is TLS-only) or
 /// the header is malformed.
 pub fn parse_output(pdu: &[u8], frag: &mut FragmentReassembler) -> Option<Vec<FastPathUpdate>> {
-    let b0 = *pdu.get(0)?;
+    let b0 = *pdu.first()?;
     if !is_fastpath_output(b0) {
         return None;
     }
@@ -567,7 +567,10 @@ mod tests {
         let cmds = parse_surface_commands(&d);
         assert_eq!(cmds.len(), 1);
         let c = &cmds[0];
-        assert_eq!((c.dest_left, c.dest_top, c.dest_right, c.dest_bottom), (10, 20, 74, 84));
+        assert_eq!(
+            (c.dest_left, c.dest_top, c.dest_right, c.dest_bottom),
+            (10, 20, 74, 84)
+        );
         assert_eq!(c.codec_id, 3);
         assert_eq!((c.width, c.height), (64, 64));
         assert_eq!(c.data, vec![9, 8, 7, 6]);
@@ -621,7 +624,13 @@ mod tests {
         let mut frag = FragmentReassembler::new();
         for seed in 0u16..2000 {
             let b = seed.to_le_bytes();
-            let junk = [b[0], b[1], b[0].wrapping_mul(3), b[1] ^ 0x5a, b[0].wrapping_add(7)];
+            let junk = [
+                b[0],
+                b[1],
+                b[0].wrapping_mul(3),
+                b[1] ^ 0x5a,
+                b[0].wrapping_add(7),
+            ];
             let _ = parse_output(&junk, &mut frag);
             let _ = parse_surface_commands(&junk);
             let _ = output_pdu_len(&junk);

@@ -48,7 +48,10 @@ unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         // Only growth counts as new allocation pressure; a shrink returns memory.
-        ALLOC_BYTES.fetch_add(new_size.saturating_sub(layout.size()) as u64, Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(
+            new_size.saturating_sub(layout.size()) as u64,
+            Ordering::Relaxed,
+        );
         INNER.realloc(ptr, layout, new_size)
     }
 

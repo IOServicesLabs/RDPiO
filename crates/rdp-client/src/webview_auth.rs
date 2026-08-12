@@ -14,12 +14,12 @@ use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
 use webview2_com::{
+    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
     Microsoft::Web::WebView2::Win32::{
         CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2Controller,
         ICoreWebView2Environment,
     },
-    CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, NavigationStartingEventHandler,
+    NavigationStartingEventHandler,
 };
 use windows::core::{Error as WindowsError, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -139,7 +139,9 @@ fn parse_auth_redirect(uri: &str) -> Option<Result<String, String>> {
     let query = uri.strip_prefix(crate::w365::NATIVE_REDIRECT_URI)?;
     // The redirect is `<redirect_uri>?code=...` (or `?error=...`). Tolerate an
     // exact match with no query as "not yet".
-    let query = query.strip_prefix('?').or_else(|| query.strip_prefix('#'))?;
+    let query = query
+        .strip_prefix('?')
+        .or_else(|| query.strip_prefix('#'))?;
     let mut code = None;
     let mut error = None;
     for pair in query.split('&') {
@@ -155,7 +157,9 @@ fn parse_auth_redirect(uri: &str) -> Option<Result<String, String>> {
     }
     if let Some(c) = code {
         Some(Ok(c))
-    } else { error.map(Err) }
+    } else {
+        error.map(Err)
+    }
 }
 
 /// Minimal `application/x-www-form-urlencoded` decoder for redirect query values.
@@ -265,28 +269,24 @@ fn init_webview(
             None,
             None,
             None,
-            &CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
-                move |_, env| {
-                    let env = match env {
-                        Some(env) => env,
-                        None => {
-                            let err = WebViewAuthError::WebView2(
-                                "WebView2 runtime failed to create environment".into(),
-                            );
-                            tracing::error!(%err);
-                            signal_ready(&ready_tx, ready_event, Err(err));
-                            return Ok(());
-                        }
-                    };
-                    tracing::info!("WebView2 environment created");
-                    if let Err(e) =
-                        init_controller(env, hwnd, &url, code_tx, ready_tx, ready_event)
-                    {
-                        tracing::error!(error = %e, "failed to create WebView2 controller");
+            &CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(move |_, env| {
+                let env = match env {
+                    Some(env) => env,
+                    None => {
+                        let err = WebViewAuthError::WebView2(
+                            "WebView2 runtime failed to create environment".into(),
+                        );
+                        tracing::error!(%err);
+                        signal_ready(&ready_tx, ready_event, Err(err));
+                        return Ok(());
                     }
-                    Ok(())
-                },
-            )),
+                };
+                tracing::info!("WebView2 environment created");
+                if let Err(e) = init_controller(env, hwnd, &url, code_tx, ready_tx, ready_event) {
+                    tracing::error!(error = %e, "failed to create WebView2 controller");
+                }
+                Ok(())
+            })),
         )
     };
     if let Err(e) = create_result {
@@ -327,12 +327,7 @@ fn pump_init_messages(
 
         let timeout = (deadline - now).as_millis().min(100) as u32;
         unsafe {
-            MsgWaitForMultipleObjectsEx(
-                Some(&handles),
-                timeout,
-                QS_ALLINPUT,
-                MWMO_INPUTAVAILABLE,
-            );
+            MsgWaitForMultipleObjectsEx(Some(&handles), timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
 
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -518,7 +513,10 @@ mod tests {
 
     #[test]
     fn redirect_with_code_is_captured() {
-        let uri = format!("{}?code=ABC123&session_state=xyz", crate::w365::NATIVE_REDIRECT_URI);
+        let uri = format!(
+            "{}?code=ABC123&session_state=xyz",
+            crate::w365::NATIVE_REDIRECT_URI
+        );
         assert_eq!(parse_auth_redirect(&uri), Some(Ok("ABC123".to_string())));
     }
 
@@ -536,7 +534,10 @@ mod tests {
 
     #[test]
     fn login_pages_are_not_treated_as_redirect() {
-        assert_eq!(parse_auth_redirect("https://login.microsoftonline.com/common/login"), None);
+        assert_eq!(
+            parse_auth_redirect("https://login.microsoftonline.com/common/login"),
+            None
+        );
         // The bare redirect URI with no query is not yet a result.
         assert_eq!(parse_auth_redirect(crate::w365::NATIVE_REDIRECT_URI), None);
     }
@@ -546,4 +547,3 @@ mod tests {
         assert_eq!(url_decode("a%20b+c%2Fd"), "a b c/d");
     }
 }
-

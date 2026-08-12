@@ -19,11 +19,12 @@ use rdp_channels::camera::{CamFormat, CameraDevice, MediaType};
 use windows::core::PWSTR;
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFMediaSource, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
-    MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources, MFStartup, MFMediaType_Video,
-    MFVideoFormat_NV12, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING,
-    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION, MFSTARTUP_LITE,
+    MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources, MFMediaType_Video, MFStartup,
+    MFVideoFormat_NV12, MFSTARTUP_LITE, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+    MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_VERSION,
 };
 
 use rdp_channels::names::CAMERA_DEVICE_PREFIX;
@@ -46,8 +47,8 @@ unsafe fn device_name(activate: &IMFActivate) -> String {
 }
 
 /// Initialize Media Foundation (idempotent) and build the vidcap-source filter.
-unsafe fn vidcap_attributes() -> windows::core::Result<windows::Win32::Media::MediaFoundation::IMFAttributes>
-{
+unsafe fn vidcap_attributes(
+) -> windows::core::Result<windows::Win32::Media::MediaFoundation::IMFAttributes> {
     MFStartup(MF_VERSION, MFSTARTUP_LITE)?;
     let mut attrs = None;
     MFCreateAttributes(&mut attrs, 1)?;
@@ -99,9 +100,27 @@ impl MfCamera {
     /// fallback the server can pick instead.
     pub fn media_types() -> Vec<MediaType> {
         vec![
-            MediaType { format: CamFormat::H264, width: 1280, height: 720, fps_num: 30, fps_den: 1 },
-            MediaType { format: CamFormat::H264, width: 640, height: 480, fps_num: 30, fps_den: 1 },
-            MediaType { format: CamFormat::Nv12, width: 640, height: 480, fps_num: 30, fps_den: 1 },
+            MediaType {
+                format: CamFormat::H264,
+                width: 1280,
+                height: 720,
+                fps_num: 30,
+                fps_den: 1,
+            },
+            MediaType {
+                format: CamFormat::H264,
+                width: 640,
+                height: 480,
+                fps_num: 30,
+                fps_den: 1,
+            },
+            MediaType {
+                format: CamFormat::Nv12,
+                width: 640,
+                height: 480,
+                fps_num: 30,
+                fps_den: 1,
+            },
         ]
     }
 
@@ -171,8 +190,7 @@ unsafe fn capture_loop(
         MFCreateAttributes(&mut reader_attrs, 1)?;
         let reader_attrs = reader_attrs.expect("attributes on success");
         reader_attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)?;
-        let reader: IMFSourceReader =
-            MFCreateSourceReaderFromMediaSource(&source, &reader_attrs)?;
+        let reader: IMFSourceReader = MFCreateSourceReaderFromMediaSource(&source, &reader_attrs)?;
         reader
     };
 

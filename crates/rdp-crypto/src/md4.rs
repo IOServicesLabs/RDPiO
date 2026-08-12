@@ -7,8 +7,12 @@
 
 /// Compute the MD4 digest of `input`.
 pub fn md4(input: &[u8]) -> [u8; 16] {
-    let (mut a0, mut b0, mut c0, mut d0) =
-        (0x6745_2301u32, 0xefcd_ab89u32, 0x98ba_dcfeu32, 0x1032_5476u32);
+    let (mut a0, mut b0, mut c0, mut d0) = (
+        0x6745_2301u32,
+        0xefcd_ab89u32,
+        0x98ba_dcfeu32,
+        0x1032_5476u32,
+    );
 
     // Padding is identical to MD5: append 0x80, zero-pad to 56 mod 64, then the
     // 64-bit little-endian bit length.
@@ -129,7 +133,10 @@ mod tests {
     fn nt_hash_of_password() {
         // The NTLM "NT hash" of "Password" (MS-NLMP 4.2.1) is MD4 of its UTF-16LE
         // encoding. This is the exact input NTLMv2 is built on.
-        let utf16: Vec<u8> = "Password".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let utf16: Vec<u8> = "Password"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
         assert_eq!(hex(&md4(&utf16)), "a4f49c406510bdcab6824ee7c30fd852");
     }
 }

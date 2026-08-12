@@ -2,43 +2,43 @@
 
 use std::collections::HashMap;
 
-use windows::core::{Interface, PCSTR, Result as WinResult};
+use windows::core::{Interface, Result as WinResult, PCSTR};
 use windows::Win32::Foundation::{HANDLE, HMODULE, HWND, RECT};
-use windows::Win32::System::Threading::WaitForSingleObjectEx;
-use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
-    D3D_FEATURE_LEVEL_11_1, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2D,
-    ID3DBlob,
-};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::Direct3D::{
+    ID3DBlob, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL,
+    D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+    D3D_SRV_DIMENSION_TEXTURE2D,
+};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDeviceAndSwapChain, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext,
     ID3D11Multithread, ID3D11PixelShader, ID3D11Query, ID3D11RenderTargetView, ID3D11SamplerState,
     ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader, ID3D11VideoContext,
-    ID3D11VideoDevice, ID3D11VideoProcessor,
-    ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
-    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX,
-    D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_READ,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_QUERY, D3D11_QUERY_DATA_TIMESTAMP_DISJOINT, D3D11_QUERY_DESC,
-    D3D11_QUERY_TIMESTAMP, D3D11_QUERY_TIMESTAMP_DISJOINT, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
+    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView, D3D11_BIND_CONSTANT_BUFFER,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_BUFFER_DESC,
+    D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_QUERY,
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT, D3D11_QUERY_DESC, D3D11_QUERY_TIMESTAMP,
+    D3D11_QUERY_TIMESTAMP_DISJOINT, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
     D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_SUBRESOURCE_DATA,
-    D3D11_TEX2D_SRV, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
-    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE,
-    D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-    D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
-    D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11_VIEWPORT,
+    D3D11_TEX2D_SRV, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
+    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE, D3D11_USAGE_STAGING,
+    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
+    D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VIEWPORT, D3D11_VPIV_DIMENSION_TEXTURE2D,
+    D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
+use windows::Win32::System::Threading::WaitForSingleObjectEx;
 
 use crate::Upscaler;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_UNSPECIFIED, DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_FORMAT_R8G8B8A8_UNORM,
-    DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_UNKNOWN,
-    DXGI_MODE_DESC, DXGI_MODE_SCALING_UNSPECIFIED, DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
-    DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_MODE_DESC,
+    DXGI_MODE_SCALING_UNSPECIFIED, DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED, DXGI_RATIONAL,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGIFactory6, IDXGISwapChain,
@@ -509,10 +509,7 @@ impl D3D11Renderer {
 
     /// Install a callback that receives `(label, microseconds)` for completed
     /// GPU timestamp queries. Pass `None` to disable timing.
-    pub fn set_gpu_timing_callback(
-        &mut self,
-        cb: Option<Box<dyn Fn(&str, u64) + Send + Sync>>,
-    ) {
+    pub fn set_gpu_timing_callback(&mut self, cb: Option<Box<dyn Fn(&str, u64) + Send + Sync>>) {
         self.gpu_timing_cb = cb;
         self.present_timer = None;
     }
@@ -710,7 +707,10 @@ impl D3D11Renderer {
                 Height: height,
                 Format: DXGI_FORMAT_R8G8B8A8_UNORM,
                 Stereo: false.into(),
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: 2,
                 Scaling: DXGI_SCALING_STRETCH,
@@ -911,7 +911,9 @@ impl D3D11Renderer {
         };
         unsafe {
             let mut tex: Option<ID3D11Texture2D> = None;
-            self.device.CreateTexture2D(&desc, None, Some(&mut tex)).ok()?;
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut tex))
+                .ok()?;
             tex
         }
     }
@@ -931,17 +933,16 @@ impl D3D11Renderer {
         if w == 0 || h == 0 {
             return;
         }
-        if sx >= self.fb_width || sy >= self.fb_height || dx >= self.fb_width || dy >= self.fb_height
+        if sx >= self.fb_width
+            || sy >= self.fb_height
+            || dx >= self.fb_width
+            || dy >= self.fb_height
         {
             return;
         }
         // Clamp so neither the source nor the destination rectangle leaves the FB.
-        let cw = w
-            .min(self.fb_width - sx)
-            .min(self.fb_width - dx);
-        let ch = h
-            .min(self.fb_height - sy)
-            .min(self.fb_height - dy);
+        let cw = w.min(self.fb_width - sx).min(self.fb_width - dx);
+        let ch = h.min(self.fb_height - sy).min(self.fb_height - dy);
         if cw == 0 || ch == 0 {
             return;
         }
@@ -1116,8 +1117,21 @@ impl D3D11Renderer {
                 }
             }
         }
-        let v = self.videos.get_mut(&(w, h)).expect("video present after init");
-        match v.blit(&self.device, &self.context, &fb, dest_x, dest_y, w, h, nv12, regions) {
+        let v = self
+            .videos
+            .get_mut(&(w, h))
+            .expect("video present after init");
+        match v.blit(
+            &self.device,
+            &self.context,
+            &fb,
+            dest_x,
+            dest_y,
+            w,
+            h,
+            nv12,
+            regions,
+        ) {
             Ok(()) => {
                 self.note_dirty(dest_x, dest_y, w, h);
                 true
@@ -1295,8 +1309,16 @@ impl D3D11Renderer {
                             bottom: fb_h.min(sc_h),
                             back: 1,
                         };
-                        self.context
-                            .CopySubresourceRegion(&back_buffer, 0, 0, 0, 0, &fb, 0, Some(&src_box));
+                        self.context.CopySubresourceRegion(
+                            &back_buffer,
+                            0,
+                            0,
+                            0,
+                            0,
+                            &fb,
+                            0,
+                            Some(&src_box),
+                        );
                     }
                 }
             }
@@ -1305,7 +1327,11 @@ impl D3D11Renderer {
         // Hand DWM this frame's changed rects (`Present1`) so composition also
         // touches only what changed. The scaled/sharpen paths redraw the whole
         // backbuffer, so they present full-frame.
-        let dirty_now = if painted { None } else { self.frame_dirty.clone() };
+        let dirty_now = if painted {
+            None
+        } else {
+            self.frame_dirty.clone()
+        };
         let res = unsafe { self.present_with_rects(sync, flags, dirty_now.as_deref()) };
         // Rotate the dirty history for the next buffer in the ring.
         self.rotate_dirty(painted);
@@ -1426,7 +1452,10 @@ impl D3D11Renderer {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_STAGING,
                 BindFlags: 0,
                 CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
@@ -1769,8 +1798,12 @@ impl VideoConv {
                 },
             };
             let mut iv: Option<ID3D11VideoProcessorInputView> = None;
-            self.vdevice
-                .CreateVideoProcessorInputView(&nv12_tex, &self.enumerator, &id, Some(&mut iv))?;
+            self.vdevice.CreateVideoProcessorInputView(
+                &nv12_tex,
+                &self.enumerator,
+                &id,
+                Some(&mut iv),
+            )?;
             let input_view = iv.expect("input view");
 
             // Color spaces (once): RDP AVC video is BT.709 studio-range YCbCr;
@@ -1819,7 +1852,11 @@ impl VideoConv {
     ) -> WinResult<()> {
         let (out_w, out_h) = self.out_size;
         let whole = [(0, 0, w, h)];
-        let regions = if regions.is_empty() { &whole[..] } else { regions };
+        let regions = if regions.is_empty() {
+            &whole[..]
+        } else {
+            regions
+        };
         let stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: true.into(),
             OutputIndex: 0,
@@ -1930,7 +1967,10 @@ impl VideoConv {
                 FourCC: 0,
                 ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
                 Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-                    Texture2D: D3D11_TEX2D_VPIV { MipSlice: 0, ArraySlice: 0 },
+                    Texture2D: D3D11_TEX2D_VPIV {
+                        MipSlice: 0,
+                        ArraySlice: 0,
+                    },
                 },
             };
             let mut iv: Option<ID3D11VideoProcessorInputView> = None;
@@ -2019,7 +2059,11 @@ unsafe fn enable_rtx_super_resolution(
         method: u32,
         enable: u32,
     }
-    let ext = NvSuperResStreamExt { version: 1, method: 2, enable: 1 };
+    let ext = NvSuperResStreamExt {
+        version: 1,
+        method: 2,
+        enable: 1,
+    };
     let hr = vcontext.VideoProcessorSetStreamExtension(
         processor,
         0,
@@ -2097,10 +2141,16 @@ impl RgbaScaler {
             let vcontext: ID3D11VideoContext = context.cast()?;
             let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
                 InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-                InputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
+                InputFrameRate: DXGI_RATIONAL {
+                    Numerator: 60,
+                    Denominator: 1,
+                },
                 InputWidth: in_w,
                 InputHeight: in_h,
-                OutputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
+                OutputFrameRate: DXGI_RATIONAL {
+                    Numerator: 60,
+                    Denominator: 1,
+                },
                 OutputWidth: out_w,
                 OutputHeight: out_h,
                 Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
@@ -2144,7 +2194,13 @@ impl RgbaScaler {
                     }
                 }
             } else {
-                tracing::info!(in_w, in_h, out_w, out_h, "client upscale: bilinear (video processor)");
+                tracing::info!(
+                    in_w,
+                    in_h,
+                    out_w,
+                    out_h,
+                    "client upscale: bilinear (video processor)"
+                );
             }
             Ok(Self {
                 vdevice,
@@ -2172,12 +2228,19 @@ impl RgbaScaler {
                 FourCC: 0,
                 ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
                 Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-                    Texture2D: D3D11_TEX2D_VPIV { MipSlice: 0, ArraySlice: 0 },
+                    Texture2D: D3D11_TEX2D_VPIV {
+                        MipSlice: 0,
+                        ArraySlice: 0,
+                    },
                 },
             };
             let mut iv: Option<ID3D11VideoProcessorInputView> = None;
-            self.vdevice
-                .CreateVideoProcessorInputView(framebuffer, &self.enumerator, &iv_desc, Some(&mut iv))?;
+            self.vdevice.CreateVideoProcessorInputView(
+                framebuffer,
+                &self.enumerator,
+                &iv_desc,
+                Some(&mut iv),
+            )?;
             let input_view = iv.expect("input view");
 
             let ov_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
@@ -2187,8 +2250,12 @@ impl RgbaScaler {
                 },
             };
             let mut ov: Option<ID3D11VideoProcessorOutputView> = None;
-            self.vdevice
-                .CreateVideoProcessorOutputView(backbuffer, &self.enumerator, &ov_desc, Some(&mut ov))?;
+            self.vdevice.CreateVideoProcessorOutputView(
+                backbuffer,
+                &self.enumerator,
+                &ov_desc,
+                Some(&mut ov),
+            )?;
             let output_view = ov.expect("output view");
 
             let (sx, sy, sw, sh) = src_rect;
@@ -2198,7 +2265,12 @@ impl RgbaScaler {
                 right: (sx + sw) as i32,
                 bottom: (sy + sh) as i32,
             };
-            let dst = RECT { left: 0, top: 0, right: out_w as i32, bottom: out_h as i32 };
+            let dst = RECT {
+                left: 0,
+                top: 0,
+                right: out_w as i32,
+                bottom: out_h as i32,
+            };
             self.vcontext
                 .VideoProcessorSetStreamSourceRect(&self.processor, 0, true, Some(&src));
             self.vcontext
@@ -2591,10 +2663,8 @@ impl ShaderScaler {
         sharpness: f32,
     ) -> WinResult<Self> {
         unsafe {
-            let vs_blob = compile_scale_shader(
-                windows::core::s!("vs_main"),
-                windows::core::s!("vs_5_0"),
-            )?;
+            let vs_blob =
+                compile_scale_shader(windows::core::s!("vs_main"), windows::core::s!("vs_5_0"))?;
             let ps_blob = compile_scale_shader(kernel.entry(), windows::core::s!("ps_5_0"))?;
             let vs_code = core::slice::from_raw_parts(
                 vs_blob.GetBufferPointer() as *const u8,
@@ -2630,7 +2700,10 @@ impl ShaderScaler {
                 src_off: [src_rect.0 as f32, src_rect.1 as f32],
                 src_size: [src_rect.2 as f32, src_rect.3 as f32],
                 out_size: [out_size.0 as f32, out_size.1 as f32],
-                inv_tex_size: [1.0 / tex_size.0.max(1) as f32, 1.0 / tex_size.1.max(1) as f32],
+                inv_tex_size: [
+                    1.0 / tex_size.0.max(1) as f32,
+                    1.0 / tex_size.1.max(1) as f32,
+                ],
                 tex_size: [tex_size.0 as f32, tex_size.1 as f32],
                 sharpness,
                 _pad: 0.0,
@@ -2950,7 +3023,11 @@ impl Nv12Shader {
             ctx.PSSetConstantBuffers(0, Some(&cbs));
 
             let whole = [(0u32, 0u32, w, h)];
-            let regions = if regions.is_empty() { &whole[..] } else { regions };
+            let regions = if regions.is_empty() {
+                &whole[..]
+            } else {
+                regions
+            };
             for &(rx, ry, rw, rh) in regions {
                 if rx >= w || ry >= h {
                     continue;
@@ -3065,15 +3142,41 @@ impl UpscalePipeline {
             if !sharpen_on {
                 return false;
             }
-            return self.run_rcas(device, context, sharpen, src, src_tex_size, (sx, sy), dst, dst_size);
+            return self.run_rcas(
+                device,
+                context,
+                sharpen,
+                src,
+                src_tex_size,
+                (sx, sy),
+                dst,
+                dst_size,
+            );
         }
         if sharpen_on {
             if let Some(mid) = self.ensure_mid(device, dst_size) {
-                if !self.run_scale(device, context, mode, src, src_tex_size, src_rect, &mid, dst_size)
-                {
+                if !self.run_scale(
+                    device,
+                    context,
+                    mode,
+                    src,
+                    src_tex_size,
+                    src_rect,
+                    &mid,
+                    dst_size,
+                ) {
                     return false;
                 }
-                if !self.run_rcas(device, context, sharpen, &mid, dst_size, (0, 0), dst, dst_size) {
+                if !self.run_rcas(
+                    device,
+                    context,
+                    sharpen,
+                    &mid,
+                    dst_size,
+                    (0, 0),
+                    dst,
+                    dst_size,
+                ) {
                     // RCAS failed: ship the unsharpened upscale rather than nothing.
                     unsafe { context.CopySubresourceRegion(dst, 0, 0, 0, 0, &mid, 0, None) };
                 }
@@ -3082,7 +3185,16 @@ impl UpscalePipeline {
             // Mid alloc failed: plain unsharpened upscale from here on.
             self.rcas_disabled = true;
         }
-        self.run_scale(device, context, mode, src, src_tex_size, src_rect, dst, dst_size)
+        self.run_scale(
+            device,
+            context,
+            mode,
+            src,
+            src_tex_size,
+            src_rect,
+            dst,
+            dst_size,
+        )
     }
 
     /// The upscale stage: shader kernel (with VideoProcessor bilinear fallback)
@@ -3107,15 +3219,42 @@ impl UpscalePipeline {
         };
         if let Some(kernel) = kernel {
             if !self.scale_disabled
-                && self.run_shader(device, context, kernel, src, src_tex_size, src_rect, dst, dst_size)
+                && self.run_shader(
+                    device,
+                    context,
+                    kernel,
+                    src,
+                    src_tex_size,
+                    src_rect,
+                    dst,
+                    dst_size,
+                )
             {
                 return true;
             }
             // Shader unavailable → clean bilinear rather than a hard crop.
-            return self.run_vp(device, context, false, src, src_tex_size, src_rect, dst, dst_size);
+            return self.run_vp(
+                device,
+                context,
+                false,
+                src,
+                src_tex_size,
+                src_rect,
+                dst,
+                dst_size,
+            );
         }
         let want_vsr = matches!(mode, Upscaler::Vsr);
-        self.run_vp(device, context, want_vsr, src, src_tex_size, src_rect, dst, dst_size)
+        self.run_vp(
+            device,
+            context,
+            want_vsr,
+            src,
+            src_tex_size,
+            src_rect,
+            dst,
+            dst_size,
+        )
     }
 
     /// Run (building if stale) the shader upscale kernel into `dst`.
@@ -3136,7 +3275,15 @@ impl UpscalePipeline {
             Some(s) => s.stale(kernel, src_tex_size, src_rect, dst_size, 0.0),
         };
         if stale {
-            match ShaderScaler::new(device, context, kernel, src_tex_size, src_rect, dst_size, 0.0) {
+            match ShaderScaler::new(
+                device,
+                context,
+                kernel,
+                src_tex_size,
+                src_rect,
+                dst_size,
+                0.0,
+            ) {
                 Ok(s) => self.scale = Some(s),
                 Err(e) => {
                     tracing::warn!(error = %e, kernel = kernel.label(), "scale shader unavailable; using bilinear");
@@ -3175,7 +3322,13 @@ impl UpscalePipeline {
         let src_rect = (src_off.0, src_off.1, dst_size.0, dst_size.1);
         let stale = match &self.rcas {
             None => true,
-            Some(s) => s.stale(ScaleKernel::Rcas, src_tex_size, src_rect, dst_size, sharpness),
+            Some(s) => s.stale(
+                ScaleKernel::Rcas,
+                src_tex_size,
+                src_rect,
+                dst_size,
+                sharpness,
+            ),
         };
         if stale {
             match ShaderScaler::new(
@@ -3270,7 +3423,10 @@ impl UpscalePipeline {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
             CPUAccessFlags: 0,

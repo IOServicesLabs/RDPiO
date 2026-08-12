@@ -12,16 +12,22 @@
 //! hosts so the sans-I/O crates stay testable everywhere.
 
 #[cfg(windows)]
+mod backend;
+#[cfg(windows)]
 mod d3d11;
 #[cfg(windows)]
 mod d3d12;
-#[cfg(windows)]
-mod backend;
 #[cfg(windows)]
 pub use backend::{Backend, Renderer};
 
 #[cfg(windows)]
 pub mod h264;
+
+/// Decode → UI frame handoff: the [`DecodedFrame`] type and the non-blocking
+/// channel that carries it from the decode path to the UI window's swap chain.
+/// Platform-neutral (the D3D11 surface only appears behind `#[cfg(windows)]`),
+/// so the conversion/handoff logic is unit-testable on headless hosts.
+pub mod frame;
 
 #[cfg(not(windows))]
 mod stub;

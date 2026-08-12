@@ -63,14 +63,24 @@ mod tests {
     #[test]
     fn parses_error_info_code() {
         // Share Data PDU of type SET_ERROR_INFO carrying ERRINFO_IDLE_TIMEOUT.
-        let pdu = share_data(0x0001_03EA, 1002, PDUTYPE2_SET_ERROR_INFO, &0x3u32.to_le_bytes());
+        let pdu = share_data(
+            0x0001_03EA,
+            1002,
+            PDUTYPE2_SET_ERROR_INFO,
+            &0x3u32.to_le_bytes(),
+        );
         assert_eq!(parse_set_error_info(&pdu), Some(0x3));
         assert_eq!(describe(0x3), "idle session timeout");
     }
 
     #[test]
     fn ignores_other_pdu_types() {
-        let pdu = share_data(1, 1002, crate::finalization::PDUTYPE2_FONTMAP, &[0, 0, 0, 0]);
+        let pdu = share_data(
+            1,
+            1002,
+            crate::finalization::PDUTYPE2_FONTMAP,
+            &[0, 0, 0, 0],
+        );
         assert_eq!(parse_set_error_info(&pdu), None);
     }
 

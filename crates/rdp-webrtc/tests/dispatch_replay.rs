@@ -46,10 +46,16 @@ async fn dispatcher_drives_the_captured_negotiation() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     ice_events += redirector.drain_ice().await.len();
 
-    assert!(calls_dispatched > 150, "expected the full call, dispatched {calls_dispatched}");
+    assert!(
+        calls_dispatched > 150,
+        "expected the full call, dispatched {calls_dispatched}"
+    );
 
     // Diagnostics: surface any engine errors the dispatcher reported.
-    let errors: Vec<&Value> = outbound.iter().filter(|m| m.get("error").is_some()).collect();
+    let errors: Vec<&Value> = outbound
+        .iter()
+        .filter(|m| m.get("error").is_some())
+        .collect();
     eprintln!("outbound={} errors={}", outbound.len(), errors.len());
     for e in errors.iter().take(6) {
         eprintln!("  ERR: {}", e);
@@ -64,7 +70,10 @@ async fn dispatcher_drives_the_captured_negotiation() {
     assert!(offer.contains("m=audio"), "offer has no audio");
     assert!(offer.contains("m=video"), "offer has no video");
     assert!(offer.to_lowercase().contains("opus"), "offer has no opus");
-    assert!(offer.contains("a=fingerprint:"), "offer has no DTLS fingerprint");
+    assert!(
+        offer.contains("a=fingerprint:"),
+        "offer has no DTLS fingerprint"
+    );
 
     // Every reply is correlated by callId (the whole point of the RPC).
     let replies_with_callid = outbound

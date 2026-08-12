@@ -123,16 +123,18 @@ pub fn encode_redirect_password(
 fn aes256_cbc_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
     use windows::core::PCWSTR;
     use windows::Win32::Security::Cryptography::{
-        BCryptCloseAlgorithmProvider, BCryptDestroyKey, BCryptEncrypt,
-        BCryptGenerateSymmetricKey, BCryptOpenAlgorithmProvider, BCryptSetProperty,
-        BCRYPT_AES_ALGORITHM, BCRYPT_ALG_HANDLE, BCRYPT_BLOCK_PADDING, BCRYPT_CHAINING_MODE,
-        BCRYPT_HANDLE, BCRYPT_KEY_HANDLE, BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS,
+        BCryptCloseAlgorithmProvider, BCryptDestroyKey, BCryptEncrypt, BCryptGenerateSymmetricKey,
+        BCryptOpenAlgorithmProvider, BCryptSetProperty, BCRYPT_AES_ALGORITHM, BCRYPT_ALG_HANDLE,
+        BCRYPT_BLOCK_PADDING, BCRYPT_CHAINING_MODE, BCRYPT_HANDLE, BCRYPT_KEY_HANDLE,
+        BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS,
     };
 
     // CNG chaining-mode property value: the wide string "ChainingModeCBC\0".
-    let cbc: Vec<u16> = "ChainingModeCBC".encode_utf16().chain(std::iter::once(0)).collect();
-    let cbc_bytes =
-        unsafe { std::slice::from_raw_parts(cbc.as_ptr().cast::<u8>(), cbc.len() * 2) };
+    let cbc: Vec<u16> = "ChainingModeCBC"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let cbc_bytes = unsafe { std::slice::from_raw_parts(cbc.as_ptr().cast::<u8>(), cbc.len() * 2) };
 
     unsafe {
         let mut halg = BCRYPT_ALG_HANDLE::default();
@@ -168,7 +170,9 @@ fn aes256_cbc_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
                 BCRYPT_BLOCK_PADDING,
             );
             let _ = BCryptDestroyKey(hkey);
-            status.ok().map_err(|e| format!("BCryptEncrypt(AES-CBC): {e}"))?;
+            status
+                .ok()
+                .map_err(|e| format!("BCryptEncrypt(AES-CBC): {e}"))?;
             out.truncate(result_len as usize);
             Ok::<Vec<u8>, String>(out)
         })();
@@ -181,9 +185,9 @@ fn aes256_cbc_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(windows)]
 fn rsa_pkcs1_encrypt(cert_der: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     use windows::Win32::Security::Cryptography::{
-        BCryptDestroyKey, BCryptEncrypt, CertCreateCertificateContext,
-        CertFreeCertificateContext, CryptImportPublicKeyInfoEx2, BCRYPT_KEY_HANDLE,
-        BCRYPT_PAD_PKCS1, CRYPT_IMPORT_PUBLIC_KEY_FLAGS, X509_ASN_ENCODING,
+        BCryptDestroyKey, BCryptEncrypt, CertCreateCertificateContext, CertFreeCertificateContext,
+        CryptImportPublicKeyInfoEx2, BCRYPT_KEY_HANDLE, BCRYPT_PAD_PKCS1,
+        CRYPT_IMPORT_PUBLIC_KEY_FLAGS, X509_ASN_ENCODING,
     };
 
     unsafe {
@@ -216,7 +220,9 @@ fn rsa_pkcs1_encrypt(cert_der: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
                 BCRYPT_PAD_PKCS1,
             );
             let _ = BCryptDestroyKey(hkey);
-            status.ok().map_err(|e| format!("BCryptEncrypt(RSA-PKCS1): {e}"))?;
+            status
+                .ok()
+                .map_err(|e| format!("BCryptEncrypt(RSA-PKCS1): {e}"))?;
             out.truncate(result_len as usize);
             Ok::<Vec<u8>, String>(out)
         })();

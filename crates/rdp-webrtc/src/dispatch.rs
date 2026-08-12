@@ -244,7 +244,9 @@ impl Redirector {
         // `sessioninfo` event advertising its display/versions/features. Emitting
         // this is what makes Teams treat the endpoint as optimization-capable.
         if otype == ObjectType::Redirector && method == "setVersionInfo" {
-            tracing::info!("dispatch: setVersionInfo → advertising sessioninfo (capability handshake)");
+            tracing::info!(
+                "dispatch: setVersionInfo → advertising sessioninfo (capability handshake)"
+            );
             return vec![self.session_info_event()];
         }
 
@@ -282,11 +284,17 @@ impl Redirector {
             // section — Teams then closed the data channel and the peer connection
             // without ever answering. So open it for real.
             (ObjectType::PeerConnection, "createDataChannel") => {
-                let label = a0.get("label").and_then(Value::as_str).unwrap_or("main-channel");
+                let label = a0
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("main-channel");
                 let id = a0.get("rpcObjectId").and_then(Value::as_u64).unwrap_or(0);
                 match self.engine.create_data_channel(label, id).await {
                     Ok(()) => {
-                        tracing::info!(label, "dispatch: data channel opened (offer gains m=application)");
+                        tracing::info!(
+                            label,
+                            "dispatch: data channel opened (offer gains m=application)"
+                        );
                         Ok(ack())
                     }
                     Err(e) => Err(e.to_string()),
@@ -303,9 +311,18 @@ impl Redirector {
             }
             (ObjectType::PeerConnection, "addTransceiver") => {
                 let kind = a0.get("kind").and_then(Value::as_str).unwrap_or("video");
-                let dir = a0.get("direction").and_then(Value::as_str).unwrap_or("inactive");
-                let id = a0.get("transceiverRpcObjectId").and_then(Value::as_u64).unwrap_or(0);
-                let sender_id = a0.get("senderRpcObjectId").and_then(Value::as_u64).unwrap_or(0);
+                let dir = a0
+                    .get("direction")
+                    .and_then(Value::as_str)
+                    .unwrap_or("inactive");
+                let id = a0
+                    .get("transceiverRpcObjectId")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let sender_id = a0
+                    .get("senderRpcObjectId")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 // Teams marks a *send* (camera) transceiver by supplying `sendEncodings`
                 // (simulcast layers). Those must be created send-capable so `replaceTrack`
                 // can bind the real camera track; receive m-lines stay recvonly.
@@ -341,7 +358,10 @@ impl Redirector {
             }
             (ObjectType::RtpTransceiver, "setDirection") => {
                 let id = msg.object_id_u64().unwrap_or(0);
-                let dir = a0.get("direction").and_then(Value::as_str).unwrap_or("inactive");
+                let dir = a0
+                    .get("direction")
+                    .and_then(Value::as_str)
+                    .unwrap_or("inactive");
                 self.engine
                     .set_transceiver_direction(id, dir)
                     .await
@@ -460,15 +480,18 @@ impl Redirector {
                         "dispatch: reporting NO media devices — Teams will not optimize the call"
                     );
                 } else {
-                    tracing::info!(devices = list.len(), "dispatch: reporting client media devices");
+                    tracing::info!(
+                        devices = list.len(),
+                        "dispatch: reporting client media devices"
+                    );
                 }
                 Ok(Value::Array(list))
             }
             (ObjectType::HidManager, "enumerateDevices") => Ok(json!([])),
             // E911 (emergency-call location): return a well-formed placeholder.
-            (ObjectType::Redirector, "getE911Info") => {
-                Ok(json!({ "ipv4": "0.0.0.0", "mac": "00-00-00-00-00-00", "subnetLengthIpv4": "0" }))
-            }
+            (ObjectType::Redirector, "getE911Info") => Ok(
+                json!({ "ipv4": "0.0.0.0", "mac": "00-00-00-00-00-00", "subnetLengthIpv4": "0" }),
+            ),
             // Everything else (Redirector/Hid/MediaElement/MediaStream(Track)
             // control & UI surfaces not yet engine-backed) → acknowledge so the
             // server's RPC sequence keeps flowing.
@@ -570,12 +593,18 @@ impl Redirector {
             if !in_answer {
                 continue;
             }
-            let (receiver, sender, track, stream) =
-                (self.alloc_obj_id(), self.alloc_obj_id(), self.alloc_obj_id(), self.alloc_obj_id());
+            let (receiver, sender, track, stream) = (
+                self.alloc_obj_id(),
+                self.alloc_obj_id(),
+                self.alloc_obj_id(),
+                self.alloc_obj_id(),
+            );
             let kind = tx.get("kind").and_then(Value::as_str).unwrap_or("audio");
             let mid = tx.get("mid").and_then(Value::as_str).unwrap_or("0");
-            let stream_name =
-                format!("native{}-{mid}", if kind == "video" { "Video" } else { "Audio" });
+            let stream_name = format!(
+                "native{}-{mid}",
+                if kind == "video" { "Video" } else { "Audio" }
+            );
             out.push(json!({
                 "rpcEventArgs": {
                     "receiver": { "rpcObjectId": receiver, "kind": kind },
@@ -692,7 +721,10 @@ fn accepted_mids(answer: &str) -> std::collections::HashSet<String> {
     let mut port_nonzero = false;
     let mut inactive = false;
     let mut mid: Option<String> = None;
-    let commit = |port_nonzero: bool, inactive: bool, mid: &mut Option<String>, out: &mut std::collections::HashSet<String>| {
+    let commit = |port_nonzero: bool,
+                  inactive: bool,
+                  mid: &mut Option<String>,
+                  out: &mut std::collections::HashSet<String>| {
         if port_nonzero && !inactive {
             if let Some(m) = mid.take() {
                 out.insert(m);
@@ -705,7 +737,11 @@ fn accepted_mids(answer: &str) -> std::collections::HashSet<String> {
         if let Some(rest) = t.strip_prefix("m=") {
             // Commit the m-line we just finished, then start the new one.
             commit(port_nonzero, inactive, &mut mid, &mut out);
-            port_nonzero = rest.split_whitespace().nth(1).map(|p| p != "0").unwrap_or(false);
+            port_nonzero = rest
+                .split_whitespace()
+                .nth(1)
+                .map(|p| p != "0")
+                .unwrap_or(false);
             inactive = false;
         } else if t == "a=inactive" {
             inactive = true;
@@ -768,12 +804,18 @@ fn sanitize_remote_sdp(sdp: &str) -> String {
             if t.starts_with("a=rid:") || t.starts_with("a=simulcast:") {
                 continue;
             }
-            if let Some(pt) = t.strip_prefix("a=rtpmap:").and_then(|r| r.split_whitespace().next()) {
+            if let Some(pt) = t
+                .strip_prefix("a=rtpmap:")
+                .and_then(|r| r.split_whitespace().next())
+            {
                 if rtx_pts.contains(pt) {
                     continue;
                 }
             }
-            if let Some(pt) = t.strip_prefix("a=fmtp:").and_then(|r| r.split_whitespace().next()) {
+            if let Some(pt) = t
+                .strip_prefix("a=fmtp:")
+                .and_then(|r| r.split_whitespace().next())
+            {
                 if rtx_pts.contains(pt) {
                     continue;
                 }
@@ -818,7 +860,10 @@ fn sanitize_remote_sdp(sdp: &str) -> String {
         let pts: Vec<&str> = fields.skip(2).collect();
         let mapped: std::collections::HashSet<&str> = kept
             .iter()
-            .filter_map(|l| l.strip_prefix("a=rtpmap:").and_then(|r| r.split_whitespace().next()))
+            .filter_map(|l| {
+                l.strip_prefix("a=rtpmap:")
+                    .and_then(|r| r.split_whitespace().next())
+            })
             .collect();
         for pt in pts {
             let dynamic = pt.parse::<u16>().map(|n| n > 34).unwrap_or(false);
@@ -925,7 +970,11 @@ fn enrich_offer(sdp: &str) -> String {
     let already_paired: std::collections::HashSet<u16> = sdp
         .lines()
         .filter_map(|l| {
-            let params = l.trim().strip_prefix("a=fmtp:")?.split_whitespace().nth(1)?;
+            let params = l
+                .trim()
+                .strip_prefix("a=fmtp:")?
+                .split_whitespace()
+                .nth(1)?;
             params.strip_prefix("apt=")?.parse::<u16>().ok()
         })
         .collect();
@@ -936,7 +985,8 @@ fn enrich_offer(sdp: &str) -> String {
             continue;
         };
         let mut it = r.split_whitespace();
-        let (Some(pt), Some(codec)) = (it.next().and_then(|p| p.parse::<u16>().ok()), it.next()) else {
+        let (Some(pt), Some(codec)) = (it.next().and_then(|p| p.parse::<u16>().ok()), it.next())
+        else {
             continue;
         };
         // Pair RTX with every *primary* video codec (not just H264): webrtc-rs offers
@@ -966,10 +1016,20 @@ fn enrich_offer(sdp: &str) -> String {
             .first()
             .map(|l| l.trim_start().starts_with("m=application"))
             .unwrap_or(false);
-        let is_media = block.first().map(|l| l.trim_start().starts_with("m=")).unwrap_or(false);
-        let is_video = block.first().map(|l| l.trim_start().starts_with("m=video")).unwrap_or(false);
-        let has_fingerprint = block.iter().any(|l| l.trim_start().starts_with("a=fingerprint:"));
-        let has_ice_options = block.iter().any(|l| l.trim_start().starts_with("a=ice-options:"));
+        let is_media = block
+            .first()
+            .map(|l| l.trim_start().starts_with("m="))
+            .unwrap_or(false);
+        let is_video = block
+            .first()
+            .map(|l| l.trim_start().starts_with("m=video"))
+            .unwrap_or(false);
+        let has_fingerprint = block
+            .iter()
+            .any(|l| l.trim_start().starts_with("a=fingerprint:"));
+        let has_ice_options = block
+            .iter()
+            .any(|l| l.trim_start().starts_with("a=ice-options:"));
 
         // The RTX pairings that apply to THIS video block (those whose H264 PT it lists).
         let block_rtx: Vec<(u16, u16)> = if is_video {
@@ -982,7 +1042,11 @@ fn enrich_offer(sdp: &str) -> String {
                         .and_then(|p| p.parse::<u16>().ok())
                 })
                 .collect();
-            rtx_map.iter().copied().filter(|&(h, _)| pts.contains(&h)).collect()
+            rtx_map
+                .iter()
+                .copied()
+                .filter(|&(h, _)| pts.contains(&h))
+                .collect()
         } else {
             Vec::new()
         };
@@ -993,7 +1057,10 @@ fn enrich_offer(sdp: &str) -> String {
                 continue;
             }
             if is_application
-                && (t == "a=sendrecv" || t == "a=recvonly" || t == "a=sendonly" || t == "a=inactive")
+                && (t == "a=sendrecv"
+                    || t == "a=recvonly"
+                    || t == "a=sendonly"
+                    || t == "a=inactive")
             {
                 continue;
             }
@@ -1081,7 +1148,10 @@ fn slim_video_offer(sdp: &str) -> String {
 
     let mut out = String::with_capacity(sdp.len());
     for block in &blocks {
-        let is_video = block.first().map(|l| l.trim_start().starts_with("m=video")).unwrap_or(false);
+        let is_video = block
+            .first()
+            .map(|l| l.trim_start().starts_with("m=video"))
+            .unwrap_or(false);
         if !is_video {
             for l in block {
                 out.push_str(l);
@@ -1111,7 +1181,10 @@ fn slim_video_offer(sdp: &str) -> String {
                 if let (Some(pt), Some(params)) =
                     (it.next().and_then(|p| p.parse::<u16>().ok()), it.next())
                 {
-                    if let Some(apt) = params.strip_prefix("apt=").and_then(|a| a.parse::<u16>().ok()) {
+                    if let Some(apt) = params
+                        .strip_prefix("apt=")
+                        .and_then(|a| a.parse::<u16>().ok())
+                    {
                         if keep.contains(&apt) {
                             keep.insert(pt);
                         }
@@ -1129,7 +1202,11 @@ fn slim_video_offer(sdp: &str) -> String {
                 let head = toks.len().min(3);
                 let mut rebuilt = toks[..head].join(" ");
                 for pt in &toks[head..] {
-                    if pt.parse::<u16>().map(|n| keep.contains(&n)).unwrap_or(false) {
+                    if pt
+                        .parse::<u16>()
+                        .map(|n| keep.contains(&n))
+                        .unwrap_or(false)
+                    {
                         rebuilt.push(' ');
                         rebuilt.push_str(pt);
                     }
@@ -1230,14 +1307,20 @@ mod tests {
         assert!(caps.get("sendCapabilities").is_some());
         assert!(caps.get("recvCapabilities").is_some());
         let feats = session_features();
-        assert_eq!(feats.get("unifiedplan").and_then(Value::as_str), Some("enabled"));
+        assert_eq!(
+            feats.get("unifiedplan").and_then(Value::as_str),
+            Some("enabled")
+        );
     }
 
     #[test]
     fn session_info_event_has_the_handshake_shape() {
         let r = Redirector::new();
         let ev = r.session_info_event();
-        assert_eq!(ev.get("rpcEventName").and_then(Value::as_str), Some("sessioninfo"));
+        assert_eq!(
+            ev.get("rpcEventName").and_then(Value::as_str),
+            Some("sessioninfo")
+        );
         assert_eq!(ev.get("hr").and_then(Value::as_i64), Some(0));
         assert!(ev.pointer("/rpcEventArgs/features/unifiedplan").is_some());
         assert!(ev.pointer("/rpcEventArgs/display/width").is_some());
@@ -1245,11 +1328,14 @@ mod tests {
 
     #[test]
     fn munged_offer_is_recognized_by_its_fingerprint() {
-        let ours = "v=0\r\na=ice-ufrag:abcd\r\na=fingerprint:sha-256 AA:BB:CC\r\nm=video 9 RTP 96 97\r\n";
+        let ours =
+            "v=0\r\na=ice-ufrag:abcd\r\na=fingerprint:sha-256 AA:BB:CC\r\nm=video 9 RTP 96 97\r\n";
         // The server prunes a codec but keeps the fingerprint → still our offer.
-        let munged = "v=0\r\na=ice-ufrag:abcd\r\na=fingerprint:sha-256 AA:BB:CC\r\nm=video 9 RTP 97\r\n";
+        let munged =
+            "v=0\r\na=ice-ufrag:abcd\r\na=fingerprint:sha-256 AA:BB:CC\r\nm=video 9 RTP 97\r\n";
         // A different session (what a capture replay feeds us) → must be rejected.
-        let foreign = "v=0\r\na=ice-ufrag:zzzz\r\na=fingerprint:sha-256 99:88:77\r\nm=video 9 RTP 96\r\n";
+        let foreign =
+            "v=0\r\na=ice-ufrag:zzzz\r\na=fingerprint:sha-256 99:88:77\r\nm=video 9 RTP 96\r\n";
         assert!(same_dtls_session(ours, munged));
         assert!(!same_dtls_session(ours, foreign));
         assert!(!same_dtls_session(ours, "v=0\r\n"));
@@ -1270,7 +1356,11 @@ mod tests {
         let out = r
             .handle(&call(r#"{"rpcObjectType":"RTCPeerConnection","rpcObjectId":1,"rpcName":"createPeerConnection","rpcArgs":[{"iceServers":[]}],"rpcCallId":1}"#.into()))
             .await;
-        assert_eq!(out[0].get("hr").and_then(Value::as_i64), Some(0), "createPeerConnection");
+        assert_eq!(
+            out[0].get("hr").and_then(Value::as_i64),
+            Some(0),
+            "createPeerConnection"
+        );
 
         // Data channel first (gives the offer its m=application), then media.
         r.handle(&call(r#"{"rpcObjectType":"RTCPeerConnection","rpcObjectId":1,"rpcName":"createDataChannel","rpcArgs":[{"label":"main-channel","rpcObjectId":10}],"rpcCallId":2}"#.into())).await;
@@ -1285,7 +1375,10 @@ mod tests {
             .and_then(Value::as_str)
             .expect("offer sdp")
             .to_string();
-        assert!(our_sdp.contains("m=application"), "offer lacks the data channel");
+        assert!(
+            our_sdp.contains("m=application"),
+            "offer lacks the data channel"
+        );
 
         // Munge the way Teams does: prune codec (rtpmap) lines, keeping the DTLS
         // fingerprint. This is a *different* string than createOffer produced, so
@@ -1315,18 +1408,21 @@ mod tests {
             .expect("setLocalDescription result must list transceivers");
         assert_eq!(tx.len(), 2, "both transceivers should be reported");
         assert!(
-            tx.iter().any(|t| t.get("kind").and_then(Value::as_str) == Some("audio")
-                && t.get("mid").and_then(Value::as_str).is_some()),
+            tx.iter()
+                .any(|t| t.get("kind").and_then(Value::as_str) == Some("audio")
+                    && t.get("mid").and_then(Value::as_str).is_some()),
             "audio transceiver must be reported with an assigned mid: {tx:?}"
         );
         assert!(
-            tx.iter().all(|t| t.get("mid").and_then(Value::as_str).is_some()),
+            tx.iter()
+                .all(|t| t.get("mid").and_then(Value::as_str).is_some()),
             "every transceiver must carry its assigned mid: {tx:?}"
         );
         // And the state-change events the add-in fires must accompany the reply.
         assert!(
-            out.iter().any(|m| m.get("rpcEventName").and_then(Value::as_str)
-                == Some("signalingstatechange")),
+            out.iter()
+                .any(|m| m.get("rpcEventName").and_then(Value::as_str)
+                    == Some("signalingstatechange")),
             "signalingstatechange event not emitted after setLocalDescription"
         );
 
@@ -1370,8 +1466,14 @@ mod tests {
         );
         let out = enrich_offer(sdp);
         assert!(out.contains("a=ice-options:trickle"), "missing trickle");
-        assert!(out.contains("a=msid-semantic: WMS"), "missing msid-semantic");
-        assert!(out.contains("a=max-message-size:262144"), "missing max-message-size");
+        assert!(
+            out.contains("a=msid-semantic: WMS"),
+            "missing msid-semantic"
+        );
+        assert!(
+            out.contains("a=max-message-size:262144"),
+            "missing max-message-size"
+        );
         // The DTLS fingerprint is copied onto every m-line (session + 3 m-lines = 4)
         // so the media server accepts the SCTP data-channel m-line.
         assert_eq!(
@@ -1381,17 +1483,28 @@ mod tests {
         );
         // Specifically the data-channel block must now carry it.
         let app_block = out.split("m=application").nth(1).unwrap_or("");
-        assert!(app_block.contains("a=fingerprint:"), "data channel missing fingerprint:\n{out}");
+        assert!(
+            app_block.contains("a=fingerprint:"),
+            "data channel missing fingerprint:\n{out}"
+        );
         // Sendrecv m-line keeps its send markers.
         assert!(out.contains("a=ssrc:111"), "sendrecv ssrc wrongly stripped");
         assert!(out.contains("a=msid:s t"), "sendrecv msid wrongly stripped");
         // Recvonly m-line loses them (the phantom send markers Teams rejects).
         assert!(!out.contains("a=ssrc:222"), "recvonly ssrc not stripped");
         // Exactly one msid line survives (the sendrecv one).
-        assert_eq!(out.matches("a=msid:s t").count(), 1, "recvonly msid not stripped");
+        assert_eq!(
+            out.matches("a=msid:s t").count(),
+            1,
+            "recvonly msid not stripped"
+        );
         // The audio m-line's real direction is untouched; only the data channel's
         // stray direction is removed (SCTP m-lines carry no direction).
-        assert_eq!(out.matches("a=sendrecv").count(), 1, "data-channel a=sendrecv not stripped");
+        assert_eq!(
+            out.matches("a=sendrecv").count(),
+            1,
+            "data-channel a=sendrecv not stripped"
+        );
         assert!(out.contains("a=recvonly"), "recvonly direction preserved");
     }
 
@@ -1421,7 +1534,11 @@ mod tests {
         let out = r
             .handle(&call(r#"{"rpcObjectType":"RTCPeerConnection","rpcObjectId":1,"rpcName":"createOffer","rpcArgs":[{}],"rpcCallId":20}"#.into()))
             .await;
-        let offer = out[0].pointer("/result/desc/sdp").and_then(Value::as_str).expect("offer").to_string();
+        let offer = out[0]
+            .pointer("/result/desc/sdp")
+            .and_then(Value::as_str)
+            .expect("offer")
+            .to_string();
         let sld = format!(
             r#"{{"rpcObjectType":"RTCPeerConnection","rpcObjectId":1,"rpcName":"setLocalDescription","rpcArgs":[{{"type":"offer","sdp":{}}}],"rpcCallId":21}}"#,
             serde_json::to_string(&offer).unwrap()
@@ -1448,10 +1565,14 @@ mod tests {
             .iter()
             .filter(|m| m.get("rpcEventName").and_then(Value::as_str) == Some("track"))
             .count();
-        assert_eq!(track_events, 1, "expected one track event for the accepted audio only: {out:#?}");
+        assert_eq!(
+            track_events, 1,
+            "expected one track event for the accepted audio only: {out:#?}"
+        );
         assert!(
-            out.iter().any(|m| m.get("rpcEventName").and_then(Value::as_str)
-                == Some("iceconnectionstatechange")),
+            out.iter()
+                .any(|m| m.get("rpcEventName").and_then(Value::as_str)
+                    == Some("iceconnectionstatechange")),
             "iceconnectionstatechange not emitted after the answer"
         );
     }
@@ -1474,10 +1595,21 @@ mod tests {
         );
         let out = sanitize_remote_sdp(answer);
         // The rejected video line's bare PT 36 gets a synthetic rtpmap so parsing works.
-        assert!(out.contains("a=rtpmap:36 H264/90000"), "bare video PT not mapped:\n{out}");
+        assert!(
+            out.contains("a=rtpmap:36 H264/90000"),
+            "bare video PT not mapped:\n{out}"
+        );
         // The audio line already had rtpmaps — nothing spurious added.
-        assert_eq!(out.matches("a=rtpmap:111").count(), 1, "audio rtpmap duplicated");
-        assert_eq!(out.matches("a=rtpmap:0 ").count(), 1, "static audio rtpmap duplicated");
+        assert_eq!(
+            out.matches("a=rtpmap:111").count(),
+            1,
+            "audio rtpmap duplicated"
+        );
+        assert_eq!(
+            out.matches("a=rtpmap:0 ").count(),
+            1,
+            "static audio rtpmap duplicated"
+        );
         // Idempotent: a second pass changes nothing.
         assert_eq!(sanitize_remote_sdp(&out), out, "sanitize is not idempotent");
     }
@@ -1514,19 +1646,42 @@ mod tests {
         let vblock = out.split("m=video").nth(1).unwrap_or("");
         // Only H264 (102) + its rtx (103) survive on the m= line.
         let mline = out.lines().find(|l| l.starts_with("m=video")).unwrap();
-        assert_eq!(mline, "m=video 9 UDP/TLS/RTP/SAVPF 102 103", "m= line not slimmed:\n{out}");
+        assert_eq!(
+            mline, "m=video 9 UDP/TLS/RTP/SAVPF 102 103",
+            "m= line not slimmed:\n{out}"
+        );
         // Non-H264 codecs + their rtx are gone.
         assert!(!vblock.contains("VP8"), "VP8 not removed:\n{out}");
         assert!(!vblock.contains("AV1"), "AV1 not removed:\n{out}");
-        assert!(!vblock.contains("apt=96") && !vblock.contains("apt=41"), "orphan rtx left:\n{out}");
+        assert!(
+            !vblock.contains("apt=96") && !vblock.contains("apt=41"),
+            "orphan rtx left:\n{out}"
+        );
         // H264 + its rtx remain.
-        assert!(vblock.contains("a=rtpmap:102 H264/90000"), "H264 dropped:\n{out}");
-        assert!(vblock.contains("a=rtpmap:103 rtx/90000") && vblock.contains("apt=102"), "H264 rtx dropped:\n{out}");
+        assert!(
+            vblock.contains("a=rtpmap:102 H264/90000"),
+            "H264 dropped:\n{out}"
+        );
+        assert!(
+            vblock.contains("a=rtpmap:103 rtx/90000") && vblock.contains("apt=102"),
+            "H264 rtx dropped:\n{out}"
+        );
         // rtcp-fb deduped: exactly one `nack` and one `nack pli` for 102.
-        assert_eq!(vblock.matches("a=rtcp-fb:102 nack\r\n").count(), 1, "nack not deduped:\n{out}");
-        assert_eq!(vblock.matches("a=rtcp-fb:102 nack pli").count(), 1, "nack pli not deduped:\n{out}");
+        assert_eq!(
+            vblock.matches("a=rtcp-fb:102 nack\r\n").count(),
+            1,
+            "nack not deduped:\n{out}"
+        );
+        assert_eq!(
+            vblock.matches("a=rtcp-fb:102 nack pli").count(),
+            1,
+            "nack pli not deduped:\n{out}"
+        );
         // Audio block untouched (its duplicate fb is not our concern; audio is accepted).
-        assert!(out.contains("a=rtpmap:111 opus/48000/2"), "audio mangled:\n{out}");
+        assert!(
+            out.contains("a=rtpmap:111 opus/48000/2"),
+            "audio mangled:\n{out}"
+        );
     }
 
     #[test]
@@ -1550,16 +1705,32 @@ mod tests {
         // Each distinct H264 PT is paired with exactly one RTX codec, bundle-wide.
         let apt102 = out.matches("apt=102").count();
         let apt125 = out.matches("apt=125").count();
-        assert!(apt102 >= 1 && apt125 >= 1, "H264 not paired with RTX:\n{out}");
+        assert!(
+            apt102 >= 1 && apt125 >= 1,
+            "H264 not paired with RTX:\n{out}"
+        );
         // The RTX codecs are declared as rtx/90000.
         assert!(out.contains("rtx/90000"), "no rtx rtpmap emitted:\n{out}");
         // Audio must carry no RTX.
-        let audio_block = out.split("m=audio").nth(1).and_then(|s| s.split("m=video").next()).unwrap_or("");
-        assert!(!audio_block.contains("rtx/90000"), "RTX wrongly added to audio:\n{out}");
+        let audio_block = out
+            .split("m=audio")
+            .nth(1)
+            .and_then(|s| s.split("m=video").next())
+            .unwrap_or("");
+        assert!(
+            !audio_block.contains("rtx/90000"),
+            "RTX wrongly added to audio:\n{out}"
+        );
         // The same H264 PT maps to the SAME RTX PT across both video m-lines (max-BUNDLE
         // shares one payload-type space): apt=102 appears once per video m-line = twice.
-        assert_eq!(apt102, 2, "apt=102 should appear once per video m-line:\n{out}");
-        assert_eq!(apt125, 2, "apt=125 should appear once per video m-line:\n{out}");
+        assert_eq!(
+            apt102, 2,
+            "apt=102 should appear once per video m-line:\n{out}"
+        );
+        assert_eq!(
+            apt125, 2,
+            "apt=125 should appear once per video m-line:\n{out}"
+        );
 
         // Idempotent: a second pass sees the RTX already paired and adds nothing.
         let out2 = enrich_offer(&out);
@@ -1588,7 +1759,11 @@ mod tests {
         );
         let mids = accepted_mids(answer);
         assert!(mids.contains("0"), "accepted audio mid missing: {mids:?}");
-        assert_eq!(mids.len(), 1, "only the audio m-line should be accepted: {mids:?}");
+        assert_eq!(
+            mids.len(),
+            1,
+            "only the audio m-line should be accepted: {mids:?}"
+        );
 
         // An all-accepted answer (audio + one video, both with mids and real ports).
         let full = concat!(
@@ -1609,7 +1784,10 @@ mod tests {
         .unwrap();
         let r = reply(&msg, 79, Some(json!("RPC succeeded.")), 0);
         assert_eq!(r.get("hr").and_then(Value::as_i64), Some(0));
-        assert_eq!(r.get("rpcName").and_then(Value::as_str), Some("createOffer"));
+        assert_eq!(
+            r.get("rpcName").and_then(Value::as_str),
+            Some("createOffer")
+        );
         assert_eq!(r.get("rpcObjectId").and_then(Value::as_u64), Some(11));
         assert_eq!(r.get("rpcCallId").and_then(Value::as_u64), Some(79));
     }

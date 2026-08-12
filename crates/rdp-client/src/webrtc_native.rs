@@ -16,7 +16,9 @@
 use std::sync::Arc;
 
 use rdp_graphics::redirect::DvcRedirector;
-use rdp_webrtc::{DeviceProvider, NativeRedirector, TurnResolver, VideoCaptureSource, CHANNEL_NAME};
+use rdp_webrtc::{
+    DeviceProvider, NativeRedirector, TurnResolver, VideoCaptureSource, CHANNEL_NAME,
+};
 
 use crate::webrtc_devices::{CameraVideoSource, WinDeviceProvider};
 use crate::webrtc_turn::WinTurnResolver;

@@ -10,7 +10,10 @@ members = [
     "crates/rdp-graphics",
     "crates/rdp-gpu",
     "crates/rdp-client",
+    "crates/rdpio",
     "crates/rdp-webrtc",
+    "crates/wire-main",
+    "crates/ui-app",
 ]
 
 [workspace.package]
@@ -31,6 +34,11 @@ rdp-nla = { path = "crates/rdp-nla", version = "0.0.1" }
 rdp-channels = { path = "crates/rdp-channels", version = "0.0.1" }
 rdp-graphics = { path = "crates/rdp-graphics", version = "0.0.1" }
 rdp-gpu = { path = "crates/rdp-gpu", version = "0.0.1" }
+rdp-client = { path = "crates/rdp-client", version = "0.0.1" }
+rdpio = { path = "crates/rdpio", version = "0.0.1" }
+rdp-webrtc = { path = "crates/rdp-webrtc", version = "0.0.1" }
+wire-main = { path = "crates/wire-main", version = "0.0.1" }
+ui-app = { path = "crates/ui-app", version = "0.0.1" }
 
 # Third-party, pure and cross-platform
 thiserror = "1.0"
@@ -45,7 +53,16 @@ ureq = { version = "2.10", features = ["json"] }
 # allocate a buffer per tile — hundreds per frame. mimalloc's per-thread free
 # lists take that contention off the hot path.
 mimalloc = "0.1"
+# Raw window handle encoding shared by the UI front-ends (winit-style
+# `RawWindowHandle`) so the D3D11 present path can consume the native surface.
+raw-window-handle = "0.6"
 serde_json = "1.0"
+serde = { version = "1", features = ["derive"] }
+# GUI (egui/eframe) and persistence. Same release line so `egui` types used by
+# the UI module unify with the `eframe` re-export.
+eframe = "0.36"
+egui = "0.36"
+directories = "5"
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 url = "2.5"
 http = "1.0"

@@ -362,10 +362,7 @@ impl ClipboardProvider for Win32Clipboard {
     fn read_file(&mut self, index: u32, offset: u64, len: u32) -> Option<Vec<u8>> {
         // Reuse the open handle across chunks: a multi-gigabyte upload would
         // otherwise reopen and re-seek the file thousands of times.
-        let reusable = self
-            .upload
-            .as_ref()
-            .is_some_and(|u| u.index == index);
+        let reusable = self.upload.as_ref().is_some_and(|u| u.index == index);
         if !reusable {
             let path = self.files.get(index as usize)?;
             // A directory entry carries no bytes, but peers do probe them — and
@@ -476,7 +473,9 @@ impl ClipboardProvider for Win32Clipboard {
                 }
                 self.current = Some(f);
             }
-            Err(e) => tracing::warn!(error = %e, file = %path.display(), "cannot create pasted file"),
+            Err(e) => {
+                tracing::warn!(error = %e, file = %path.display(), "cannot create pasted file")
+            }
         }
     }
 
@@ -498,7 +497,10 @@ impl ClipboardProvider for Win32Clipboard {
         // real CF_HDROP inside WM_RENDERFORMAT (only it may set clipboard data
         // during a render), so just hand the paths over.
         let paths = std::mem::take(&mut self.staged_roots);
-        tracing::info!(count = paths.len(), "clipboard files staged; completing the paste");
+        tracing::info!(
+            count = paths.len(),
+            "clipboard files staged; completing the paste"
+        );
         crate::session::clipboard_files_ready(paths);
     }
 
@@ -695,7 +697,10 @@ mod tests {
         let (offset, len) = (1_000_003u64, 700_000u32);
         let got = clip.read_file(0, offset, len).unwrap();
         assert_eq!(got.len(), len as usize);
-        assert_eq!(got[..], data[offset as usize..offset as usize + len as usize]);
+        assert_eq!(
+            got[..],
+            data[offset as usize..offset as usize + len as usize]
+        );
 
         // A range running past EOF returns just the tail — the one legitimate
         // short answer.
@@ -738,7 +743,10 @@ mod tests {
 
     #[test]
     fn hdrop_payload_is_well_formed() {
-        let paths = vec![PathBuf::from(r"C:\tmp\a.exe"), PathBuf::from(r"C:\tmp\b.bin")];
+        let paths = vec![
+            PathBuf::from(r"C:\tmp\a.exe"),
+            PathBuf::from(r"C:\tmp\b.bin"),
+        ];
         let b = hdrop_bytes(&paths);
         // DROPFILES: list starts at 20, and fWide marks the paths as UTF-16.
         assert_eq!(u32::from_le_bytes([b[0], b[1], b[2], b[3]]), 20);

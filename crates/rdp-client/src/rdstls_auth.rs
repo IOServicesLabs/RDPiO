@@ -37,9 +37,7 @@ pub fn authenticate<S: Read + Write>(
         "RDSTLS server capabilities raw bytes"
     );
     if n == 0 || !rdstls::is_capabilities(&buf[..n]) {
-        return Err(io::Error::other(
-            "RDSTLS: expected server Capabilities PDU",
-        ));
+        return Err(io::Error::other("RDSTLS: expected server Capabilities PDU"));
     }
 
     // The server's SupportedVersions is a bitmask (AVD/W365 advertise 0x0003 =
@@ -47,7 +45,10 @@ pub fn authenticate<S: Read + Write>(
     // set — what actually differs for AVD is the *credential* (an AES+RSA encrypted
     // password), not the version field.
     let supported = rdstls::capabilities_version(&buf[..n]).unwrap_or(rdstls::VERSION_1);
-    tracing::info!(supported_versions = supported, "RDSTLS server supported-versions bitmask");
+    tracing::info!(
+        supported_versions = supported,
+        "RDSTLS server supported-versions bitmask"
+    );
 
     // 2. Client → Server: Authentication Request (password-credentials variant).
     let req = rdstls::build_auth_request_password(
@@ -81,7 +82,9 @@ pub fn authenticate<S: Read + Write>(
             "RDSTLS authentication rejected: {} (0x{code:08X})",
             rdstls::result_name(code)
         ))),
-        None => Err(io::Error::other("RDSTLS: malformed authentication response")),
+        None => Err(io::Error::other(
+            "RDSTLS: malformed authentication response",
+        )),
     }
 }
 
@@ -133,7 +136,10 @@ mod tests {
             rdstls::build_capabilities(), // server caps
             auth_response(rdstls::RESULT_SUCCESS),
         ]);
-        let mut peer = MockPeer { inbound, written: Vec::new() };
+        let mut peer = MockPeer {
+            inbound,
+            written: Vec::new(),
+        };
         authenticate(&mut peer, &[0xAB; 16], "user", "", b"blob").unwrap();
         // The client must NOT send a Capabilities PDU — its first (and only)
         // write is the Authentication Request (server speaks first).
@@ -150,14 +156,20 @@ mod tests {
             rdstls::build_capabilities(),
             auth_response(0x0000_052E), // LOGON_FAILURE
         ]);
-        let mut peer = MockPeer { inbound, written: Vec::new() };
+        let mut peer = MockPeer {
+            inbound,
+            written: Vec::new(),
+        };
         let err = authenticate(&mut peer, &[0; 16], "u", "", b"x").unwrap_err();
         assert!(err.to_string().contains("LOGON_FAILURE"));
     }
 
     #[test]
     fn missing_server_capabilities_is_an_error() {
-        let mut peer = MockPeer { inbound: VecDeque::new(), written: Vec::new() };
+        let mut peer = MockPeer {
+            inbound: VecDeque::new(),
+            written: Vec::new(),
+        };
         assert!(authenticate(&mut peer, &[0; 16], "u", "", b"x").is_err());
     }
 }

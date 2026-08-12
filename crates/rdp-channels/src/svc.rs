@@ -161,7 +161,10 @@ mod tests {
         let flags = u32::from_le_bytes([cs[0][4], cs[0][5], cs[0][6], cs[0][7]]);
         assert_eq!(flags & CHANNEL_FLAG_FIRST, CHANNEL_FLAG_FIRST);
         assert_eq!(flags & CHANNEL_FLAG_LAST, CHANNEL_FLAG_LAST);
-        assert_eq!(u32::from_le_bytes([cs[0][0], cs[0][1], cs[0][2], cs[0][3]]), 5);
+        assert_eq!(
+            u32::from_le_bytes([cs[0][0], cs[0][1], cs[0][2], cs[0][3]]),
+            5
+        );
         assert_eq!(&cs[0][8..], b"hello");
     }
 
@@ -192,7 +195,7 @@ mod tests {
         let data: Vec<u8> = (0..4000u32).map(|i| i as u8).collect();
         let cs = chunks(&data);
         assert_eq!(cs.len(), 3); // 1600 + 1600 + 800
-        // First chunk FIRST-but-not-LAST; last chunk LAST-but-not-FIRST.
+                                 // First chunk FIRST-but-not-LAST; last chunk LAST-but-not-FIRST.
         let f0 = u32::from_le_bytes([cs[0][4], cs[0][5], cs[0][6], cs[0][7]]);
         assert_eq!(f0 & CHANNEL_FLAG_FIRST, CHANNEL_FLAG_FIRST);
         assert_eq!(f0 & CHANNEL_FLAG_LAST, 0);

@@ -236,7 +236,10 @@ mod tests {
         fields.extend_from_slice(&a2);
 
         let r = parse(&pdu(REDIRECT_FLAG_TARGET_NET_ADDRESSES, &fields)).unwrap();
-        assert_eq!(r.target_net_addresses, vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()]);
+        assert_eq!(
+            r.target_net_addresses,
+            vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()]
+        );
     }
 
     #[test]
