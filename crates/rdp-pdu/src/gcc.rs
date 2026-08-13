@@ -127,7 +127,7 @@ impl Default for ClientCoreData {
 
 impl ClientCoreData {
     /// Encoded payload length (excluding the 4-byte block header).
-    const PAYLOAD_LEN: usize = 212;
+    const PAYLOAD_LEN: usize = 210;
 
     pub fn encode(&self, out: &mut Vec<u8>) {
         header(CS_CORE, (4 + Self::PAYLOAD_LEN) as u16, out);

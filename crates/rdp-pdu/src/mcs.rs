@@ -95,7 +95,7 @@ fn strip_framing(pdu: &[u8]) -> &[u8] {
     if pdu.first() == Some(&x224::TPKT_VERSION) && pdu.len() > x224::TPKT_HEADER_LEN {
         // X.224 Data header length = LI byte + 1.
         let li = pdu[x224::TPKT_HEADER_LEN] as usize;
-        let start = x224::TPKT_HEADER_LEN + li + 1;
+        let start = x224::TPKT_HEADER_LEN + li + 2;
         if start <= pdu.len() {
             return &pdu[start..];
         }
