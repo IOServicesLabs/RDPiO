@@ -169,7 +169,7 @@ impl ConnectionRequest {
         // TPKT header (big-endian length).
         out.push(TPKT_VERSION);
         out.push(0x00);
-        out.extend_from_slice(&(tpkt_len as u16).to_be_bytes());
+        out.extend_from_slice(&(tpkt_len as u16).to_le_bytes());
         // X.224 Connection Request.
         out.push(li as u8);
         out.push(X224_TPDU_CONNECTION_REQUEST);
