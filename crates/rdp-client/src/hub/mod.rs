@@ -169,14 +169,25 @@
 
 mod error;
 
-// The items below are the public API surface the later hub steps (model, store,
-// ui) consume. Nothing in the binary references them yet, so silence the
+// The hub data model (step-3): serde-serializable records, DPAPI-protected
+// password, MRU history, and the connection target. Its items are exercised by
+// the unit tests in this file today; `hub::store` (step-4) and the hub UI
+// (steps 5-8) consume them next, so silence the not-yet-used dead-code
+// warnings rather than shipping a noisy build.
+#[allow(dead_code)]
+pub mod model;
+
+// The items below are the public API surface the later hub steps (store, ui)
+// consume. Nothing in the binary references the re-exports yet, so silence the
 // not-yet-used warnings rather than shipping a noisy build.
 #[allow(unused_imports)]
+pub use model::{ConnectionRecord, ConnectionTarget, MruRecord, ProtectedPassword};
+
+// Error type shared by every fallible hub operation (model, store, ui). Used by
+// `hub::model` today and by the store/UI steps after it.
 pub use error::HubError;
 
 // Thin re-export so hub submodules (model, store) reach DPAPI through one path;
 // the functions are already `pub(crate)` in token_cache.rs — this is a
-// convenience alias, not a visibility change.
-#[allow(unused_imports)]
+// convenience alias, not a visibility change. `hub::model` uses it today.
 pub(crate) use crate::token_cache::{dpapi_protect, dpapi_unprotect};
