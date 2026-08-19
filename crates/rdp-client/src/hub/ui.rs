@@ -282,6 +282,16 @@ struct FormState {
     btn_delete: HWND,
     /// Primary "Connect" button (accent-filled, owner-drawn).
     btn_connect: HWND,
+    /// Per-form display-name autofill dirty flag (display-autofill-ui). True
+    /// once the user has manually edited the Display Name field, so later Host
+    /// edits stop autofilling it. UI-only state — never persisted to the store
+    /// — and cleared on every fresh-form reset before any host text lands.
+    display_dirty: bool,
+    /// True while the form itself is writing the Display Name edit (autofill
+    /// application, form reset, or loading a saved record), so the synchronous
+    /// EN_CHANGE from SetWindowTextW is not misread as a user edit that should
+    /// arm `display_dirty`.
+    applying_name_text: bool,
 }
 
 /// Per-window state for the hub, attached to the main window via
@@ -363,8 +373,8 @@ impl HubWindow {
                 WS_OVERLAPPEDWINDOW,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                HUB_W,
-                HUB_H,
+                HUB_W_DIP,
+                HUB_H_DIP,
                 None,
                 None,
                 Some(hinstance),
@@ -707,6 +717,21 @@ impl HubWindow {
             }
         }
 
+        // New Connection form edits (display-autofill-ui): Host EN_CHANGE
+        // drives the display-name autofill rule; Display Name EN_CHANGE from
+        // the user arms the per-form dirty flag so later host edits never
+        // clobber a typed name. Both are pure UI state, never persisted.
+        if notify == EN_CHANGE {
+            match id {
+                ID_FORM_HOST => return self.on_host_changed(),
+                ID_FORM_NAME => {
+                    self.on_display_changed();
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
         // New Connection form buttons + the Saved list's "Edit Selected".
         match id {
             ID_FORM_SAVE => return self.on_form_save(),
@@ -716,6 +741,62 @@ impl HubWindow {
             _ => {}
         }
         Ok(())
+    }
+
+    /// EN_CHANGE of the Host edit: apply the display-name autofill rule. When
+    /// the display field is not dirty, suggest the current host text as the
+    /// display name — but only write it when it actually differs from what the
+    /// edit already shows, which guards against the recursive EN_CHANGE from
+    /// SetWindowTextW (a no-op rewrite still fires EN_CHANGE on the name
+    /// edit). The write is flagged with `applying_name_text` so the name
+    /// edit's own EN_CHANGE is not mistaken for a user edit. UI-only.
+    fn on_host_changed(&mut self) -> Result<(), HubError> {
+        let (host, current, dirty, name) = {
+            let Some(f) = self.form.as_ref() else {
+                return Ok(());
+            };
+            (
+                read_edit_text(f.host),
+                read_edit_text(f.name),
+                f.display_dirty,
+                f.name,
+            )
+        };
+        if dirty {
+            return Ok(());
+        }
+        let Some(suggestion) = super::model::autofill_display_name(&host, Some(&current), false)
+        else {
+            return Ok(());
+        };
+        if suggestion == current {
+            return Ok(());
+        }
+        if let Some(f) = self.form.as_mut() {
+            f.applying_name_text = true;
+        }
+        set_edit_text(name, &suggestion);
+        if let Some(f) = self.form.as_mut() {
+            f.applying_name_text = false;
+        }
+        tracing::debug!(host = %host, "autofilled display name from host");
+        Ok(())
+    }
+
+    /// EN_CHANGE of the Display Name edit: arm the per-form dirty flag when a
+    /// real user edit changed the field. Programmatic writes (host autofill,
+    /// form reset, loading a saved record) set `applying_name_text` first, so
+    /// their synchronous EN_CHANGE is ignored here and the flag stays clean.
+    /// The dirty state is UI-only and never persisted to the store.
+    fn on_display_changed(&mut self) {
+        let Some(f) = self.form.as_mut() else {
+            return;
+        };
+        if f.applying_name_text {
+            return;
+        }
+        f.display_dirty = true;
+        tracing::debug!("display name manually edited; autofill now dirty");
     }
 
     /// WM_NOTIFY: list-view notifications. Activation (NM_DBLCLK /
@@ -1272,6 +1353,10 @@ impl HubWindow {
             btn_save,
             btn_delete,
             btn_connect,
+            // Fresh form: autofill is armed (display not dirty) and no
+            // programmatic name write is in flight.
+            display_dirty: false,
+            applying_name_text: false,
         });
         // Start blank with the save-password box checked.
         self.clear_form();
@@ -1560,6 +1645,13 @@ impl HubWindow {
         let Some(f) = self.form.as_mut() else {
             return;
         };
+        // Fresh form / reset: clear the display-autofill dirty flag BEFORE any
+        // host text is applied so host typing re-arms autofill. The
+        // programmatic writes below are guarded by applying_name_text so their
+        // synchronous EN_CHANGEs are not read as user edits (which would
+        // re-arm the dirty flag we just cleared).
+        f.display_dirty = false;
+        f.applying_name_text = true;
         set_edit_text(f.name, "");
         set_edit_text(f.host, "");
         set_edit_text(f.user, "");
@@ -1571,6 +1663,7 @@ impl HubWindow {
         if port_text != FORM_DEFAULT_PORT {
             set_edit_text(f.port, FORM_DEFAULT_PORT);
         }
+        f.applying_name_text = false;
         unsafe {
             let _ = SendMessageW(f.save_pw, BM_SETCHECK, Some(WPARAM(1)), None);
         }
