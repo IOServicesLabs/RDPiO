@@ -197,7 +197,40 @@ fn args_from_target(base: &Args, target: &hub::ConnectionTarget) -> Args {
     args.user = target.username.clone();
     args.domain = target.domain.clone();
     args.password = target.password.clone();
+    // Step-9: thread the hub selection metadata through to the success point so
+    // the MRU entry records the display name and the saved-record link.
+    args.hub_display_name = Some(target.display_name.clone());
+    args.hub_connection_id = target.connection_id;
     args
+}
+
+/// Record a successful connection in the hub's MRU history (step-9). No
+/// password is ever stored — the entry only links back to a saved record via
+/// `connection_id` when the connection came from the hub's Saved list. Called
+/// at the same success point for both CLI- and hub-launched sessions. Failures
+/// are logged and never fail the session itself.
+#[cfg(windows)]
+fn record_mru(args: &Args) {
+    let Some(host) = args.host.clone() else {
+        return;
+    };
+    let display_name = args
+        .hub_display_name
+        .clone()
+        .unwrap_or_else(|| host.clone());
+    match hub::MruStore::load().and_then(|mut store| {
+        store.record(
+            host.clone(),
+            args.port,
+            args.user.clone(),
+            args.domain.clone(),
+            display_name,
+            args.hub_connection_id,
+        )
+    }) {
+        Ok(()) => tracing::debug!(host = %host, "recorded MRU entry"),
+        Err(e) => tracing::warn!(error = %e, "could not record MRU entry"),
+    }
 }
 
 /// Build a [`ClientConfig`] from the parsed command-line arguments.
@@ -770,6 +803,13 @@ struct Args {
     /// needs no Microsoft binary, and is the path that will run on Linux. Takes
     /// precedence over `--teams` when both are set.
     teams_native: bool,
+    /// Display name of the connection selected in the hub (hub launches only);
+    /// recorded on the MRU entry. `None` for plain CLI launches.
+    hub_display_name: Option<String>,
+    /// Saved-record id of the hub-selected connection when it came from the
+    /// Saved list; recorded on the MRU entry so a later Recent launch can reuse
+    /// the saved password. `None` for CLI / unsaved launches.
+    hub_connection_id: Option<uuid::Uuid>,
 }
 
 impl Args {
@@ -797,6 +837,8 @@ impl Args {
             bpp: None,
             low_latency: false,
             quality: QualityPreset::default(),
+            hub_display_name: None,
+            hub_connection_id: None,
             force_avc444: false,
             no_avc: false,
             render_scale: 1.0,
@@ -3752,6 +3794,11 @@ mod win {
                 protocol,
             } = conn;
             tracing::info!(?protocol, info = ?session.info(), "RDP session ACTIVE");
+            // Step-9: a connection is established — record it in the hub's MRU
+            // history (host, port, user, domain, display name, and the saved
+            // record link when the hub launched it from Saved). No password is
+            // ever stored; failures only log, never affect the session.
+            record_mru(args);
             // Unconditional: the title also says "Reconnecting…" after a GPU
             // device rebuild, which can reach here with `attempts` still zero.
             window.set_title("RDPiO");
