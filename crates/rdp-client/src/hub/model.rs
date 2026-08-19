@@ -65,7 +65,8 @@ impl ProtectedPassword {
 
     /// The raw DPAPI blob, still encrypted (base64-decoded). No decryption.
     pub fn blob(&self) -> Result<Vec<u8>, HubError> {
-        B64.decode(&self.0).map_err(|e| HubError::dpapi(format!("base64 decode: {e}")))
+        B64.decode(&self.0)
+            .map_err(|e| HubError::dpapi(format!("base64 decode: {e}")))
     }
 
     /// Recover the plaintext password. This is the only place the password
@@ -269,7 +270,10 @@ mod tests {
             m.last_connected_at >= before,
             "touch must refresh the timestamp"
         );
-        assert!(m.last_connected_at > 1_700_000_000, "timestamp should be unix 'now'");
+        assert!(
+            m.last_connected_at > 1_700_000_000,
+            "timestamp should be unix 'now'"
+        );
         m.touch();
         assert_eq!(m.connect_count, 5);
         assert!(m.last_connected_at >= 1_700_000_000);

@@ -176,12 +176,19 @@ mod error;
 // warnings rather than shipping a noisy build.
 #[allow(dead_code)]
 pub mod model;
+// The JSON persistence layer (step-4): ConnectionStore + MruStore under
+// %LOCALAPPDATA%\rdpio\. Consumed by the hub UI steps (5-7, 10) and the MRU
+// recording hook (step-9); exercised by its unit tests today.
+#[allow(dead_code)]
+pub mod store;
 
-// The items below are the public API surface the later hub steps (store, ui)
-// consume. Nothing in the binary references the re-exports yet, so silence the
+// The items below are the public API surface the later hub steps (ui) consume.
+// Nothing in the binary references the re-exports yet, so silence the
 // not-yet-used warnings rather than shipping a noisy build.
 #[allow(unused_imports)]
 pub use model::{ConnectionRecord, ConnectionTarget, MruRecord, ProtectedPassword};
+#[allow(unused_imports)]
+pub use store::{ConnectionInput, ConnectionStore, MruStore};
 
 // Error type shared by every fallible hub operation (model, store, ui). Used by
 // `hub::model` today and by the store/UI steps after it.
