@@ -190,25 +190,34 @@ impl ConnectionTarget {
 
 /// Suggested display name for the New Connection form's display-name field.
 ///
-/// Returns `Some(host)` — the current host text as the display name — only
-/// when the user has not manually edited the display field (`display_edited`
-/// is false) **and** the host actually differs from the value currently shown
-/// (`host != current_display`, so typing the same host back does not rewrite
-/// the field). Returns `None` once the user has edited the display field, so a
-/// typed name is never clobbered by later host edits.
+/// This is the autofill dirty rule: the display name follows the host only
+/// while the user has not manually edited the display field.
+///
+/// - `display_dirty == true` (the user typed in the display field): returns
+///   `None`, so a later host edit never clobbers the typed name.
+/// - `display_dirty == false` (fresh form / untouched display): returns
+///   `Some(host)` — the current host text as the display name — but only when
+///   the host actually differs from the value currently shown
+///   (`host != current_display`, so typing the same host back does not rewrite
+///   the field and no recursive `EN_CHANGE` fires). A `None` (or empty)
+///   `current_display` means the field is blank, so the first host keystroke
+///   autofills it.
 ///
 /// Pure and side-effect free, so the form's autofill rule can be unit-tested
-/// without a window. The hub form (step-10) calls this on every host
-/// `EN_CHANGE` and applies the returned value, if any.
+/// without a window. The hub form calls this on every host `EN_CHANGE` and
+/// applies the returned value, if any. The dirty flag is UI-only state — it is
+/// never persisted to the store, and a fresh form resets it to `false` before
+/// any host text is applied.
 pub fn autofill_display_name(
     host: &str,
-    current_display: &str,
-    display_edited: bool,
+    current_display: Option<&str>,
+    display_dirty: bool,
 ) -> Option<String> {
-    if display_edited {
+    if display_dirty {
         return None;
     }
-    if host == current_display {
+    let current = current_display.unwrap_or("");
+    if host == current {
         return None;
     }
     Some(host.to_string())
@@ -372,18 +381,23 @@ mod tests {
 
     #[test]
     fn autofill_display_name_changes_with_host_while_not_edited() {
-        // Not edited: the suggestion follows the host as it is typed.
+        // Not edited: the suggestion follows the host as it is typed. A blank
+        // display field (None or empty) is the fresh-form state.
         assert_eq!(
-            autofill_display_name("10.0.0.5", "", false),
+            autofill_display_name("10.0.0.5", None, false),
             Some("10.0.0.5".to_string())
         );
         assert_eq!(
-            autofill_display_name("10.0.0.5", "10", false),
+            autofill_display_name("10.0.0.5", Some(""), false),
+            Some("10.0.0.5".to_string())
+        );
+        assert_eq!(
+            autofill_display_name("10.0.0.5", Some("10"), false),
             Some("10.0.0.5".to_string())
         );
         // No actual change → nothing to apply (avoids rewriting the field).
         assert_eq!(
-            autofill_display_name("10.0.0.5", "10.0.0.5", false),
+            autofill_display_name("10.0.0.5", Some("10.0.0.5"), false),
             None,
             "host equal to current display must not re-suggest"
         );
@@ -391,16 +405,37 @@ mod tests {
 
     #[test]
     fn autofill_display_name_never_overwrites_after_manual_edit() {
-        // Once edited, never clobber — even when the host changes again.
+        // The user typed into the display field → dirty; never clobber, even
+        // when the host changes again afterwards.
         assert_eq!(
-            autofill_display_name("10.0.0.6", "My Server", true),
+            autofill_display_name("10.0.0.6", Some("My Server"), true),
             None,
             "a manually edited display name must never be overwritten"
         );
         assert_eq!(
-            autofill_display_name("", "My Server", true),
+            autofill_display_name("10.0.0.7", Some("My Server"), true),
+            None,
+            "later host edits must not clobber a dirty display name"
+        );
+        assert_eq!(
+            autofill_display_name("", Some("My Server"), true),
             None,
             "even an emptied display field stays untouched once edited"
+        );
+    }
+
+    #[test]
+    fn autofill_display_name_fresh_form_resets_dirty() {
+        // A fresh form clears the dirty flag and blanks the display field, so
+        // the next host edit autofills again even after a previous form had a
+        // manually edited display name.
+        assert_eq!(
+            autofill_display_name("box.local", None, false),
+            Some("box.local".to_string())
+        );
+        assert_eq!(
+            autofill_display_name("10.0.0.5", None, false),
+            Some("10.0.0.5".to_string())
         );
     }
 
