@@ -104,6 +104,11 @@ const DQ_GR: u32 = 3;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RlgrMode {
     Rlgr1,
+    /// RLGR3 is fully implemented in `rlgr_decode` (the non-RLGR1 branch), but
+    /// the base-layer path always decodes RLGR1 because the progressive
+    /// header's entropy-mode flag is not parsed yet. Kept so the wire mode can
+    /// be wired up without re-adding the variant.
+    #[allow(dead_code)]
     Rlgr3,
 }
 
