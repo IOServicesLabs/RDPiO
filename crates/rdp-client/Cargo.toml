@@ -81,4 +81,8 @@ windows = { workspace = true, features = [
     "Win32_System_Variant",
     "Win32_Graphics_Printing",
     "Win32_UI_Shell",
+    # Hub window (steps 5-7): InitCommonControlsEx + DRAWITEMSTRUCT for the
+    # owner-draw activity rail, and (step-6) the SysListView32 Recent/Saved lists.
+    # A feature of the already-present `windows` crate - no new UI framework.
+    "Win32_UI_Controls",
 ] }

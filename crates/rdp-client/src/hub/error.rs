@@ -30,6 +30,13 @@ pub enum HubError {
     #[error("DPAPI error: {0}")]
     Dpapi(String),
 
+    /// A Win32 API failure from the hub UI (window/control creation, GDI
+    /// painting, common controls). The `windows` crate reports these as
+    /// `windows::core::Error`; the UI paths convert them here so every hub
+    /// failure surfaces as one typed error.
+    #[error("Win32 error: {0}")]
+    Win32(String),
+
     /// UUID generation / parsing failures on `ConnectionRecord::id`.
     #[error("UUID error: {0}")]
     Uuid(#[from] uuid::Error),
@@ -46,6 +53,12 @@ impl HubError {
     /// text `CryptProtectData`/`CryptUnprotectData` already carry).
     pub fn dpapi(e: impl Display) -> Self {
         HubError::Dpapi(e.to_string())
+    }
+
+    /// Build a [`HubError::Win32`] from a `windows::core::Error` (or any
+    /// displayable Win32 failure text).
+    pub fn win32(e: impl Display) -> Self {
+        HubError::Win32(e.to_string())
     }
 
     /// Build a [`HubError::InvalidInput`] from a message.
