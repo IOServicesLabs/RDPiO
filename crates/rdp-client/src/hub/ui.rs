@@ -23,8 +23,8 @@ use core::ffi::c_void;
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, InvalidateRect, SetBkMode, SetTextColor,
-    DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
+    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, HDC, InvalidateRect, SetBkMode,
+    SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
@@ -33,8 +33,10 @@ use windows::Win32::UI::Controls::{
     LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED, LVN_ITEMACTIVATE, LVS_EX_FULLROWSELECT,
     LVS_EX_GRIDLINES, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMITEMACTIVATE, NM_DBLCLK,
-    ODT_BUTTON,
+    ODT_BUTTON, WM_MOUSELEAVE,
 };
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::{
@@ -58,6 +60,14 @@ const ID_LIST_SAVED: usize = 7;
 /// user presses Enter — single-line edit controls send no Enter notification
 /// of their own.
 const NOTIFY_FILTER_ENTER: u32 = 0x4000;
+
+/// Custom message the (subclassed) activity-rail buttons post to the hub when
+/// the mouse enters or leaves a rail button. `wParam` = rail index
+/// ([`Section::index`]), `lParam` = 1 entered / 0 left. The hub updates its
+/// hover state and repaints the affected button so `WM_DRAWITEM` can render
+/// the `ROW_HOVER` fill. Private to the hub window, so `WM_APP` is the safe
+/// base.
+const WM_APP_RAIL_HOVER: u32 = WM_APP + 1;
 
 /// VK_RETURN; kept local to avoid pulling in more windows feature modules.
 const VK_RETURN: u16 = 0x0D;
@@ -93,13 +103,20 @@ const FORM_PORT_W: i32 = 140;
 const HUB_W: i32 = 940;
 const HUB_H: i32 = 620;
 
-/// Slim left activity rail geometry.
+/// Slim left activity rail geometry. These are 96-DPI design values: the hub
+/// multiplies them through `theme::scale_px` so the rail stays at the same DIP
+/// size on high-DPI displays. `RAIL_BTN_H` (40 DIPs) is the minimum hit-target
+/// height every rail button keeps, per the dark-rail step.
 const RAIL_W: i32 = 152;
 const RAIL_PAD_TOP: i32 = 16;
 const RAIL_BTN_X: i32 = 10;
 const RAIL_BTN_W: i32 = RAIL_W - RAIL_BTN_X * 2;
 const RAIL_BTN_H: i32 = 40;
 const RAIL_BTN_GAP: i32 = 6;
+
+/// Width of the accent bar drawn on the active section's left edge (DIPs,
+/// scaled via `theme::scale_px` like the rest of the rail geometry).
+const RAIL_ACCENT_BAR_W: i32 = 2;
 
 /// Height of the filter-edit strip at the top of each list pane.
 const FILTER_H: i32 = 26;
@@ -212,6 +229,10 @@ struct HubWindow {
     section: Section,
     /// The three rail buttons, indexed by [`Section::index`].
     rail: [HWND; 3],
+    /// Per-button mouse-hover state, indexed by [`Section::index`]. Maintained
+    /// by the rail-button subclass wndproc via [`WM_APP_RAIL_HOVER`]; read by
+    /// `on_draw_item` so a hovered button paints `theme::ROW_HOVER`.
+    rail_hover: [bool; 3],
     /// The New Connection form controls (created lazily; the New section shows
     /// them instead of the step-5 placeholder pane).
     form: Option<FormState>,
@@ -286,6 +307,7 @@ impl HubWindow {
                 hinstance,
                 section: Section::Recent,
                 rail: [HWND::default(); 3],
+                rail_hover: [false; 3],
                 form: None,
                 sections: [None, None, None],
                 selected: None,
@@ -314,10 +336,18 @@ impl HubWindow {
     }
 
     /// Create the three owner-draw rail buttons as children of the hub window.
+    /// Each button is subclassed with [`rail_button_proc`] so mouse enter/leave
+    /// is reported back to the hub (via [`WM_APP_RAIL_HOVER`]) for the dark
+    /// hover state. Geometry is DPI-scaled: every hit target stays at least
+    /// 40 DIPs tall.
     fn create_rail(&mut self) -> Result<(), HubError> {
         unsafe {
+            let dpi = self.dpi();
+            let btn_h = theme::scale_px(RAIL_BTN_H, dpi);
+            let gap = theme::scale_px(RAIL_BTN_GAP, dpi);
+            let pad_top = theme::scale_px(RAIL_PAD_TOP, dpi);
             for (i, section) in Section::ALL.iter().enumerate() {
-                let y = RAIL_PAD_TOP + i as i32 * (RAIL_BTN_H + RAIL_BTN_GAP);
+                let y = pad_top + i as i32 * (btn_h + gap);
                 // BS_OWNERDRAW is a plain i32, WS_* are WINDOW_STYLE — combine
                 // through the raw u32 so the style value stays well-typed.
                 let style = WINDOW_STYLE(
@@ -331,13 +361,18 @@ impl HubWindow {
                     RAIL_BTN_X,
                     y,
                     RAIL_BTN_W,
-                    RAIL_BTN_H,
+                    btn_h,
                     Some(self.hwnd),
                     Some(HMENU(section.id() as *mut c_void)),
                     Some(self.hinstance),
                     None,
                 )
                 .map_err(|e| HubError::win32(format!("CreateWindowExW(rail {section:?}): {e}")))?;
+                // Chain the stock button proc (kept in GWLP_USERDATA) so clicks,
+                // focus, and capture still work; ours only observes the mouse.
+                let old_proc = GetWindowLongPtrW(btn, GWLP_WNDPROC);
+                SetWindowLongPtrW(btn, GWLP_USERDATA, old_proc);
+                SetWindowLongPtrW(btn, GWLP_WNDPROC, rail_button_proc as *const () as isize);
                 self.rail[i] = btn;
             }
             Ok(())
@@ -409,13 +444,25 @@ impl HubWindow {
         }
     }
 
+    /// The window's effective DPI (per-monitor V2 aware; 96 when the window is
+    /// not DPI aware). Every rail metric is scaled through [`theme::scale_px`]
+    /// with this value so hit targets and padding keep their DIP size.
+    fn dpi(&self) -> u32 {
+        let d = unsafe { GetDpiForWindow(self.hwnd) };
+        if d == 0 { 96 } else { d }
+    }
+
     /// Re-layout all children for the current client size (WM_SIZE handler):
     /// the rail buttons always, plus whatever content is active.
     fn layout(&mut self) -> Result<(), HubError> {
         unsafe {
+            let dpi = self.dpi();
+            let btn_h = theme::scale_px(RAIL_BTN_H, dpi);
+            let gap = theme::scale_px(RAIL_BTN_GAP, dpi);
+            let pad_top = theme::scale_px(RAIL_PAD_TOP, dpi);
             for (i, btn) in self.rail.iter().enumerate() {
-                let y = RAIL_PAD_TOP + i as i32 * (RAIL_BTN_H + RAIL_BTN_GAP);
-                let _ = MoveWindow(*btn, RAIL_BTN_X, y, RAIL_BTN_W, RAIL_BTN_H, true);
+                let y = pad_top + i as i32 * (btn_h + gap);
+                let _ = MoveWindow(*btn, RAIL_BTN_X, y, RAIL_BTN_W, btn_h, true);
             }
             match self.section {
                 Section::Recent | Section::Saved => self.layout_section(self.section)?,
@@ -1134,7 +1181,12 @@ impl HubWindow {
         f.editing_id = None;
     }
 
-    /// WM_DRAWITEM: paint the owner-draw rail buttons.
+    /// WM_DRAWITEM: paint the owner-draw rail buttons flat dark. Resting
+    /// buttons fill with the window background (`theme::BG`), hovered ones lift
+    /// to `theme::ROW_HOVER`, and the active section uses the lighter
+    /// `theme::ACTIVE_BG` plus a 2px `theme::ACCENT` bar on its left edge. Rail
+    /// text is `theme::TEXT` for active/hovered items and `theme::MUTED` for
+    /// inactive ones. No stock brushes or `DrawFrameControl` are used.
     fn on_draw_item(&self, lparam: LPARAM) -> Result<(), HubError> {
         let ptr = lparam.0 as *const DRAWITEMSTRUCT;
         if ptr.is_null() {
@@ -1148,31 +1200,81 @@ impl HubWindow {
             return Ok(());
         };
 
+        let idx = section.index();
         let active = section == self.section;
-        // Dark palette from the theme module: the resting rail button uses the
-        // panel fill, the active one a lighter fill. The 2px accent bar on the
-        // active section lands with the step-5 rail refactor.
-        let bg = if active { theme::ACTIVE_BG } else { theme::PANEL_BG };
+        let hovered = self.rail_hover[idx];
+        let dpi = self.dpi();
+
+        // Priority: the active section keeps its highlight; otherwise hover
+        // lifts the button toward the row-hover tint; resting is the dark
+        // window background so the rail reads as flat dark between buttons.
+        let fill = if active {
+            theme::ACTIVE_BG
+        } else if hovered {
+            theme::ROW_HOVER
+        } else {
+            theme::BG
+        };
+        let text = if active || hovered {
+            theme::TEXT
+        } else {
+            theme::MUTED
+        };
+
         unsafe {
-            let brush = CreateSolidBrush(bg);
+            let brush = CreateSolidBrush(fill);
             let _ = FillRect(dis.hDC, &dis.rcItem, brush);
             let _ = DeleteObject(brush.into());
 
+            // 2px accent bar on the active section's left edge, DIP-scaled.
+            if active {
+                let bar_w = theme::scale_px(RAIL_ACCENT_BAR_W, dpi);
+                let mut bar = dis.rcItem;
+                bar.right = bar.left + bar_w;
+                let accent = CreateSolidBrush(theme::ACCENT);
+                let _ = FillRect(dis.hDC, &bar, accent);
+                let _ = DeleteObject(accent.into());
+            }
+
             let _ = SetBkMode(dis.hDC, TRANSPARENT);
-            let _ = SetTextColor(
-                dis.hDC,
-                if active { theme::TEXT } else { theme::MUTED_TEXT },
-            );
+            let _ = SetTextColor(dis.hDC, text);
             let mut text: Vec<u16> = section
                 .title()
                 .encode_utf16()
                 .chain(std::iter::once(0))
                 .collect();
             let mut rc = dis.rcItem;
+            if active {
+                // Keep the label optically centered on the area right of the
+                // accent bar rather than under it.
+                rc.left += theme::scale_px(RAIL_ACCENT_BAR_W, dpi);
+            }
             let _ =
                 DrawTextW(dis.hDC, &mut text, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         Ok(())
+    }
+
+    /// WM_APP_RAIL_HOVER: a rail button's subclass reports a mouse enter/leave
+    /// (wParam = rail index, lParam = 1 entered / 0 left). When the hover state
+    /// actually changed, repaint the affected button so WM_DRAWITEM picks up
+    /// the `theme::ROW_HOVER` fill / `theme::TEXT` color.
+    fn on_rail_hover(&mut self, wparam: WPARAM, lparam: LPARAM) {
+        let idx = wparam.0;
+        if idx >= 3 {
+            return;
+        }
+        let hovered = lparam.0 != 0;
+        if self.rail_hover[idx] == hovered {
+            return;
+        }
+        self.rail_hover[idx] = hovered;
+        unsafe {
+            if let Some(btn) = self.rail.get(idx) {
+                let _ = InvalidateRect(Some(*btn), None, true);
+            }
+        }
+        tracing::debug!(idx, hovered, "rail hover changed");
     }
 
     /// WM_SIZE: re-layout the rail and the visible pane for the new client size.
@@ -1360,6 +1462,98 @@ unsafe extern "system" fn filter_edit_proc(
     CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
 }
 
+/// Fill the hub client area with the dark palette: the left activity rail
+/// strip (0..RAIL_W, full height) in [`theme::PANEL`], the content area to its
+/// right in [`theme::BG`]. Called from `WM_ERASEBKGND`; returns nothing so the
+/// caller always answers `LRESULT(1)`. Logs on failure rather than panicking.
+unsafe fn paint_hub_background(hwnd: HWND, hdc: HDC) {
+    let mut rc = RECT::default();
+    if let Err(e) = GetClientRect(hwnd, &mut rc) {
+        tracing::warn!(error = %e, "paint_hub_background: GetClientRect failed");
+        return;
+    }
+    let mut rail = rc;
+    rail.right = rail.left + RAIL_W;
+    if rail.right > rail.left {
+        let brush = CreateSolidBrush(theme::PANEL);
+        let _ = FillRect(hdc, &rail, brush);
+        let _ = DeleteObject(brush.into());
+    }
+    if rc.right > rail.right {
+        let mut content = rc;
+        content.left = rail.right;
+        let brush = CreateSolidBrush(theme::BG);
+        let _ = FillRect(hdc, &content, brush);
+        let _ = DeleteObject(brush.into());
+    }
+}
+
+/// Post a rail-hover change to the hub window: `wParam` = the button's rail
+/// index ([`Section::index`]), `lParam` = 1 entered / 0 left. Uses the button's
+/// control id (its section id) to recover the index, so no per-button state is
+/// needed in the subclass.
+unsafe fn post_rail_hover(btn: HWND, hovered: bool) {
+    let id = GetDlgCtrlID(btn) as usize;
+    let Some(section) = Section::from_id(id) else {
+        return;
+    };
+    if let Ok(parent) = GetParent(btn) {
+        let _ = PostMessageW(
+            Some(parent),
+            WM_APP_RAIL_HOVER,
+            WPARAM(section.index()),
+            LPARAM(hovered as isize),
+        );
+    }
+}
+
+/// Subclass wndproc for the activity-rail buttons. It only observes the mouse:
+/// on `WM_MOUSEMOVE` it arms `TrackMouseEvent` leave tracking and reports the
+/// enter to the hub; on `WM_MOUSELEAVE` it reports the leave. It also answers
+/// `WM_ERASEBKGND` with a dark fill so no stock `COLOR_BTNFACE` flash ever
+/// shows before `WM_DRAWITEM` paints the button. Everything else chains to the
+/// stock button proc (kept in `GWLP_USERDATA`) so clicks, focus, and capture
+/// keep working. Never unwraps or panics.
+unsafe extern "system" fn rail_button_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_MOUSEMOVE => {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut tme);
+            post_rail_hover(hwnd, true);
+        }
+        WM_MOUSELEAVE => {
+            post_rail_hover(hwnd, false);
+            return LRESULT(0);
+        }
+        WM_ERASEBKGND => {
+            // Dark button background: resting fill is the window BG. WM_DRAWITEM
+            // overpaints hover/active states on top of this.
+            let hdc = HDC(wparam.0 as *mut c_void);
+            let mut rc = RECT::default();
+            if GetClientRect(hwnd, &mut rc).is_ok() && rc.right > rc.left && rc.bottom > rc.top {
+                let brush = CreateSolidBrush(theme::BG);
+                let _ = FillRect(hdc, &rc, brush);
+                let _ = DeleteObject(brush.into());
+            }
+            return LRESULT(1);
+        }
+        _ => {}
+    }
+    let old = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    let old_proc: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
+    CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
+}
+
 /// Format a unix timestamp as "YYYY-MM-DD HH:MM". Pure arithmetic (no chrono
 /// dependency), using the standard civil-from-days conversion.
 fn format_ts(unix: u64) -> String {
@@ -1423,6 +1617,23 @@ unsafe extern "system" fn hub_proc(
                 if let Err(e) = state.on_draw_item(lparam) {
                     tracing::error!(error = %e, "hub WM_DRAWITEM handler failed");
                 }
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_ERASEBKGND => {
+            // Paint the whole client area ourselves: the left activity rail in
+            // theme::PANEL, the content area in theme::BG (matching the class
+            // brush). Returning 1 tells DefWindowProc to skip the class-background
+            // erase so no stock brush ever shows behind the rail buttons.
+            unsafe {
+                paint_hub_background(hwnd, HDC(wparam.0 as *mut c_void));
+            }
+            LRESULT(1)
+        }
+        WM_APP_RAIL_HOVER => {
+            if let Some(state) = hub_state_mut(hwnd) {
+                state.on_rail_hover(wparam, lparam);
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
