@@ -43,7 +43,9 @@ use windows::Win32::UI::Controls::{
     WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::model::prefill_username;
@@ -77,8 +79,21 @@ const NOTIFY_FILTER_ENTER: u32 = 0x4000;
 /// base.
 const WM_APP_RAIL_HOVER: u32 = WM_APP + 1;
 
-/// VK_RETURN; kept local to avoid pulling in more windows feature modules.
+/// Custom message a (subclassed) SysListView32 posts to the hub when the user
+/// presses Enter while the list has focus. `lParam` = the list's HWND; the hub
+/// activates that list's selected row (only when one is actually selected).
+/// Private to the hub window, so `WM_APP` is the safe base.
+const WM_APP_LIST_ENTER: u32 = WM_APP + 2;
+
+/// Virtual key codes used by the keyboard-first navigation (kept local to
+/// avoid pulling in more windows feature modules).
 const VK_RETURN: u16 = 0x0D;
+/// Esc closes the hub with no target.
+const VK_ESCAPE: u16 = 0x1B;
+/// Control modifier state for Ctrl+N.
+const VK_CONTROL: u16 = 0x11;
+/// 'N' (same code for upper/lower case) — Ctrl+N opens the New Connection form.
+const VK_N: u16 = 0x4E;
 
 /// Control ids for the New Connection form controls.
 const ID_FORM_NAME: usize = 20;
@@ -376,6 +391,9 @@ impl HubWindow {
             }
 
             let _ = ShowWindow(hwnd, SW_SHOW);
+            // Keyboard-first: focus lands in the active section's filter edit
+            // so the user can start typing to filter connections immediately.
+            hub.focus_filter();
             tracing::info!("hub window created");
             Ok(hub)
         }
@@ -396,8 +414,12 @@ impl HubWindow {
                 let y = pad_top + i as i32 * (btn_h + gap);
                 // BS_OWNERDRAW is a plain i32, WS_* are WINDOW_STYLE — combine
                 // through the raw u32 so the style value stays well-typed.
+                // WS_TABSTOP puts the rail buttons in the hub's dialog-style
+                // tab order (rail → filter → list → form).
                 let style = WINDOW_STYLE(
-                    (WS_CHILD | WS_VISIBLE).0 | BS_OWNERDRAW as u32 | BS_NOTIFY as u32,
+                    (WS_CHILD | WS_VISIBLE | WS_TABSTOP).0
+                        | BS_OWNERDRAW as u32
+                        | BS_NOTIFY as u32,
                 );
                 let btn = CreateWindowExW(
                     WINDOW_EX_STYLE(0),
@@ -479,6 +501,10 @@ impl HubWindow {
             // Fonts are fanned out after lazy control creation so late-created
             // panes/forms pick up the cached Segoe UI faces too (idempotent).
             self.apply_fonts();
+            // Re-run the dialog tab-order pass: newly created controls (list
+            // panes / the form) must slot into the rail → filter → list →
+            // form Z-order that IsDialogMessageW walks.
+            self.enforce_tab_order();
             tracing::debug!(section = ?section, "hub switched section");
             Ok(())
         }
@@ -529,6 +555,93 @@ impl HubWindow {
         unsafe {
             for btn in &self.rail {
                 let _ = InvalidateRect(Some(*btn), None, true);
+            }
+        }
+    }
+
+    /// Move keyboard focus to the active section's filter edit. Called on
+    /// launch (after the window is shown) so the user can start typing to
+    /// filter connections immediately.
+    fn focus_filter(&self) {
+        unsafe {
+            if let Some(ui) = &self.sections[self.section.index()] {
+                let _ = SetFocus(Some(ui.filter));
+            }
+        }
+    }
+
+    /// Arrange the child windows' Z-order so the dialog-manager tab sequence
+    /// (IsDialogMessageW walks the Z-order from top to bottom, skipping
+    /// controls without WS_TABSTOP and hidden/disabled ones) runs
+    /// rail → filter → list → form. SetWindowPos with HWND_TOP brings a window
+    /// to the top of the Z-order; doing so in reverse tab order leaves the
+    /// desired order on top. Idempotent — safe to call after every lazy
+    /// control creation.
+    fn enforce_tab_order(&self) {
+        unsafe {
+            // Form fields last in tab order: bring them to the top first so
+            // they end up at the bottom of the Z-order, in field order.
+            if let Some(f) = &self.form {
+                for c in [
+                    f.btn_connect, f.btn_delete, f.btn_save, f.save_pw, f.password, f.domain,
+                    f.user, f.port, f.host, f.name,
+                ] {
+                    let _ = SetWindowPos(
+                        c,
+                        Some(HWND_TOP),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            // List panes (filter above its list), then the rail buttons on top.
+            for s in Section::ALL {
+                if let Some(ui) = &self.sections[s.index()] {
+                    if let Some(btn) = ui.edit_btn {
+                        let _ = SetWindowPos(
+                            btn,
+                            Some(HWND_TOP),
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                    }
+                    let _ = SetWindowPos(
+                        ui.list,
+                        Some(HWND_TOP),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                    let _ = SetWindowPos(
+                        ui.filter,
+                        Some(HWND_TOP),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            // Rail buttons last so the first one (Recent) ends up topmost.
+            for btn in self.rail.iter().rev() {
+                let _ = SetWindowPos(
+                    *btn,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
             }
         }
     }
@@ -644,7 +757,7 @@ impl HubWindow {
                 WINDOW_EX_STYLE(0),
                 w!("EDIT"),
                 w!(""),
-                WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0 | ES_AUTOHSCROLL as u32),
+                WINDOW_STYLE((WS_CHILD | WS_VISIBLE | WS_TABSTOP).0 | ES_AUTOHSCROLL as u32),
                 x,
                 content_top,
                 w,
@@ -674,7 +787,10 @@ impl HubWindow {
             // their column header (LVS_NOCOLUMNHEADER) and paint dark rows via
             // NM_CUSTOMDRAW (see paint_list_custom_draw), so neither pane can
             // show a stock white header or row background.
-            let list_style = (WS_CHILD | WS_VISIBLE).0
+            // WS_TABSTOP puts the list in the dialog tab order (right after
+            // the filter); Enter on the focused list is forwarded by
+            // list_view_proc so the selected row connects.
+            let list_style = (WS_CHILD | WS_VISIBLE | WS_TABSTOP).0
                 | LVS_REPORT
                 | LVS_SINGLESEL
                 | LVS_SHOWSELALWAYS
@@ -694,6 +810,9 @@ impl HubWindow {
                 None,
             )
             .map_err(|e| HubError::win32(format!("CreateWindowExW(list {section:?}): {e}")))?;
+            // Forward Enter / Esc / Ctrl+N from the focused list to the hub
+            // (the hub window only sees WM_KEYDOWN when it has focus itself).
+            subclass_list_view(list);
             // Track-select hover highlighting + full-row selection + grid
             // separators; LVS_EX_TRACKSELECT is what feeds CDIS_HOT to both
             // lists' shared custom-draw handler on hover.
@@ -753,7 +872,7 @@ impl HubWindow {
                     self.hinstance,
                     "BUTTON",
                     "Edit Selected",
-                    WS_CHILD | WS_VISIBLE,
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                     ID_BTN_EDIT_SAVED,
                 )?)
             } else {
@@ -1017,6 +1136,31 @@ impl HubWindow {
         }
     }
 
+    /// Connect the currently selected row of `section` — and only when a row
+    /// is actually selected (no fallback to the first row, unlike filter
+    /// Enter). Used by Enter on the hub window itself and on a focused list:
+    /// the selected Recent/Saved entry connects through the same activate_row
+    /// → ConnectionTarget path as a double-click.
+    fn activate_selected(&mut self, section: Section) -> Result<(), HubError> {
+        let list = match self.sections[section.index()].as_ref() {
+            Some(ui) => ui.list,
+            None => return Ok(()),
+        };
+        let sel = unsafe {
+            SendMessageW(
+                list,
+                LVM_GETNEXTITEM,
+                Some(WPARAM(usize::MAX)),
+                Some(LPARAM(LVNI_SELECTED as isize)),
+            )
+            .0
+        };
+        if sel < 0 {
+            return Ok(());
+        }
+        self.activate_row(section, sel as i32)
+    }
+
     // --- New Connection form (step-7) ----------------------------------------
 
     /// Create the form controls on first visit to the New section.
@@ -1026,16 +1170,23 @@ impl HubWindow {
         }
         let h = self.hwnd;
         let inst = self.hinstance;
-        let edit_style =
-            WINDOW_STYLE((WS_CHILD | WS_VISIBLE | WS_BORDER).0 | ES_AUTOHSCROLL as u32);
+        // Every form field gets WS_TABSTOP so the dialog tab order runs
+        // through the fields (name → host → port → … → buttons) after the
+        // list panes.
+        let edit_style = WINDOW_STYLE(
+            (WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER).0 | ES_AUTOHSCROLL as u32,
+        );
         let label_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0);
         // Every hub button is owner-drawn so no stock push-button gray
         // remains; WM_DRAWITEM paints them from the dark palette. The
         // Save-password checkbox keeps BS_AUTOCHECKBOX so the system still
         // toggles and reports its check state.
-        let btn_style = WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0 | BS_OWNERDRAW as u32);
+        let btn_style =
+            WINDOW_STYLE((WS_CHILD | WS_VISIBLE | WS_TABSTOP).0 | BS_OWNERDRAW as u32);
         let checkbox_style = WINDOW_STYLE(
-            (WS_CHILD | WS_VISIBLE).0 | BS_AUTOCHECKBOX as u32 | BS_OWNERDRAW as u32,
+            (WS_CHILD | WS_VISIBLE | WS_TABSTOP).0
+                | BS_AUTOCHECKBOX as u32
+                | BS_OWNERDRAW as u32,
         );
         let mk = |class: &'static str, text: &'static str, style: WINDOW_STYLE, id: usize| {
             create_child(h, inst, class, text, style, id)
@@ -1562,6 +1713,52 @@ impl HubWindow {
         tracing::debug!(idx, hovered, "rail hover changed");
     }
 
+    /// WM_KEYDOWN on the hub window itself (focus is on the hub, not a child
+    /// control): Enter connects the active list section's selected row (only
+    /// when a row is actually selected — the same activate_row path as a
+    /// double-click), Ctrl+N activates the New Connection form, and Esc posts
+    /// WM_CLOSE so the hub closes with no target.
+    fn on_key_down(&mut self, wparam: WPARAM) -> Result<(), HubError> {
+        let key = (wparam.0 & 0xffff) as u16;
+        match key {
+            VK_RETURN => match self.section {
+                Section::Recent | Section::Saved => self.activate_selected(self.section)?,
+                // Enter on the New form does nothing (Connect is a button).
+                Section::New => {}
+            },
+            VK_ESCAPE => {
+                unsafe {
+                    let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+            }
+            _ => {
+                // Ctrl+N opens the New Connection form.
+                if key == VK_N && ctrl_down() {
+                    self.show_section(Section::New)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// WM_APP_LIST_ENTER: a focused SysListView32 (subclassed with
+    /// [`list_view_proc`]) pressed Enter. `lParam` = the list's HWND; resolve
+    /// it back to its section and connect the selected row — only when a row
+    /// is actually selected.
+    fn on_list_enter(&mut self, lparam: LPARAM) -> Result<(), HubError> {
+        let list = HWND(lparam.0 as *mut c_void);
+        let section = match list {
+            h if Some(h) == self.sections[Section::Recent.index()].as_ref().map(|u| u.list) => {
+                Section::Recent
+            }
+            h if Some(h) == self.sections[Section::Saved.index()].as_ref().map(|u| u.list) => {
+                Section::Saved
+            }
+            _ => return Ok(()),
+        };
+        self.activate_selected(section)
+    }
+
     /// WM_SIZE: re-layout the rail and the visible pane for the new client size.
     fn on_size(&mut self, _lparam: LPARAM) -> Result<(), HubError> {
         self.layout()
@@ -1963,6 +2160,19 @@ unsafe extern "system" fn hub_button_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_KEYDOWN => {
+            let key = (wparam.0 & 0xffff) as u16;
+            if key == VK_ESCAPE {
+                // Esc closes the hub from a focused form/action button.
+                post_close_to_parent(hwnd);
+                return LRESULT(0);
+            }
+            if key == VK_N && ctrl_down() {
+                // Ctrl+N opens the New Connection form from any button.
+                post_ctrl_new_to_parent(hwnd);
+                return LRESULT(0);
+            }
+        }
         WM_MOUSEMOVE => {
             let mut tme = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -2158,6 +2368,32 @@ fn is_filter_edit(hwnd: HWND) -> bool {
     }
 }
 
+/// True while the Control key is held (Ctrl+N detection). GetKeyState reflects
+/// the keyboard state at the time the current message was retrieved, so this
+/// is accurate inside WM_KEYDOWN processing.
+fn ctrl_down() -> bool {
+    unsafe { GetKeyState(VK_CONTROL as i32) < 0 }
+}
+
+/// Post WM_CLOSE to the hub so Esc closes it from any focused child control
+/// (the hub proc handles Esc when the hub itself has focus; the subclasses
+/// forward it here when a child has focus).
+unsafe fn post_close_to_parent(child: HWND) {
+    if let Ok(parent) = GetParent(child) {
+        let _ = PostMessageW(Some(parent), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Post WM_COMMAND for the "New Connection" rail button to the hub, so Ctrl+N
+/// activates the New form from any focused child control. The hub proc handles
+/// Ctrl+N when the hub itself has focus; on_command resolves the rail id to
+/// the New section, so posting the same id reuses that path.
+unsafe fn post_ctrl_new_to_parent(child: HWND) {
+    if let Ok(parent) = GetParent(child) {
+        let _ = PostMessageW(Some(parent), WM_COMMAND, WPARAM(ID_RAIL_NEW), LPARAM(0));
+    }
+}
+
 /// Install the dark-edit subclass on `edit`: the original class proc is kept
 /// in `GWLP_USERDATA` and `GWLP_WNDPROC` becomes [`dark_edit_proc`], which
 /// paints a 1px `theme::BORDER` frame on `WM_NCPAINT` (the edit is created
@@ -2191,23 +2427,34 @@ unsafe extern "system" fn dark_edit_proc(
             paint_dark_edit_border(hwnd);
             return LRESULT(0);
         }
-        WM_KEYDOWN if (wparam.0 & 0xffff) as u16 == VK_RETURN => {
-            if is_filter_edit(hwnd) {
-                // Tell the hub (the edit's parent) the user pressed Enter; it
-                // connects the top filtered row. The edit's HWND rides along
-                // in lParam.
-                if let Ok(parent) = GetParent(hwnd) {
-                    let _ = PostMessageW(
-                        Some(parent),
-                        WM_COMMAND,
-                        WPARAM((NOTIFY_FILTER_ENTER as usize) << 16),
-                        LPARAM(hwnd.0 as isize),
-                    );
+        WM_KEYDOWN => {
+            let key = (wparam.0 & 0xffff) as u16;
+            if key == VK_RETURN {
+                if is_filter_edit(hwnd) {
+                    // Tell the hub (the edit's parent) the user pressed Enter;
+                    // it connects the top filtered row. The edit's HWND rides
+                    // along in lParam.
+                    if let Ok(parent) = GetParent(hwnd) {
+                        let _ = PostMessageW(
+                            Some(parent),
+                            WM_COMMAND,
+                            WPARAM((NOTIFY_FILTER_ENTER as usize) << 16),
+                            LPARAM(hwnd.0 as isize),
+                        );
+                    }
+                    return LRESULT(0);
                 }
+                // Not a filter edit: fall through to the default edit behavior
+                // (the hub has no default button, so Enter does nothing).
+            } else if key == VK_ESCAPE {
+                // Esc closes the hub from any focused edit (filter or form).
+                post_close_to_parent(hwnd);
+                return LRESULT(0);
+            } else if key == VK_N && ctrl_down() {
+                // Ctrl+N opens the New Connection form from any focused edit.
+                post_ctrl_new_to_parent(hwnd);
                 return LRESULT(0);
             }
-            // Not a filter edit: fall through to the default edit behavior
-            // (the hub has no default button, so Enter does nothing).
         }
         _ => {}
     }
@@ -2242,6 +2489,62 @@ unsafe fn paint_dark_edit_border(hwnd: HWND) {
     let _ = FrameRect(hdc, &frame, brush);
     let _ = DeleteObject(brush.into());
     let _ = ReleaseDC(Some(hwnd), hdc);
+}
+
+/// Install the list-view subclass on `list`: the original class proc is kept
+/// in `GWLP_USERDATA` and `GWLP_WNDPROC` becomes [`list_view_proc`], which
+/// forwards Enter / Esc / Ctrl+N to the hub so the keyboard shortcuts work
+/// while a list has focus.
+unsafe fn subclass_list_view(list: HWND) {
+    let old_proc = GetWindowLongPtrW(list, GWLP_WNDPROC);
+    SetWindowLongPtrW(list, GWLP_USERDATA, old_proc);
+    SetWindowLongPtrW(list, GWLP_WNDPROC, list_view_proc as *const () as isize);
+}
+
+/// Subclass wndproc for the Recent/Saved SysListView32 panes. The hub window
+/// only sees WM_KEYDOWN when it has focus itself, so when a list has focus
+/// this subclass forwards the keyboard shortcuts the hub needs: Enter
+/// activates the selected row (via [`WM_APP_LIST_ENTER`]), Esc posts WM_CLOSE,
+/// and Ctrl+N switches to the New Connection form. Everything else chains to
+/// the original list-view proc kept in `GWLP_USERDATA` (selection, scrolling,
+/// column/header behavior). Never unwraps or panics.
+unsafe extern "system" fn list_view_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_KEYDOWN => {
+            let key = (wparam.0 & 0xffff) as u16;
+            if key == VK_RETURN {
+                // Connect the selected row of this list: post the list's HWND
+                // so the hub resolves it back to its section and activates the
+                // selection (only when a row is actually selected).
+                if let Ok(parent) = GetParent(hwnd) {
+                    let _ = PostMessageW(
+                        Some(parent),
+                        WM_APP_LIST_ENTER,
+                        WPARAM(0),
+                        LPARAM(hwnd.0 as isize),
+                    );
+                }
+                return LRESULT(0);
+            }
+            if key == VK_ESCAPE {
+                post_close_to_parent(hwnd);
+                return LRESULT(0);
+            }
+            if key == VK_N && ctrl_down() {
+                post_ctrl_new_to_parent(hwnd);
+                return LRESULT(0);
+            }
+        }
+        _ => {}
+    }
+    let old = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    let old_proc: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
+    CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
 }
 
 /// Fill the hub client area with the dark palette. The base fill is the window
@@ -2326,6 +2629,19 @@ unsafe extern "system" fn rail_button_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_KEYDOWN => {
+            let key = (wparam.0 & 0xffff) as u16;
+            if key == VK_ESCAPE {
+                // Esc closes the hub from a focused rail button.
+                post_close_to_parent(hwnd);
+                return LRESULT(0);
+            }
+            if key == VK_N && ctrl_down() {
+                // Ctrl+N opens the New Connection form from a rail button.
+                post_ctrl_new_to_parent(hwnd);
+                return LRESULT(0);
+            }
+        }
         WM_MOUSEMOVE => {
             let mut tme = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -2457,6 +2773,30 @@ unsafe extern "system" fn hub_proc(
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        // Keyboard-first navigation when the hub window itself has focus:
+        // Enter connects the selected list row, Ctrl+N opens the New form,
+        // Esc closes the hub. Children forward the same keys via their
+        // subclasses (dark_edit_proc / list_view_proc / rail_button_proc /
+        // hub_button_proc), since the hub only sees WM_KEYDOWN with focus on
+        // itself.
+        WM_KEYDOWN => {
+            if let Some(state) = hub_state_mut(hwnd) {
+                if let Err(e) = state.on_key_down(wparam) {
+                    tracing::error!(error = %e, "hub WM_KEYDOWN handler failed");
+                }
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_APP_LIST_ENTER => {
+            if let Some(state) = hub_state_mut(hwnd) {
+                if let Err(e) = state.on_list_enter(lparam) {
+                    tracing::error!(error = %e, "hub list-Enter handler failed");
+                }
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_SIZE => {
             if let Some(state) = hub_state_mut(hwnd) {
                 if let Err(e) = state.on_size(lparam) {
@@ -2498,8 +2838,17 @@ pub fn run() -> Result<Option<ConnectionTarget>, HubError> {
         // GetMessageW returns 0 on WM_QUIT (posted from WM_DESTROY or from a
         // row activation) and -1 on error; both end the loop cleanly.
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            // IsDialogMessageW gives the hub dialog-style keyboard navigation:
+            // Tab / Shift+Tab move focus between the WS_TABSTOP children in
+            // Z-order (rail → filter → list → form), skipping hidden and
+            // disabled controls. It returns TRUE only when it consumed the
+            // message; the hub has no default/cancel push button, so Enter and
+            // Esc fall through to the normal translate/dispatch path (the
+            // focused window's subclass or the hub proc handles them).
+            if IsDialogMessageW(hub.hwnd, &msg).0 == 0 {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
     }
     let selected = hub.selected.clone();
