@@ -153,9 +153,23 @@ fn main() {
 
     #[cfg(windows)]
     {
-        if let Err(err) = win::run() {
-            tracing::error!(error = %err, "rdpio exited with an error");
-            std::process::exit(1);
+        // No connection-target args (no `--host`, `--w365`, `--feed`): open the
+        // hub. Selecting a Recent or Saved entry returns a ConnectionTarget that
+        // is handed to the exact same bootstrap the CLI `--host` path uses;
+        // closing the hub with no selection exits 0.
+        match hub::run() {
+            Ok(Some(target)) => {
+                let args = args_from_target(&args, &target);
+                if let Err(err) = win::run_connected(&args) {
+                    tracing::error!(error = %err, "connection attempt failed");
+                    std::process::exit(1);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "hub could not be opened");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -168,6 +182,22 @@ fn main() {
         );
         std::process::exit(2);
     }
+}
+
+/// Convert a hub-selected [`hub::ConnectionTarget`] into connection `Args`,
+/// carrying over any session flags the user passed alongside (e.g. `--multimon`,
+/// `--quality`). Only the target fields differ from the no-args parse; the
+/// result feeds the same `win::run_connected` bootstrap the `--host` path uses,
+/// so the session behaves identically to a CLI launch.
+#[cfg(windows)]
+fn args_from_target(base: &Args, target: &hub::ConnectionTarget) -> Args {
+    let mut args = base.clone();
+    args.host = Some(target.host.clone());
+    args.port = target.port;
+    args.user = target.username.clone();
+    args.domain = target.domain.clone();
+    args.password = target.password.clone();
+    args
 }
 
 /// Build a [`ClientConfig`] from the parsed command-line arguments.
@@ -595,7 +625,11 @@ impl Default for QualityPreset {
 }
 
 /// Minimal command-line arguments (no external arg-parsing dependency).
-#[derive(Debug)]
+///
+/// `Clone` is derived so the hub hand-off (step-8) can carry any session flags
+/// (e.g. `--multimon`, `--quality`) from the no-args parse into the selected
+/// target's connect call.
+#[derive(Debug, Clone)]
 struct Args {
     host: Option<String>,
     port: u16,
@@ -2959,7 +2993,10 @@ mod win {
         Ok(())
     }
 
-    /// The no-host demo window (slate background): launched without `--host`.
+    /// The no-host demo window (slate background). Superseded by the hub
+    /// (step-8): launching without `--host` now opens `hub::run()` instead, so
+    /// this M0 window is kept only as a reference/demo entry point.
+    #[allow(dead_code)]
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let (width, height) = (1280u32, 720u32);
         let window = Window::new("RDPiO", width, height)?;
