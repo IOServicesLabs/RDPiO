@@ -20,27 +20,45 @@
 
 use core::ffi::c_void;
 
-use windows::core::w;
+use windows::core::{w, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DEFAULT_GUI_FONT, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GetStockObject, InvalidateRect, SelectObject, SetBkMode, SetTextColor,
-    DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_TOP, DT_VCENTER, HDC, PAINTSTRUCT, TRANSPARENT,
+    GetStockObject, InvalidateRect, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_LEFT,
+    DT_SINGLELINE, DT_TOP, DT_VCENTER, HDC, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, DRAWITEMSTRUCT, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES,
-    INITCOMMONCONTROLSEX, ODT_BUTTON,
+    INITCOMMONCONTROLSEX, LVCOLUMNW, LVCOLUMNW_FORMAT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH,
+    LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED, LVN_ITEMACTIVATE, LVS_EX_FULLROWSELECT,
+    LVS_EX_GRIDLINES, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMITEMACTIVATE, NM_DBLCLK,
+    ODT_BUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use super::{ConnectionTarget, HubError};
+use super::{ConnectionStore, ConnectionTarget, HubError, MruStore};
 
 /// Control ids for the three activity-rail buttons (delivered as the LOWORD of
 /// `WM_COMMAND`'s `wParam`).
 const ID_RAIL_RECENT: usize = 1;
 const ID_RAIL_SAVED: usize = 2;
 const ID_RAIL_NEW: usize = 3;
+
+/// Control ids for the Recent/Saved filter edits and SysListView32 lists.
+const ID_FILTER_RECENT: usize = 4;
+const ID_FILTER_SAVED: usize = 5;
+const ID_LIST_RECENT: usize = 6;
+const ID_LIST_SAVED: usize = 7;
+
+/// Custom WM_COMMAND notification the (subclassed) filter edit posts when the
+/// user presses Enter — single-line edit controls send no Enter notification
+/// of their own.
+const NOTIFY_FILTER_ENTER: u32 = 0x4000;
+
+/// VK_RETURN; kept local to avoid pulling in more windows feature modules.
+const VK_RETURN: u16 = 0x0D;
 
 /// Default hub window size (in pixels; `WM_SIZE` re-lays-out from the real
 /// client rect after creation).
@@ -54,6 +72,9 @@ const RAIL_BTN_X: i32 = 10;
 const RAIL_BTN_W: i32 = RAIL_W - RAIL_BTN_X * 2;
 const RAIL_BTN_H: i32 = 40;
 const RAIL_BTN_GAP: i32 = 6;
+
+/// Height of the filter-edit strip at the top of each list pane.
+const FILTER_H: i32 = 26;
 
 /// Dark-theme palette. `COLORREF` is 0x00BBGGRR.
 const COLOR_RAIL: u32 = 0x001E1E1E; // hub background visible behind the rail
@@ -127,6 +148,38 @@ impl Section {
     }
 }
 
+/// One row of the Recent or Saved list: the four displayed columns plus the
+/// payload needed to build a [`ConnectionTarget`] on activation.
+#[derive(Debug, Clone)]
+struct ListRow {
+    display_name: String,
+    host: String,
+    /// Column text (username or empty).
+    user: String,
+    /// Pre-formatted "Last Used" column text.
+    last_used: String,
+    port: u16,
+    username: Option<String>,
+    domain: Option<String>,
+    /// Links to a saved record whose DPAPI password can be reused. Always
+    /// `Some` for Saved rows; for MRU rows it is the saved link when present.
+    connection_id: Option<uuid::Uuid>,
+}
+
+/// The controls + live data of one list section (Recent or Saved).
+struct SectionUi {
+    /// Filter edit (subclassed to catch Enter).
+    filter: HWND,
+    /// SysListView32 report view.
+    list: HWND,
+    /// Current filter text (live-filtered on EN_CHANGE).
+    filter_text: String,
+    /// Full, unfiltered row set (rebuilt on section refresh).
+    rows: Vec<ListRow>,
+    /// Indices into `rows` matching the current filter, in list order.
+    filtered: Vec<usize>,
+}
+
 /// Per-window state for the hub, attached to the main window via
 /// `GWLP_USERDATA`. Lives in a `Box` owned by `ui::run`, so the raw pointer the
 /// window procedure holds stays valid for the whole message loop.
@@ -138,10 +191,16 @@ struct HubWindow {
     /// The three rail buttons, indexed by [`Section::index`].
     rail: [HWND; 3],
     /// The content pane per section; created lazily on first visit and reused.
+    /// Only the New section uses a pane (the step-5 placeholder); the Recent/
+    /// Saved sections use `sections` (filter edit + list view) instead.
     panes: [Option<HWND>; 3],
-    /// The pane currently visible (mirrors `section`; kept so layout can move
-    /// it without re-deriving from the section).
+    /// The placeholder pane currently visible (mirrors `section` for New).
     content: Option<HWND>,
+    /// Per-section list controls (Recent/Saved), created lazily.
+    sections: [Option<SectionUi>; 3],
+    /// The connection the user activated, returned by `run()` to the connect
+    /// bootstrap (step-8). `None` until a Recent/Saved row is activated.
+    selected: Option<ConnectionTarget>,
     /// Set once `WM_DESTROY` runs so `Drop` never double-destroys windows.
     destroyed: bool,
 }
@@ -223,6 +282,8 @@ impl HubWindow {
                 rail: [HWND::default(); 3],
                 panes: [None, None, None],
                 content: None,
+                sections: [None, None, None],
+                selected: None,
                 destroyed: false,
             });
 
@@ -278,33 +339,59 @@ impl HubWindow {
         }
     }
 
-    /// Switch the visible content pane to `section`, creating its pane on first
-    /// visit. Also re-highlights the rail buttons.
+    /// Switch the visible content to `section`, creating the section's controls
+    /// (filter edit + list view) or the placeholder pane on first visit. List
+    /// sections re-read their store on every switch so new saves / MRU entries
+    /// appear. Also re-highlights the rail buttons.
     fn show_section(&mut self, section: Section) -> Result<(), HubError> {
         unsafe {
+            // Hide whatever is currently showing: the placeholder pane and
+            // every list section's filter/list pair.
             if let Some(cur) = self.content {
                 let _ = ShowWindow(cur, SW_HIDE);
+                self.content = None;
             }
-            let idx = section.index();
-            let pane = match self.panes[idx] {
-                Some(p) => p,
-                None => {
-                    let p = self.create_pane(section)?;
-                    self.panes[idx] = Some(p);
-                    p
+            for s in Section::ALL {
+                if let Some(ui) = &self.sections[s.index()] {
+                    let _ = ShowWindow(ui.filter, SW_HIDE);
+                    let _ = ShowWindow(ui.list, SW_HIDE);
                 }
-            };
-            let rc = self.content_rect()?;
-            let _ = MoveWindow(
-                pane,
-                rc.left,
-                rc.top,
-                (rc.right - rc.left).max(1),
-                (rc.bottom - rc.top).max(1),
-                true,
-            );
-            let _ = ShowWindow(pane, SW_SHOW);
-            self.content = Some(pane);
+            }
+
+            match section {
+                Section::Recent | Section::Saved => {
+                    self.ensure_section_ui(section)?;
+                    self.refresh_section(section)?;
+                    self.layout_section(section)?;
+                    if let Some(ui) = &self.sections[section.index()] {
+                        let _ = ShowWindow(ui.filter, SW_SHOW);
+                        let _ = ShowWindow(ui.list, SW_SHOW);
+                    }
+                }
+                Section::New => {
+                    // Placeholder pane for now; step-7 replaces it with the form.
+                    let idx = section.index();
+                    let pane = match self.panes[idx] {
+                        Some(p) => p,
+                        None => {
+                            let p = self.create_pane(section)?;
+                            self.panes[idx] = Some(p);
+                            p
+                        }
+                    };
+                    let rc = self.content_rect()?;
+                    let _ = MoveWindow(
+                        pane,
+                        rc.left,
+                        rc.top,
+                        (rc.right - rc.left).max(1),
+                        (rc.bottom - rc.top).max(1),
+                        true,
+                    );
+                    let _ = ShowWindow(pane, SW_SHOW);
+                    self.content = Some(pane);
+                }
+            }
             self.section = section;
             self.repaint_rail();
             tracing::debug!(section = ?section, "hub switched section");
@@ -349,23 +436,29 @@ impl HubWindow {
         }
     }
 
-    /// Re-layout all children for the current client size (WM_SIZE handler).
+    /// Re-layout all children for the current client size (WM_SIZE handler):
+    /// the rail buttons always, plus whatever content is active.
     fn layout(&mut self) -> Result<(), HubError> {
         unsafe {
             for (i, btn) in self.rail.iter().enumerate() {
                 let y = RAIL_PAD_TOP + i as i32 * (RAIL_BTN_H + RAIL_BTN_GAP);
                 let _ = MoveWindow(*btn, RAIL_BTN_X, y, RAIL_BTN_W, RAIL_BTN_H, true);
             }
-            if let Some(pane) = self.content {
-                let rc = self.content_rect()?;
-                let _ = MoveWindow(
-                    pane,
-                    rc.left,
-                    rc.top,
-                    (rc.right - rc.left).max(1),
-                    (rc.bottom - rc.top).max(1),
-                    true,
-                );
+            match self.section {
+                Section::Recent | Section::Saved => self.layout_section(self.section)?,
+                Section::New => {
+                    if let Some(pane) = self.content {
+                        let rc = self.content_rect()?;
+                        let _ = MoveWindow(
+                            pane,
+                            rc.left,
+                            rc.top,
+                            (rc.right - rc.left).max(1),
+                            (rc.bottom - rc.top).max(1),
+                            true,
+                        );
+                    }
+                }
             }
             Ok(())
         }
@@ -385,21 +478,387 @@ impl HubWindow {
     // Each returns Result so the window procedure can log the failure and keep
     // running; none of them unwrap or panic.
 
-    /// WM_COMMAND: rail-button clicks arrive here with the control id in the
-    /// LOWORD of `wParam`.
-    fn on_command(&mut self, wparam: WPARAM, _lparam: LPARAM) -> Result<(), HubError> {
+    /// WM_COMMAND: rail-button clicks (LOWORD = rail id), filter-edit text
+    /// changes (HIWORD = EN_CHANGE), and the subclassed filter edit's Enter
+    /// (HIWORD = NOTIFY_FILTER_ENTER).
+    fn on_command(&mut self, wparam: WPARAM, lparam: LPARAM) -> Result<(), HubError> {
         let id = wparam.0 & 0xffff;
+        let notify = ((wparam.0 >> 16) & 0xffff) as u32;
+
+        // Activity rail: switch sections.
         if let Some(section) = Section::from_id(id) {
-            self.show_section(section)?;
+            return self.show_section(section);
+        }
+
+        // Filter edits (Recent/Saved).
+        let filter_section = match id {
+            ID_FILTER_RECENT => Some(Section::Recent),
+            ID_FILTER_SAVED => Some(Section::Saved),
+            _ => None,
+        };
+        if let Some(section) = filter_section {
+            match notify {
+                // Live narrowing as the user types.
+                EN_CHANGE => {
+                    let text = read_edit_text(HWND(lparam.0 as *mut c_void));
+                    self.set_filter(section, text)?;
+                }
+                // Enter: connect the top (or selected) matching row.
+                NOTIFY_FILTER_ENTER => {
+                    let edit = HWND(lparam.0 as *mut c_void);
+                    let section = match edit {
+                        h if Some(h) == self.sections[Section::Recent.index()].as_ref().map(|u| u.filter) => Section::Recent,
+                        h if Some(h) == self.sections[Section::Saved.index()].as_ref().map(|u| u.filter) => Section::Saved,
+                        _ => return Ok(()),
+                    };
+                    self.activate_top(section)?;
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
 
-    /// WM_NOTIFY: common-control notifications (list-view activation, etc.).
-    /// The step-5 shell has no common controls to handle yet — step-6 routes
-    /// NM_DBLCLK / LVN_ITEMACTIVATE here.
-    fn on_notify(&mut self, _lparam: LPARAM) -> Result<(), HubError> {
+    /// WM_NOTIFY: list-view activation — a double-click (NM_DBLCLK) or Enter on
+    /// the focused row (LVN_ITEMACTIVATE) builds a [`ConnectionTarget`] from
+    /// the activated row and hands it to the hub runner (posts WM_QUIT; `run()`
+    /// returns the target).
+    fn on_notify(&mut self, lparam: LPARAM) -> Result<(), HubError> {
+        let ptr = lparam.0 as *const NMHDR;
+        if ptr.is_null() {
+            return Ok(());
+        }
+        let hdr = unsafe { &*ptr };
+        if hdr.code == NM_DBLCLK || hdr.code == LVN_ITEMACTIVATE {
+            let item = unsafe { &*(lparam.0 as *const NMITEMACTIVATE) };
+            let section = match hdr.idFrom {
+                ID_LIST_RECENT => Some(Section::Recent),
+                ID_LIST_SAVED => Some(Section::Saved),
+                _ => None,
+            };
+            if let Some(section) = section {
+                self.activate_row(section, item.iItem)?;
+            }
+        }
         Ok(())
+    }
+
+    /// Create the filter edit + SysListView32 for a list section on first visit.
+    fn ensure_section_ui(&mut self, section: Section) -> Result<(), HubError> {
+        if self.sections[section.index()].is_some() {
+            return Ok(());
+        }
+        unsafe {
+            let rc = self.content_rect()?;
+            let x = rc.left + 16;
+            let w = (rc.right - rc.left - 32).max(1);
+
+            // Filter edit, subclassed so Enter can be caught (single-line edits
+            // send no Enter notification of their own).
+            let filter = CreateWindowExW(
+                WS_EX_CLIENTEDGE,
+                w!("EDIT"),
+                w!(""),
+                WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0 | ES_AUTOHSCROLL as u32),
+                x,
+                rc.top + 16,
+                w,
+                FILTER_H,
+                Some(self.hwnd),
+                Some(HMENU(section_filter_id(section) as *mut c_void)),
+                Some(self.hinstance),
+                None,
+            )
+            .map_err(|e| HubError::win32(format!("CreateWindowExW(filter {section:?}): {e}")))?;
+            // Chain the original wndproc: keep it in GWLP_USERDATA, install ours.
+            let old_proc = GetWindowLongPtrW(filter, GWLP_WNDPROC);
+            SetWindowLongPtrW(filter, GWLP_USERDATA, old_proc);
+            SetWindowLongPtrW(filter, GWLP_WNDPROC, filter_edit_proc as *const () as isize);
+
+            // SysListView32 report view.
+            let list = CreateWindowExW(
+                WS_EX_CLIENTEDGE,
+                w!("SysListView32"),
+                w!(""),
+                WINDOW_STYLE(
+                    (WS_CHILD | WS_VISIBLE).0 | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                ),
+                x,
+                rc.top + 16 + FILTER_H + 14,
+                w,
+                (rc.bottom - rc.top - 16 - FILTER_H - 14 - 16).max(1),
+                Some(self.hwnd),
+                Some(HMENU(section_list_id(section) as *mut c_void)),
+                Some(self.hinstance),
+                None,
+            )
+            .map_err(|e| HubError::win32(format!("CreateWindowExW(list {section:?}): {e}")))?;
+            let _ = SendMessageW(
+                list,
+                LVM_SETEXTENDEDLISTVIEWSTYLE,
+                Some(WPARAM(0)),
+                Some(LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize)),
+            );
+
+            // Columns: Name, Host, User, Last Used.
+            const COLS: [(&str, i32); 4] = [
+                ("Name", 200),
+                ("Host", 170),
+                ("User", 130),
+                ("Last Used", 150),
+            ];
+            for (i, (title, width)) in COLS.iter().enumerate() {
+                let mut title_buf: Vec<u16> =
+                    title.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut col = LVCOLUMNW {
+                    mask: LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
+                    fmt: LVCOLUMNW_FORMAT(0),
+                    cx: *width,
+                    pszText: PWSTR(title_buf.as_mut_ptr()),
+                    iSubItem: i as i32,
+                    ..Default::default()
+                };
+                let _ = SendMessageW(
+                    list,
+                    LVM_INSERTCOLUMNW,
+                    Some(WPARAM(i)),
+                    Some(LPARAM(&mut col as *mut LVCOLUMNW as isize)),
+                );
+            }
+
+            self.sections[section.index()] = Some(SectionUi {
+                filter,
+                list,
+                filter_text: String::new(),
+                rows: Vec::new(),
+                filtered: Vec::new(),
+            });
+            Ok(())
+        }
+    }
+
+    /// Re-read the store for a list section and rebuild the row set + list.
+    /// Called on every section switch so the lists always reflect disk.
+    fn refresh_section(&mut self, section: Section) -> Result<(), HubError> {
+        let rows = match section {
+            Section::Recent => {
+                let store = MruStore::load()?;
+                store
+                    .list_most_recent_first()
+                    .iter()
+                    .map(|m| ListRow {
+                        display_name: m.display_name.clone(),
+                        host: m.host.clone(),
+                        user: m.username.clone().unwrap_or_default(),
+                        last_used: format_ts(m.last_connected_at),
+                        port: m.port,
+                        username: m.username.clone(),
+                        domain: m.domain.clone(),
+                        connection_id: m.connection_id,
+                    })
+                    .collect::<Vec<_>>()
+            }
+            Section::Saved => {
+                let store = ConnectionStore::load()?;
+                store
+                    .list()
+                    .iter()
+                    .map(|r| ListRow {
+                        display_name: r.display_name.clone(),
+                        host: r.host.clone(),
+                        user: r.username.clone().unwrap_or_default(),
+                        last_used: format_ts(r.updated_at),
+                        port: r.port,
+                        username: r.username.clone(),
+                        domain: r.domain.clone(),
+                        connection_id: Some(r.id),
+                    })
+                    .collect::<Vec<_>>()
+            }
+            Section::New => Vec::new(),
+        };
+        self.set_rows(section, rows)
+    }
+
+    /// Replace the full row set of a list section and re-apply the filter.
+    fn set_rows(&mut self, section: Section, rows: Vec<ListRow>) -> Result<(), HubError> {
+        let Some(ui) = self.sections[section.index()].as_mut() else {
+            return Ok(());
+        };
+        ui.rows = rows;
+        apply_filter(ui);
+        self.populate_list(section)
+    }
+
+    /// Set the live filter text and narrow the list.
+    fn set_filter(&mut self, section: Section, text: String) -> Result<(), HubError> {
+        let Some(ui) = self.sections[section.index()].as_mut() else {
+            return Ok(());
+        };
+        ui.filter_text = text;
+        apply_filter(ui);
+        self.populate_list(section)
+    }
+
+    /// Position the filter edit + list view within the content area.
+    fn layout_section(&mut self, section: Section) -> Result<(), HubError> {
+        let Some(ui) = self.sections[section.index()].as_ref() else {
+            return Ok(());
+        };
+        let rc = self.content_rect()?;
+        let x = rc.left + 16;
+        let w = (rc.right - rc.left - 32).max(1);
+        let list_top = rc.top + 16 + FILTER_H + 14;
+        let list_h = (rc.bottom - list_top - 16).max(1);
+        unsafe {
+            let _ = MoveWindow(ui.filter, x, rc.top + 16, w, FILTER_H, true);
+            let _ = MoveWindow(ui.list, x, list_top, w, list_h, true);
+        }
+        Ok(())
+    }
+
+    /// Rebuild the SysListView32 contents from `ui.filtered`.
+    fn populate_list(&self, section: Section) -> Result<(), HubError> {
+        let Some(ui) = self.sections[section.index()].as_ref() else {
+            return Ok(());
+        };
+        unsafe {
+            let _ = SendMessageW(
+                ui.list,
+                LVM_DELETEALLITEMS,
+                Some(WPARAM(0)),
+                Some(LPARAM(0)),
+            );
+            for (list_idx, &row_idx) in ui.filtered.iter().enumerate() {
+                let row = &ui.rows[row_idx];
+                let i = list_idx as i32;
+
+                // Column 0 = Name (LVM_INSERTITEMW creates the row).
+                let mut name_buf: Vec<u16> = row
+                    .display_name
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let mut item = LVITEMW {
+                    mask: LVIF_TEXT,
+                    iItem: i,
+                    iSubItem: 0,
+                    pszText: PWSTR(name_buf.as_mut_ptr()),
+                    ..Default::default()
+                };
+                let _ = SendMessageW(
+                    ui.list,
+                    LVM_INSERTITEMW,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(&mut item as *mut LVITEMW as isize)),
+                );
+
+                // Columns 1..3 = Host, User, Last Used.
+                for (col, text) in [
+                    (1, row.host.as_str()),
+                    (2, row.user.as_str()),
+                    (3, row.last_used.as_str()),
+                ] {
+                    let mut buf: Vec<u16> =
+                        text.encode_utf16().chain(std::iter::once(0)).collect();
+                    let mut sub = LVITEMW {
+                        mask: LVIF_TEXT,
+                        iItem: i,
+                        iSubItem: col,
+                        pszText: PWSTR(buf.as_mut_ptr()),
+                        ..Default::default()
+                    };
+                    let _ = SendMessageW(
+                        ui.list,
+                        LVM_SETITEMTEXTW,
+                        Some(WPARAM(i as usize)),
+                        Some(LPARAM(&mut sub as *mut LVITEMW as isize)),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Build a [`ConnectionTarget`] for the activated row and hand it to the
+    /// hub runner. The saved password is unprotected only here, at connect
+    /// time: Saved rows and MRU rows linked to a saved record get the
+    /// plaintext; unlinked MRU rows keep `password` unset so the existing
+    /// prompt.rs flow asks.
+    fn activate_row(&mut self, section: Section, list_index: i32) -> Result<(), HubError> {
+        if list_index < 0 {
+            return Ok(());
+        }
+        // Copy the row out of the borrow first (password resolution below needs
+        // &mut self to record the selection).
+        let row: Option<ListRow> = {
+            let Some(ui) = self.sections[section.index()].as_ref() else {
+                return Ok(());
+            };
+            ui.filtered
+                .get(list_index as usize)
+                .and_then(|&i| ui.rows.get(i))
+                .cloned()
+        };
+        let Some(row) = row else {
+            tracing::debug!(section = ?section, list_index, "activation on empty/out-of-range row");
+            return Ok(());
+        };
+
+        let mut target = ConnectionTarget {
+            display_name: row.display_name.clone(),
+            host: row.host.clone(),
+            port: row.port,
+            username: row.username.clone(),
+            domain: row.domain.clone(),
+            password: None,
+            connection_id: row.connection_id,
+        };
+
+        if let Some(id) = target.connection_id {
+            match ConnectionStore::load() {
+                Ok(store) => match store.get(&id) {
+                    Some(rec) => match rec.saved_password.unprotect() {
+                        Ok(p) => target.password = Some(p),
+                        Err(e) => tracing::warn!(error = %e, %id, "could not unprotect saved password"),
+                    },
+                    None => tracing::debug!(%id, "no saved record for connection link"),
+                },
+                Err(e) => tracing::warn!(error = %e, "could not load connections to resolve password"),
+            }
+        }
+
+        self.selected = Some(target);
+        unsafe {
+            PostQuitMessage(0);
+        }
+        tracing::info!(section = ?section, "hub selected a connection target; exiting to connect");
+        Ok(())
+    }
+
+    /// Connect the top matching row (Enter in the filter): the currently
+    /// selected row if any, otherwise the first filtered row.
+    fn activate_top(&mut self, section: Section) -> Result<(), HubError> {
+        let (list, count) = match self.sections[section.index()].as_ref() {
+            Some(ui) => (ui.list, ui.filtered.len()),
+            None => return Ok(()),
+        };
+        let idx = unsafe {
+            // LVM_GETNEXTITEM with a -1 start searches from the top.
+            let sel = SendMessageW(
+                list,
+                LVM_GETNEXTITEM,
+                Some(WPARAM(usize::MAX)),
+                Some(LPARAM(LVNI_SELECTED as isize)),
+            )
+            .0;
+            if sel >= 0 { sel as usize } else { 0 }
+        };
+        if idx < count {
+            self.activate_row(section, idx as i32)
+        } else {
+            Ok(())
+        }
     }
 
     /// WM_DRAWITEM: paint the owner-draw rail buttons.
@@ -474,6 +933,98 @@ impl Drop for HubWindow {
             }
         }
     }
+}
+
+/// Control id of the filter edit for a section (0 for the New placeholder).
+fn section_filter_id(section: Section) -> usize {
+    match section {
+        Section::Recent => ID_FILTER_RECENT,
+        Section::Saved => ID_FILTER_SAVED,
+        Section::New => 0,
+    }
+}
+
+/// Control id of the list view for a section (0 for the New placeholder).
+fn section_list_id(section: Section) -> usize {
+    match section {
+        Section::Recent => ID_LIST_RECENT,
+        Section::Saved => ID_LIST_SAVED,
+        Section::New => 0,
+    }
+}
+
+/// Read an edit control's text (UTF-16, truncated at the first NUL).
+fn read_edit_text(hwnd: HWND) -> String {
+    unsafe {
+        let mut buf = [0u16; 512];
+        let n = GetWindowTextW(hwnd, &mut buf).max(0) as usize;
+        String::from_utf16_lossy(&buf[..n.min(buf.len())])
+    }
+}
+
+/// Recompute `filtered` from `rows` + `filter_text`: a case-insensitive
+/// substring match on display name, host, or username. An empty filter keeps
+/// every row.
+fn apply_filter(ui: &mut SectionUi) {
+    let needle = ui.filter_text.to_lowercase();
+    ui.filtered = ui
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            needle.is_empty()
+                || r.display_name.to_lowercase().contains(&needle)
+                || r.host.to_lowercase().contains(&needle)
+                || r.user.to_lowercase().contains(&needle)
+        })
+        .map(|(i, _)| i)
+        .collect();
+}
+
+/// Subclass wndproc for the filter edits: intercepts Enter (connect the top
+/// match) and chains everything else to the original proc, whose pointer is
+/// kept in the edit's `GWLP_USERDATA`. Never unwraps or panics.
+unsafe extern "system" fn filter_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_KEYDOWN && (wparam.0 & 0xffff) as u16 == VK_RETURN {
+        // Tell the hub (the edit's parent) the user pressed Enter; it connects
+        // the top filtered row. The edit's HWND rides along in lParam.
+        if let Ok(parent) = GetParent(hwnd) {
+            let _ = PostMessageW(
+                Some(parent),
+                WM_COMMAND,
+                WPARAM((NOTIFY_FILTER_ENTER as usize) << 16),
+                LPARAM(hwnd.0 as isize),
+            );
+        }
+        return LRESULT(0);
+    }
+    let old = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    let old_proc: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
+    CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
+}
+
+/// Format a unix timestamp as "YYYY-MM-DD HH:MM". Pure arithmetic (no chrono
+/// dependency), using the standard civil-from-days conversion.
+fn format_ts(unix: u64) -> String {
+    let days = unix / 86400;
+    let secs = unix % 86400;
+    let (hh, mm) = (secs / 3600, (secs % 3600) / 60);
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
 }
 
 /// Recover the per-window state pointer stashed with `SetWindowLongPtrW`.
@@ -630,17 +1181,18 @@ fn paint_placeholder(hwnd: HWND, hdc: HDC, clip: &RECT, section: Section) {
 pub fn run() -> Result<Option<ConnectionTarget>, HubError> {
     // The Box keeps the HubWindow alive (and its GWLP_USERDATA pointer valid)
     // for the whole loop; it is dropped after WM_QUIT ends the loop.
-    let _hub = HubWindow::create()?;
+    let hub = HubWindow::create()?;
     tracing::info!("hub window open; entering message loop");
     let mut msg = MSG::default();
     unsafe {
-        // GetMessageW returns 0 on WM_QUIT (posted from WM_DESTROY) and -1 on
-        // error; both end the loop cleanly.
+        // GetMessageW returns 0 on WM_QUIT (posted from WM_DESTROY or from a
+        // row activation) and -1 on error; both end the loop cleanly.
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
-    tracing::info!("hub window closed");
-    Ok(None)
+    let selected = hub.selected.clone();
+    tracing::info!(selected = selected.is_some(), "hub window closed");
+    Ok(selected)
 }
