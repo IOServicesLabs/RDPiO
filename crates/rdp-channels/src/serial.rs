@@ -48,6 +48,13 @@ enum State {
     /// Waiting to send our client announce.
     Idle,
     /// Sent client announce, waiting for server announce.
+    ///
+    /// The RDPESP handshake sends the client announce immediately when the
+    /// channel opens, so `process` transitions straight from `Idle` to `Ready`
+    /// on the server announce and this intermediate state is never constructed.
+    /// Kept as part of the documented protocol state machine so handshake
+    /// diagnostics can be added without re-introducing the variant.
+    #[allow(dead_code)]
     AwaitingServerAnnounce,
     /// Handshake complete; processing device announces and I/O.
     Ready,

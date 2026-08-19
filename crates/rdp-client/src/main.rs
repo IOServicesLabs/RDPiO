@@ -1344,7 +1344,7 @@ mod win {
 
     use crate::window::{Frame, RawInput, Window};
     use crate::{
-        config_from_args, connect, feed, gateway, net_listener, reconnect_delay,
+        config_from_args, connect, feed, gateway, net_listener, record_mru, reconnect_delay,
         save_reconnect_cookie, session, w365, Args,
     };
     use rdp_pdu::input as inpdu;
