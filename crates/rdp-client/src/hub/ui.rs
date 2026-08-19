@@ -248,6 +248,8 @@ struct FormState {
     save_pw: HWND,
     btn_save: HWND,
     btn_delete: HWND,
+    /// Primary "Connect" button (accent-filled, owner-drawn).
+    btn_connect: HWND,
 }
 
 /// Per-window state for the hub, attached to the main window via
@@ -580,6 +582,7 @@ impl HubWindow {
             ID_FORM_SAVE => return self.on_form_save(),
             ID_FORM_DELETE => return self.on_form_delete(),
             ID_BTN_EDIT_SAVED => return self.on_edit_saved(),
+            ID_FORM_CONNECT => return self.on_form_connect(),
             _ => {}
         }
         Ok(())
@@ -1026,7 +1029,14 @@ impl HubWindow {
         let edit_style =
             WINDOW_STYLE((WS_CHILD | WS_VISIBLE | WS_BORDER).0 | ES_AUTOHSCROLL as u32);
         let label_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0);
-        let btn_style = WS_CHILD | WS_VISIBLE;
+        // Every hub button is owner-drawn so no stock push-button gray
+        // remains; WM_DRAWITEM paints them from the dark palette. The
+        // Save-password checkbox keeps BS_AUTOCHECKBOX so the system still
+        // toggles and reports its check state.
+        let btn_style = WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0 | BS_OWNERDRAW as u32);
+        let checkbox_style = WINDOW_STYLE(
+            (WS_CHILD | WS_VISIBLE).0 | BS_AUTOCHECKBOX as u32 | BS_OWNERDRAW as u32,
+        );
         let mk = |class: &'static str, text: &'static str, style: WINDOW_STYLE, id: usize| {
             create_child(h, inst, class, text, style, id)
         };
@@ -1066,11 +1076,19 @@ impl HubWindow {
         let save_pw = mk(
             "BUTTON",
             "Save password (DPAPI-protected)",
-            WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0 | BS_AUTOCHECKBOX as u32),
+            checkbox_style,
             ID_FORM_SAVE_PW,
         )?;
         let btn_save = mk("BUTTON", "Save", btn_style, ID_FORM_SAVE)?;
         let btn_delete = mk("BUTTON", "Delete", btn_style, ID_FORM_DELETE)?;
+        let btn_connect = mk("BUTTON", "Connect", btn_style, ID_FORM_CONNECT)?;
+        // Subclass the owner-drawn buttons so mouse enter/leave is reported to
+        // the shared hover tracker (via WM_MOUSEMOVE + TrackMouseEvent) and
+        // WM_ERASEBKGND paints a dark fill instead of a stock button face.
+        subclass_hub_button(save_pw);
+        subclass_hub_button(btn_save);
+        subclass_hub_button(btn_delete);
+        subclass_hub_button(btn_connect);
 
         self.form = Some(FormState {
             editing_id: None,
@@ -1085,6 +1103,7 @@ impl HubWindow {
             save_pw,
             btn_save,
             btn_delete,
+            btn_connect,
         });
         // Start blank with the save-password box checked.
         self.clear_form();
@@ -1130,6 +1149,12 @@ impl HubWindow {
             y += FORM_ROW_H;
             let _ = MoveWindow(f.btn_save, edit_x, y, 100, 28, true);
             let _ = MoveWindow(f.btn_delete, edit_x + 112, y, 100, 28, true);
+            // The primary Connect button spans the form width at the bottom
+            // (the layout step owns final positioning; drawing + hit testing
+            // live here).
+            let connect_y = y + FORM_ROW_H;
+            let connect_w = (rc.right - edit_x - FORM_X).max(1);
+            let _ = MoveWindow(f.btn_connect, edit_x, connect_y, connect_w, 30, true);
         }
         Ok(())
     }
@@ -1242,6 +1267,56 @@ impl HubWindow {
             Ok(false) => tracing::warn!(%id, "delete: no such record"),
             Err(e) => tracing::error!(error = %e, %id, "delete failed"),
         }
+        Ok(())
+    }
+
+    /// The primary Connect button: connect straight to the host typed in the
+    /// New Connection form without saving it. Builds a [`ConnectionTarget`]
+    /// from the current fields and hands it to the hub runner exactly like a
+    /// list-row activation (empty/invalid port falls back to a validation
+    /// message; passwords are left unset so the existing prompt.rs flow asks).
+    fn on_form_connect(&mut self) -> Result<(), HubError> {
+        let Some(f) = self.form.as_ref() else {
+            return Ok(());
+        };
+        let host = read_edit_text(f.host).trim().to_string();
+        if host.is_empty() {
+            show_message(self.hwnd, "Host must not be empty.", "Connect");
+            return Ok(());
+        }
+        let port: u16 = match read_edit_text(f.port).trim().parse::<u16>() {
+            Ok(p) if (1..=65535).contains(&p) => p,
+            _ => {
+                show_message(
+                    self.hwnd,
+                    "Port must be a number from 1 to 65535.",
+                    "Connect",
+                );
+                return Ok(());
+            }
+        };
+        let display = {
+            let n = read_edit_text(f.name).trim().to_string();
+            if n.is_empty() {
+                host.clone()
+            } else {
+                n
+            }
+        };
+        let target = ConnectionTarget {
+            display_name: display,
+            host,
+            port,
+            username: non_empty(read_edit_text(f.user)),
+            domain: non_empty(read_edit_text(f.domain)),
+            password: None,
+            connection_id: None,
+        };
+        self.selected = Some(target);
+        unsafe {
+            PostQuitMessage(0);
+        }
+        tracing::info!("hub connected from the New Connection form; exiting to connect");
         Ok(())
     }
 
@@ -1719,7 +1794,7 @@ fn paint_solid_rect(hdc: HDC, rc: &RECT, color: windows::Win32::Foundation::COLO
 /// transparent background, `color` text, and `align` plus single-line vertical
 /// centering. Restores the previously selected font afterwards, so every
 /// owner-drawn button label renders in the theme font at the window DPI.
-fn draw_button_label(
+fn paint_button_label(
     hdc: HDC,
     rc: &RECT,
     dpi: u32,
@@ -1758,9 +1833,9 @@ fn draw_primary_button(dis: &DRAWITEMSTRUCT, dpi: u32, hovered: bool, pressed: b
     } else {
         theme::ACCENT
     };
-    fill_rect(dis.hDC, &dis.rcItem, fill);
+    paint_solid_rect(dis.hDC, &dis.rcItem, fill);
     let label = read_edit_text(dis.hwndItem);
-    draw_button_label(dis.hDC, &dis.rcItem, dpi, theme::ON_ACCENT, DT_CENTER, &label);
+    paint_button_label(dis.hDC, &dis.rcItem, dpi, theme::ON_ACCENT, DT_CENTER, &label);
 }
 
 /// Paint a secondary hub button (Save / Delete / Edit Selected): a dark
@@ -1778,19 +1853,19 @@ fn draw_secondary_button(dis: &DRAWITEMSTRUCT, dpi: u32, hovered: bool, pressed:
     // Frame: fill the outer rect with the outline color, then the interior
     // with the fill color, so the border is exactly `border` px at any DPI.
     let border = theme::scale_px(1, dpi).max(1);
-    fill_rect(dis.hDC, &dis.rcItem, theme::BORDER);
+    paint_solid_rect(dis.hDC, &dis.rcItem, theme::BORDER);
     let mut inner = dis.rcItem;
     inner.left += border;
     inner.top += border;
     inner.right -= border;
     inner.bottom -= border;
-    fill_rect(dis.hDC, &inner, fill);
+    paint_solid_rect(dis.hDC, &inner, fill);
     let label = read_edit_text(dis.hwndItem);
     let pad = theme::scale_px(10, dpi).max(4);
     let mut trc = inner;
     trc.left += pad;
     trc.right -= pad;
-    draw_button_label(dis.hDC, &trc, dpi, theme::TEXT, DT_CENTER, &label);
+    paint_button_label(dis.hDC, &trc, dpi, theme::TEXT, DT_CENTER, &label);
 }
 
 /// Paint the Save-password checkbox: a BORDER-framed dark glyph square
@@ -1819,13 +1894,13 @@ fn draw_checkbox(dis: &DRAWITEMSTRUCT, dpi: u32, hovered: bool, pressed: bool) {
         theme::PANEL
     };
     let border = theme::scale_px(1, dpi).max(1);
-    fill_rect(dis.hDC, &box_rc, theme::BORDER);
+    paint_solid_rect(dis.hDC, &box_rc, theme::BORDER);
     let mut inner = box_rc;
     inner.left += border;
     inner.top += border;
     inner.right -= border;
     inner.bottom -= border;
-    fill_rect(dis.hDC, &inner, fill);
+    paint_solid_rect(dis.hDC, &inner, fill);
     if checked {
         // White check glyph (U+2713) centered in the box, in the theme font.
         unsafe {
@@ -2036,7 +2111,7 @@ fn non_empty(s: String) -> Option<String> {
 }
 
 /// Every form control hwnd, for the show/hide pass on section switches.
-fn form_hwnds(f: &FormState) -> [HWND; 16] {
+fn form_hwnds(f: &FormState) -> [HWND; 17] {
     [
         f.header,
         f.labels[0],
@@ -2054,6 +2129,7 @@ fn form_hwnds(f: &FormState) -> [HWND; 16] {
         f.save_pw,
         f.btn_save,
         f.btn_delete,
+        f.btn_connect,
     ]
 }
 
