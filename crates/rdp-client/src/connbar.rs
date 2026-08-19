@@ -274,8 +274,8 @@ fn open_save_dialog(owner: HWND) {
             class_name,
             w!("Save this connection"),
             WS_POPUP | WS_CAPTION | WS_SYSMENU,
-            0,
-            0,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
             SAVE_DLG_W,
             SAVE_DLG_H,
             Some(owner),
@@ -292,12 +292,6 @@ fn open_save_dialog(owner: HWND) {
 
         create_dialog_controls(dlg, hinstance);
 
-        // Centre over the bar.
-        let mut rc = RECT::default();
-        let _ = GetWindowRect(owner, &mut rc);
-        let x = rc.left + (rc.right - rc.left - SAVE_DLG_W) / 2;
-        let y = rc.top + (rc.bottom - rc.top - SAVE_DLG_H) / 2;
-        let _ = MoveWindow(dlg, x, y, SAVE_DLG_W, SAVE_DLG_H, true);
         let _ = ShowWindow(dlg, SW_SHOWNOACTIVATE);
     }
 }
@@ -459,12 +453,12 @@ unsafe extern "system" fn save_dialog_proc(
 /// [`ConnectionStore::upsert`] (which protects the password with DPAPI before
 /// it ever reaches disk). The dialog closes on success.
 unsafe fn save_from_dialog(dlg: HWND) {
-    let name = edit_text(GetDlgItem(dlg, DLG_NAME as i32));
-    let host = edit_text(GetDlgItem(dlg, DLG_HOST as i32));
-    let port_text = edit_text(GetDlgItem(dlg, DLG_PORT as i32));
-    let user = edit_text(GetDlgItem(dlg, DLG_USER as i32));
-    let domain = edit_text(GetDlgItem(dlg, DLG_DOMAIN as i32));
-    let password = edit_text(GetDlgItem(dlg, DLG_PASSWORD as i32));
+    let name = edit_text(GetDlgItem(Some(dlg), DLG_NAME as i32).unwrap_or_default());
+    let host = edit_text(GetDlgItem(Some(dlg), DLG_HOST as i32).unwrap_or_default());
+    let port_text = edit_text(GetDlgItem(Some(dlg), DLG_PORT as i32).unwrap_or_default());
+    let user = edit_text(GetDlgItem(Some(dlg), DLG_USER as i32).unwrap_or_default());
+    let domain = edit_text(GetDlgItem(Some(dlg), DLG_DOMAIN as i32).unwrap_or_default());
+    let password = edit_text(GetDlgItem(Some(dlg), DLG_PASSWORD as i32).unwrap_or_default());
 
     let host = host.trim().to_string();
     if host.is_empty() {
