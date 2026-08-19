@@ -20,18 +20,21 @@
 
 use core::ffi::c_void;
 
-use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::core::{w, PCWSTR, PWSTR, HRESULT};
+use windows::Win32::Foundation::{
+    COLORREF, ERROR_INSUFFICIENT_BUFFER, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FrameRect, GetWindowDC, HBRUSH, HDC,
     HGDIOBJ, InvalidateRect, ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor,
     DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT, HFONT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::WindowsProgramming::GetUserNameW;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, DRAWITEMSTRUCT, EM_SETCUEBANNER, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES,
     INITCOMMONCONTROLSEX, LVCOLUMNW, LVCOLUMNW_FORMAT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH,
-    LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETHEADER, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
     LVM_SETBKCOLOR, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVM_SETTEXTBKCOLOR,
     LVNI_SELECTED, LVN_ITEMACTIVATE, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_EX_TRACKSELECT,
     LVS_NOCOLUMNHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMITEMACTIVATE,
@@ -43,9 +46,10 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use super::model::prefill_username;
 use super::{
-    theme, ConnectionInput, ConnectionRecord, ConnectionStore, ConnectionTarget, HubError,
-    MruStore,
+    format_local_short_datetime, format_recent_identity, theme, ConnectionInput, ConnectionRecord,
+    ConnectionStore, ConnectionTarget, HubError, MruStore,
 };
 
 /// Control ids for the three activity-rail buttons (delivered as the LOWORD of
@@ -100,6 +104,12 @@ const FORM_LABEL_W: i32 = 120;
 const FORM_EDIT_H: i32 = 24;
 const FORM_ROW_H: i32 = 36;
 const FORM_PORT_W: i32 = 140;
+
+/// Default port prefilled into the Port edit every time a fresh blank New
+/// Connection form is opened (the standard RDP listener port). Only the blank
+/// form gets this default; `load_into_form` sets the port from the saved
+/// record and is unaffected.
+const FORM_DEFAULT_PORT: &str = "3389";
 
 /// Default hub window size (in pixels; `WM_SIZE` re-lays-out from the real
 /// client rect after creation).
@@ -777,8 +787,12 @@ impl HubWindow {
                     .map(|m| ListRow {
                         display_name: m.display_name.clone(),
                         host: m.host.clone(),
-                        user: m.username.clone().unwrap_or_default(),
-                        last_used: format_ts(m.last_connected_at),
+                        // Identity half of `format_recent_entry`: user@host
+                        // when the record has a username, bare host otherwise.
+                        user: format_recent_identity(m.username.as_deref(), &m.host),
+                        // Timestamp half of `format_recent_entry`: local short
+                        // date + time (GetDateFormatW/GetTimeFormatW).
+                        last_used: format_local_short_datetime(m.last_connected_at),
                         port: m.port,
                         username: m.username.clone(),
                         domain: m.domain.clone(),
@@ -1284,21 +1298,63 @@ impl HubWindow {
         tracing::info!(id = %rec.id, host = %rec.host, "loaded saved connection into edit form");
     }
 
-    /// Reset the form to a blank "new connection" state.
+    /// Reset the form to a blank "new connection" state. The Port edit is set
+    /// to the default RDP port (3389) every time a fresh blank form is opened;
+    /// if it already reads "3389" it is left unchanged (no redundant
+    /// SetWindowTextW). Saved-connection loads go through `load_into_form`,
+    /// which sets the port from the record and is not affected.
     fn clear_form(&mut self) {
         let Some(f) = self.form.as_mut() else {
             return;
         };
         set_edit_text(f.name, "");
         set_edit_text(f.host, "");
-        set_edit_text(f.port, "");
         set_edit_text(f.user, "");
         set_edit_text(f.domain, "");
         set_edit_text(f.password, "");
+        // Port default: a fresh blank form always shows 3389. Read first so an
+        // edit that already contains exactly "3389" is left untouched.
+        let port_text = read_edit_text(f.port);
+        if port_text != FORM_DEFAULT_PORT {
+            set_edit_text(f.port, FORM_DEFAULT_PORT);
+        }
         unsafe {
             let _ = SendMessageW(f.save_pw, BM_SETCHECK, Some(WPARAM(1)), None);
         }
         f.editing_id = None;
+        // Username default: seed a fresh form with the most recently used
+        // non-empty username from MRU history; when history has none, fall
+        // back to the current Windows user (GetUserNameW). The field stays a
+        // normal editable/clearable edit — this only seeds it. Domain stays
+        // blank. Saved-connection loads go through `load_into_form`, which
+        // sets the username from the record and is not affected.
+        self.prefill_username_field();
+    }
+
+    /// Prefill the New Connection form's Username field on a fresh form.
+    ///
+    /// Rule (username-default): MRU wins — the most recently used non-empty
+    /// username from history; empty/blank MRU usernames are skipped. When MRU
+    /// yields nothing, the current Windows user (`GetUserNameW`) is the final
+    /// fallback. Only when both are unavailable does the field stay blank. The
+    /// tested pure rule in `model::prefill_username` implements the fallback
+    /// chain; this method feeds it from the live store and the Win32 API.
+    /// Read-only with respect to the stores: MRU ordering/cap/dedupe are never
+    /// touched, and errors are logged with `tracing`, never panicked on.
+    fn prefill_username_field(&mut self) {
+        let Some(f) = self.form.as_mut() else {
+            return;
+        };
+        let last_used = match MruStore::load() {
+            Ok(store) => store.last_used_username().map(str::to_owned),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not load MRU for username prefill");
+                None
+            }
+        };
+        let current_user = current_windows_username();
+        let username = prefill_username(last_used.as_deref(), current_user.as_deref());
+        set_edit_text(f.user, username.as_deref().unwrap_or(""));
     }
 
     /// WM_DRAWITEM: paint the owner-draw rail buttons flat dark. Resting
@@ -1605,6 +1661,44 @@ fn set_edit_text(hwnd: HWND, text: &str) {
     unsafe {
         let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
         let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
+    }
+}
+
+/// The current Windows user name (`GetUserNameW`), or `None` when the call
+/// fails or yields a blank value.
+///
+/// This is the final fallback for the New Connection form's username prefill
+/// when MRU history has no usable username: MRU wins, the current Windows user
+/// is the last resort, and the field stays blank only when both are
+/// unavailable. The two-call pattern keeps it robust for any name length —
+/// `GetUserNameW` fails with `ERROR_INSUFFICIENT_BUFFER` and writes the
+/// required size (in `u16`s, including the NUL) into `*pcbbuffer`, so we
+/// retry with the exact allocation instead of trusting a fixed cap.
+fn current_windows_username() -> Option<String> {
+    unsafe {
+        // Windows logon names are capped at UNLEN (256) characters, so 256 is
+        // the documented safe starting size.
+        let mut cap = 256u32;
+        loop {
+            let mut buf = vec![0u16; cap as usize];
+            let mut len = buf.len() as u32;
+            match GetUserNameW(Some(PWSTR(buf.as_mut_ptr())), &mut len) {
+                Ok(()) => {
+                    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                    let name = String::from_utf16(&buf[..end]).ok()?;
+                    let name = name.trim();
+                    return (!name.is_empty()).then(|| name.to_string());
+                }
+                Err(e) => {
+                    if e.code() == HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) && len > cap {
+                        cap = len;
+                        continue;
+                    }
+                    tracing::warn!(error = %e, "GetUserNameW failed; leaving username blank");
+                    return None;
+                }
+            }
+        }
     }
 }
 

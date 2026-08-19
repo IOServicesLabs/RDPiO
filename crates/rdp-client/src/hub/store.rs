@@ -24,6 +24,12 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use windows::Win32::Foundation::SYSTEMTIME;
+use windows::Win32::Globalization::{
+    GetDateFormatW, GetTimeFormatW, DATE_SHORTDATE, LOCALE_USER_DEFAULT, TIME_NOSECONDS,
+};
+use windows::Win32::System::Time::SystemTimeToTzSpecificLocalTime;
+
 use crate::hub::model::{now_unix, ConnectionRecord, MruRecord, ProtectedPassword};
 use crate::hub::HubError;
 
@@ -380,6 +386,121 @@ pub fn format_recent_identity(user: Option<&str>, host: &str) -> String {
     }
 }
 
+/// Build the UTC [`SYSTEMTIME`] for a unix timestamp using the standard
+/// civil-from-days conversion. Pure arithmetic (no chrono / Win32 calls), so
+/// it is deterministic and testable; the time-zone shift happens afterwards in
+/// [`unix_to_local_systemtime`].
+fn unix_to_utc_systemtime(unix: u64) -> SYSTEMTIME {
+    let days = unix / 86400;
+    let secs = unix % 86400;
+    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    SYSTEMTIME {
+        wYear: y as u16,
+        wMonth: m as u16,
+        wDay: d as u16,
+        wHour: hh as u16,
+        wMinute: mm as u16,
+        wSecond: ss as u16,
+        wMilliseconds: 0,
+        wDayOfWeek: 0,
+    }
+}
+
+/// Convert a unix timestamp to the user's local [`SYSTEMTIME`] by shifting the
+/// UTC time through `SystemTimeToTzSpecificLocalTime`. Returns `None` when the
+/// native conversion fails, so callers can fall back instead of panicking on
+/// the UI path.
+fn unix_to_local_systemtime(unix: u64) -> Option<SYSTEMTIME> {
+    let st_utc = unix_to_utc_systemtime(unix);
+    unsafe {
+        let mut st_local = SYSTEMTIME::default();
+        SystemTimeToTzSpecificLocalTime(None, &st_utc, &mut st_local)
+            .ok()
+            .map(|()| st_local)
+    }
+}
+
+/// Render a unix timestamp as a plain UTC "YYYY-MM-DD HH:MM" string. Pure
+/// arithmetic (no chrono dependency), used only as the defensive fallback when
+/// the native locale-aware formatter cannot produce a value.
+fn format_ts_utc(unix: u64) -> String {
+    let st = unix_to_utc_systemtime(unix);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
+    )
+}
+
+/// Format a unix timestamp as the user's **local** short date + time, e.g.
+/// "1/15/2024 3:04 PM" on an en-US system. Uses `GetDateFormatW` with
+/// `DATE_SHORTDATE` and `GetTimeFormatW` with `TIME_NOSECONDS`, so the output
+/// follows the current user's locale and time zone — the "Last Used" column of
+/// the Recent list. Falls back to the UTC [`format_ts_utc`] rendering if the
+/// native path fails, so a locale edge case can never panic the hub.
+pub fn format_local_short_datetime(unix: u64) -> String {
+    let Some(st) = unix_to_local_systemtime(unix) else {
+        return format_ts_utc(unix);
+    };
+    unsafe {
+        let mut date = [0u16; 64];
+        let mut time = [0u16; 64];
+        // Both calls return the written length *including* the trailing NUL
+        // (or 0 on failure); 64 u16s is ample for any short date / time.
+        let dlen = GetDateFormatW(
+            LOCALE_USER_DEFAULT,
+            DATE_SHORTDATE.0,
+            Some(&st),
+            None,
+            Some(&mut date),
+        );
+        let tlen = GetTimeFormatW(
+            LOCALE_USER_DEFAULT,
+            TIME_NOSECONDS.0,
+            Some(&st),
+            None,
+            Some(&mut time),
+        );
+        if dlen <= 1 || tlen <= 1 {
+            return format_ts_utc(unix);
+        }
+        let date = String::from_utf16_lossy(&date[..dlen as usize - 1]);
+        let time = String::from_utf16_lossy(&time[..tlen as usize - 1]);
+        format!("{date} {time}")
+    }
+}
+
+/// Render a Recent (MRU) entry as one display string: `user@host` (or bare
+/// `host` when the record has no usable username) followed by the local short
+/// date + time of the last connection, e.g. `alice@box.local 1/15/2024 3:04 PM`.
+///
+/// A record with no usable timestamp (`last_connected_at == 0`, the sentinel
+/// for "never recorded") renders as the bare address only, so the Recent list
+/// never shows a meaningless epoch date.
+///
+/// The Recent list's columns are populated from exactly the two halves of this
+/// formatter — the identity in the "User" column and the local date + time in
+/// the "Last Used" column — so the list and this helper cannot drift.
+pub fn format_recent_entry(record: &MruRecord) -> String {
+    let identity = format_recent_identity(record.username.as_deref(), &record.host);
+    if record.last_connected_at == 0 {
+        return identity;
+    }
+    format!(
+        "{identity} {}",
+        format_local_short_datetime(record.last_connected_at)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,5 +843,90 @@ mod tests {
         assert_eq!(format_recent_identity(None, "box.local"), "box.local");
         assert_eq!(format_recent_identity(Some(""), "box.local"), "box.local");
         assert_eq!(format_recent_identity(Some("  "), "box.local"), "box.local");
+    }
+
+    /// A fixed MRU record with the given username / timestamp; the remaining
+    /// fields are constants so tests read as "username present / absent".
+    fn mru(user: Option<&str>, last_connected_at: u64) -> MruRecord {
+        MruRecord {
+            host: "box.local".into(),
+            port: 3389,
+            username: user.map(String::from),
+            domain: None,
+            display_name: "Box".into(),
+            last_connected_at,
+            connect_count: 1,
+            connection_id: None,
+        }
+    }
+
+    #[test]
+    fn format_recent_entry_with_username_includes_user_at_host_and_local_time() {
+        // 2023-11-14 22:13:20 UTC — the timestamp half must render as the
+        // user's local short date + time, never an epoch or blank.
+        let text = format_recent_entry(&mru(Some("alice"), 1_700_000_000));
+        assert!(
+            text.starts_with("alice@box.local "),
+            "identity half must be user@host: {text}"
+        );
+        let ts = text.trim_start_matches("alice@box.local ");
+        assert!(!ts.is_empty(), "timestamp half must not be empty: {text}");
+        assert!(
+            ts.chars().any(|c| c.is_ascii_digit()),
+            "timestamp half must carry a real date/time: {text}"
+        );
+        // The whole entry is one line with the identity and time separated.
+        assert!(text.contains(' '));
+    }
+
+    #[test]
+    fn format_recent_entry_without_username_uses_bare_host() {
+        let text = format_recent_entry(&mru(None, 1_700_000_000));
+        assert!(
+            text.starts_with("box.local "),
+            "no username must render bare host (no dangling '@'): {text}"
+        );
+        let ts = text.trim_start_matches("box.local ");
+        assert!(!ts.is_empty());
+        assert!(ts.chars().any(|c| c.is_ascii_digit()));
+        // Blank username degrades to the bare-host form too.
+        let blank = format_recent_entry(&mru(Some("   "), 1_700_000_000));
+        assert!(blank.starts_with("box.local "), "{blank}");
+    }
+
+    #[test]
+    fn format_recent_entry_without_timestamp_shows_address_only() {
+        // last_connected_at == 0 is the "no timestamp" sentinel: the entry is
+        // the bare address, with no epoch date appended.
+        assert_eq!(
+            format_recent_entry(&mru(Some("alice"), 0)),
+            "alice@box.local"
+        );
+        assert_eq!(format_recent_entry(&mru(None, 0)), "box.local");
+        assert_eq!(format_recent_entry(&mru(Some("  "), 0)), "box.local");
+    }
+
+    #[test]
+    fn format_local_short_datetime_renders_local_date_and_time() {
+        let text = format_local_short_datetime(1_700_000_000);
+        assert!(!text.is_empty(), "local datetime must never be blank");
+        assert!(
+            text.chars().any(|c| c.is_ascii_digit()),
+            "must contain a real date/time: {text}"
+        );
+        // DATE_SHORTDATE + TIME_NOSECONDS yields two parts separated by space.
+        assert!(text.contains(' '), "date and time must be separated: {text}");
+        // The zero timestamp (sentinel) still formats deterministically.
+        let epoch = format_local_short_datetime(0);
+        assert!(!epoch.is_empty());
+    }
+
+    #[test]
+    fn format_ts_utc_fallback_renders_civil_datetime() {
+        assert_eq!(format_ts_utc(0), "1970-01-01 00:00");
+        // 1700000000 = 2023-11-14 22:13:20 UTC.
+        assert_eq!(format_ts_utc(1_700_000_000), "2023-11-14 22:13");
+        // Round-trips through a full day boundary without wrapping.
+        assert_eq!(format_ts_utc(86400), "1970-01-02 00:00");
     }
 }
