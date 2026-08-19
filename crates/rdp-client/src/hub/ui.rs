@@ -20,12 +20,11 @@
 
 use core::ffi::c_void;
 
-use windows::core::{w, PWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DEFAULT_GUI_FONT, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GetStockObject, InvalidateRect, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_LEFT,
-    DT_SINGLELINE, DT_TOP, DT_VCENTER, HDC, PAINTSTRUCT, TRANSPARENT,
+    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, InvalidateRect, SetBkMode, SetTextColor,
+    DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
@@ -38,7 +37,9 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use super::{ConnectionStore, ConnectionTarget, HubError, MruStore};
+use super::{
+    ConnectionInput, ConnectionRecord, ConnectionStore, ConnectionTarget, HubError, MruStore,
+};
 
 /// Control ids for the three activity-rail buttons (delivered as the LOWORD of
 /// `WM_COMMAND`'s `wParam`).
@@ -60,6 +61,32 @@ const NOTIFY_FILTER_ENTER: u32 = 0x4000;
 /// VK_RETURN; kept local to avoid pulling in more windows feature modules.
 const VK_RETURN: u16 = 0x0D;
 
+/// Control ids for the New Connection form controls.
+const ID_FORM_NAME: usize = 20;
+const ID_FORM_HOST: usize = 21;
+const ID_FORM_PORT: usize = 22;
+const ID_FORM_USER: usize = 23;
+const ID_FORM_DOMAIN: usize = 24;
+const ID_FORM_PASSWORD: usize = 25;
+const ID_FORM_SAVE_PW: usize = 26;
+const ID_FORM_SAVE: usize = 27;
+const ID_FORM_DELETE: usize = 28;
+
+/// "Edit Selected" button under the Saved list (loads a row into the form).
+const ID_BTN_EDIT_SAVED: usize = 29;
+
+/// BM_GETCHECK result values (kept local; the BST_* constants live in another
+/// windows feature module we do not enable).
+const BST_CHECKED: isize = 1;
+
+/// New Connection form geometry (relative to the content area).
+const FORM_X: i32 = 32;
+const FORM_TOP: i32 = 28;
+const FORM_LABEL_W: i32 = 120;
+const FORM_EDIT_H: i32 = 24;
+const FORM_ROW_H: i32 = 36;
+const FORM_PORT_W: i32 = 140;
+
 /// Default hub window size (in pixels; `WM_SIZE` re-lays-out from the real
 /// client rect after creation).
 const HUB_W: i32 = 940;
@@ -78,7 +105,6 @@ const FILTER_H: i32 = 26;
 
 /// Dark-theme palette. `COLORREF` is 0x00BBGGRR.
 const COLOR_RAIL: u32 = 0x001E1E1E; // hub background visible behind the rail
-const COLOR_BG: u32 = 0x00252525; // content pane background
 const COLOR_RAIL_BTN: u32 = 0x002E2E2E; // inactive rail button
 const COLOR_RAIL_BTN_ACTIVE: u32 = 0x0080531F; // RGB(0x1F,0x53,0x80) blue accent
 const COLOR_TEXT: u32 = 0x00E8E8E8; // bright text
@@ -100,15 +126,6 @@ impl Section {
             Section::Recent => 0,
             Section::Saved => 1,
             Section::New => 2,
-        }
-    }
-
-    fn from_index(i: usize) -> Option<Section> {
-        match i {
-            0 => Some(Section::Recent),
-            1 => Some(Section::Saved),
-            2 => Some(Section::New),
-            _ => None,
         }
     }
 
@@ -134,16 +151,6 @@ impl Section {
             Section::Recent => "Recent",
             Section::Saved => "Saved",
             Section::New => "New Connection",
-        }
-    }
-
-    /// Placeholder text shown under the title until step-6/7 fill the pane
-    /// with the real controls.
-    fn placeholder_subtitle(self) -> &'static str {
-        match self {
-            Section::Recent => "Connections you have used will appear here.",
-            Section::Saved => "Saved connections will appear here once you create one.",
-            Section::New => "Create and save a connection from the form on this pane.",
         }
     }
 }
@@ -172,12 +179,33 @@ struct SectionUi {
     filter: HWND,
     /// SysListView32 report view.
     list: HWND,
+    /// "Edit Selected" button under the Saved list (None for Recent).
+    edit_btn: Option<HWND>,
     /// Current filter text (live-filtered on EN_CHANGE).
     filter_text: String,
     /// Full, unfiltered row set (rebuilt on section refresh).
     rows: Vec<ListRow>,
     /// Indices into `rows` matching the current filter, in list order.
     filtered: Vec<usize>,
+}
+
+/// The New Connection form: six labelled edit controls (display name, host,
+/// port, username, domain, password), a save-password checkbox, and Save /
+/// Delete buttons. `editing_id` is `Some` when the form was loaded from a
+/// saved record — Save then updates it and Delete removes it.
+struct FormState {
+    editing_id: Option<uuid::Uuid>,
+    /// The six field labels (one per edit row).
+    labels: [HWND; 6],
+    name: HWND,
+    host: HWND,
+    port: HWND,
+    user: HWND,
+    domain: HWND,
+    password: HWND,
+    save_pw: HWND,
+    btn_save: HWND,
+    btn_delete: HWND,
 }
 
 /// Per-window state for the hub, attached to the main window via
@@ -190,12 +218,9 @@ struct HubWindow {
     section: Section,
     /// The three rail buttons, indexed by [`Section::index`].
     rail: [HWND; 3],
-    /// The content pane per section; created lazily on first visit and reused.
-    /// Only the New section uses a pane (the step-5 placeholder); the Recent/
-    /// Saved sections use `sections` (filter edit + list view) instead.
-    panes: [Option<HWND>; 3],
-    /// The placeholder pane currently visible (mirrors `section` for New).
-    content: Option<HWND>,
+    /// The New Connection form controls (created lazily; the New section shows
+    /// them instead of the step-5 placeholder pane).
+    form: Option<FormState>,
     /// Per-section list controls (Recent/Saved), created lazily.
     sections: [Option<SectionUi>; 3],
     /// The connection the user activated, returned by `run()` to the connect
@@ -245,20 +270,6 @@ impl HubWindow {
             // process, so ignoring "already exists" is fine (as in connbar.rs).
             let _ = RegisterClassExW(&wc);
 
-            // Placeholder pane class: custom-painted child windows that draw
-            // the section title + subtitle. Steps 6/7 replace these with real
-            // control hosts, but the shell needs a class to switch between.
-            let pane_class = w!("rdpioHubPaneClass");
-            let pane_wc = WNDCLASSEXW {
-                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                lpfnWndProc: Some(hub_pane_proc),
-                hInstance: hinstance,
-                lpszClassName: pane_class,
-                hbrBackground: CreateSolidBrush(COLORREF(COLOR_BG)),
-                ..Default::default()
-            };
-            let _ = RegisterClassExW(&pane_wc);
-
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 class_name,
@@ -280,8 +291,7 @@ impl HubWindow {
                 hinstance,
                 section: Section::Recent,
                 rail: [HWND::default(); 3],
-                panes: [None, None, None],
-                content: None,
+                form: None,
                 sections: [None, None, None],
                 selected: None,
                 destroyed: false,
@@ -340,21 +350,25 @@ impl HubWindow {
     }
 
     /// Switch the visible content to `section`, creating the section's controls
-    /// (filter edit + list view) or the placeholder pane on first visit. List
-    /// sections re-read their store on every switch so new saves / MRU entries
-    /// appear. Also re-highlights the rail buttons.
+    /// (list panes or the New Connection form) on first visit. List sections
+    /// re-read their store on every switch so new saves / MRU entries appear.
+    /// Also re-highlights the rail buttons.
     fn show_section(&mut self, section: Section) -> Result<(), HubError> {
         unsafe {
-            // Hide whatever is currently showing: the placeholder pane and
-            // every list section's filter/list pair.
-            if let Some(cur) = self.content {
-                let _ = ShowWindow(cur, SW_HIDE);
-                self.content = None;
+            // Hide whatever is currently showing: the form controls and every
+            // list section's filter/list/edit-button set.
+            if let Some(f) = &self.form {
+                for c in form_hwnds(f) {
+                    let _ = ShowWindow(c, SW_HIDE);
+                }
             }
             for s in Section::ALL {
                 if let Some(ui) = &self.sections[s.index()] {
                     let _ = ShowWindow(ui.filter, SW_HIDE);
                     let _ = ShowWindow(ui.list, SW_HIDE);
+                    if let Some(btn) = ui.edit_btn {
+                        let _ = ShowWindow(btn, SW_HIDE);
+                    }
                 }
             }
 
@@ -366,62 +380,26 @@ impl HubWindow {
                     if let Some(ui) = &self.sections[section.index()] {
                         let _ = ShowWindow(ui.filter, SW_SHOW);
                         let _ = ShowWindow(ui.list, SW_SHOW);
+                        if let Some(btn) = ui.edit_btn {
+                            let _ = ShowWindow(btn, SW_SHOW);
+                        }
                     }
                 }
                 Section::New => {
-                    // Placeholder pane for now; step-7 replaces it with the form.
-                    let idx = section.index();
-                    let pane = match self.panes[idx] {
-                        Some(p) => p,
-                        None => {
-                            let p = self.create_pane(section)?;
-                            self.panes[idx] = Some(p);
-                            p
+                    // The connection form (create, edit, delete).
+                    self.ensure_form()?;
+                    self.layout_form()?;
+                    if let Some(f) = &self.form {
+                        for c in form_hwnds(f) {
+                            let _ = ShowWindow(c, SW_SHOW);
                         }
-                    };
-                    let rc = self.content_rect()?;
-                    let _ = MoveWindow(
-                        pane,
-                        rc.left,
-                        rc.top,
-                        (rc.right - rc.left).max(1),
-                        (rc.bottom - rc.top).max(1),
-                        true,
-                    );
-                    let _ = ShowWindow(pane, SW_SHOW);
-                    self.content = Some(pane);
+                    }
                 }
             }
             self.section = section;
             self.repaint_rail();
             tracing::debug!(section = ?section, "hub switched section");
             Ok(())
-        }
-    }
-
-    /// Create the placeholder content pane for `section` (step-5 shell; steps
-    /// 6/7 replace this with the real per-section control sets).
-    fn create_pane(&mut self, section: Section) -> Result<HWND, HubError> {
-        unsafe {
-            let rc = self.content_rect()?;
-            let pane = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("rdpioHubPaneClass"),
-                w!(""),
-                WS_CHILD | WS_VISIBLE,
-                rc.left,
-                rc.top,
-                (rc.right - rc.left).max(1),
-                (rc.bottom - rc.top).max(1),
-                Some(self.hwnd),
-                None,
-                Some(self.hinstance),
-                None,
-            )
-            .map_err(|e| HubError::win32(format!("CreateWindowExW(pane {section:?}): {e}")))?;
-            // The pane window procedure reads this to pick the placeholder text.
-            SetWindowLongPtrW(pane, GWLP_USERDATA, section.index() as isize);
-            Ok(pane)
         }
     }
 
@@ -446,19 +424,7 @@ impl HubWindow {
             }
             match self.section {
                 Section::Recent | Section::Saved => self.layout_section(self.section)?,
-                Section::New => {
-                    if let Some(pane) = self.content {
-                        let rc = self.content_rect()?;
-                        let _ = MoveWindow(
-                            pane,
-                            rc.left,
-                            rc.top,
-                            (rc.right - rc.left).max(1),
-                            (rc.bottom - rc.top).max(1),
-                            true,
-                        );
-                    }
-                }
+                Section::New => self.layout_form()?,
             }
             Ok(())
         }
@@ -515,6 +481,14 @@ impl HubWindow {
                 }
                 _ => {}
             }
+        }
+
+        // New Connection form buttons + the Saved list's "Edit Selected".
+        match id {
+            ID_FORM_SAVE => return self.on_form_save(),
+            ID_FORM_DELETE => return self.on_form_delete(),
+            ID_BTN_EDIT_SAVED => return self.on_edit_saved(),
+            _ => {}
         }
         Ok(())
     }
@@ -626,9 +600,25 @@ impl HubWindow {
                 );
             }
 
+            // The Saved section gets an "Edit Selected" button that loads the
+            // highlighted row into the New Connection form for editing.
+            let edit_btn = if section == Section::Saved {
+                Some(create_child(
+                    self.hwnd,
+                    self.hinstance,
+                    "BUTTON",
+                    "Edit Selected",
+                    WS_CHILD | WS_VISIBLE,
+                    ID_BTN_EDIT_SAVED,
+                )?)
+            } else {
+                None
+            };
+
             self.sections[section.index()] = Some(SectionUi {
                 filter,
                 list,
+                edit_btn,
                 filter_text: String::new(),
                 rows: Vec::new(),
                 filtered: Vec::new(),
@@ -713,6 +703,9 @@ impl HubWindow {
         unsafe {
             let _ = MoveWindow(ui.filter, x, rc.top + 16, w, FILTER_H, true);
             let _ = MoveWindow(ui.list, x, list_top, w, list_h, true);
+            if let Some(btn) = ui.edit_btn {
+                let _ = MoveWindow(btn, x, list_top + list_h + 10, 140, 28, true);
+            }
         }
         Ok(())
     }
@@ -861,6 +854,291 @@ impl HubWindow {
         }
     }
 
+    // --- New Connection form (step-7) ----------------------------------------
+
+    /// Create the form controls on first visit to the New section.
+    fn ensure_form(&mut self) -> Result<(), HubError> {
+        if self.form.is_some() {
+            return Ok(());
+        }
+        let h = self.hwnd;
+        let inst = self.hinstance;
+        let edit_style =
+            WINDOW_STYLE((WS_CHILD | WS_VISIBLE | WS_BORDER).0 | ES_AUTOHSCROLL as u32);
+        let label_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0);
+        let btn_style = WS_CHILD | WS_VISIBLE;
+        let mk = |class: &'static str, text: &'static str, style: WINDOW_STYLE, id: usize| {
+            create_child(h, inst, class, text, style, id)
+        };
+
+        let labels = [
+            mk("STATIC", "Display name", label_style, 0)?,
+            mk("STATIC", "Host", label_style, 0)?,
+            mk("STATIC", "Port", label_style, 0)?,
+            mk("STATIC", "Username", label_style, 0)?,
+            mk("STATIC", "Domain", label_style, 0)?,
+            mk("STATIC", "Password", label_style, 0)?,
+        ];
+        let name = mk("EDIT", "", edit_style, ID_FORM_NAME)?;
+        let host = mk("EDIT", "", edit_style, ID_FORM_HOST)?;
+        let port = mk("EDIT", "", edit_style, ID_FORM_PORT)?;
+        let user = mk("EDIT", "", edit_style, ID_FORM_USER)?;
+        let domain = mk("EDIT", "", edit_style, ID_FORM_DOMAIN)?;
+        // The password edit masks input; the plaintext only exists in memory
+        // inside the edit buffer and is DPAPI-protected before any disk write.
+        let password = mk(
+            "EDIT",
+            "",
+            WINDOW_STYLE(edit_style.0 | ES_PASSWORD as u32),
+            ID_FORM_PASSWORD,
+        )?;
+        let save_pw = mk(
+            "BUTTON",
+            "Save password (DPAPI-protected)",
+            WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0 | BS_AUTOCHECKBOX as u32),
+            ID_FORM_SAVE_PW,
+        )?;
+        let btn_save = mk("BUTTON", "Save", btn_style, ID_FORM_SAVE)?;
+        let btn_delete = mk("BUTTON", "Delete", btn_style, ID_FORM_DELETE)?;
+
+        self.form = Some(FormState {
+            editing_id: None,
+            labels,
+            name,
+            host,
+            port,
+            user,
+            domain,
+            password,
+            save_pw,
+            btn_save,
+            btn_delete,
+        });
+        // Start blank with the save-password box checked.
+        self.clear_form();
+        Ok(())
+    }
+
+    /// Position the form controls in the content area (label column + edit
+    /// column, then the checkbox and the Save/Delete buttons).
+    fn layout_form(&mut self) -> Result<(), HubError> {
+        let Some(f) = self.form.as_ref() else {
+            return Ok(());
+        };
+        let rc = self.content_rect()?;
+        let left = rc.left + FORM_X;
+        let label_x = left;
+        let edit_x = left + FORM_LABEL_W;
+        let edit_w = (rc.right - edit_x - FORM_X).max(1);
+        let mut y = rc.top + FORM_TOP;
+        unsafe {
+            let rows: [(HWND, HWND, i32); 6] = [
+                (f.labels[0], f.name, edit_w),
+                (f.labels[1], f.host, edit_w),
+                (f.labels[2], f.port, FORM_PORT_W),
+                (f.labels[3], f.user, edit_w),
+                (f.labels[4], f.domain, edit_w),
+                (f.labels[5], f.password, edit_w),
+            ];
+            for (label, edit, ew) in rows {
+                let _ = MoveWindow(label, label_x, y, FORM_LABEL_W, FORM_EDIT_H, true);
+                let _ = MoveWindow(edit, edit_x, y, ew, FORM_EDIT_H, true);
+                y += FORM_ROW_H;
+            }
+            let _ = MoveWindow(f.save_pw, edit_x, y, 280, FORM_EDIT_H, true);
+            y += FORM_ROW_H;
+            let _ = MoveWindow(f.btn_save, edit_x, y, 100, 28, true);
+            let _ = MoveWindow(f.btn_delete, edit_x + 112, y, 100, 28, true);
+        }
+        Ok(())
+    }
+
+    /// Read the form, validate, and save via [`ConnectionStore::upsert`] (which
+    /// protects the password with DPAPI before anything touches disk). A blank
+    /// password on edit preserves the existing blob; unchecking "Save password"
+    /// stores none.
+    fn on_form_save(&mut self) -> Result<(), HubError> {
+        let Some(f) = self.form.as_ref() else {
+            return Ok(());
+        };
+        let name = read_edit_text(f.name);
+        let host = read_edit_text(f.host);
+        let port_text = read_edit_text(f.port);
+        let user = read_edit_text(f.user);
+        let domain = read_edit_text(f.domain);
+        let password = read_edit_text(f.password);
+        let save_pw = unsafe { SendMessageW(f.save_pw, BM_GETCHECK, None, None).0 == BST_CHECKED };
+        let editing_id = f.editing_id;
+
+        let host = host.trim().to_string();
+        if host.is_empty() {
+            show_message(self.hwnd, "Host must not be empty.", "Save Connection");
+            return Ok(());
+        }
+        let port: u16 = match port_text.trim().parse::<u16>() {
+            Ok(p) if (1..=65535).contains(&p) => p,
+            _ => {
+                show_message(
+                    self.hwnd,
+                    "Port must be a number from 1 to 65535.",
+                    "Save Connection",
+                );
+                return Ok(());
+            }
+        };
+
+        let input = ConnectionInput {
+            id: editing_id,
+            display_name: if name.trim().is_empty() {
+                host.clone()
+            } else {
+                name.trim().to_string()
+            },
+            host: host.clone(),
+            port,
+            username: non_empty(user),
+            domain: non_empty(domain),
+            password: if save_pw { Some(password) } else { None },
+        };
+        let mut store = ConnectionStore::load()?;
+        match store.upsert(input) {
+            Ok(rec) => {
+                tracing::info!(
+                    id = %rec.id,
+                    host = %rec.host,
+                    port,
+                    stored_password = save_pw,
+                    "saved connection"
+                );
+                self.clear_form();
+                if self.sections[Section::Saved.index()].is_some() {
+                    self.refresh_section(Section::Saved)?;
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "could not save connection"),
+        }
+        Ok(())
+    }
+
+    /// Delete the record loaded in the form, after a MessageBoxW confirmation.
+    fn on_form_delete(&mut self) -> Result<(), HubError> {
+        let Some(f) = self.form.as_ref() else {
+            return Ok(());
+        };
+        let Some(id) = f.editing_id else {
+            tracing::debug!("delete pressed with no record loaded");
+            return Ok(());
+        };
+        let host = read_edit_text(f.host);
+        let display = if host.trim().is_empty() {
+            "(unnamed connection)"
+        } else {
+            host.trim()
+        };
+        let question = format!("Delete the saved connection '{display}'?");
+        let confirmed = unsafe {
+            let q_w: Vec<u16> = question.encode_utf16().chain(std::iter::once(0)).collect();
+            MessageBoxW(
+                Some(self.hwnd),
+                PCWSTR(q_w.as_ptr()),
+                w!("Delete Connection"),
+                MB_YESNO | MB_ICONWARNING,
+            ) == IDYES
+        };
+        if !confirmed {
+            tracing::debug!(%id, "delete cancelled");
+            return Ok(());
+        }
+        let mut store = ConnectionStore::load()?;
+        match store.delete(&id) {
+            Ok(true) => {
+                tracing::info!(%id, "deleted saved connection");
+                self.clear_form();
+                if self.sections[Section::Saved.index()].is_some() {
+                    self.refresh_section(Section::Saved)?;
+                }
+            }
+            Ok(false) => tracing::warn!(%id, "delete: no such record"),
+            Err(e) => tracing::error!(error = %e, %id, "delete failed"),
+        }
+        Ok(())
+    }
+
+    /// Load the selected Saved row into the edit form, then switch to New.
+    fn on_edit_saved(&mut self) -> Result<(), HubError> {
+        let row = {
+            let Some(ui) = self.sections[Section::Saved.index()].as_ref() else {
+                return Ok(());
+            };
+            let sel = unsafe {
+                SendMessageW(
+                    ui.list,
+                    LVM_GETNEXTITEM,
+                    Some(WPARAM(usize::MAX)),
+                    Some(LPARAM(LVNI_SELECTED as isize)),
+                )
+                .0
+            };
+            if sel < 0 {
+                return Ok(());
+            }
+            ui.filtered
+                .get(sel as usize)
+                .and_then(|&i| ui.rows.get(i))
+                .cloned()
+        };
+        let Some(row) = row else {
+            return Ok(());
+        };
+        let Some(id) = row.connection_id else {
+            tracing::warn!("selected row has no saved record to edit");
+            return Ok(());
+        };
+        let store = ConnectionStore::load()?;
+        let Some(rec) = store.get(&id).cloned() else {
+            tracing::warn!(%id, "saved record for selected row no longer exists");
+            return Ok(());
+        };
+        self.load_into_form(&rec);
+        self.show_section(Section::New)
+    }
+
+    /// Fill the form from a saved record. The password field is left blank so
+    /// an untouched save preserves the existing DPAPI blob (store semantics).
+    fn load_into_form(&mut self, rec: &ConnectionRecord) {
+        let Some(f) = self.form.as_mut() else {
+            return;
+        };
+        set_edit_text(f.name, &rec.display_name);
+        set_edit_text(f.host, &rec.host);
+        set_edit_text(f.port, &rec.port.to_string());
+        set_edit_text(f.user, rec.username.as_deref().unwrap_or(""));
+        set_edit_text(f.domain, rec.domain.as_deref().unwrap_or(""));
+        set_edit_text(f.password, "");
+        unsafe {
+            let _ = SendMessageW(f.save_pw, BM_SETCHECK, Some(WPARAM(1)), None);
+        }
+        f.editing_id = Some(rec.id);
+        tracing::info!(id = %rec.id, host = %rec.host, "loaded saved connection into edit form");
+    }
+
+    /// Reset the form to a blank "new connection" state.
+    fn clear_form(&mut self) {
+        let Some(f) = self.form.as_mut() else {
+            return;
+        };
+        set_edit_text(f.name, "");
+        set_edit_text(f.host, "");
+        set_edit_text(f.port, "");
+        set_edit_text(f.user, "");
+        set_edit_text(f.domain, "");
+        set_edit_text(f.password, "");
+        unsafe {
+            let _ = SendMessageW(f.save_pw, BM_SETCHECK, Some(WPARAM(1)), None);
+        }
+        f.editing_id = None;
+    }
+
     /// WM_DRAWITEM: paint the owner-draw rail buttons.
     fn on_draw_item(&self, lparam: LPARAM) -> Result<(), HubError> {
         let ptr = lparam.0 as *const DRAWITEMSTRUCT;
@@ -919,16 +1197,12 @@ impl HubWindow {
 impl Drop for HubWindow {
     fn drop(&mut self) {
         unsafe {
-            // On the normal close path WM_DESTROY already ran (children and the
-            // main window are gone); only destroy explicitly when create()
-            // failed partway and the Box is dropped with the window still alive.
+            // On the normal close path WM_DESTROY already ran (the window and
+            // every child are gone); only destroy explicitly when create()
+            // failed partway and the Box is dropped with the window still
+            // alive. DestroyWindow tears down all children (rail buttons, list
+            // views, filter edits, the form) with the parent.
             if !self.destroyed {
-                for pane in self.panes.iter().flatten() {
-                    let _ = DestroyWindow(*pane);
-                }
-                for btn in &self.rail {
-                    let _ = DestroyWindow(*btn);
-                }
                 let _ = DestroyWindow(self.hwnd);
             }
         }
@@ -979,6 +1253,90 @@ fn apply_filter(ui: &mut SectionUi) {
         })
         .map(|(i, _)| i)
         .collect();
+}
+
+/// Create a child control of the hub window (labels, edits, buttons,
+/// checkboxes). System classes ("STATIC"/"EDIT"/"BUTTON") need no registration.
+fn create_child(
+    parent: HWND,
+    inst: HINSTANCE,
+    class: &'static str,
+    text: &'static str,
+    style: WINDOW_STYLE,
+    id: usize,
+) -> Result<HWND, HubError> {
+    unsafe {
+        let class_w: Vec<u16> = class.encode_utf16().chain(std::iter::once(0)).collect();
+        let text_w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(class_w.as_ptr()),
+            PCWSTR(text_w.as_ptr()),
+            style,
+            0,
+            0,
+            0,
+            0,
+            Some(parent),
+            Some(HMENU(id as *mut c_void)),
+            Some(inst),
+            None,
+        )
+        .map_err(|e| HubError::win32(format!("CreateWindowExW({class}): {e}")))
+    }
+}
+
+/// Set a control's text (edits, labels, buttons, checkbox).
+fn set_edit_text(hwnd: HWND, text: &str) {
+    unsafe {
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
+    }
+}
+
+/// Trim `s`; `None` when empty (for the optional username/domain fields).
+fn non_empty(s: String) -> Option<String> {
+    let t = s.trim().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// Every form control hwnd, for the show/hide pass on section switches.
+fn form_hwnds(f: &FormState) -> [HWND; 15] {
+    [
+        f.labels[0],
+        f.labels[1],
+        f.labels[2],
+        f.labels[3],
+        f.labels[4],
+        f.labels[5],
+        f.name,
+        f.host,
+        f.port,
+        f.user,
+        f.domain,
+        f.password,
+        f.save_pw,
+        f.btn_save,
+        f.btn_delete,
+    ]
+}
+
+/// A small modal warning box (validation failures).
+fn show_message(parent: HWND, text: &str, caption: &str) {
+    unsafe {
+        let text_w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let cap_w: Vec<u16> = caption.encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = MessageBoxW(
+            Some(parent),
+            PCWSTR(text_w.as_ptr()),
+            PCWSTR(cap_w.as_ptr()),
+            MB_OK | MB_ICONWARNING,
+        );
+    }
 }
 
 /// Subclass wndproc for the filter edits: intercepts Enter (connect the top
@@ -1099,78 +1457,6 @@ unsafe extern "system" fn hub_proc(
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-/// Placeholder pane window procedure: paints the section title + subtitle on a
-/// dark background. Steps 6/7 replace this with the real control hosts.
-unsafe extern "system" fn hub_pane_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_PAINT => {
-            let mut ps = PAINTSTRUCT::default();
-            let hdc = BeginPaint(hwnd, &mut ps);
-            let idx = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-            let section = match Section::from_index(idx as usize) {
-                Some(s) => s,
-                None => Section::Recent,
-            };
-            paint_placeholder(hwnd, hdc, &ps.rcPaint, section);
-            let _ = EndPaint(hwnd, &ps);
-            LRESULT(0)
-        }
-        // Everything is painted in WM_PAINT; skip the erase pass to avoid
-        // flicker.
-        WM_ERASEBKGND => LRESULT(1),
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-/// Draw the placeholder pane content: background fill (over the invalid clip
-/// rect), then a title and a dim subtitle positioned against the full client
-/// rect so partial repaints still land in the right place.
-fn paint_placeholder(hwnd: HWND, hdc: HDC, clip: &RECT, section: Section) {
-    unsafe {
-        let bg = CreateSolidBrush(COLORREF(COLOR_BG));
-        let _ = FillRect(hdc, clip, bg);
-        let _ = DeleteObject(bg.into());
-
-        let mut full = RECT::default();
-        if GetClientRect(hwnd, &mut full).is_err() {
-            full = *clip;
-        }
-
-        let _ = SetBkMode(hdc, TRANSPARENT);
-        let title_font = GetStockObject(DEFAULT_GUI_FONT);
-        let old_font = SelectObject(hdc, title_font);
-
-        let _ = SetTextColor(hdc, COLORREF(COLOR_TEXT));
-        let title = section.title();
-        let mut title_buf: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut title_rc = RECT {
-            left: full.left + 28,
-            top: full.top + 24,
-            right: full.right - 28,
-            bottom: full.top + 72,
-        };
-        let _ = DrawTextW(hdc, &mut title_buf, &mut title_rc, DT_LEFT | DT_TOP | DT_SINGLELINE);
-
-        let _ = SetTextColor(hdc, COLORREF(COLOR_TEXT_DIM));
-        let subtitle = section.placeholder_subtitle();
-        let mut sub_buf: Vec<u16> = subtitle.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut sub_rc = RECT {
-            left: full.left + 28,
-            top: full.top + 76,
-            right: full.right - 28,
-            bottom: full.top + 120,
-        };
-        let _ = DrawTextW(hdc, &mut sub_buf, &mut sub_rc, DT_LEFT | DT_TOP | DT_SINGLELINE);
-
-        let _ = SelectObject(hdc, old_font);
     }
 }
 
