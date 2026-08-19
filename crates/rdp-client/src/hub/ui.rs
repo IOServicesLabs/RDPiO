@@ -120,10 +120,14 @@ const BST_CHECKED: isize = 1;
 
 /// New Connection form geometry (relative to the content area).
 const FORM_X: i32 = 32;
-const FORM_LABEL_W: i32 = 120;
+const FORM_LABEL_H: i32 = 16;
+const FORM_LABEL_GAP: i32 = 12; // 12-16 DIP padding between label and field
 const FORM_EDIT_H: i32 = 24;
-const FORM_ROW_H: i32 = 36;
 const FORM_PORT_W: i32 = 140;
+const FORM_CHECK_H: i32 = 24;
+const FORM_BTN_H: i32 = 28;
+const FORM_BTN_GAP: i32 = 8;
+const FORM_ROW_GAP: i32 = 8;
 
 /// Default port prefilled into the Port edit every time a fresh blank New
 /// Connection form is opened (the standard RDP listener port). Only the blank
@@ -133,8 +137,10 @@ const FORM_DEFAULT_PORT: &str = "3389";
 
 /// Default hub window size (in pixels; `WM_SIZE` re-lays-out from the real
 /// client rect after creation).
-const HUB_W: i32 = 940;
-const HUB_H: i32 = 620;
+const HUB_W_DIP: i32 = 900;
+const HUB_H_DIP: i32 = 600;
+const HUB_MIN_W_DIP: i32 = 720;
+const HUB_MIN_H_DIP: i32 = 480;
 
 /// Slim left activity rail geometry. These are 96-DPI design values: the hub
 /// multiplies them through `theme::scale_px` so the rail stays at the same DIP
@@ -153,6 +159,17 @@ const RAIL_ACCENT_BAR_W: i32 = 2;
 
 /// Height of the filter-edit strip at the top of each list pane.
 const FILTER_H: i32 = 26;
+
+/// List-pane layout gaps (96-DPI design units, scaled via `theme::scale_px`):
+/// the list starts one grid step below the filter, keeps a bottom margin, and
+/// the Saved section reserves a row under the list for the Edit Selected
+/// button. Heights derive from the content rect at layout time so nothing
+/// overlaps even at the 720x480 DIP minimum window size.
+const LIST_TOP_GAP: i32 = 16;
+const LIST_BOTTOM_PAD: i32 = 16;
+const EDIT_BTN_H: i32 = 28;
+const EDIT_BTN_GAP: i32 = 8;
+const EDIT_BTN_W: i32 = 160;
 
 /// Section-header geometry: each pane starts with a 10pt-semibold title strip
 /// ("Recent" / "Saved" / "New Connection") above its content. Values are
@@ -1268,44 +1285,49 @@ impl HubWindow {
             return Ok(());
         };
         let rc = self.content_rect()?;
-        let left = rc.left + FORM_X;
-        let label_x = left;
-        let edit_x = left + FORM_LABEL_W;
-        let edit_w = (rc.right - edit_x - FORM_X).max(1);
-        let header_y = rc.top + SECTION_HEADER_TOP;
-        let mut y = header_y + SECTION_HEADER_H + SECTION_HEADER_GAP;
+        let dpi = self.dpi();
+        let left = rc.left + theme::scale_px(FORM_X, dpi);
+        let right = rc.right - theme::scale_px(FORM_X, dpi);
+        let field_w = (right - left).max(1);
+        let label_h = theme::scale_px(FORM_LABEL_H, dpi);
+        let label_gap = theme::scale_px(FORM_LABEL_GAP, dpi);
+        let edit_h = theme::scale_px(FORM_EDIT_H, dpi);
+        let row_h = label_h + label_gap + edit_h;
+        let header_y = rc.top + theme::scale_px(SECTION_HEADER_TOP, dpi);
+        let header_h = theme::scale_px(SECTION_HEADER_H, dpi);
+        let check_h = theme::scale_px(FORM_CHECK_H, dpi);
+        let btn_h = theme::scale_px(FORM_BTN_H, dpi);
+        let row_gap = theme::scale_px(FORM_ROW_GAP, dpi);
+        let btn_gap = theme::scale_px(FORM_BTN_GAP, dpi);
+        let port_w = theme::scale_px(FORM_PORT_W, dpi);
+        let mut y = header_y + header_h + theme::scale_px(SECTION_HEADER_GAP, dpi);
         unsafe {
-            let _ = MoveWindow(
-                f.header,
-                label_x,
-                header_y,
-                FORM_LABEL_W + edit_w,
-                SECTION_HEADER_H,
-                true,
-            );
+            let _ = MoveWindow(f.header, left, header_y, field_w, header_h, true);
+            // Six label-above-field rows on an 8px DIP grid: Port keeps its
+            // narrower width, the other five fields stretch to the right edge.
             let rows: [(HWND, HWND, i32); 6] = [
-                (f.labels[0], f.name, edit_w),
-                (f.labels[1], f.host, edit_w),
-                (f.labels[2], f.port, FORM_PORT_W),
-                (f.labels[3], f.user, edit_w),
-                (f.labels[4], f.domain, edit_w),
-                (f.labels[5], f.password, edit_w),
+                (f.labels[0], f.name, field_w),
+                (f.labels[1], f.host, field_w),
+                (f.labels[2], f.port, port_w),
+                (f.labels[3], f.user, field_w),
+                (f.labels[4], f.domain, field_w),
+                (f.labels[5], f.password, field_w),
             ];
             for (label, edit, ew) in rows {
-                let _ = MoveWindow(label, label_x, y, FORM_LABEL_W, FORM_EDIT_H, true);
-                let _ = MoveWindow(edit, edit_x, y, ew, FORM_EDIT_H, true);
-                y += FORM_ROW_H;
+                let _ = MoveWindow(label, left, y, ew, label_h, true);
+                let _ = MoveWindow(edit, left, y + label_h + label_gap, ew, edit_h, true);
+                y += row_h;
             }
-            let _ = MoveWindow(f.save_pw, edit_x, y, 280, FORM_EDIT_H, true);
-            y += FORM_ROW_H;
-            let _ = MoveWindow(f.btn_save, edit_x, y, 100, 28, true);
-            let _ = MoveWindow(f.btn_delete, edit_x + 112, y, 100, 28, true);
-            // The primary Connect button spans the form width at the bottom
-            // (the layout step owns final positioning; drawing + hit testing
-            // live here).
-            let connect_y = y + FORM_ROW_H;
-            let connect_w = (rc.right - edit_x - FORM_X).max(1);
-            let _ = MoveWindow(f.btn_connect, edit_x, connect_y, connect_w, 30, true);
+            // Save-password checkbox row.
+            let _ = MoveWindow(f.save_pw, left, y, field_w, check_h, true);
+            y += check_h + row_gap;
+            // Secondary buttons: Save + Delete side by side.
+            let btn_w = ((field_w - btn_gap) / 2).max(1);
+            let _ = MoveWindow(f.btn_save, left, y, btn_w, btn_h, true);
+            let _ = MoveWindow(f.btn_delete, left + btn_w + btn_gap, y, btn_w, btn_h, true);
+            y += btn_h + row_gap;
+            // Primary Connect button: spans the full form width at the bottom.
+            let _ = MoveWindow(f.btn_connect, left, y, field_w, btn_h, true);
         }
         Ok(())
     }
@@ -1761,6 +1783,50 @@ impl HubWindow {
 
     /// WM_SIZE: re-layout the rail and the visible pane for the new client size.
     fn on_size(&mut self, _lparam: LPARAM) -> Result<(), HubError> {
+        self.layout()
+    }
+
+    /// WM_GETMINMAXINFO: enforce the 720x480 DIP minimum window size, scaled
+    /// to physical pixels for the window's current DPI so the hub never shrinks
+    /// below what its panes need. Logs instead of panicking on a null pointer.
+    fn on_get_minmaxinfo(&self, lparam: LPARAM) -> Result<(), HubError> {
+        let ptr = lparam.0 as *mut MINMAXINFO;
+        if ptr.is_null() {
+            return Ok(());
+        }
+        let dpi = self.dpi();
+        unsafe {
+            let mmi = &mut *ptr;
+            mmi.ptMinTrackSize.x = theme::scale_px(HUB_MIN_W_DIP, dpi);
+            mmi.ptMinTrackSize.y = theme::scale_px(HUB_MIN_H_DIP, dpi);
+        }
+        Ok(())
+    }
+
+    /// WM_DPICHANGED: the window moved to a monitor with a different DPI.
+    /// Apply the system-suggested rect, recreate the DPI-keyed fonts and
+    /// margins, and re-run the reflow so every control stays crisp.
+    fn on_dpi_changed(&mut self, wparam: WPARAM, lparam: LPARAM) -> Result<(), HubError> {
+        let new_dpi = (wparam.0 & 0xffff) as u32;
+        tracing::info!(new_dpi, "hub DPI changed");
+        let ptr = lparam.0 as *const RECT;
+        if !ptr.is_null() {
+            unsafe {
+                let rc = &*ptr;
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    rc.left,
+                    rc.top,
+                    rc.right - rc.left,
+                    rc.bottom - rc.top,
+                    SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0),
+                );
+            }
+        }
+        // Fonts are DPI-keyed (cached per (pt, weight, dpi)); recreate and
+        // fan out, then reflow with the new scale.
+        self.apply_fonts();
         self.layout()
     }
 
