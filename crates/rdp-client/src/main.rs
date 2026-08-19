@@ -1232,6 +1232,13 @@ mod window;
 #[cfg(windows)]
 mod connbar;
 
+// Connection hub: saved-connection / MRU stores (DPAPI-protected passwords) and,
+// in later steps, the native Win32 hub window that launches sessions. Windows-only
+// because it reuses the DPAPI helpers in token_cache.rs and the Win32 window
+// pattern (the audit map lives in hub/mod.rs).
+#[cfg(windows)]
+mod hub;
+
 #[cfg(windows)]
 mod clipboard;
 
