@@ -21,7 +21,7 @@
 use core::ffi::c_void;
 
 use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, DrawTextW, FillRect, InvalidateRect, SetBkMode, SetTextColor,
     DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
@@ -38,7 +38,8 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::{
-    ConnectionInput, ConnectionRecord, ConnectionStore, ConnectionTarget, HubError, MruStore,
+    theme, ConnectionInput, ConnectionRecord, ConnectionStore, ConnectionTarget, HubError,
+    MruStore,
 };
 
 /// Control ids for the three activity-rail buttons (delivered as the LOWORD of
@@ -102,13 +103,6 @@ const RAIL_BTN_GAP: i32 = 6;
 
 /// Height of the filter-edit strip at the top of each list pane.
 const FILTER_H: i32 = 26;
-
-/// Dark-theme palette. `COLORREF` is 0x00BBGGRR.
-const COLOR_RAIL: u32 = 0x001E1E1E; // hub background visible behind the rail
-const COLOR_RAIL_BTN: u32 = 0x002E2E2E; // inactive rail button
-const COLOR_RAIL_BTN_ACTIVE: u32 = 0x0080531F; // RGB(0x1F,0x53,0x80) blue accent
-const COLOR_TEXT: u32 = 0x00E8E8E8; // bright text
-const COLOR_TEXT_DIM: u32 = 0x009A9A9A; // muted text
 
 /// The three hub activity sections, in rail order (index == rail slot).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,8 +256,9 @@ impl HubWindow {
                 hCursor: LoadCursorW(None, IDC_ARROW)
                     .map_err(|e| HubError::win32(format!("LoadCursorW: {e}")))?,
                 // The rail background; the content panes paint over their own
-                // area with COLOR_BG, so the hub brush only shows in the rail.
-                hbrBackground: CreateSolidBrush(COLORREF(COLOR_RAIL)),
+                // area with the theme palette, so the hub brush only shows in
+                // the rail.
+                hbrBackground: CreateSolidBrush(theme::BG),
                 ..Default::default()
             };
             // Registering an already-registered class fails; one window per
@@ -1154,20 +1149,19 @@ impl HubWindow {
         };
 
         let active = section == self.section;
-        let bg = if active {
-            COLOR_RAIL_BTN_ACTIVE
-        } else {
-            COLOR_RAIL_BTN
-        };
+        // Dark palette from the theme module: the resting rail button uses the
+        // panel fill, the active one a lighter fill. The 2px accent bar on the
+        // active section lands with the step-5 rail refactor.
+        let bg = if active { theme::ACTIVE_BG } else { theme::PANEL_BG };
         unsafe {
-            let brush = CreateSolidBrush(COLORREF(bg));
+            let brush = CreateSolidBrush(bg);
             let _ = FillRect(dis.hDC, &dis.rcItem, brush);
             let _ = DeleteObject(brush.into());
 
             let _ = SetBkMode(dis.hDC, TRANSPARENT);
             let _ = SetTextColor(
                 dis.hDC,
-                COLORREF(if active { COLOR_TEXT } else { COLOR_TEXT_DIM }),
+                if active { theme::TEXT } else { theme::MUTED_TEXT },
             );
             let mut text: Vec<u16> = section
                 .title()
