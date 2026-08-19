@@ -94,6 +94,11 @@ const ID_FORM_DELETE: usize = 28;
 /// "Edit Selected" button under the Saved list (loads a row into the form).
 const ID_BTN_EDIT_SAVED: usize = 29;
 
+/// The primary "Connect" button in the New Connection form: owner-drawn and
+/// accent-filled (buttons-dark step). The layout step positions it full-width
+/// at the bottom of the form; this step owns its drawing and hit testing.
+const ID_FORM_CONNECT: usize = 30;
+
 /// BM_GETCHECK result values (kept local; the BST_* constants live in another
 /// windows feature module we do not enable).
 const BST_CHECKED: isize = 1;
@@ -1372,6 +1377,28 @@ impl HubWindow {
         if dis.CtlType != ODT_BUTTON {
             return Ok(());
         }
+        // Non-rail hub buttons are owner-drawn here (buttons-dark): the
+        // primary Connect button is accent-filled, secondary buttons (Save /
+        // Delete / Edit Selected) are dark panel faces with a BORDER outline,
+        // and the Save-password checkbox gets a dark glyph + label. Rail
+        // buttons fall through to the rail painter below.
+        let dpi = self.dpi();
+        let pressed = (dis.itemState.0 & windows::Win32::UI::Controls::ODS_SELECTED.0) != 0;
+        match dis.CtlID as usize {
+            ID_FORM_CONNECT => {
+                draw_primary_button(dis, dpi, button_draw_hovered(dis.hwndItem), pressed);
+                return Ok(());
+            }
+            ID_FORM_SAVE | ID_FORM_DELETE | ID_BTN_EDIT_SAVED => {
+                draw_secondary_button(dis, dpi, button_draw_hovered(dis.hwndItem), pressed);
+                return Ok(());
+            }
+            ID_FORM_SAVE_PW => {
+                draw_checkbox(dis, dpi, button_draw_hovered(dis.hwndItem), pressed);
+                return Ok(());
+            }
+            _ => {}
+        }
         let Some(section) = Section::from_id(dis.CtlID as usize) else {
             return Ok(());
         };
@@ -1595,6 +1622,300 @@ fn section_list_id(section: Section) -> usize {
         Section::Saved => ID_LIST_SAVED,
         Section::New => 0,
     }
+}
+
+// --- buttons-dark: owner-drawn form/action buttons --------------------------
+// The activity-rail buttons are owner-drawn and hover-tracked by the rail
+// step; every other hub button (Save / Delete / Connect / "Edit Selected" /
+// the Save-password checkbox) is owner-drawn here with the same dark palette:
+// a BORDER-outlined PANEL face (hover -> ROW_HOVER, press -> darker) for the
+// secondary buttons, an ACCENT-filled primary Connect button, and a dark glyph
+// checkbox. Hover is tracked by subclassing the buttons (hub_button_proc) with
+// TrackMouseEvent; the shared flag below is read by the WM_DRAWITEM painter
+// and cross-checked against the real cursor so a hidden/re-shown button can
+// never paint a stale highlight.
+
+/// Process-global hover tracker for the owner-drawn form/action buttons, as
+/// `(hwnd, drawn_hovered)`. `drawn_hovered` records what WM_DRAWITEM last
+/// painted so the button subclass only invalidates on real visual transitions.
+/// The raw HWND is stored as `usize` so the mutex stays `Send`/`Sync` for the
+/// `static`. One hub per process, so a single slot is enough.
+static BTN_HOVER: std::sync::Mutex<Option<(usize, bool)>> = std::sync::Mutex::new(None);
+
+/// WM_DRAWITEM side of the hover tracker: returns whether `btn` should paint
+/// its hovered face right now — the tracked flag AND the cursor actually being
+/// over the button (belt-and-suspenders against stale state after a hidden
+/// button is re-shown, which never receives `WM_MOUSELEAVE`). Records the
+/// outcome so the subclass can dedupe repaints.
+fn button_draw_hovered(btn: HWND) -> bool {
+    let tracked = match BTN_HOVER.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    };
+    let tracked_here = tracked.map(|(h, _)| h == btn.0 as usize).unwrap_or(false);
+    let hovered = if tracked_here {
+        unsafe {
+            let mut pt = windows::Win32::Foundation::POINT::default();
+            if GetCursorPos(&mut pt).is_err() {
+                false
+            } else {
+                WindowFromPoint(pt) == btn
+            }
+        }
+    } else {
+        false
+    };
+    let mut guard = match BTN_HOVER.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    *guard = Some((btn.0 as usize, hovered));
+    hovered
+}
+
+/// Subclass side of the hover tracker: record that the cursor entered/left
+/// `btn` and invalidate only when the painted face actually changes. Entering
+/// always repaints when the button was not already drawn hovered (covers the
+/// hidden-then-re-shown case); leaving repaints only when the hover face was
+/// actually up.
+fn button_hover_changed(btn: HWND, hovered: bool) {
+    let mut guard = match BTN_HOVER.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let cur = *guard;
+    let matches = cur.map(|(h, _)| h == btn.0 as usize).unwrap_or(false);
+    let drawn = if matches { cur.unwrap().1 } else { false };
+    let repaint = if hovered {
+        !matches || !drawn
+    } else {
+        matches && drawn
+    };
+    *guard = if hovered {
+        Some((btn.0 as usize, drawn))
+    } else if matches {
+        None
+    } else {
+        cur
+    };
+    drop(guard);
+    if repaint {
+        unsafe {
+            let _ = InvalidateRect(Some(btn), None, true);
+        }
+    }
+}
+
+/// Fill `rc` with a solid `color` brush (create, fill, delete).
+fn paint_solid_rect(hdc: HDC, rc: &RECT, color: windows::Win32::Foundation::COLORREF) {
+    unsafe {
+        let brush = CreateSolidBrush(color);
+        let _ = FillRect(hdc, rc, brush);
+        let _ = DeleteObject(brush.into());
+    }
+}
+
+/// Draw `text` into `rc` on `hdc` with the cached Segoe UI face for `dpi`,
+/// transparent background, `color` text, and `align` plus single-line vertical
+/// centering. Restores the previously selected font afterwards, so every
+/// owner-drawn button label renders in the theme font at the window DPI.
+fn draw_button_label(
+    hdc: HDC,
+    rc: &RECT,
+    dpi: u32,
+    color: windows::Win32::Foundation::COLORREF,
+    align: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
+    text: &str,
+) {
+    unsafe {
+        let font = theme::ui_font(dpi);
+        let old = windows::Win32::Graphics::Gdi::SelectObject(
+            hdc,
+            windows::Win32::Graphics::Gdi::HGDIOBJ::from(font),
+        );
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, color);
+        let mut buf: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut trc = *rc;
+        let _ = DrawTextW(
+            hdc,
+            &mut buf,
+            &mut trc,
+            align | DT_SINGLELINE | DT_VCENTER | windows::Win32::Graphics::Gdi::DT_NOPREFIX,
+        );
+        let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old);
+    }
+}
+
+/// Paint the primary Connect button: a filled `theme::ACCENT` rectangle with
+/// white (`theme::ON_ACCENT`) text. Hover lifts the accent slightly, pressing
+/// darkens it toward the background so the click reads.
+fn draw_primary_button(dis: &DRAWITEMSTRUCT, dpi: u32, hovered: bool, pressed: bool) {
+    let fill = if pressed {
+        theme::color_mix(theme::ACCENT, theme::BG, 25)
+    } else if hovered {
+        theme::lighten(theme::ACCENT, 10)
+    } else {
+        theme::ACCENT
+    };
+    fill_rect(dis.hDC, &dis.rcItem, fill);
+    let label = read_edit_text(dis.hwndItem);
+    draw_button_label(dis.hDC, &dis.rcItem, dpi, theme::ON_ACCENT, DT_CENTER, &label);
+}
+
+/// Paint a secondary hub button (Save / Delete / Edit Selected): a dark
+/// `theme::PANEL` face (hover -> `theme::ROW_HOVER`, press -> darker) framed
+/// by a DPI-scaled 1px `theme::BORDER` outline, with a `theme::TEXT` label.
+/// Border width and text padding are scaled through [`theme::scale_px`].
+fn draw_secondary_button(dis: &DRAWITEMSTRUCT, dpi: u32, hovered: bool, pressed: bool) {
+    let fill = if pressed {
+        theme::color_mix(theme::PANEL, theme::BG, 40)
+    } else if hovered {
+        theme::ROW_HOVER
+    } else {
+        theme::PANEL
+    };
+    // Frame: fill the outer rect with the outline color, then the interior
+    // with the fill color, so the border is exactly `border` px at any DPI.
+    let border = theme::scale_px(1, dpi).max(1);
+    fill_rect(dis.hDC, &dis.rcItem, theme::BORDER);
+    let mut inner = dis.rcItem;
+    inner.left += border;
+    inner.top += border;
+    inner.right -= border;
+    inner.bottom -= border;
+    fill_rect(dis.hDC, &inner, fill);
+    let label = read_edit_text(dis.hwndItem);
+    let pad = theme::scale_px(10, dpi).max(4);
+    let mut trc = inner;
+    trc.left += pad;
+    trc.right -= pad;
+    draw_button_label(dis.hDC, &trc, dpi, theme::TEXT, DT_CENTER, &label);
+}
+
+/// Paint the Save-password checkbox: a BORDER-framed dark glyph square
+/// (ACCENT-filled with a white check when checked, `ROW_HOVER` on hover) and
+/// the label in `theme::TEXT` to its right. The check state comes from
+/// `ODS_CHECKED`, which the system maintains from the BS_AUTOCHECKBOX state.
+fn draw_checkbox(dis: &DRAWITEMSTRUCT, dpi: u32, hovered: bool, pressed: bool) {
+    let checked = (dis.itemState.0 & windows::Win32::UI::Controls::ODS_CHECKED.0) != 0;
+    let pad = theme::scale_px(6, dpi).max(3);
+    let gap = theme::scale_px(8, dpi).max(4);
+    let size = theme::scale_px(14, dpi).max(12);
+    let cy = (dis.rcItem.top + dis.rcItem.bottom) / 2;
+    let box_rc = RECT {
+        left: dis.rcItem.left + pad,
+        top: cy - size / 2,
+        right: dis.rcItem.left + pad + size,
+        bottom: cy - size / 2 + size,
+    };
+    let fill = if pressed {
+        theme::color_mix(theme::PANEL, theme::BG, 40)
+    } else if checked {
+        theme::ACCENT
+    } else if hovered {
+        theme::ROW_HOVER
+    } else {
+        theme::PANEL
+    };
+    let border = theme::scale_px(1, dpi).max(1);
+    fill_rect(dis.hDC, &box_rc, theme::BORDER);
+    let mut inner = box_rc;
+    inner.left += border;
+    inner.top += border;
+    inner.right -= border;
+    inner.bottom -= border;
+    fill_rect(dis.hDC, &inner, fill);
+    if checked {
+        // White check glyph (U+2713) centered in the box, in the theme font.
+        unsafe {
+            let font = theme::ui_font(dpi);
+            let old = windows::Win32::Graphics::Gdi::SelectObject(
+                dis.hDC,
+                windows::Win32::Graphics::Gdi::HGDIOBJ::from(font),
+            );
+            let _ = SetBkMode(dis.hDC, TRANSPARENT);
+            let _ = SetTextColor(dis.hDC, theme::ON_ACCENT);
+            let mut mark: Vec<u16> =
+                "\u{2713}".encode_utf16().chain(std::iter::once(0)).collect();
+            let mut mrc = inner;
+            let _ = DrawTextW(dis.hDC, &mut mark, &mut mrc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            let _ = windows::Win32::Graphics::Gdi::SelectObject(dis.hDC, old);
+        }
+    }
+    let label = read_edit_text(dis.hwndItem);
+    if !label.is_empty() {
+        let trc = RECT {
+            left: box_rc.right + gap,
+            top: dis.rcItem.top,
+            right: dis.rcItem.right - pad,
+            bottom: dis.rcItem.bottom,
+        };
+        paint_button_label(
+            dis.hDC,
+            &trc,
+            dpi,
+            theme::TEXT,
+            windows::Win32::Graphics::Gdi::DT_LEFT,
+            &label,
+        );
+    }
+}
+
+/// Install [`hub_button_proc`] on an owner-drawn hub button, chaining the
+/// stock button proc (kept in `GWLP_USERDATA`) so clicks, focus, and the
+/// auto-checkbox toggle keep working; ours only observes the mouse and paints
+/// a dark erase background.
+fn subclass_hub_button(btn: HWND) {
+    unsafe {
+        let old_proc = GetWindowLongPtrW(btn, GWLP_WNDPROC);
+        SetWindowLongPtrW(btn, GWLP_USERDATA, old_proc);
+        SetWindowLongPtrW(btn, GWLP_WNDPROC, hub_button_proc as *const () as isize);
+    }
+}
+
+/// Subclass wndproc for the owner-drawn form/action buttons (Save, Delete,
+/// Connect, Edit Selected, the Save-password checkbox): arms
+/// `TrackMouseEvent` leave-tracking and flips the shared hover flag on
+/// `WM_MOUSEMOVE` / `WM_MOUSELEAVE` (which repaints only on real visual
+/// transitions), and answers `WM_ERASEBKGND` with the dark panel fill so no
+/// stock `COLOR_BTNFACE` flash shows before `WM_DRAWITEM` paints. Everything
+/// else chains to the stock button proc. Never unwraps or panics.
+unsafe extern "system" fn hub_button_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_MOUSEMOVE => {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut tme);
+            button_hover_changed(hwnd, true);
+        }
+        WM_MOUSELEAVE => {
+            button_hover_changed(hwnd, false);
+            return LRESULT(0);
+        }
+        WM_ERASEBKGND => {
+            // Dark resting fill; WM_DRAWITEM overpaints hover/press states.
+            let hdc = HDC(wparam.0 as *mut c_void);
+            let mut rc = RECT::default();
+            if GetClientRect(hwnd, &mut rc).is_ok() && rc.right > rc.left && rc.bottom > rc.top {
+                paint_solid_rect(hdc, &rc, theme::PANEL);
+            }
+            return LRESULT(1);
+        }
+        _ => {}
+    }
+    let old = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    let old_proc: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
+    CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
 }
 
 /// Read an edit control's text (UTF-16, truncated at the first NUL).
