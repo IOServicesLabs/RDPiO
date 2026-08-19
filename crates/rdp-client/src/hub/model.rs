@@ -188,6 +188,49 @@ impl ConnectionTarget {
     }
 }
 
+/// Suggested display name for the New Connection form's display-name field.
+///
+/// Returns `Some(host)` — the current host text as the display name — only
+/// when the user has not manually edited the display field (`display_edited`
+/// is false) **and** the host actually differs from the value currently shown
+/// (`host != current_display`, so typing the same host back does not rewrite
+/// the field). Returns `None` once the user has edited the display field, so a
+/// typed name is never clobbered by later host edits.
+///
+/// Pure and side-effect free, so the form's autofill rule can be unit-tested
+/// without a window. The hub form (step-10) calls this on every host
+/// `EN_CHANGE` and applies the returned value, if any.
+pub fn autofill_display_name(
+    host: &str,
+    current_display: &str,
+    display_edited: bool,
+) -> Option<String> {
+    if display_edited {
+        return None;
+    }
+    if host == current_display {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+/// Preferred username for the New Connection form's username field.
+///
+/// Prefers the last-used username from MRU history; when history yields no
+/// non-empty username, falls back to the current Windows user. Returns `None`
+/// only when neither source has a usable (present, non-blank) value, in which
+/// case the form leaves the field empty.
+///
+/// Pure and side-effect free, so the prefill rule can be unit-tested without a
+/// window or DPAPI. The hub form (step-10) calls it with
+/// `store.last_used_username()` as `last_used` and `GetUserNameW` as
+/// `current_user`.
+pub fn prefill_username(last_used: Option<&str>, current_user: Option<&str>) -> Option<String> {
+    let last_used = last_used.map(str::trim).filter(|s| !s.is_empty());
+    let current_user = current_user.map(str::trim).filter(|s| !s.is_empty());
+    last_used.or(current_user).map(String::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +368,56 @@ mod tests {
         assert_eq!(t.username, None);
         assert_eq!(t.password, None);
         assert_eq!(t.connection_id, None);
+    }
+
+    #[test]
+    fn autofill_display_name_changes_with_host_while_not_edited() {
+        // Not edited: the suggestion follows the host as it is typed.
+        assert_eq!(
+            autofill_display_name("10.0.0.5", "", false),
+            Some("10.0.0.5".to_string())
+        );
+        assert_eq!(
+            autofill_display_name("10.0.0.5", "10", false),
+            Some("10.0.0.5".to_string())
+        );
+        // No actual change → nothing to apply (avoids rewriting the field).
+        assert_eq!(
+            autofill_display_name("10.0.0.5", "10.0.0.5", false),
+            None,
+            "host equal to current display must not re-suggest"
+        );
+    }
+
+    #[test]
+    fn autofill_display_name_never_overwrites_after_manual_edit() {
+        // Once edited, never clobber — even when the host changes again.
+        assert_eq!(
+            autofill_display_name("10.0.0.6", "My Server", true),
+            None,
+            "a manually edited display name must never be overwritten"
+        );
+        assert_eq!(
+            autofill_display_name("", "My Server", true),
+            None,
+            "even an emptied display field stays untouched once edited"
+        );
+    }
+
+    #[test]
+    fn prefill_username_prefers_last_used_then_falls_back() {
+        // Last-used wins over the current Windows user.
+        assert_eq!(
+            prefill_username(Some("bob"), Some("alice")),
+            Some("bob".to_string())
+        );
+        // A blank last-used username is not usable → fall back to current user.
+        assert_eq!(
+            prefill_username(Some("   "), Some("alice")),
+            Some("alice".to_string())
+        );
+        // Neither source has a value → blank field.
+        assert_eq!(prefill_username(None, None), None);
+        assert_eq!(prefill_username(Some(""), None), None);
     }
 }

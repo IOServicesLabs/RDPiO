@@ -188,6 +188,15 @@ pub mod store;
 // target args are given.
 mod ui;
 
+// The dark-theme palette and spacing/DPI helpers (step-2): the single source
+// of truth for every hub UI color; ui.rs paints from these constants, never
+// from raw color literals. Derived constants (HOVER_BG, SELECTION_BG, GRID,
+// scale, …) are consumed by the steps that follow (3-8); like `model` and
+// `store` above, silence the not-yet-used warnings rather than shipping a
+// noisy build.
+#[allow(dead_code)]
+mod theme;
+
 // The items below are the public API surface the later hub steps (ui) consume.
 // Nothing in the binary references the re-exports yet, so silence the
 // not-yet-used warnings rather than shipping a noisy build.
@@ -200,11 +209,30 @@ pub use store::{ConnectionInput, ConnectionStore, MruStore};
 // `hub::model` today and by the store/UI steps after it.
 pub use error::HubError;
 
+// Per-monitor DPI awareness is set at the top of [`run`] before any window or
+// font exists. `Win32_UI_HiDpi` is already enabled in this crate's `windows`
+// feature list (the connect window uses the same pair via `window.rs`).
+use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+
 /// Open the hub window and pump its message loop until the user closes it or
 /// selects a connection. Returns the chosen [`ConnectionTarget`] (from a
 /// Recent/Saved row activation), or `None` when the hub was closed without
 /// choosing. Called by `main()` when no connection-target args are given.
 pub fn run() -> Result<Option<ConnectionTarget>, HubError> {
+    // Per-monitor DPI awareness must be requested before any HWND or GDI font
+    // is created: the window class and every child control inherit the process
+    // DPI mode, and the hub lays out on an 8px grid scaled by the window DPI.
+    // Best-effort — on Windows releases older than 10 1607 the call fails
+    // harmlessly and we keep the default awareness so the hub still opens.
+    unsafe {
+        if let Err(e) = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        {
+            tracing::warn!(
+                error = %e,
+                "could not set per-monitor V2 DPI awareness; hub will use system DPI"
+            );
+        }
+    }
     ui::run()
 }
 

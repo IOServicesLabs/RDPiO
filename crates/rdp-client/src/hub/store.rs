@@ -266,6 +266,22 @@ impl MruStore {
         &self.records
     }
 
+    /// The most recently used non-empty username, or `None` when history has
+    /// no usable username.
+    ///
+    /// Walks the MRU list from the front (most recent) to the back and returns
+    /// the first username that is present and not blank. This is the New
+    /// Connection form's preferred username prefill: the most recent person
+    /// this user connected as. Read-only; never mutates the MRU list, so
+    /// ordering, cap, dedupe, and move-to-front behavior are untouched.
+    pub fn last_used_username(&self) -> Option<&str> {
+        self.records
+            .iter()
+            .filter_map(|r| r.username.as_deref())
+            .map(str::trim)
+            .find(|u| !u.is_empty())
+    }
+
     /// Record one successful connection and persist immediately.
     ///
     /// Dedupe key is the full target identity `(host, port, username, domain)`:
@@ -346,6 +362,21 @@ impl MruStore {
         let json = serde_json::to_vec_pretty(&self.records)?;
         atomic_write(&self.path, &json)?;
         Ok(())
+    }
+}
+
+/// Render the identity portion of a Recent entry: `user@host` when the user
+/// is present and non-empty, otherwise just `host`.
+///
+/// Pure and side-effect free so the Recent-list formatting (step-12) can be
+/// unit-tested without a window. A blank username renders as bare `host`,
+/// matching the CLI convention (`main.rs` shows `user@host` only when a user
+/// is known). The username is trimmed so a whitespace-only value degrades to
+/// the bare-host form instead of producing a dangling `@`.
+pub fn format_recent_identity(user: Option<&str>, host: &str) -> String {
+    match user.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(user) => format!("{user}@{host}"),
+        None => host.to_string(),
     }
 }
 
@@ -640,5 +671,56 @@ mod tests {
         assert_eq!(reloaded.list().len(), 1);
         assert_eq!(reloaded.list()[0].saved_password.unprotect().unwrap(), "pw");
         cleanup(&path);
+    }
+
+    #[test]
+    fn last_used_username_walks_mru_front_to_back() {
+        let path = temp_file("lastuser");
+        let mut store = MruStore::load_from(path.clone()).unwrap();
+        assert_eq!(
+            store.last_used_username(),
+            None,
+            "empty history has no username"
+        );
+
+        store
+            .record("first", 3389, None, None, "First", None)
+            .unwrap();
+        assert_eq!(store.last_used_username(), None, "no entry has a username");
+
+        store
+            .record("second", 3389, Some("bob".into()), None, "Second", None)
+            .unwrap();
+        store
+            .record("third", 3389, Some("carol".into()), None, "Third", None)
+            .unwrap();
+        // Newest first: carol is the most recent non-empty username.
+        assert_eq!(store.last_used_username(), Some("carol"));
+
+        // A blank username at the front is skipped in favour of the next one.
+        store
+            .record("blank", 3390, Some("".into()), None, "Blank", None)
+            .unwrap();
+        assert_eq!(store.last_used_username(), Some("carol"));
+
+        // The helper is read-only: history is unchanged by calling it.
+        assert_eq!(store.list_most_recent_first().len(), 4);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn format_recent_identity_renders_user_at_host_or_bare_host() {
+        assert_eq!(
+            format_recent_identity(Some("alice"), "box.local"),
+            "alice@box.local"
+        );
+        assert_eq!(
+            format_recent_identity(Some("alice"), "10.0.0.5"),
+            "alice@10.0.0.5"
+        );
+        // Empty or blank user → bare host, never a dangling '@'.
+        assert_eq!(format_recent_identity(None, "box.local"), "box.local");
+        assert_eq!(format_recent_identity(Some(""), "box.local"), "box.local");
+        assert_eq!(format_recent_identity(Some("  "), "box.local"), "box.local");
     }
 }
