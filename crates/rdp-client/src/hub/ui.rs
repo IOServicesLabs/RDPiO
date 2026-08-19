@@ -23,15 +23,15 @@ use core::ffi::c_void;
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, HDC, HGDIOBJ, InvalidateRect,
-    SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
-    HFONT,
+    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FrameRect, GetWindowDC, HBRUSH, HDC,
+    HGDIOBJ, InvalidateRect, ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+    DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT, HFONT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, DRAWITEMSTRUCT, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES,
+    InitCommonControlsEx, DRAWITEMSTRUCT, EM_SETCUEBANNER, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES,
     INITCOMMONCONTROLSEX, LVCOLUMNW, LVCOLUMNW_FORMAT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH,
-    LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETHEADER, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
     LVM_SETBKCOLOR, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVM_SETTEXTBKCOLOR,
     LVNI_SELECTED, LVN_ITEMACTIVATE, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_EX_TRACKSELECT,
     LVS_NOCOLUMNHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMITEMACTIVATE,
@@ -129,7 +129,7 @@ const FILTER_H: i32 = 26;
 /// 96-DPI design units; `WM_SIZE`/`WM_DPICHANGED` layout scales them through
 /// `theme::scale_px`.
 const SECTION_HEADER_TOP: i32 = 16;
-
+const SECTION_HEADER_H: i32 = 24;
 const SECTION_HEADER_GAP: i32 = 8;
 
 /// The three hub activity sections, in rail order (index == rail slot).
@@ -241,6 +241,11 @@ struct FormState {
 struct HubWindow {
     hwnd: HWND,
     hinstance: HINSTANCE,
+    /// Cached theme brushes returned from the WM_CTLCOLOR* handlers. Created
+    /// once in create(), deleted in Drop. A child control keeps the brush it
+    /// received until its next CTLCOLOR message, so it must outlive the call.
+    brush_bg: HBRUSH,
+    brush_panel: HBRUSH,
     /// The active section (highlighted rail button + visible content pane).
     section: Section,
     /// The three rail buttons, indexed by [`Section::index`].
@@ -318,9 +323,17 @@ impl HubWindow {
             )
             .map_err(|e| HubError::win32(format!("CreateWindowExW(hub): {e}")))?;
 
+            // Cached CTLCOLOR brushes: BG answers WM_CTLCOLORSTATIC (labels),
+            // PANEL answers WM_CTLCOLOREDIT (dark input fields). Both live for
+            // the whole hub lifetime and are freed in Drop.
+            let brush_bg = CreateSolidBrush(theme::BG);
+            let brush_panel = CreateSolidBrush(theme::PANEL);
+
             let mut hub = Box::new(HubWindow {
                 hwnd,
                 hinstance,
+                brush_bg,
+                brush_panel,
                 section: Section::Recent,
                 rail: [HWND::default(); 3],
                 rail_hover: [false; 3],
@@ -605,10 +618,12 @@ impl HubWindow {
             let header_y = rc.top + SECTION_HEADER_TOP;
             let content_top = header_y + SECTION_HEADER_H + SECTION_HEADER_GAP;
 
-            // Filter edit, subclassed so Enter can be caught (single-line edits
-            // send no Enter notification of their own).
+            // Filter edit. Created without WS_EX_CLIENTEDGE so no stock 3D
+            // sunken edge shows; the dark-edit subclass paints a 1px
+            // theme::BORDER frame and catches Enter (single-line edits send no
+            // Enter notification of their own).
             let filter = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
+                WINDOW_EX_STYLE(0),
                 w!("EDIT"),
                 w!(""),
                 WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0 | ES_AUTOHSCROLL as u32),
@@ -622,10 +637,20 @@ impl HubWindow {
                 None,
             )
             .map_err(|e| HubError::win32(format!("CreateWindowExW(filter {section:?}): {e}")))?;
-            // Chain the original wndproc: keep it in GWLP_USERDATA, install ours.
-            let old_proc = GetWindowLongPtrW(filter, GWLP_WNDPROC);
-            SetWindowLongPtrW(filter, GWLP_USERDATA, old_proc);
-            SetWindowLongPtrW(filter, GWLP_WNDPROC, filter_edit_proc as *const () as isize);
+            // Chain the original wndproc (kept in GWLP_USERDATA), install the
+            // dark-edit subclass, and set the cue-banner placeholder shown
+            // while the filter is empty.
+            subclass_dark_edit(filter);
+            let cue: Vec<u16> = "Filter connections..."
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let _ = SendMessageW(
+                filter,
+                EM_SETCUEBANNER,
+                Some(WPARAM(1)), // show the cue even while the filter has focus
+                Some(LPARAM(cue.as_ptr() as isize)),
+            );
 
             // SysListView32 report view. Both the Recent and Saved lists hide
             // their column header (LVS_NOCOLUMNHEADER) and paint dark rows via
@@ -1011,6 +1036,14 @@ impl HubWindow {
             WINDOW_STYLE(edit_style.0 | ES_PASSWORD as u32),
             ID_FORM_PASSWORD,
         )?;
+        // Every edit gets the dark-edit subclass: a 1px theme::BORDER frame
+        // via WM_NCPAINT, with the dark fill and TEXT color coming from the
+        // hub's WM_CTLCOLOREDIT handling.
+        for edit in [name, host, port, user, domain, password] {
+            // ensure_form is not an unsafe fn, so the subclass call (which
+            // pokes GWLP_WNDPROC) goes through an explicit unsafe block.
+            unsafe { subclass_dark_edit(edit); }
+        }
         let save_pw = mk(
             "BUTTON",
             "Save password (DPAPI-protected)",
@@ -1382,6 +1415,38 @@ impl HubWindow {
         self.destroyed = true;
         tracing::info!("hub window destroyed");
     }
+
+    /// WM_CTLCOLOREDIT / WM_CTLCOLORSTATIC / WM_CTLCOLORBTN: paint the form and
+    /// filter controls with the dark palette. Edit controls (the New Connection
+    /// fields and the Recent/Saved filter boxes) get `theme::TEXT` on a
+    /// `theme::PANEL` background; static labels get `theme::MUTED` on
+    /// `theme::BG`; the save-password checkbox gets `theme::TEXT` on
+    /// `theme::BG`. Returns the cached brush matching the background — the
+    /// control keeps it until its next CTLCOLOR message. No stock
+    /// `COLOR_WINDOW` / `COLOR_BTNFACE` brush is ever used.
+    fn on_ctl_color(&self, msg: u32, wparam: WPARAM, _lparam: LPARAM) -> LRESULT {
+        let hdc = HDC(wparam.0 as *mut c_void);
+        unsafe {
+            match msg {
+                WM_CTLCOLOREDIT => {
+                    let _ = SetTextColor(hdc, theme::TEXT);
+                    let _ = SetBkColor(hdc, theme::PANEL);
+                    LRESULT(self.brush_panel.0 as isize)
+                }
+                WM_CTLCOLORSTATIC => {
+                    let _ = SetTextColor(hdc, theme::MUTED);
+                    let _ = SetBkColor(hdc, theme::BG);
+                    LRESULT(self.brush_bg.0 as isize)
+                }
+                WM_CTLCOLORBTN => {
+                    let _ = SetTextColor(hdc, theme::TEXT);
+                    let _ = SetBkColor(hdc, theme::BG);
+                    LRESULT(self.brush_bg.0 as isize)
+                }
+                _ => LRESULT(0),
+            }
+        }
+    }
 }
 
 impl Drop for HubWindow {
@@ -1395,6 +1460,10 @@ impl Drop for HubWindow {
             if !self.destroyed {
                 let _ = DestroyWindow(self.hwnd);
             }
+            // Free the cached CTLCOLOR brushes. Once the window (and every
+            // child) is gone no control can still reference them.
+            let _ = DeleteObject(self.brush_bg.into());
+            let _ = DeleteObject(self.brush_panel.into());
         }
     }
 }
@@ -1587,31 +1656,101 @@ fn show_message(parent: HWND, text: &str, caption: &str) {
     }
 }
 
-/// Subclass wndproc for the filter edits: intercepts Enter (connect the top
-/// match) and chains everything else to the original proc, whose pointer is
-/// kept in the edit's `GWLP_USERDATA`. Never unwraps or panics.
-unsafe extern "system" fn filter_edit_proc(
+/// True when `hwnd` is one of the two list-section filter edits (which connect
+/// the top match on Enter). Form edits return false so Enter stays inert there.
+fn is_filter_edit(hwnd: HWND) -> bool {
+    unsafe {
+        match GetDlgCtrlID(hwnd) as usize {
+            ID_FILTER_RECENT | ID_FILTER_SAVED => true,
+            _ => false,
+        }
+    }
+}
+
+/// Install the dark-edit subclass on `edit`: the original class proc is kept
+/// in `GWLP_USERDATA` and `GWLP_WNDPROC` becomes [`dark_edit_proc`], which
+/// paints a 1px `theme::BORDER` frame on `WM_NCPAINT` (the edit is created
+/// without `WS_BORDER` / `WS_EX_CLIENTEDGE`, so no stock sunken edge shows)
+/// and reports Enter for the filter edits. Every hub edit goes through this so
+/// no stock white or 3D background ever appears.
+unsafe fn subclass_dark_edit(edit: HWND) {
+    let old_proc = GetWindowLongPtrW(edit, GWLP_WNDPROC);
+    SetWindowLongPtrW(edit, GWLP_USERDATA, old_proc);
+    SetWindowLongPtrW(edit, GWLP_WNDPROC, dark_edit_proc as *const () as isize);
+}
+
+/// Subclass wndproc for every hub edit control: the Recent/Saved filter edits
+/// and the six New Connection form fields. On `WM_NCPAINT` it paints a 1px
+/// `theme::BORDER` frame around the whole window; for the filter edits it
+/// intercepts Enter (connect the top match). Everything else chains to the
+/// original class proc kept in `GWLP_USERDATA`. Never unwraps or panics.
+unsafe extern "system" fn dark_edit_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if msg == WM_KEYDOWN && (wparam.0 & 0xffff) as u16 == VK_RETURN {
-        // Tell the hub (the edit's parent) the user pressed Enter; it connects
-        // the top filtered row. The edit's HWND rides along in lParam.
-        if let Ok(parent) = GetParent(hwnd) {
-            let _ = PostMessageW(
-                Some(parent),
-                WM_COMMAND,
-                WPARAM((NOTIFY_FILTER_ENTER as usize) << 16),
-                LPARAM(hwnd.0 as isize),
-            );
+    match msg {
+        WM_NCPAINT => {
+            // Run the standard non-client handling first (a no-op for our
+            // border-less edits), then paint the dark frame over the edge.
+            let old = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            let old_proc: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
+            let _ = CallWindowProcW(old_proc, hwnd, msg, wparam, lparam);
+            paint_dark_edit_border(hwnd);
+            return LRESULT(0);
         }
-        return LRESULT(0);
+        WM_KEYDOWN if (wparam.0 & 0xffff) as u16 == VK_RETURN => {
+            if is_filter_edit(hwnd) {
+                // Tell the hub (the edit's parent) the user pressed Enter; it
+                // connects the top filtered row. The edit's HWND rides along
+                // in lParam.
+                if let Ok(parent) = GetParent(hwnd) {
+                    let _ = PostMessageW(
+                        Some(parent),
+                        WM_COMMAND,
+                        WPARAM((NOTIFY_FILTER_ENTER as usize) << 16),
+                        LPARAM(hwnd.0 as isize),
+                    );
+                }
+                return LRESULT(0);
+            }
+            // Not a filter edit: fall through to the default edit behavior
+            // (the hub has no default button, so Enter does nothing).
+        }
+        _ => {}
     }
     let old = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     let old_proc: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
     CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
+}
+
+/// Paint a 1px `theme::BORDER` frame around the whole window (client +
+/// non-client) of an edit control. A window DC has its origin at the window's
+/// top-left corner, so the frame rect is (0,0,width,height) — the exact outer
+/// edge. Logs on failure rather than panicking.
+unsafe fn paint_dark_edit_border(hwnd: HWND) {
+    let hdc = GetWindowDC(Some(hwnd));
+    if hdc.is_invalid() {
+        tracing::warn!("paint_dark_edit_border: GetWindowDC failed");
+        return;
+    }
+    let mut rc = RECT::default();
+    if let Err(e) = GetWindowRect(hwnd, &mut rc) {
+        tracing::warn!(error = %e, "paint_dark_edit_border: GetWindowRect failed");
+        let _ = ReleaseDC(Some(hwnd), hdc);
+        return;
+    }
+    let frame = RECT {
+        left: 0,
+        top: 0,
+        right: rc.right - rc.left,
+        bottom: rc.bottom - rc.top,
+    };
+    let brush = CreateSolidBrush(theme::BORDER);
+    let _ = FrameRect(hdc, &frame, brush);
+    let _ = DeleteObject(brush.into());
+    let _ = ReleaseDC(Some(hwnd), hdc);
 }
 
 /// Fill the hub client area with the dark palette. The base fill is the window
@@ -1768,6 +1907,15 @@ unsafe extern "system" fn hub_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Dark form/filter controls: WM_CTLCOLOR* asks the parent for the brush
+    // and text colors an edit, static label, or checkbox paints with. Answer
+    // with the cached theme brushes so no stock white/gray background shows.
+    if msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLORBTN {
+        if let Some(state) = hub_state_mut(hwnd) {
+            return state.on_ctl_color(msg, wparam, lparam);
+        }
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
     match msg {
         WM_COMMAND => {
             if let Some(state) = hub_state_mut(hwnd) {
@@ -1921,12 +2069,8 @@ mod tests {
 }
 
 // --- fonts-typography: cached Segoe UI faces fanned out to every control ---
-/// Height of the section-header static (10pt semibold) at the top of a pane.
-const SECTION_HEADER_H: i32 = 26;
-/// Gap between the section header and the first control below it.
-const SECTION_HEADER_GAP: i32 = 10;
-/// Offset of the section header from the top of the content area.
-const SECTION_HEADER_TOP: i32 = 8;
+// The SECTION_HEADER_* layout constants live with the other geometry at the
+// top of this file (single definition).
 
 /// Send WM_SETFONT (with a redraw) so `hwnd` renders its text with `font`.
 fn set_font(hwnd: HWND, font: HFONT) {
@@ -1946,34 +2090,32 @@ impl HubWindow {
     fn apply_fonts(&self) {
         let base = theme::ui_font(self.dpi());
         let semibold = theme::ui_font_semibold(self.dpi());
-        unsafe {
-            set_font(self.hwnd, base);
-            for btn in &self.rail {
-                set_font(*btn, base);
+        set_font(self.hwnd, base);
+        for btn in &self.rail {
+            set_font(*btn, base);
+        }
+        if let Some(f) = &self.form {
+            set_font(f.header, semibold);
+            for label in &f.labels {
+                set_font(*label, base);
             }
-            if let Some(f) = &self.form {
-                set_font(f.header, semibold);
-                for label in &f.labels {
-                    set_font(*label, base);
+            for edit in [f.name, f.host, f.port, f.user, f.domain, f.password] {
+                set_font(edit, base);
+            }
+            for btn in [f.save_pw, f.btn_save, f.btn_delete] {
+                set_font(btn, base);
+            }
+        }
+        for s in Section::ALL {
+            if let Some(ui) = &self.sections[s.index()] {
+                set_font(ui.header, semibold);
+                set_font(ui.filter, base);
+                set_font(ui.list, base);
+                if let Some(hdr) = list_header(ui.list) {
+                    set_font(hdr, base);
                 }
-                for edit in [f.name, f.host, f.port, f.user, f.domain, f.password] {
-                    set_font(edit, base);
-                }
-                for btn in [f.save_pw, f.btn_save, f.btn_delete] {
+                if let Some(btn) = ui.edit_btn {
                     set_font(btn, base);
-                }
-            }
-            for s in Section::ALL {
-                if let Some(ui) = &self.sections[s.index()] {
-                    set_font(ui.header, semibold);
-                    set_font(ui.filter, base);
-                    set_font(ui.list, base);
-                    if let Some(hdr) = list_header(ui.list) {
-                        set_font(hdr, base);
-                    }
-                    if let Some(btn) = ui.edit_btn {
-                        set_font(btn, base);
-                    }
                 }
             }
         }
