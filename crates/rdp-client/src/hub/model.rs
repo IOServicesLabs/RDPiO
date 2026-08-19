@@ -416,8 +416,16 @@ mod tests {
             prefill_username(Some("   "), Some("alice")),
             Some("alice".to_string())
         );
+        // No MRU username at all → the current Windows user is the final
+        // fallback.
+        assert_eq!(
+            prefill_username(None, Some("alice")),
+            Some("alice".to_string())
+        );
         // Neither source has a value → blank field.
         assert_eq!(prefill_username(None, None), None);
         assert_eq!(prefill_username(Some(""), None), None);
+        // A blank current-user fallback is not usable either.
+        assert_eq!(prefill_username(None, Some("  ")), None);
     }
 }

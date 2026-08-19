@@ -204,6 +204,8 @@ mod theme;
 pub use model::{ConnectionRecord, ConnectionTarget, MruRecord, ProtectedPassword};
 #[allow(unused_imports)]
 pub use store::{ConnectionInput, ConnectionStore, MruStore};
+#[allow(unused_imports)]
+pub use store::{format_local_short_datetime, format_recent_identity};
 
 // Error type shared by every fallible hub operation (model, store, ui). Used by
 // `hub::model` today and by the store/UI steps after it.

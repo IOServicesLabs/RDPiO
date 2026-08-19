@@ -85,4 +85,12 @@ windows = { workspace = true, features = [
     # owner-draw activity rail, and (step-6) the SysListView32 Recent/Saved lists.
     # A feature of the already-present `windows` crate - no new UI framework.
     "Win32_UI_Controls",
+    # Username-default step: GetUserNameW for the New Connection form's username
+    # prefill fallback when MRU history has no usable username.
+    "Win32_System_WindowsProgramming",
+    # Hub Recent list (step-12 mru-display): locale-aware "Last Used" timestamps
+    # via GetDateFormatW/GetTimeFormatW (DATE_SHORTDATE / TIME_NOSECONDS), plus
+    # FileTimeToLocalFileTime/FileTimeToSystemTime for the UTC->local conversion.
+    "Win32_Globalization",
+    "Win32_System_Time",
 ] }
