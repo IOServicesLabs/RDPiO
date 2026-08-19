@@ -46,6 +46,10 @@ ureq = { version = "2.10", features = ["json"] }
 # lists take that contention off the hot path.
 mimalloc = "0.1"
 serde_json = "1.0"
+# Hub model/store: serde-derive for the connection/MRU records, uuid v4 ids
+# (+serde so ConnectionRecord::id round-trips through JSON).
+serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 url = "2.5"
 http = "1.0"

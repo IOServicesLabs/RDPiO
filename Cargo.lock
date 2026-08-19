@@ -1536,6 +1536,7 @@ dependencies = [
  "rdp-webrtc",
  "rustls",
  "rustls-pki-types",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tracing",
@@ -1543,6 +1544,7 @@ dependencies = [
  "tungstenite",
  "ureq",
  "url",
+ "uuid",
  "webpki-roots 0.26.11",
  "webview2-com",
  "windows",
@@ -2408,6 +2410,7 @@ checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
