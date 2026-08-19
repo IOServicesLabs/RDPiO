@@ -218,6 +218,19 @@ fn record_mru(args: &Args) {
         .hub_display_name
         .clone()
         .unwrap_or_else(|| host.clone());
+
+    // Step-10: give the in-session connection bar the session facts so its
+    // "Save this connection" dialog can prefill display name, host, port,
+    // username, domain, and (when still available) the plaintext password.
+    crate::connbar::set_session_info(crate::connbar::SessionInfo {
+        display_name: display_name.clone(),
+        host: host.clone(),
+        port: args.port,
+        username: args.user.clone(),
+        domain: args.domain.clone(),
+        password: args.password.clone(),
+    });
+
     match hub::MruStore::load().and_then(|mut store| {
         store.record(
             host.clone(),
