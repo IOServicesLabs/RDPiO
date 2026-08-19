@@ -21,10 +21,11 @@
 use core::ffi::c_void;
 
 use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, HDC, InvalidateRect, SetBkMode,
-    SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
+    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, HDC, HGDIOBJ, InvalidateRect,
+    SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
+    HFONT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
@@ -34,8 +35,9 @@ use windows::Win32::UI::Controls::{
     LVM_SETBKCOLOR, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVM_SETTEXTBKCOLOR,
     LVNI_SELECTED, LVN_ITEMACTIVATE, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_EX_TRACKSELECT,
     LVS_NOCOLUMNHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMITEMACTIVATE,
-    NM_CUSTOMDRAW, NM_DBLCLK, NMLVCUSTOMDRAW, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_HOT,
-    CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, ODT_BUTTON, WM_MOUSELEAVE,
+    NMCUSTOMDRAW_DRAW_STATE_FLAGS, NM_CUSTOMDRAW, NM_DBLCLK, NMLVCUSTOMDRAW, CDDS_ITEMPREPAINT,
+    CDDS_PREPAINT, CDIS_HOT, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, ODT_BUTTON,
+    WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
@@ -94,7 +96,6 @@ const BST_CHECKED: isize = 1;
 
 /// New Connection form geometry (relative to the content area).
 const FORM_X: i32 = 32;
-const FORM_TOP: i32 = 28;
 const FORM_LABEL_W: i32 = 120;
 const FORM_EDIT_H: i32 = 24;
 const FORM_ROW_H: i32 = 36;
@@ -122,6 +123,14 @@ const RAIL_ACCENT_BAR_W: i32 = 2;
 
 /// Height of the filter-edit strip at the top of each list pane.
 const FILTER_H: i32 = 26;
+
+/// Section-header geometry: each pane starts with a 10pt-semibold title strip
+/// ("Recent" / "Saved" / "New Connection") above its content. Values are
+/// 96-DPI design units; `WM_SIZE`/`WM_DPICHANGED` layout scales them through
+/// `theme::scale_px`.
+const SECTION_HEADER_TOP: i32 = 16;
+const SECTION_HEADER_H: i32 = 24;
+const SECTION_HEADER_GAP: i32 = 8;
 
 /// The three hub activity sections, in rail order (index == rail slot).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +197,9 @@ struct ListRow {
 
 /// The controls + live data of one list section (Recent or Saved).
 struct SectionUi {
+    /// Section title static ("Recent" / "Saved"), set to the 10pt semibold
+    /// Segoe UI face by `apply_fonts`.
+    header: HWND,
     /// Filter edit (subclassed to catch Enter).
     filter: HWND,
     /// SysListView32 report view.
@@ -208,6 +220,8 @@ struct SectionUi {
 /// saved record — Save then updates it and Delete removes it.
 struct FormState {
     editing_id: Option<uuid::Uuid>,
+    /// "New Connection" title static (10pt semibold) at the top of the form.
+    header: HWND,
     /// The six field labels (one per edit row).
     labels: [HWND; 6],
     name: HWND,
@@ -278,9 +292,9 @@ impl HubWindow {
                 lpszClassName: class_name,
                 hCursor: LoadCursorW(None, IDC_ARROW)
                     .map_err(|e| HubError::win32(format!("LoadCursorW: {e}")))?,
-                // The rail background; the content panes paint over their own
-                // area with the theme palette, so the hub brush only shows in
-                // the rail.
+                // The window background (#1E1E1E). WM_ERASEBKGND paints the
+                // same color over the full client rect; the rail and content
+                // containers overpaint it with the panel palette.
                 hbrBackground: CreateSolidBrush(theme::BG),
                 ..Default::default()
             };
@@ -396,6 +410,7 @@ impl HubWindow {
             }
             for s in Section::ALL {
                 if let Some(ui) = &self.sections[s.index()] {
+                    let _ = ShowWindow(ui.header, SW_HIDE);
                     let _ = ShowWindow(ui.filter, SW_HIDE);
                     let _ = ShowWindow(ui.list, SW_HIDE);
                     if let Some(btn) = ui.edit_btn {
@@ -410,6 +425,7 @@ impl HubWindow {
                     self.refresh_section(section)?;
                     self.layout_section(section)?;
                     if let Some(ui) = &self.sections[section.index()] {
+                        let _ = ShowWindow(ui.header, SW_SHOW);
                         let _ = ShowWindow(ui.filter, SW_SHOW);
                         let _ = ShowWindow(ui.list, SW_SHOW);
                         if let Some(btn) = ui.edit_btn {
@@ -430,6 +446,9 @@ impl HubWindow {
             }
             self.section = section;
             self.repaint_rail();
+            // Fonts are fanned out after lazy control creation so late-created
+            // panes/forms pick up the cached Segoe UI faces too (idempotent).
+            self.apply_fonts();
             tracing::debug!(section = ?section, "hub switched section");
             Ok(())
         }
@@ -484,6 +503,7 @@ impl HubWindow {
         }
     }
 
+    
     // --- Fallible message handlers -------------------------------------------
     // Each returns Result so the window procedure can log the failure and keep
     // running; none of them unwrap or panic.
@@ -540,18 +560,22 @@ impl HubWindow {
     /// WM_NOTIFY: list-view notifications. Activation (NM_DBLCLK /
     /// LVN_ITEMACTIVATE) builds a [`ConnectionTarget`] from the activated row
     /// and hands it to the hub runner (posts WM_QUIT; `run()` returns the
-    /// target). NM_CUSTOMDRAW (Recent list) paints the rows with the dark
-    /// palette and returns the CDRF_* response the list view expects.
+    /// target). NM_CUSTOMDRAW (Recent and Saved lists) paints the rows with
+    /// the dark palette and returns the CDRF_* response the list view expects.
     fn on_notify(&mut self, lparam: LPARAM) -> Result<LRESULT, HubError> {
         let ptr = lparam.0 as *const NMHDR;
         if ptr.is_null() {
             return Ok(LRESULT(0));
         }
         let hdr = unsafe { &*ptr };
-        // Custom-draw painting for the Recent list view: the CDRF flags must be
-        // returned to the control, so this is handled before activation.
-        if hdr.code == NM_CUSTOMDRAW && hdr.idFrom == ID_LIST_RECENT {
-            return Ok(self.on_list_custom_draw(lparam));
+        // Custom-draw painting for the Recent and Saved list views: the CDRF
+        // flags must be returned to the control, so this is handled before
+        // activation. Both lists route through the same dark-row handler
+        // (paint_list_custom_draw) so the two panes cannot drift.
+        if hdr.code == NM_CUSTOMDRAW
+            && (hdr.idFrom == ID_LIST_RECENT || hdr.idFrom == ID_LIST_SAVED)
+        {
+            return Ok(paint_list_custom_draw(lparam));
         }
         if hdr.code == NM_DBLCLK || hdr.code == LVN_ITEMACTIVATE {
             let item = unsafe { &*(lparam.0 as *const NMITEMACTIVATE) };
@@ -565,53 +589,6 @@ impl HubWindow {
             }
         }
         Ok(LRESULT(0))
-    }
-
-    /// NM_CUSTOMDRAW for the Recent `SysListView32`: dark rows on the theme
-    /// palette. At `CDDS_PREPAINT` we opt into per-item drawing
-    /// (`CDRF_NOTIFYITEMDRAW`); at `CDDS_ITEMPREPAINT` we set
-    /// `NMLVCUSTOMDRAW::clrText` / `clrTextBk` — base `TEXT` on `PANEL`, a
-    /// `ROW_ALT` zebra tint on odd rows, `ROW_HOVER` while hot (track-select
-    /// lights the row under the mouse), and `ROW_SELECT` (accent tint) for the
-    /// selected row — then let the control draw with those colors
-    /// (`CDRF_DODEFAULT`). Returns the `CDRF_*` flags the list view expects;
-    /// never unwraps or panics on the paint path.
-    fn on_list_custom_draw(&self, lparam: LPARAM) -> LRESULT {
-        let ptr = lparam.0 as *mut NMLVCUSTOMDRAW;
-        if ptr.is_null() {
-            return LRESULT(CDRF_DODEFAULT as isize);
-        }
-        // Copy the fields we need out of the notification before writing the
-        // colors back through the raw pointer (no overlapping borrows).
-        let (stage, item, state) = unsafe {
-            let cd = &*ptr;
-            (cd.nmcd.dwDrawStage, cd.nmcd.dwItemSpec, cd.nmcd.uItemState)
-        };
-        if stage == CDDS_PREPAINT {
-            // Ask for per-item draw notifications.
-            return LRESULT(CDRF_NOTIFYITEMDRAW as isize);
-        }
-        if stage == CDDS_ITEMPREPAINT {
-            // Zebra tint on odd rows first; hover and selection override it.
-            let mut bg = if item % 2 == 1 {
-                theme::ROW_ALT
-            } else {
-                theme::PANEL
-            };
-            if state.contains(CDIS_HOT) {
-                bg = theme::ROW_HOVER;
-            } else if state.contains(CDIS_SELECTED) {
-                bg = theme::ROW_SELECT;
-            }
-            // Write the colors back into the notification struct; the list
-            // view paints the row text with them.
-            unsafe {
-                (*ptr).clrText = theme::TEXT;
-                (*ptr).clrTextBk = bg;
-            }
-            return LRESULT(CDRF_DODEFAULT as isize);
-        }
-        LRESULT(CDRF_DODEFAULT as isize)
     }
 
     /// Create the filter edit + SysListView32 for a list section on first visit.
@@ -632,7 +609,7 @@ impl HubWindow {
                 w!(""),
                 WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0 | ES_AUTOHSCROLL as u32),
                 x,
-                rc.top + 16,
+                content_top,
                 w,
                 FILTER_H,
                 Some(self.hwnd),
@@ -646,26 +623,24 @@ impl HubWindow {
             SetWindowLongPtrW(filter, GWLP_USERDATA, old_proc);
             SetWindowLongPtrW(filter, GWLP_WNDPROC, filter_edit_proc as *const () as isize);
 
-            // SysListView32 report view. The Recent list hides its column
-            // header (LVS_NOCOLUMNHEADER) and paints dark rows via
-            // NM_CUSTOMDRAW (see on_list_custom_draw); the Saved list keeps the
-            // stock header until the saved-list dark step lands.
-            let base_style =
-                (WS_CHILD | WS_VISIBLE).0 | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS;
-            let list_style = if section == Section::Recent {
-                base_style | LVS_NOCOLUMNHEADER
-            } else {
-                base_style
-            };
+            // SysListView32 report view. Both the Recent and Saved lists hide
+            // their column header (LVS_NOCOLUMNHEADER) and paint dark rows via
+            // NM_CUSTOMDRAW (see paint_list_custom_draw), so neither pane can
+            // show a stock white header or row background.
+            let list_style = (WS_CHILD | WS_VISIBLE).0
+                | LVS_REPORT
+                | LVS_SINGLESEL
+                | LVS_SHOWSELALWAYS
+                | LVS_NOCOLUMNHEADER;
             let list = CreateWindowExW(
                 WS_EX_CLIENTEDGE,
                 w!("SysListView32"),
                 w!(""),
                 WINDOW_STYLE(list_style),
                 x,
-                rc.top + 16 + FILTER_H + 14,
+                content_top + FILTER_H + 14,
                 w,
-                (rc.bottom - rc.top - 16 - FILTER_H - 14 - 16).max(1),
+                (rc.bottom - content_top - FILTER_H - 14 - 16).max(1),
                 Some(self.hwnd),
                 Some(HMENU(section_list_id(section) as *mut c_void)),
                 Some(self.hinstance),
@@ -673,12 +648,9 @@ impl HubWindow {
             )
             .map_err(|e| HubError::win32(format!("CreateWindowExW(list {section:?}): {e}")))?;
             // Track-select hover highlighting + full-row selection + grid
-            // separators; LVS_EX_TRACKSELECT is what feeds CDIS_HOT to the
-            // Recent list's custom-draw handler on hover.
-            let mut ext_styles = LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES;
-            if section == Section::Recent {
-                ext_styles |= LVS_EX_TRACKSELECT;
-            }
+            // separators; LVS_EX_TRACKSELECT is what feeds CDIS_HOT to both
+            // lists' shared custom-draw handler on hover.
+            let ext_styles = LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_TRACKSELECT;
             let _ = SendMessageW(
                 list,
                 LVM_SETEXTENDEDLISTVIEWSTYLE,
@@ -686,21 +658,19 @@ impl HubWindow {
                 Some(LPARAM(ext_styles as isize)),
             );
             // Dark list backdrop: the list area and its text background both
-            // use theme::PANEL so no stock white shows through the Recent list.
-            if section == Section::Recent {
-                let _ = SendMessageW(
-                    list,
-                    LVM_SETBKCOLOR,
-                    None,
-                    Some(LPARAM(theme::PANEL.0 as isize)),
-                );
-                let _ = SendMessageW(
-                    list,
-                    LVM_SETTEXTBKCOLOR,
-                    None,
-                    Some(LPARAM(theme::PANEL.0 as isize)),
-                );
-            }
+            // use theme::PANEL so no stock white shows through either list.
+            let _ = SendMessageW(
+                list,
+                LVM_SETBKCOLOR,
+                None,
+                Some(LPARAM(theme::PANEL.0 as isize)),
+            );
+            let _ = SendMessageW(
+                list,
+                LVM_SETTEXTBKCOLOR,
+                None,
+                Some(LPARAM(theme::PANEL.0 as isize)),
+            );
 
             // Columns: Name, Host, User, Last Used.
             const COLS: [(&str, i32); 4] = [
@@ -742,8 +712,19 @@ impl HubWindow {
             } else {
                 None
             };
+            // Section title static (10pt semibold, set by apply_fonts) above
+            // the filter strip.
+            let header = create_child(
+                self.hwnd,
+                self.hinstance,
+                "STATIC",
+                section.title(),
+                WS_CHILD | WS_VISIBLE,
+                0,
+            )?;
 
             self.sections[section.index()] = Some(SectionUi {
+                header,
                 filter,
                 list,
                 edit_btn,
@@ -826,10 +807,13 @@ impl HubWindow {
         let rc = self.content_rect()?;
         let x = rc.left + 16;
         let w = (rc.right - rc.left - 32).max(1);
-        let list_top = rc.top + 16 + FILTER_H + 14;
+        let header_y = rc.top + SECTION_HEADER_TOP;
+        let content_top = header_y + SECTION_HEADER_H + SECTION_HEADER_GAP;
+        let list_top = content_top + FILTER_H + 14;
         let list_h = (rc.bottom - list_top - 16).max(1);
         unsafe {
-            let _ = MoveWindow(ui.filter, x, rc.top + 16, w, FILTER_H, true);
+            let _ = MoveWindow(ui.header, x, header_y, w, SECTION_HEADER_H, true);
+            let _ = MoveWindow(ui.filter, x, content_top, w, FILTER_H, true);
             let _ = MoveWindow(ui.list, x, list_top, w, list_h, true);
             if let Some(btn) = ui.edit_btn {
                 let _ = MoveWindow(btn, x, list_top + list_h + 10, 140, 28, true);
@@ -999,6 +983,9 @@ impl HubWindow {
             create_child(h, inst, class, text, style, id)
         };
 
+        // Section-title header, rendered in the 10pt semibold face.
+        let header = mk("STATIC", "New Connection", label_style, 0)?;
+
         let labels = [
             mk("STATIC", "Display name", label_style, 0)?,
             mk("STATIC", "Host", label_style, 0)?,
@@ -1031,6 +1018,7 @@ impl HubWindow {
 
         self.form = Some(FormState {
             editing_id: None,
+            header,
             labels,
             name,
             host,
@@ -1058,8 +1046,17 @@ impl HubWindow {
         let label_x = left;
         let edit_x = left + FORM_LABEL_W;
         let edit_w = (rc.right - edit_x - FORM_X).max(1);
-        let mut y = rc.top + FORM_TOP;
+        let header_y = rc.top + SECTION_HEADER_TOP;
+        let mut y = header_y + SECTION_HEADER_H + SECTION_HEADER_GAP;
         unsafe {
+            let _ = MoveWindow(
+                f.header,
+                label_x,
+                header_y,
+                FORM_LABEL_W + edit_w,
+                SECTION_HEADER_H,
+                true,
+            );
             let rows: [(HWND, HWND, i32); 6] = [
                 (f.labels[0], f.name, edit_w),
                 (f.labels[1], f.host, edit_w),
@@ -1324,6 +1321,13 @@ impl HubWindow {
 
             let _ = SetBkMode(dis.hDC, TRANSPARENT);
             let _ = SetTextColor(dis.hDC, text);
+            // Owner-drawn buttons do not repaint with WM_SETFONT; select the
+            // control's font (set by apply_fonts) into the DC so the label
+            // renders in Segoe UI rather than the default GUI font.
+            let font = SendMessageW(dis.hwndItem, WM_GETFONT, None, None).0 as *mut c_void;
+            if !font.is_null() {
+                let _ = SelectObject(dis.hDC, HGDIOBJ(font));
+            }
             let mut text: Vec<u16> = section
                 .title()
                 .encode_utf16()
@@ -1389,6 +1393,61 @@ impl Drop for HubWindow {
             }
         }
     }
+}
+
+/// Shared NM_CUSTOMDRAW row-painting logic for the Recent and Saved
+/// `SysListView32` panes. Returns the background [`COLORREF`] a row should be
+/// painted with: `PANEL` with a `ROW_ALT` zebra tint on odd rows, lifted to
+/// `ROW_HOVER` while the row is hot (track-select lights the row under the
+/// mouse) and to `ROW_SELECT` (accent tint) for the selected row. Hover wins
+/// over selection, matching the original Recent-list behavior; both list panes
+/// call this same helper so their row rendering cannot drift.
+fn list_row_background(item: usize, state: NMCUSTOMDRAW_DRAW_STATE_FLAGS) -> COLORREF {
+    let mut bg = if item % 2 == 1 {
+        theme::ROW_ALT
+    } else {
+        theme::PANEL
+    };
+    if state.contains(CDIS_HOT) {
+        bg = theme::ROW_HOVER;
+    } else if state.contains(CDIS_SELECTED) {
+        bg = theme::ROW_SELECT;
+    }
+    bg
+}
+
+/// NM_CUSTOMDRAW handler shared by the Recent and Saved `SysListView32` panes:
+/// dark rows on the theme palette. At `CDDS_PREPAINT` we opt into per-item
+/// drawing (`CDRF_NOTIFYITEMDRAW`); at `CDDS_ITEMPREPAINT` we set
+/// `NMLVCUSTOMDRAW::clrText` / `clrTextBk` from [`list_row_background`] — base
+/// `TEXT` on `PANEL` — then let the control draw with those colors
+/// (`CDRF_DODEFAULT`). Returns the `CDRF_*` flags the list view expects; never
+/// unwraps or panics on the paint path.
+fn paint_list_custom_draw(lparam: LPARAM) -> LRESULT {
+    let ptr = lparam.0 as *mut NMLVCUSTOMDRAW;
+    if ptr.is_null() {
+        return LRESULT(CDRF_DODEFAULT as isize);
+    }
+    // Copy the fields we need out of the notification before writing the
+    // colors back through the raw pointer (no overlapping borrows).
+    let (stage, item, state) = unsafe {
+        let cd = &*ptr;
+        (cd.nmcd.dwDrawStage, cd.nmcd.dwItemSpec, cd.nmcd.uItemState)
+    };
+    if stage == CDDS_PREPAINT {
+        // Ask for per-item draw notifications.
+        return LRESULT(CDRF_NOTIFYITEMDRAW as isize);
+    }
+    if stage == CDDS_ITEMPREPAINT {
+        // Write the colors back into the notification struct; the list view
+        // paints the row text with them.
+        unsafe {
+            (*ptr).clrText = theme::TEXT;
+            (*ptr).clrTextBk = list_row_background(item, state);
+        }
+        return LRESULT(CDRF_DODEFAULT as isize);
+    }
+    LRESULT(CDRF_DODEFAULT as isize)
 }
 
 /// Control id of the filter edit for a section (0 for the New placeholder).
@@ -1476,6 +1535,8 @@ fn set_edit_text(hwnd: HWND, text: &str) {
     }
 }
 
+
+
 /// Trim `s`; `None` when empty (for the optional username/domain fields).
 fn non_empty(s: String) -> Option<String> {
     let t = s.trim().to_string();
@@ -1487,8 +1548,9 @@ fn non_empty(s: String) -> Option<String> {
 }
 
 /// Every form control hwnd, for the show/hide pass on section switches.
-fn form_hwnds(f: &FormState) -> [HWND; 15] {
+fn form_hwnds(f: &FormState) -> [HWND; 16] {
     [
+        f.header,
         f.labels[0],
         f.labels[1],
         f.labels[2],
@@ -1548,16 +1610,27 @@ unsafe extern "system" fn filter_edit_proc(
     CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
 }
 
-/// Fill the hub client area with the dark palette: the left activity rail
-/// strip (0..RAIL_W, full height) in [`theme::PANEL`], the content area to its
-/// right in [`theme::BG`]. Called from `WM_ERASEBKGND`; returns nothing so the
-/// caller always answers `LRESULT(1)`. Logs on failure rather than panicking.
+/// Fill the hub client area with the dark palette. The base fill is the window
+/// background (`theme::BG`, matching the class brush); the left activity rail
+/// container (0..RAIL_W, full height) is painted `theme::PANEL`; a 1px
+/// `theme::BORDER` divider line separates the rail from the content area; and
+/// the main list container (everything right of the divider) is `theme::PANEL`
+/// so every container pane reads as a `#252526` panel on the `#1E1E1E` window
+/// background. Called from `WM_ERASEBKGND`; returns nothing so the caller
+/// always answers `LRESULT(1)`. Logs on failure rather than panicking.
 unsafe fn paint_hub_background(hwnd: HWND, hdc: HDC) {
     let mut rc = RECT::default();
     if let Err(e) = GetClientRect(hwnd, &mut rc) {
         tracing::warn!(error = %e, "paint_hub_background: GetClientRect failed");
         return;
     }
+
+    // Base: the window background (#1E1E1E). The containers below overpaint it.
+    let bg = CreateSolidBrush(theme::BG);
+    let _ = FillRect(hdc, &rc, bg);
+    let _ = DeleteObject(bg.into());
+
+    // Activity rail container: the left strip, full height.
     let mut rail = rc;
     rail.right = rail.left + RAIL_W;
     if rail.right > rail.left {
@@ -1565,10 +1638,22 @@ unsafe fn paint_hub_background(hwnd: HWND, hdc: HDC) {
         let _ = FillRect(hdc, &rail, brush);
         let _ = DeleteObject(brush.into());
     }
+
+    // 1px divider line between the rail and the main list container.
     if rc.right > rail.right {
+        let mut divider = rc;
+        divider.left = rail.right;
+        divider.right = divider.left + 1;
+        let brush = CreateSolidBrush(theme::BORDER);
+        let _ = FillRect(hdc, &divider, brush);
+        let _ = DeleteObject(brush.into());
+    }
+
+    // Main list container: everything right of the divider.
+    if rc.right > rail.right + 1 {
         let mut content = rc;
-        content.left = rail.right;
-        let brush = CreateSolidBrush(theme::BG);
+        content.left = rail.right + 1;
+        let brush = CreateSolidBrush(theme::PANEL);
         let _ = FillRect(hdc, &content, brush);
         let _ = DeleteObject(brush.into());
     }
@@ -1775,6 +1860,120 @@ pub fn run() -> Result<Option<ConnectionTarget>, HubError> {
         }
     }
     let selected = hub.selected.clone();
-    tracing::info!(selected = selected.is_some(), "hub window closed");
+    // Drop the hub state before releasing the cached fonts: on the row-activation
+    // path WM_DESTROY never ran, and Drop destroys the still-alive window (and
+    // every child control) so nothing can paint with a deleted HFONT.
+    drop(hub);
+    // The hub owns the process-lifetime Segoe UI fonts cached in theme.rs;
+    // release them now that no control can repaint.
+    let freed = theme::delete_cached_fonts();
+    tracing::info!(selected = selected.is_some(), freed, "hub window closed");
     Ok(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Even rows rest on `PANEL`; odd rows get the `ROW_ALT` zebra tint.
+    #[test]
+    fn list_row_background_zebras_on_odd_rows() {
+        let rest = NMCUSTOMDRAW_DRAW_STATE_FLAGS(0);
+        assert_eq!(list_row_background(0, rest), theme::PANEL);
+        assert_eq!(list_row_background(1, rest), theme::ROW_ALT);
+        assert_eq!(list_row_background(2, rest), theme::PANEL);
+        assert_eq!(list_row_background(3, rest), theme::ROW_ALT);
+    }
+
+    /// Hover (track-select) lifts the row to `ROW_HOVER`, overriding both the
+    /// zebra tint and — matching the original Recent-list behavior — any
+    /// selection state.
+    #[test]
+    fn list_row_background_hover_overrides_zebra_and_selection() {
+        assert_eq!(
+            list_row_background(1, CDIS_HOT),
+            theme::ROW_HOVER,
+            "hover wins over the zebra tint"
+        );
+        assert_eq!(
+            list_row_background(0, CDIS_HOT | CDIS_SELECTED),
+            theme::ROW_HOVER,
+            "hover wins over selection (original Recent behavior)"
+        );
+        assert_eq!(
+            list_row_background(1, CDIS_HOT | CDIS_SELECTED),
+            theme::ROW_HOVER,
+            "hover wins over selection on zebra rows too"
+        );
+    }
+
+    /// The selected (non-hot) row uses the accent-tinted `ROW_SELECT`, on
+    /// both even and odd rows.
+    #[test]
+    fn list_row_background_selected_uses_accent_tint() {
+        assert_eq!(list_row_background(0, CDIS_SELECTED), theme::ROW_SELECT);
+        assert_eq!(list_row_background(1, CDIS_SELECTED), theme::ROW_SELECT);
+    }
+}
+
+// MARKER_XYZ_12345
+
+// --- fonts-typography: cached Segoe UI faces fanned out to every control ---
+/// Height of the section-header static (10pt semibold) at the top of a pane.
+const SECTION_HEADER_H: i32 = 26;
+/// Gap between the section header and the first control below it.
+const SECTION_HEADER_GAP: i32 = 10;
+/// Offset of the section header from the top of the content area.
+const SECTION_HEADER_TOP: i32 = 8;
+
+/// Send WM_SETFONT (with a redraw) so `hwnd` renders its text with `font`.
+fn set_font(hwnd: HWND, font: HFONT) {
+    unsafe {
+        let _ = SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+    }
+}
+
+/// The column-header control of a report-view list (child window id 0).
+fn list_header(list: HWND) -> Option<HWND> {
+    unsafe { GetDlgItem(Some(list), 0).ok() }
+}
+
+impl HubWindow {
+    /// Fan the cached Segoe UI fonts out to the hub window and every live
+    /// child control: 9pt base everywhere, 10pt semibold on section headers.
+    fn apply_fonts(&self) {
+        let base = theme::ui_font(self.dpi());
+        let semibold = theme::ui_font_semibold(self.dpi());
+        unsafe {
+            set_font(self.hwnd, base);
+            for btn in &self.rail {
+                set_font(*btn, base);
+            }
+            if let Some(f) = &self.form {
+                set_font(f.header, semibold);
+                for label in &f.labels {
+                    set_font(*label, base);
+                }
+                for edit in [f.name, f.host, f.port, f.user, f.domain, f.password] {
+                    set_font(edit, base);
+                }
+                for btn in [f.save_pw, f.btn_save, f.btn_delete] {
+                    set_font(btn, base);
+                }
+            }
+            for s in Section::ALL {
+                if let Some(ui) = &self.sections[s.index()] {
+                    set_font(ui.header, semibold);
+                    set_font(ui.filter, base);
+                    set_font(ui.list, base);
+                    if let Some(hdr) = list_header(ui.list) {
+                        set_font(hdr, base);
+                    }
+                    if let Some(btn) = ui.edit_btn {
+                        set_font(btn, base);
+                    }
+                }
+            }
+        }
+    }
 }
