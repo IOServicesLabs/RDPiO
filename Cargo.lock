@@ -1524,6 +1524,7 @@ dependencies = [
 name = "rdp-client"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "http",
  "mimalloc",
  "rdp-channels",
