@@ -182,6 +182,12 @@ pub mod model;
 #[allow(dead_code)]
 pub mod store;
 
+// The native Win32 hub window (step-5): the connection picker with the slim
+// activity rail and switchable content panes. `run()` below owns the window
+// and its message loop; step-8 wires main.rs to call it when no connection
+// target args are given.
+mod ui;
+
 // The items below are the public API surface the later hub steps (ui) consume.
 // Nothing in the binary references the re-exports yet, so silence the
 // not-yet-used warnings rather than shipping a noisy build.
@@ -193,6 +199,18 @@ pub use store::{ConnectionInput, ConnectionStore, MruStore};
 // Error type shared by every fallible hub operation (model, store, ui). Used by
 // `hub::model` today and by the store/UI steps after it.
 pub use error::HubError;
+
+/// Open the hub window and pump its message loop until the user closes it or
+/// selects a connection. Returns the chosen [`ConnectionTarget`] (steps 6/8
+/// populate the selection; the step-5 shell always returns `None`), or `None`
+/// when the hub was closed without choosing.
+///
+/// Wired into `main()` by step-8; `allow(dead_code)` keeps the build quiet
+/// until then.
+#[allow(dead_code)]
+pub fn run() -> Result<Option<ConnectionTarget>, HubError> {
+    ui::run()
+}
 
 // Thin re-export so hub submodules (model, store) reach DPAPI through one path;
 // the functions are already `pub(crate)` in token_cache.rs — this is a
