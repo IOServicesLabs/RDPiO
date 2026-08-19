@@ -201,13 +201,9 @@ pub use store::{ConnectionInput, ConnectionStore, MruStore};
 pub use error::HubError;
 
 /// Open the hub window and pump its message loop until the user closes it or
-/// selects a connection. Returns the chosen [`ConnectionTarget`] (steps 6/8
-/// populate the selection; the step-5 shell always returns `None`), or `None`
-/// when the hub was closed without choosing.
-///
-/// Wired into `main()` by step-8; `allow(dead_code)` keeps the build quiet
-/// until then.
-#[allow(dead_code)]
+/// selects a connection. Returns the chosen [`ConnectionTarget`] (from a
+/// Recent/Saved row activation), or `None` when the hub was closed without
+/// choosing. Called by `main()` when no connection-target args are given.
 pub fn run() -> Result<Option<ConnectionTarget>, HubError> {
     ui::run()
 }
