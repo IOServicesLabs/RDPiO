@@ -1,3 +1,3 @@
 # Swarm Workspace Log
 
-- **2026-08-19T13:57:40.034345900-05:00** `progress`: step-0-bootstrap: verified existing workspace (10 members, all present under crates/ with real source, git repo already initialized), created scripts/setup-win.ps1 and scripts/setup-unix.sh (idempotent native-dependency installers), wrote .swarm-managed marker. cargo check --workspace --all-targets passes.
+- **2026-08-19T15:56:55.117898-05:00** `progress`: step-0-bootstrap verified complete: root Cargo.toml workspace declares all 10 members (rdp-asn1, rdp-crypto, rdp-pdu, rdp-core, rdp-nla, rdp-channels, rdp-graphics, rdp-gpu, rdp-client, rdp-webrtc), all present under crates/ with Cargo.toml + src/lib.rs; rust-toolchain.toml, .gitignore, .swarm-managed (valid JSON), and idempotent scripts/setup-win.ps1 + setup-unix.sh (ffmpeg/opus/NVENC, exit 0 when present) exist; git repo initialized. Gates green: cargo check --workspace --all-targets and cargo test --workspace both return 0.
