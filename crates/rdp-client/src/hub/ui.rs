@@ -129,7 +129,7 @@ const FILTER_H: i32 = 26;
 /// 96-DPI design units; `WM_SIZE`/`WM_DPICHANGED` layout scales them through
 /// `theme::scale_px`.
 const SECTION_HEADER_TOP: i32 = 16;
-const SECTION_HEADER_H: i32 = 24;
+
 const SECTION_HEADER_GAP: i32 = 8;
 
 /// The three hub activity sections, in rail order (index == rail slot).
@@ -600,6 +600,10 @@ impl HubWindow {
             let rc = self.content_rect()?;
             let x = rc.left + 16;
             let w = (rc.right - rc.left - 32).max(1);
+            // The pane's section title strip sits above the filter; controls
+            // start below it (same formula as layout_section).
+            let header_y = rc.top + SECTION_HEADER_TOP;
+            let content_top = header_y + SECTION_HEADER_H + SECTION_HEADER_GAP;
 
             // Filter edit, subclassed so Enter can be caught (single-line edits
             // send no Enter notification of their own).
@@ -1915,8 +1919,6 @@ mod tests {
         assert_eq!(list_row_background(1, CDIS_SELECTED), theme::ROW_SELECT);
     }
 }
-
-// MARKER_XYZ_12345
 
 // --- fonts-typography: cached Segoe UI faces fanned out to every control ---
 /// Height of the section-header static (10pt semibold) at the top of a pane.
