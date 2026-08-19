@@ -31,9 +31,11 @@ use windows::Win32::UI::Controls::{
     InitCommonControlsEx, DRAWITEMSTRUCT, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES,
     INITCOMMONCONTROLSEX, LVCOLUMNW, LVCOLUMNW_FORMAT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH,
     LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED, LVN_ITEMACTIVATE, LVS_EX_FULLROWSELECT,
-    LVS_EX_GRIDLINES, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMITEMACTIVATE, NM_DBLCLK,
-    ODT_BUTTON, WM_MOUSELEAVE,
+    LVM_SETBKCOLOR, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVM_SETTEXTBKCOLOR,
+    LVNI_SELECTED, LVN_ITEMACTIVATE, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_EX_TRACKSELECT,
+    LVS_NOCOLUMNHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMITEMACTIVATE,
+    NM_CUSTOMDRAW, NM_DBLCLK, NMLVCUSTOMDRAW, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDIS_HOT,
+    CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, ODT_BUTTON, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
@@ -535,16 +537,22 @@ impl HubWindow {
         Ok(())
     }
 
-    /// WM_NOTIFY: list-view activation — a double-click (NM_DBLCLK) or Enter on
-    /// the focused row (LVN_ITEMACTIVATE) builds a [`ConnectionTarget`] from
-    /// the activated row and hands it to the hub runner (posts WM_QUIT; `run()`
-    /// returns the target).
-    fn on_notify(&mut self, lparam: LPARAM) -> Result<(), HubError> {
+    /// WM_NOTIFY: list-view notifications. Activation (NM_DBLCLK /
+    /// LVN_ITEMACTIVATE) builds a [`ConnectionTarget`] from the activated row
+    /// and hands it to the hub runner (posts WM_QUIT; `run()` returns the
+    /// target). NM_CUSTOMDRAW (Recent list) paints the rows with the dark
+    /// palette and returns the CDRF_* response the list view expects.
+    fn on_notify(&mut self, lparam: LPARAM) -> Result<LRESULT, HubError> {
         let ptr = lparam.0 as *const NMHDR;
         if ptr.is_null() {
-            return Ok(());
+            return Ok(LRESULT(0));
         }
         let hdr = unsafe { &*ptr };
+        // Custom-draw painting for the Recent list view: the CDRF flags must be
+        // returned to the control, so this is handled before activation.
+        if hdr.code == NM_CUSTOMDRAW && hdr.idFrom == ID_LIST_RECENT {
+            return Ok(self.on_list_custom_draw(lparam));
+        }
         if hdr.code == NM_DBLCLK || hdr.code == LVN_ITEMACTIVATE {
             let item = unsafe { &*(lparam.0 as *const NMITEMACTIVATE) };
             let section = match hdr.idFrom {
@@ -556,7 +564,54 @@ impl HubWindow {
                 self.activate_row(section, item.iItem)?;
             }
         }
-        Ok(())
+        Ok(LRESULT(0))
+    }
+
+    /// NM_CUSTOMDRAW for the Recent `SysListView32`: dark rows on the theme
+    /// palette. At `CDDS_PREPAINT` we opt into per-item drawing
+    /// (`CDRF_NOTIFYITEMDRAW`); at `CDDS_ITEMPREPAINT` we set
+    /// `NMLVCUSTOMDRAW::clrText` / `clrTextBk` — base `TEXT` on `PANEL`, a
+    /// `ROW_ALT` zebra tint on odd rows, `ROW_HOVER` while hot (track-select
+    /// lights the row under the mouse), and `ROW_SELECT` (accent tint) for the
+    /// selected row — then let the control draw with those colors
+    /// (`CDRF_DODEFAULT`). Returns the `CDRF_*` flags the list view expects;
+    /// never unwraps or panics on the paint path.
+    fn on_list_custom_draw(&self, lparam: LPARAM) -> LRESULT {
+        let ptr = lparam.0 as *mut NMLVCUSTOMDRAW;
+        if ptr.is_null() {
+            return LRESULT(CDRF_DODEFAULT as isize);
+        }
+        // Copy the fields we need out of the notification before writing the
+        // colors back through the raw pointer (no overlapping borrows).
+        let (stage, item, state) = unsafe {
+            let cd = &*ptr;
+            (cd.nmcd.dwDrawStage, cd.nmcd.dwItemSpec, cd.nmcd.uItemState)
+        };
+        if stage == CDDS_PREPAINT {
+            // Ask for per-item draw notifications.
+            return LRESULT(CDRF_NOTIFYITEMDRAW as isize);
+        }
+        if stage == CDDS_ITEMPREPAINT {
+            // Zebra tint on odd rows first; hover and selection override it.
+            let mut bg = if item % 2 == 1 {
+                theme::ROW_ALT
+            } else {
+                theme::PANEL
+            };
+            if state.contains(CDIS_HOT) {
+                bg = theme::ROW_HOVER;
+            } else if state.contains(CDIS_SELECTED) {
+                bg = theme::ROW_SELECT;
+            }
+            // Write the colors back into the notification struct; the list
+            // view paints the row text with them.
+            unsafe {
+                (*ptr).clrText = theme::TEXT;
+                (*ptr).clrTextBk = bg;
+            }
+            return LRESULT(CDRF_DODEFAULT as isize);
+        }
+        LRESULT(CDRF_DODEFAULT as isize)
     }
 
     /// Create the filter edit + SysListView32 for a list section on first visit.
@@ -591,14 +646,22 @@ impl HubWindow {
             SetWindowLongPtrW(filter, GWLP_USERDATA, old_proc);
             SetWindowLongPtrW(filter, GWLP_WNDPROC, filter_edit_proc as *const () as isize);
 
-            // SysListView32 report view.
+            // SysListView32 report view. The Recent list hides its column
+            // header (LVS_NOCOLUMNHEADER) and paints dark rows via
+            // NM_CUSTOMDRAW (see on_list_custom_draw); the Saved list keeps the
+            // stock header until the saved-list dark step lands.
+            let base_style =
+                (WS_CHILD | WS_VISIBLE).0 | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS;
+            let list_style = if section == Section::Recent {
+                base_style | LVS_NOCOLUMNHEADER
+            } else {
+                base_style
+            };
             let list = CreateWindowExW(
                 WS_EX_CLIENTEDGE,
                 w!("SysListView32"),
                 w!(""),
-                WINDOW_STYLE(
-                    (WS_CHILD | WS_VISIBLE).0 | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-                ),
+                WINDOW_STYLE(list_style),
                 x,
                 rc.top + 16 + FILTER_H + 14,
                 w,
@@ -609,12 +672,35 @@ impl HubWindow {
                 None,
             )
             .map_err(|e| HubError::win32(format!("CreateWindowExW(list {section:?}): {e}")))?;
+            // Track-select hover highlighting + full-row selection + grid
+            // separators; LVS_EX_TRACKSELECT is what feeds CDIS_HOT to the
+            // Recent list's custom-draw handler on hover.
+            let mut ext_styles = LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES;
+            if section == Section::Recent {
+                ext_styles |= LVS_EX_TRACKSELECT;
+            }
             let _ = SendMessageW(
                 list,
                 LVM_SETEXTENDEDLISTVIEWSTYLE,
                 Some(WPARAM(0)),
-                Some(LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize)),
+                Some(LPARAM(ext_styles as isize)),
             );
+            // Dark list backdrop: the list area and its text background both
+            // use theme::PANEL so no stock white shows through the Recent list.
+            if section == Section::Recent {
+                let _ = SendMessageW(
+                    list,
+                    LVM_SETBKCOLOR,
+                    None,
+                    Some(LPARAM(theme::PANEL.0 as isize)),
+                );
+                let _ = SendMessageW(
+                    list,
+                    LVM_SETTEXTBKCOLOR,
+                    None,
+                    Some(LPARAM(theme::PANEL.0 as isize)),
+                );
+            }
 
             // Columns: Name, Host, User, Last Used.
             const COLS: [(&str, i32); 4] = [
@@ -1605,10 +1691,15 @@ unsafe extern "system" fn hub_proc(
         }
         WM_NOTIFY => {
             if let Some(state) = hub_state_mut(hwnd) {
-                if let Err(e) = state.on_notify(lparam) {
-                    tracing::error!(error = %e, "hub WM_NOTIFY handler failed");
+                match state.on_notify(lparam) {
+                    // NM_CUSTOMDRAW returns the CDRF_* flags the list view
+                    // needs; ordinary notifications return LRESULT(0).
+                    Ok(result) => return result,
+                    Err(e) => {
+                        tracing::error!(error = %e, "hub WM_NOTIFY handler failed");
+                        return LRESULT(0);
+                    }
                 }
-                return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
