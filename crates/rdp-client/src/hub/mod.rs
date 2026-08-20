@@ -217,9 +217,15 @@ pub use error::HubError;
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 
 /// Open the hub window and pump its message loop until the user closes it or
-/// selects a connection. Returns the chosen [`ConnectionTarget`] (from a
-/// Recent/Saved row activation), or `None` when the hub was closed without
-/// choosing. Called by `main()` when no connection-target args are given.
+/// selects a connection.
+///
+/// With the keep-open pin OFF (the pre-step-6 behavior) selecting a
+/// Recent/Saved/New connection returns that [`ConnectionTarget`] so `main()`
+/// runs the session in-process. With the pin ON the hub launches the session
+/// as a detached child process and keeps pumping — so `run()` returns `None`
+/// whenever the user closes the hub window, and `Some(target)` only on the
+/// keep-open-OFF selection path (or its in-process fallback). Called by
+/// `main()` when no connection-target args are given.
 pub fn run() -> Result<Option<ConnectionTarget>, HubError> {
     // Per-monitor DPI awareness must be requested before any HWND or GDI font
     // is created: the window class and every child control inherit the process
@@ -235,7 +241,23 @@ pub fn run() -> Result<Option<ConnectionTarget>, HubError> {
             );
         }
     }
-    ui::run()
+    // Load the user's keep-open preference once at startup: the rail pin button
+    // is initialized from it, and toggling the pin persists back to the same
+    // Settings store. Missing/unset LOCALAPPDATA or a missing, unreadable, or
+    // corrupt settings file falls back to [`store::Settings::default`]
+    // (keep-hub-open ON), so a fresh install keeps the hub open after connect
+    // with no configuration and a bad file can never panic the hub.
+    let keep_hub_open = match store::settings_path() {
+        Ok(path) => store::load_settings(&path).keep_hub_open,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not resolve settings path; using default keep-open=ON"
+            );
+            store::Settings::default().keep_hub_open
+        }
+    };
+    ui::run(keep_hub_open)
 }
 
 /// Launch a detached child `rdpio` process for `target` and return immediately.
@@ -249,9 +271,14 @@ pub fn run() -> Result<Option<ConnectionTarget>, HubError> {
 /// the resulting `Child` handle is dropped without waiting, keeping the hub
 /// message loop responsive while the session runs detached.
 ///
-/// Not called yet — step-6-wire-keep-open invokes it from the hub's
-/// select-a-connection points when `keep_hub_open` is ON.
-#[allow(dead_code)]
+/// Invoked by the hub's select-a-connection points (step-6-wire-keep-open)
+/// when the keep-open pin is ON: the child makes the same MRU record at its
+/// connect-success point that the in-process path makes, so the Recent list
+/// stays current either way. The child's argv carries no hub-only metadata
+/// (display name / saved-record link), so `record_mru` in the child falls back
+/// to host-as-display-name and no connection link — the price of keeping
+/// `target_to_args` the exact inverse of `parse_connection_args` and `main.rs`
+/// unchanged.
 pub fn spawn_connection_child(target: &ConnectionTarget) -> std::io::Result<()> {
     use std::process::Command;
 
