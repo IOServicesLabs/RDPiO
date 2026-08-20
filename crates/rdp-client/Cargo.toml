@@ -94,3 +94,8 @@ windows = { workspace = true, features = [
     "Win32_Globalization",
     "Win32_System_Time",
 ] }
+
+[build-dependencies]
+# Embeds res/rdpio.rc (icon resource id 1) into the rdpio.exe at link time.
+# NONE = icon only; no manifest, no version resource.
+embed-resource = "2"
