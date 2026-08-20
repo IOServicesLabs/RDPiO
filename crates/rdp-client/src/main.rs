@@ -204,6 +204,93 @@ fn args_from_target(base: &Args, target: &hub::ConnectionTarget) -> Args {
     args
 }
 
+/// Parse a connection-target argv into a [`hub::ConnectionTarget`], the exact
+/// inverse of [`target_to_args`].
+///
+/// Recognizes the five target flags (`--host|-h`, `--port`, `--user|-u`,
+/// `--domain|-d`, `--password|-p`) using the same space-separated token syntax
+/// the CLI parser in [`Args::from_env`] uses; any other flag is skipped, so the
+/// full process argv can be fed straight in without tripping over session/UI
+/// knobs. Returns `None` when no `--host` was present — a connection target
+/// without a host is meaningless, and callers treat that as "not a connection
+/// launch". The display name defaults to the host and `connection_id` to `None`
+/// (the argv format carries neither; both are hub-only metadata).
+///
+/// Kept `pub` and side-effect free so the exact inverse property
+/// `parse_connection_args(target_to_args(&t)) == t` is unit-testable and so the
+/// keep-open child-launch path (step-6) can re-enter argv when it needs to.
+#[cfg(windows)]
+#[allow(dead_code)] // exercised by the round-trip tests; production call site arrives with the keep-open launch work
+pub fn parse_connection_args(
+    args: impl Iterator<Item = String>,
+) -> Option<hub::ConnectionTarget> {
+    let mut host: Option<String> = None;
+    let mut port: u16 = 3389;
+    let mut username: Option<String> = None;
+    let mut domain: Option<String> = None;
+    let mut password: Option<String> = None;
+
+    let mut it = args;
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--host" | "-h" => host = it.next(),
+            "--port" => {
+                // Unparseable port keeps the default, matching Args::from_env.
+                if let Some(v) = it.next().and_then(|v| v.parse::<u16>().ok()) {
+                    port = v;
+                }
+            }
+            "--user" | "-u" => username = it.next(),
+            "--domain" | "-d" => domain = it.next(),
+            "--password" | "-p" => password = it.next(),
+            // Everything else (--multimon, --quality, …) is not part of the
+            // target and is skipped, matching the CLI parser's tolerance.
+            _ => {}
+        }
+    }
+
+    let host = host?;
+    Some(hub::ConnectionTarget {
+        display_name: host.clone(),
+        host,
+        port,
+        username,
+        domain,
+        password,
+        connection_id: None,
+    })
+}
+
+/// Serialize a [`hub::ConnectionTarget`] into connection argv, the exact
+/// inverse of [`parse_connection_args`]: `--host <host> --port <port>
+/// [--user <user>] [--domain <domain>] [--password <password>]`, always in
+/// that order with the optional fields omitted when unset. The detached child
+/// session launcher (`hub::spawn_connection_child`) appends this to the current
+/// executable so the child's `Args::from_env()` re-parses the exact target the
+/// hub selected.
+#[cfg(windows)]
+pub fn target_to_args(target: &hub::ConnectionTarget) -> Vec<String> {
+    let mut out = vec![
+        "--host".to_string(),
+        target.host.clone(),
+        "--port".to_string(),
+        target.port.to_string(),
+    ];
+    if let Some(user) = &target.username {
+        out.push("--user".to_string());
+        out.push(user.clone());
+    }
+    if let Some(domain) = &target.domain {
+        out.push("--domain".to_string());
+        out.push(domain.clone());
+    }
+    if let Some(password) = &target.password {
+        out.push("--password".to_string());
+        out.push(password.clone());
+    }
+    out
+}
+
 /// Record a successful connection in the hub's MRU history (step-9). No
 /// password is ever stored — the entry only links back to a saved record via
 /// `connection_id` when the connection came from the hub's Saved list. Called
@@ -4787,5 +4874,99 @@ mod policy_tests {
         assert_eq!(size, (3840, 1080));
         assert_eq!((defs[0].left, defs[0].right), (0, 1919));
         assert_eq!(slices[1], ((1920, 0), (1920, 1080)));
+    }
+}
+
+// Windows-only: the ConnectionTarget argv mapping is the exact inverse pair the
+// detached child launcher (hub::spawn_connection_child, step-4) serializes, and
+// ConnectionTarget itself only exists under cfg(windows) via `mod hub`.
+#[cfg(test)]
+#[cfg(windows)]
+mod connection_target_argv_tests {
+    use super::{parse_connection_args, target_to_args};
+    use crate::hub::ConnectionTarget;
+
+    /// Fully populated target: every optional field set. `display_name` equals
+    /// the host because the argv format cannot carry a display name — that
+    /// keeps the strict round-trip comparison exact.
+    fn full_target() -> ConnectionTarget {
+        ConnectionTarget {
+            display_name: "10.0.0.5".to_string(),
+            host: "10.0.0.5".to_string(),
+            port: 3390,
+            username: Some("alice".to_string()),
+            domain: Some("CORP".to_string()),
+            password: Some("s3cret".to_string()),
+            connection_id: None,
+        }
+    }
+
+    /// A fully populated target serializes to exactly this flag/value sequence,
+    /// in the documented order: --host, --port, --user, --domain, --password.
+    #[test]
+    fn target_to_args_emits_exact_flag_value_sequence() {
+        assert_eq!(
+            target_to_args(&full_target()),
+            vec![
+                "--host", "10.0.0.5",
+                "--port", "3390",
+                "--user", "alice",
+                "--domain", "CORP",
+                "--password", "s3cret",
+            ]
+        );
+    }
+
+    /// `target_to_args` then `parse_connection_args` must land back on the same
+    /// target — the two functions are exact inverses.
+    #[test]
+    fn parse_connection_args_round_trips_target_to_args() {
+        let t = full_target();
+        let back = parse_connection_args(target_to_args(&t).into_iter())
+            .expect("round-tripped argv must parse back to a target");
+        assert_eq!(back, t);
+    }
+
+    /// Unset optional fields are omitted from the argv, so a minimal target
+    /// round-trips as just `--host <host> --port <port>`.
+    #[test]
+    fn optional_fields_are_omitted_and_round_trip() {
+        let t = ConnectionTarget::new("server.corp", 3389);
+        assert_eq!(
+            target_to_args(&t),
+            vec!["--host", "server.corp", "--port", "3389"]
+        );
+        let back = parse_connection_args(target_to_args(&t).into_iter())
+            .expect("minimal argv must parse back to a target");
+        assert_eq!(back, t);
+    }
+
+    /// A target without a host is meaningless: the parser reports None.
+    #[test]
+    fn missing_host_parses_to_none() {
+        assert_eq!(
+            parse_connection_args(
+                ["--user", "alice", "--port", "3390"]
+                    .into_iter()
+                    .map(str::to_string)
+            ),
+            None
+        );
+    }
+
+    /// Non-target flags interspersed with the target flags must not disturb the
+    /// parse (the child argv can carry session knobs alongside the target).
+    #[test]
+    fn unknown_flags_are_skipped() {
+        let t = full_target();
+        let mut argv = vec![
+            "--multimon".to_string(),
+            "--quality".to_string(),
+            "gaming".to_string(),
+        ];
+        argv.extend(target_to_args(&t));
+        let back = parse_connection_args(argv.into_iter())
+            .expect("known target flags still parsed among unknown ones");
+        assert_eq!(back, t);
     }
 }

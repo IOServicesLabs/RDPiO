@@ -238,6 +238,40 @@ pub fn run() -> Result<Option<ConnectionTarget>, HubError> {
     ui::run()
 }
 
+/// Launch a detached child `rdpio` process for `target` and return immediately.
+///
+/// The child is spawned from the current executable (`std::env::current_exe()`)
+/// with `crate::target_to_args(target)` appended as argv, so the child's
+/// `Args::from_env()` re-parses the exact connection the hub selected and runs
+/// the normal `win::run_connected` session path. On Windows the child is
+/// created with `DETACHED_PROCESS` (0x00000008) so it gets no console of its
+/// own and is not tied to the hub's window or the parent console's lifetime;
+/// the resulting `Child` handle is dropped without waiting, keeping the hub
+/// message loop responsive while the session runs detached.
+///
+/// Not called yet — step-6-wire-keep-open invokes it from the hub's
+/// select-a-connection points when `keep_hub_open` is ON.
+#[allow(dead_code)]
+pub fn spawn_connection_child(target: &ConnectionTarget) -> std::io::Result<()> {
+    use std::process::Command;
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.args(crate::target_to_args(target));
+    #[cfg(windows)]
+    {
+        // DETACHED_PROCESS: the child has no console window and survives on its
+        // own; `CommandExt` is the std Windows extension trait that adds
+        // `creation_flags` to `std::process::Command`.
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0000_0008);
+    }
+    // Spawn and drop the handle: we intentionally never wait on the child, so
+    // the hub keeps pumping messages while the session runs detached.
+    cmd.spawn()?;
+    Ok(())
+}
+
 // Thin re-export so hub submodules (model, store) reach DPAPI through one path;
 // the functions are already `pub(crate)` in token_cache.rs — this is a
 // convenience alias, not a visibility change. `hub::model` uses it today.
