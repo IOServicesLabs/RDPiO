@@ -382,6 +382,13 @@ impl HubWindow {
             )
             .map_err(|e| HubError::win32(format!("CreateWindowExW(hub): {e}")))?;
 
+            // Step-8 (hub window icon): apply the embedded rdpio.ico (resource
+            // id 1, linked by build.rs via embed-resource) to the hub window
+            // before it is first shown, so both the title bar (ICON_SMALL) and
+            // the taskbar/Alt-Tab entry (ICON_BIG) display it. Best-effort: on
+            // failure the window keeps the default icon and the hub still runs.
+            set_hub_icon(hwnd, hinstance);
+
             // Cached CTLCOLOR brushes: BG answers WM_CTLCOLORSTATIC (labels),
             // PANEL answers WM_CTLCOLOREDIT (dark input fields). Both live for
             // the whole hub lifetime and are freed in Drop.
@@ -2388,6 +2395,46 @@ fn apply_filter(ui: &mut SectionUi) {
         })
         .map(|(i, _)| i)
         .collect();
+}
+
+/// Load the embedded rdpio.ico (resource id 1, linked by build.rs via
+/// embed-resource) at the system default size and apply it to `hwnd` with
+/// `WM_SETICON`: `ICON_SMALL` paints the title-bar icon, `ICON_BIG` paints the
+/// taskbar/Alt-Tab icon. `MAKEINTRESOURCEW(1)` is just the integer resource id
+/// cast to a `PCWSTR`; `LoadImageW` resolves it against the module instance.
+/// The system copies the icon on `WM_SETICON`, so the returned handle needs no
+/// `DestroyIcon` bookkeeping. Best-effort: failures are logged, never fatal —
+/// the hub falls back to the default window icon.
+fn set_hub_icon(hwnd: HWND, hinstance: HINSTANCE) {
+    unsafe {
+        match LoadImageW(
+            Some(hinstance),
+            PCWSTR(1usize as *const u16), // MAKEINTRESOURCEW(1) == res/rdpio.rc
+            IMAGE_ICON,
+            0,
+            0,
+            LR_DEFAULTSIZE,
+        ) {
+            Ok(handle) => {
+                let hic = HICON(handle.0);
+                let _ = SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    Some(WPARAM(ICON_SMALL as usize)),
+                    Some(LPARAM(hic.0 as isize)),
+                );
+                let _ = SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    Some(WPARAM(ICON_BIG as usize)),
+                    Some(LPARAM(hic.0 as isize)),
+                );
+            }
+            Err(e) => {
+                tracing::warn!("LoadImageW(rdpio.ico id 1): {e}; hub uses default window icon");
+            }
+        }
+    }
 }
 
 /// Create a child control of the hub window (labels, edits, buttons,

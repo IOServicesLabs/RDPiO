@@ -23,6 +23,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::SYSTEMTIME;
 use windows::Win32::Globalization::{
@@ -35,6 +36,8 @@ use crate::hub::HubError;
 
 const CONNECTIONS_FILE: &str = "connections.json";
 const HISTORY_FILE: &str = "history.json";
+/// `%LOCALAPPDATA%\rdpio\settings.json` — user preferences (see [`Settings`]).
+const SETTINGS_FILE: &str = "settings.json";
 /// Maximum number of MRU entries kept; the oldest are dropped beyond this.
 const MRU_CAP: usize = 50;
 
@@ -50,19 +53,67 @@ fn data_dir() -> Result<PathBuf, HubError> {
     Ok(dir)
 }
 
-/// Write `contents` to `path` atomically: write a sibling `*.tmp` file, flush
-/// and sync it, then rename over the target. `std::fs::rename` replaces an
+/// Monotonic counter that makes the temp file name of [`atomic_write`] unique
+/// within this process; the PID component makes it unique across processes.
+/// Two interleaved writers — the hub and a detached child session — therefore
+/// always target different temp files and can never observe each other's
+/// half-written output.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A uniquely-named sibling temp path for `path`:
+/// `<stem>.<pid>.<counter>.tmp` in the same directory as `path`. The name
+/// carries the process id and a per-process counter, so concurrent writers
+/// (hub + child session) never collide on one temp file.
+fn temp_path_for(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("store");
+    let pid = std::process::id();
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!("{stem}.{pid}.{counter}.tmp"))
+}
+
+/// Create `tmp`, write `contents`, flush + sync it, then rename it over
+/// `path`. Split out so [`atomic_write`] can clean the temp file up on error.
+fn write_temp_then_rename(tmp: &Path, path: &Path, contents: &[u8]) -> Result<(), HubError> {
+    let mut file = fs::File::create(tmp)?;
+    file.write_all(contents)?;
+    file.flush()?;
+    file.sync_all()?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+/// Write `contents` to `path` atomically via write-temp-then-rename: serialize
+/// to a uniquely-named sibling `*.tmp` file, flush and sync it, then
+/// `std::fs::rename` it over the destination. `std::fs::rename` replaces an
 /// existing destination on Windows (MoveFileExW with MOVEFILE_REPLACE_EXISTING),
 /// so a crash between the write and the rename leaves the previous file intact.
+/// On any error the temp file is deleted before the error is returned.
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), HubError> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
+    let tmp = temp_path_for(path);
+    if let Err(e) = write_temp_then_rename(&tmp, path, contents) {
+        // Best-effort cleanup: never leave a half-written temp file behind.
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// The single atomic JSON-write helper every `%LOCALAPPDATA%\rdpio\` store
+/// persists through: serialize `value` as pretty JSON, then write it via
+/// [`atomic_write`]'s write-temp-then-rename. All stores (`connections.json`,
+/// `history.json`, `settings.json`) save through this one path, so interleaved
+/// writers — the hub and a detached child session — can never corrupt a store
+/// file.
+pub fn write_json_atomic<T>(path: &Path, value: &T) -> Result<(), HubError>
+where
+    T: serde::Serialize,
+{
+    let json = serde_json::to_vec_pretty(value)?;
+    atomic_write(path, &json)
 }
 
 /// Load a JSON array of records from `path`. A missing file is an empty store;
@@ -230,9 +281,7 @@ impl ConnectionStore {
     }
 
     fn save(&self) -> Result<(), HubError> {
-        let json = serde_json::to_vec_pretty(&self.records)?;
-        atomic_write(&self.path, &json)?;
-        Ok(())
+        write_json_atomic(&self.path, &self.records)
     }
 }
 
@@ -365,10 +414,73 @@ impl MruStore {
     }
 
     fn save(&self) -> Result<(), HubError> {
-        let json = serde_json::to_vec_pretty(&self.records)?;
-        atomic_write(&self.path, &json)?;
-        Ok(())
+        write_json_atomic(&self.path, &self.records)
     }
+}
+
+/// User preferences persisted under `%LOCALAPPDATA%\rdpio\settings.json`.
+///
+/// `Default` is the factory state: `keep_hub_open` starts **ON**, so a fresh
+/// install keeps the hub window open after a connection is launched. Missing
+/// or corrupt settings files fall back to [`Settings::default`] (see
+/// [`load_settings`]), so the hub never bricks on a bad file and never panics
+/// on a missing one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Keep the hub window open after a connection is launched, so the user
+    /// can pick another target without re-opening the hub.
+    pub keep_hub_open: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { keep_hub_open: true }
+    }
+}
+
+/// Resolve `%LOCALAPPDATA%\rdpio\settings.json` — the same directory
+/// resolution as `history.json` / `connections.json` (see [`data_dir`]). The
+/// directory is created if missing.
+pub fn settings_path() -> Result<PathBuf, HubError> {
+    Ok(data_dir()?.join(SETTINGS_FILE))
+}
+
+/// Load settings from `path`, falling back to [`Settings::default()`] on a
+/// missing, unreadable, or unparseable file — the hub must never panic on a
+/// bad settings file, and a fresh install (no file yet) gets the ON default.
+/// Errors are logged with `tracing` so a silently-ignored disk failure stays
+/// diagnosable.
+pub fn load_settings(path: &Path) -> Settings {
+    match fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not read settings file; using defaults"
+            );
+            Settings::default()
+        }
+        Ok(bytes) => match serde_json::from_slice::<Settings>(&bytes) {
+            Ok(settings) => settings,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "corrupt settings file; using defaults"
+                );
+                Settings::default()
+            }
+        },
+    }
+}
+
+/// Persist `settings` to `path` atomically via [`write_json_atomic`]
+/// (write-temp-then-rename), so an interleaved writer or a crash mid-write can
+/// never leave a truncated settings file behind.
+pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), HubError> {
+    write_json_atomic(path, settings)
 }
 
 /// Render the identity portion of a Recent entry: `user@host` when the user
@@ -520,6 +632,22 @@ mod tests {
         }
     }
 
+    /// Names of any `*.tmp` siblings in `path`'s parent directory — a leak
+    /// check for the atomic write-temp-then-rename helpers: after a successful
+    /// write the uniquely-named temp file must have been renamed over the
+    /// target, leaving no `*.tmp` behind.
+    fn leftover_temp_files(path: &Path) -> Vec<String> {
+        let Some(parent) = path.parent() else {
+            return Vec::new();
+        };
+        fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
     fn input(display_name: &str, host: &str, port: u16, password: Option<&str>) -> ConnectionInput {
         ConnectionInput {
             id: None,
@@ -542,8 +670,11 @@ mod tests {
                 .unwrap();
             assert_eq!(store.list().len(), 1);
             assert_eq!(store.get(&rec.id).unwrap().host, "work.corp");
-            // Atomic write leaves no .tmp behind.
-            assert!(!path.with_extension("tmp").exists(), "stale .tmp file");
+            // Atomic write leaves no temp file behind.
+            assert!(
+                leftover_temp_files(&path).is_empty(),
+                "stale temp files after atomic write"
+            );
         }
 
         // Reload in a fresh store: the record (and its recoverable password)
@@ -762,6 +893,93 @@ mod tests {
         let entry = &store.list_most_recent_first()[0];
         assert_eq!(entry.connection_id, Some(saved_id));
         assert_eq!(entry.connect_count, 2);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn write_json_atomic_persists_history_and_leaves_no_temp_files() {
+        let path = temp_file("atomic-history");
+        // The exact payload the hub persists for Recent: a newest-first MRU
+        // history list.
+        let payload = vec![
+            mru(Some("alice"), 1_700_000_000),
+            mru(None, 1_700_000_001),
+        ];
+
+        // Step-1 acceptance: history writes go through write-temp-then-rename.
+        write_json_atomic(&path, &payload).unwrap();
+
+        // The file reloads through the store's own loader and parses back to
+        // the same records.
+        let reloaded: Vec<MruRecord> = load_records(&path, "history");
+        assert_eq!(reloaded.len(), 2, "history payload must survive a reload");
+        assert_eq!(reloaded[0].host, "box.local");
+        assert_eq!(reloaded[0].username.as_deref(), Some("alice"));
+        assert_eq!(reloaded[0].last_connected_at, 1_700_000_000);
+        assert_eq!(reloaded[1].username, None);
+        assert_eq!(reloaded[1].last_connected_at, 1_700_000_001);
+
+        // No temp file remains: the uniquely-named `*.tmp` was renamed over
+        // the target.
+        assert!(
+            leftover_temp_files(&path).is_empty(),
+            "temp files must not remain: {:?}",
+            leftover_temp_files(&path)
+        );
+
+        // A second write through the same helper still leaves nothing behind
+        // (the PID+counter naming never collides with the previous temp file).
+        write_json_atomic(&path, &payload).unwrap();
+        assert!(leftover_temp_files(&path).is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn settings_missing_file_loads_default_on() {
+        let path = temp_file("settings-missing");
+        // Never written: load_settings must not panic and must fall back to
+        // the ON default.
+        let settings = load_settings(&path);
+        assert!(
+            settings.keep_hub_open,
+            "missing settings must default to keep-hub-open ON"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn settings_save_then_load_round_trips() {
+        let path = temp_file("settings-roundtrip");
+
+        // OFF survives a save → load round-trip.
+        save_settings(&path, &Settings { keep_hub_open: false }).unwrap();
+        assert!(!load_settings(&path).keep_hub_open);
+
+        // ON (the default) round-trips too.
+        save_settings(&path, &Settings::default()).unwrap();
+        assert!(load_settings(&path).keep_hub_open);
+
+        // The atomic save leaves no temp sibling behind.
+        assert!(
+            leftover_temp_files(&path).is_empty(),
+            "settings save must not leave temp files: {:?}",
+            leftover_temp_files(&path)
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn settings_garbage_file_loads_default_on() {
+        let path = temp_file("settings-garbage");
+        fs::write(&path, b"\x00\x01{ not json \xff\xfe").unwrap();
+
+        // Corrupt settings must never panic and must fall back to the ON
+        // default.
+        let settings = load_settings(&path);
+        assert!(
+            settings.keep_hub_open,
+            "corrupt settings must default to keep-hub-open ON"
+        );
         cleanup(&path);
     }
 
