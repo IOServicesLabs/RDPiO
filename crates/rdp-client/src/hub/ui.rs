@@ -50,6 +50,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::model::prefill_username;
+use super::store::{Settings, save_settings, settings_path};
 use super::{
     format_local_short_datetime, format_recent_identity, theme, ConnectionInput, ConnectionRecord,
     ConnectionStore, ConnectionTarget, HubError, MruStore,
@@ -349,7 +350,10 @@ struct HubWindow {
     /// Per-section list controls (Recent/Saved), created lazily.
     sections: [Option<SectionUi>; 3],
     /// The connection the user activated, returned by `run()` to the connect
-    /// bootstrap (step-8). `None` until a Recent/Saved row is activated.
+    /// bootstrap. Set only on the keep-open-OFF selection path (and its
+    /// in-process spawn-failure fallback); with the keep-open pin ON a
+    /// selection is launched as a detached child and `selected` stays `None`,
+    /// so the hub keeps running until the user closes it.
     selected: Option<ConnectionTarget>,
     /// Set once `WM_DESTROY` runs so `Drop` never double-destroys windows.
     destroyed: bool,
@@ -357,9 +361,11 @@ struct HubWindow {
 
 impl HubWindow {
     /// Register the classes, create the main window, attach the state, build
-    /// the rail, and show the initial (Recent) pane. Returns the boxed state
-    /// whose pointer is stored in the window's `GWLP_USERDATA`.
-    fn create() -> Result<Box<HubWindow>, HubError> {
+    /// the rail, and show the initial (Recent) pane. `keep_hub_open` seeds the
+    /// rail pin toggle from the persisted settings (loaded once in
+    /// `hub::run`). Returns the boxed state whose pointer is stored in the
+    /// window's `GWLP_USERDATA`.
+    fn create(keep_hub_open: bool) -> Result<Box<HubWindow>, HubError> {
         unsafe {
             // Common controls must be initialised before any SysListView32 (or
             // other common control) is created; the owner-draw button messages
@@ -435,7 +441,7 @@ impl HubWindow {
                 rail_hover: [false; 3],
                 pin_btn: HWND::default(),
                 pin_hover: false,
-                keep_open: true,
+                keep_open: keep_hub_open,
                 tooltip: HWND::default(),
                 form: None,
                 sections: [None, None, None],
@@ -801,13 +807,27 @@ impl HubWindow {
         Ok(())
     }
 
-    /// Flip the keep-open pin toggle and repaint the pin button so its accent
-    /// fill/bar follows the new state. This step owns the UI toggle and the
-    /// in-memory `keep_open` flag; step-6 wires loading/persistence through
-    /// the Settings store.
+    /// Flip the keep-open pin toggle, persist the new preference, and repaint
+    /// the pin button so its accent fill/bar follows the new state. The
+    /// in-memory `keep_open` flag is the single source of truth for this
+    /// session; persistence is best-effort — a missing LOCALAPPDATA or a disk
+    /// error is logged, never fatal, so a failed write can't take down the UI
+    /// or leave the toggle half-flipped.
     fn on_pin_toggle(&mut self) -> Result<(), HubError> {
         self.keep_open = !self.keep_open;
         tracing::info!(keep_open = self.keep_open, "keep-open pin toggled");
+        // Persist the new state so it survives restarts: the same Settings
+        // store hub::run loaded from, through the atomic write helper.
+        match settings_path().and_then(|p| {
+            save_settings(&p, &Settings { keep_hub_open: self.keep_open })
+        }) {
+            Ok(()) => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                keep_open = self.keep_open,
+                "could not persist keep-open setting; keeping in-memory value"
+            ),
+        }
         unsafe {
             let _ = InvalidateRect(Some(self.pin_btn), None, true);
         }
@@ -1272,11 +1292,55 @@ impl HubWindow {
             }
         }
 
+        tracing::info!(section = ?section, "hub activated a connection row");
+        self.launch_target(target)
+    }
+
+    /// Hand a finished [`ConnectionTarget`] to the hub runner.
+    ///
+    /// With the keep-open pin OFF this is the original behavior: the target is
+    /// stored in `self.selected` and WM_QUIT is posted, so `ui::run` returns it
+    /// and `main()` connects in-process — identical to the pre-step-6 path.
+    /// With the pin ON the target is launched as a detached child session via
+    /// [`super::spawn_connection_child`] and the message loop keeps running:
+    /// the hub stays open for the next pick. The MRU record is made by the same
+    /// `record_mru` connect-success hook in both cases (in-process from this
+    /// process's connect; in the detached child from its own connect), so the
+    /// Recent list stays current either way. If the detached spawn fails the
+    /// hub surfaces the error and stays open with the loop still running —
+    /// `hub::run` returns `None` only when the user closes the hub window — and
+    /// the user can toggle the pin off and retry in-process.
+    fn launch_target(&mut self, target: ConnectionTarget) -> Result<(), HubError> {
+        if self.keep_open {
+            match super::spawn_connection_child(&target) {
+                Ok(()) => {
+                    tracing::info!(
+                        host = %target.host,
+                        "keep-open: launched detached session; hub stays open"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        host = %target.host,
+                        "keep-open spawn failed; hub stays open (toggle the pin off to connect in-process)"
+                    );
+                    show_message(
+                        self.hwnd,
+                        "Could not launch the session as a separate process.\n\n\
+                         Turn off 'Keep hub open after connect' and try again, or check the log.",
+                        "Launch failed",
+                    );
+                    return Ok(());
+                }
+            }
+        }
         self.selected = Some(target);
         unsafe {
             PostQuitMessage(0);
         }
-        tracing::info!(section = ?section, "hub selected a connection target; exiting to connect");
+        tracing::info!("hub selected a connection target; exiting to connect");
         Ok(())
     }
 
@@ -1641,12 +1705,8 @@ impl HubWindow {
             password: None,
             connection_id: None,
         };
-        self.selected = Some(target);
-        unsafe {
-            PostQuitMessage(0);
-        }
-        tracing::info!("hub connected from the New Connection form; exiting to connect");
-        Ok(())
+        tracing::info!("hub connected from the New Connection form");
+        self.launch_target(target)
     }
 
     /// Load the selected Saved row into the edit form, then switch to New.
@@ -3216,14 +3276,19 @@ unsafe extern "system" fn hub_proc(
     }
 }
 
-/// Run the hub window and its message loop until the user closes it. Returns
-/// the selected [`ConnectionTarget`] once steps 6/8 wire the selection through;
-/// `None` today (the shell has no selectable rows yet) and whenever the hub is
-/// closed without choosing a connection.
-pub fn run() -> Result<Option<ConnectionTarget>, HubError> {
+/// Run the hub window and its message loop until the user closes it.
+///
+/// `keep_hub_open` is the persisted preference loaded once in `hub::run`; it
+/// seeds the rail pin button. With the pin OFF selecting a connection returns
+/// that [`ConnectionTarget`] (main connects in-process); with the pin ON the
+/// selection launches a detached child session and the loop keeps running, so
+/// `None` is returned only when the hub window is closed. The window state Box
+/// is dropped after WM_QUIT ends the loop; the cached fonts are released
+/// afterwards so no control can repaint with a deleted HFONT.
+pub fn run(keep_hub_open: bool) -> Result<Option<ConnectionTarget>, HubError> {
     // The Box keeps the HubWindow alive (and its GWLP_USERDATA pointer valid)
     // for the whole loop; it is dropped after WM_QUIT ends the loop.
-    let hub = HubWindow::create()?;
+    let hub = HubWindow::create(keep_hub_open)?;
     tracing::info!("hub window open; entering message loop");
     let mut msg = MSG::default();
     unsafe {
