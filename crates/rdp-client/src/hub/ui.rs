@@ -22,12 +22,13 @@ use core::ffi::c_void;
 
 use windows::core::{w, PCWSTR, PWSTR, HRESULT};
 use windows::Win32::Foundation::{
-    COLORREF, ERROR_INSUFFICIENT_BUFFER, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    COLORREF, ERROR_INSUFFICIENT_BUFFER, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FrameRect, GetWindowDC, HBRUSH, HDC,
-    HGDIOBJ, InvalidateRect, ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-    DT_CENTER, DT_SINGLELINE, DT_VCENTER, TRANSPARENT, HFONT,
+    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, FillRect, FrameRect,
+    GetWindowDC, HBRUSH, HDC, HGDIOBJ, InvalidateRect, Polygon, PS_SOLID, ReleaseDC,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
+    TRANSPARENT, HFONT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::WindowsProgramming::GetUserNameW;
@@ -59,6 +60,20 @@ use super::{
 const ID_RAIL_RECENT: usize = 1;
 const ID_RAIL_SAVED: usize = 2;
 const ID_RAIL_NEW: usize = 3;
+/// Control id for the keep-open pin toggle pinned at the BOTTOM of the
+/// activity rail. Deliberately NOT a [`Section`] id — the pin is a separate
+/// toggle button, so `Section::from_id` keeps returning `None` for it and
+/// `on_command` toggles the state instead of switching sections.
+const ID_RAIL_PIN: usize = 40;
+
+/// Rail hover index reported for the keep-open pin over [`WM_APP_RAIL_HOVER`]
+/// (sections occupy 0..=2; the pin is the virtual slot 3).
+const RAIL_INDEX_PIN: usize = 3;
+
+/// Tooltip / accessible-name text for the keep-open pin toggle: the exact
+/// string the step requires, shown by the tooltip control over the pin and set
+/// as the button's window text so screen readers announce it too.
+const KEEP_OPEN_TOOLTIP: &str = "Keep hub open after connect";
 
 /// Control ids for the Recent/Saved filter edits and SysListView32 lists.
 const ID_FILTER_RECENT: usize = 4;
@@ -313,6 +328,21 @@ struct HubWindow {
     /// by the rail-button subclass wndproc via [`WM_APP_RAIL_HOVER`]; read by
     /// `on_draw_item` so a hovered button paints `theme::ROW_HOVER`.
     rail_hover: [bool; 3],
+    /// The keep-open pin toggle button, pinned at the BOTTOM of the rail.
+    /// A separate toggle (not a [`Section`]): it keeps its own hover state and
+    /// the on/off `keep_open` flag, reusing the same owner-draw / hover /
+    /// hit-test / tooltip machinery as the section buttons.
+    pin_btn: HWND,
+    /// Mouse-hover state of the pin button, maintained by the rail-button
+    /// subclass wndproc via [`WM_APP_RAIL_HOVER`] with index
+    /// [`RAIL_INDEX_PIN`].
+    pin_hover: bool,
+    /// Keep-hub-open-after-connect toggle state. `true` = ON (accent fill +
+    /// bar painted). Initialized to `true`; loading/persistence is wired in
+    /// step-6 (Settings store) — this step owns the UI toggle only.
+    keep_open: bool,
+    /// The tooltip control that shows [`KEEP_OPEN_TOOLTIP`] over the pin.
+    tooltip: HWND,
     /// The New Connection form controls (created lazily; the New section shows
     /// them instead of the step-5 placeholder pane).
     form: Option<FormState>,
@@ -403,6 +433,10 @@ impl HubWindow {
                 section: Section::Recent,
                 rail: [HWND::default(); 3],
                 rail_hover: [false; 3],
+                pin_btn: HWND::default(),
+                pin_hover: false,
+                keep_open: true,
+                tooltip: HWND::default(),
                 form: None,
                 sections: [None, None, None],
                 selected: None,
@@ -665,6 +699,18 @@ impl HubWindow {
                     );
                 }
             }
+            // The keep-open pin sits below the section buttons in the Z-order
+            // (so the dialog manager tabs to it after them): bring it to the
+            // top first, then the section loop puts Recent/Saved/New above it.
+            let _ = SetWindowPos(
+                self.pin_btn,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
             // Rail buttons last so the first one (Recent) ends up topmost.
             for btn in self.rail.iter().rev() {
                 let _ = SetWindowPos(
@@ -695,6 +741,11 @@ impl HubWindow {
         // Activity rail: switch sections.
         if let Some(section) = Section::from_id(id) {
             return self.show_section(section);
+        }
+
+        // Keep-open pin toggle (not a Section): flip the state and repaint.
+        if id == ID_RAIL_PIN {
+            return self.on_pin_toggle();
         }
 
         // Filter edits (Recent/Saved).
@@ -746,6 +797,19 @@ impl HubWindow {
             ID_BTN_EDIT_SAVED => return self.on_edit_saved(),
             ID_FORM_CONNECT => return self.on_form_connect(),
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Flip the keep-open pin toggle and repaint the pin button so its accent
+    /// fill/bar follows the new state. This step owns the UI toggle and the
+    /// in-memory `keep_open` flag; step-6 wires loading/persistence through
+    /// the Settings store.
+    fn on_pin_toggle(&mut self) -> Result<(), HubError> {
+        self.keep_open = !self.keep_open;
+        tracing::info!(keep_open = self.keep_open, "keep-open pin toggled");
+        unsafe {
+            let _ = InvalidateRect(Some(self.pin_btn), None, true);
         }
         Ok(())
     }
@@ -1747,6 +1811,12 @@ impl HubWindow {
             }
             _ => {}
         }
+        // The keep-open pin toggle is a separate bottom-of-rail button, not a
+        // Section: paint it with the same rail machinery (accent fill/bar when
+        // ON) plus the pin glyph.
+        if dis.CtlID as usize == ID_RAIL_PIN {
+            return self.on_draw_pin(dis);
+        }
         let Some(section) = Section::from_id(dis.CtlID as usize) else {
             return Ok(());
         };
@@ -1810,6 +1880,41 @@ impl HubWindow {
             let _ =
                 DrawTextW(dis.hDC, &mut text, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
+        Ok(())
+    }
+
+    /// WM_DRAWITEM for the keep-open pin toggle: the same fill logic as the
+    /// section rail buttons — when ON the button shows the active-section
+    /// `theme::ACTIVE_BG` fill plus the 2px `theme::ACCENT` bar; otherwise it
+    /// rests on `theme::BG` and lifts to `theme::ROW_HOVER` on hover. The pin
+    /// glyph is drawn with GDI primitives (no asset) in `theme::PIN_ON_GLYPH`
+    /// when ON and `theme::MUTED` when OFF.
+    fn on_draw_pin(&self, dis: &DRAWITEMSTRUCT) -> Result<(), HubError> {
+        let dpi = self.dpi();
+        let fill = if self.keep_open {
+            theme::ACTIVE_BG
+        } else if self.pin_hover {
+            theme::ROW_HOVER
+        } else {
+            theme::BG
+        };
+        let glyph = if self.keep_open {
+            theme::PIN_ON_GLYPH
+        } else {
+            theme::MUTED
+        };
+        unsafe {
+            paint_solid_rect(dis.hDC, &dis.rcItem, fill);
+            // Same 2px accent bar the active section button gets, on the left
+            // edge, DIP-scaled.
+            if self.keep_open {
+                let bar_w = theme::scale_px(RAIL_ACCENT_BAR_W, dpi);
+                let mut bar = dis.rcItem;
+                bar.right = bar.left + bar_w;
+                paint_solid_rect(dis.hDC, &bar, theme::ACCENT);
+            }
+        }
+        draw_pin_glyph(dis.hDC, &dis.rcItem, dpi, glyph, fill);
         Ok(())
     }
 
@@ -2185,6 +2290,71 @@ fn paint_button_label(
     }
 }
 
+/// Draw the keep-open pin glyph with GDI primitives only (no image asset): a
+/// location-pin head (filled circle) with a hollow center punched through to
+/// `hole`, and a tail that tapers from the head's lower edge down to a point.
+/// `glyph` is the pin color (lighter accent when toggled ON, muted when OFF);
+/// `hole` is the button's fill color so the hollow reads as empty.
+fn draw_pin_glyph(hdc: HDC, rc: &RECT, dpi: u32, glyph: COLORREF, hole: COLORREF) {
+    unsafe {
+        let cx = (rc.left + rc.right) / 2;
+        let cy = (rc.top + rc.bottom) / 2;
+        let head_r = theme::scale_px(4, dpi).max(3);
+        let tail_half = theme::scale_px(4, dpi).max(3);
+        let tail_len = theme::scale_px(9, dpi).max(7);
+        let top = cy - head_r - tail_len / 2;
+        let head_cy = top + head_r;
+        let tip_y = top + head_r * 2 + tail_len;
+
+        // Same-color pen so the filled shapes have no contrasting outline.
+        let pen = CreatePen(PS_SOLID, 1, glyph);
+        let old_pen = SelectObject(hdc, HGDIOBJ::from(pen));
+        let brush = CreateSolidBrush(glyph);
+        let old_brush = SelectObject(hdc, HGDIOBJ::from(brush));
+
+        // Tail: triangle from the head's lower edge to the tip point.
+        let tail = [
+            POINT {
+                x: cx - tail_half,
+                y: head_cy + head_r - 1,
+            },
+            POINT {
+                x: cx + tail_half,
+                y: head_cy + head_r - 1,
+            },
+            POINT { x: cx, y: tip_y },
+        ];
+        let _ = Polygon(hdc, &tail);
+
+        // Head: filled circle capping the tail.
+        let _ = Ellipse(
+            hdc,
+            cx - head_r,
+            head_cy - head_r,
+            cx + head_r,
+            head_cy + head_r,
+        );
+
+        // Hollow center: punch the button fill through the head.
+        let hole_r = theme::scale_px(2, dpi).max(1);
+        let hole_brush = CreateSolidBrush(hole);
+        let _ = SelectObject(hdc, HGDIOBJ::from(hole_brush));
+        let _ = Ellipse(
+            hdc,
+            cx - hole_r,
+            head_cy - hole_r,
+            cx + hole_r,
+            head_cy + hole_r,
+        );
+        let _ = DeleteObject(hole_brush.into());
+
+        let _ = SelectObject(hdc, old_brush);
+        let _ = DeleteObject(brush.into());
+        let _ = SelectObject(hdc, old_pen);
+        let _ = DeleteObject(pen.into());
+    }
+}
+
 /// Paint the primary Connect button: a filled `theme::ACCENT` rectangle with
 /// white (`theme::ON_ACCENT`) text. Hover lifts the accent slightly, pressing
 /// darkens it toward the background so the click reads.
@@ -2367,6 +2537,20 @@ unsafe extern "system" fn hub_button_proc(
     let old = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     let old_proc: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
     CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
+}
+
+/// Process-lifetime NUL-terminated UTF-16 copy of [`KEEP_OPEN_TOOLTIP`], for
+/// the tooltip control's `lpszText`. The tooltip keeps this pointer for its
+/// whole life, so the buffer must outlive the hub window; `OnceLock` leaks the
+/// Vec on first use and every later call returns the same slice.
+fn keep_open_tooltip_text() -> &'static [u16] {
+    static TIP: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+    TIP.get_or_init(|| {
+        KEEP_OPEN_TOOLTIP
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    })
 }
 
 /// Read an edit control's text (UTF-16, truncated at the first NUL).
@@ -2808,14 +2992,16 @@ unsafe fn paint_hub_background(hwnd: HWND, hdc: HDC) {
 /// needed in the subclass.
 unsafe fn post_rail_hover(btn: HWND, hovered: bool) {
     let id = GetDlgCtrlID(btn) as usize;
-    let Some(section) = Section::from_id(id) else {
-        return;
+    let idx = match Section::from_id(id) {
+        Some(section) => section.index(),
+        None if id == ID_RAIL_PIN => RAIL_INDEX_PIN,
+        None => return,
     };
     if let Ok(parent) = GetParent(btn) {
         let _ = PostMessageW(
             Some(parent),
             WM_APP_RAIL_HOVER,
-            WPARAM(section.index()),
+            WPARAM(idx),
             LPARAM(hovered as isize),
         );
     }
@@ -3140,6 +3326,7 @@ impl HubWindow {
         for btn in &self.rail {
             set_font(*btn, base);
         }
+        set_font(self.pin_btn, base);
         if let Some(f) = &self.form {
             set_font(f.header, semibold);
             for label in &f.labels {
