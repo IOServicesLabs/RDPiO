@@ -126,6 +126,10 @@ pub const ROW_SELECT: COLORREF = color_mix(PANEL, ACCENT, 35);
 pub const ACTIVE_BG: COLORREF = rgb(0x37, 0x37, 0x3A);
 /// Text drawn on accent-filled surfaces (primary button, accent bar).
 pub const ON_ACCENT: COLORREF = rgb(0xFF, 0xFF, 0xFF);
+/// Keep-open pin glyph when the toggle is ON (rail toggle step): [`ACCENT`]
+/// lifted 15% toward white so the pin reads clearly against the `ACTIVE_BG`
+/// fill behind it. Off-state glyphs use [`MUTED`].
+pub const PIN_ON_GLYPH: COLORREF = lighten(ACCENT, 15);
 
 // Row-tint back-compat aliases (pre-step-2 names), mirroring the canonical
 // derived constants above so ui.rs call sites keep compiling.
