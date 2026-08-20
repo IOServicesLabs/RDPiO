@@ -8,7 +8,7 @@
 
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -89,6 +89,41 @@ static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 static CAPTURE: AtomicBool = AtomicBool::new(false);
 /// Raw-input mouse registration is process-wide and done once.
 static RAW_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// The rdpio app icons (resource id 1 — the icon group `build.rs` embeds from
+/// `res/rdpio.rc`), loaded once per process: `.0` = big icon (taskbar button),
+/// `.1` = small icon (title bar). Both are referenced by the registered window
+/// class for the whole process lifetime, so the handles are intentionally never
+/// destroyed (a deliberate, tiny process-lifetime allocation — one 32×32 and
+/// one 16×16 icon).
+static APP_ICONS: OnceLock<(HICON, HICON)> = OnceLock::new();
+
+/// Load `rdpio.ico` from the module instance. `MAKEINTRESOURCEW(1)` is simply
+/// the pointer value `1` — the icon-group resource id declared in
+/// `res/rdpio.rc`. `LR_DEFAULTSIZE` picks the icon's default size (32×32) for
+/// the taskbar icon; the title-bar icon is loaded at exactly 16×16 so the small
+/// frame from the .ico is used as-is. Any failure degrades gracefully to the
+/// system default icon (null handles).
+fn app_icons(hinstance: HINSTANCE) -> (HICON, HICON) {
+    *APP_ICONS.get_or_init(|| unsafe {
+        let res_id = PCWSTR(1 as *const u16); // MAKEINTRESOURCEW(1)
+        let big = match LoadImageW(Some(hinstance), res_id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE) {
+            Ok(h) => HICON(h.0),
+            Err(e) => {
+                tracing::warn!(error = %e, "LoadImageW(app icon, big) failed; using default icon");
+                HICON::default()
+            }
+        };
+        let small = match LoadImageW(Some(hinstance), res_id, IMAGE_ICON, 16, 16, IMAGE_FLAGS(0)) {
+            Ok(h) => HICON(h.0),
+            Err(e) => {
+                tracing::warn!(error = %e, "LoadImageW(app icon, small) failed; using default icon");
+                HICON::default()
+            }
+        };
+        (big, small)
+    })
+}
 
 /// A raw, platform-decoded input event. The UI loop maps these to RDP input
 /// PDUs (scaling mouse coordinates from client pixels to the desktop).
@@ -323,6 +358,7 @@ impl Window {
             let module = GetModuleHandleW(None)?;
             let hinstance = HINSTANCE(module.0);
             let class_name = w!("rdpioWindowClass");
+            let (h_icon, h_icon_sm) = app_icons(hinstance);
 
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -332,6 +368,11 @@ impl Window {
                 lpszClassName: class_name,
                 hCursor: LoadCursorW(None, IDC_ARROW)?,
                 hbrBackground: HBRUSH::default(),
+                // rdpio.ico (embedded by build.rs as resource id 1): hIcon feeds
+                // the taskbar button, hIconSm the title bar. Both are referenced
+                // by the class for the process lifetime (never freed).
+                hIcon: h_icon,
+                hIconSm: h_icon_sm,
                 ..Default::default()
             };
             // Registering the same class twice fails; we only ever create one
