@@ -91,12 +91,33 @@ static CAPTURE: AtomicBool = AtomicBool::new(false);
 static RAW_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// The rdpio app icons (resource id 1 — the icon group `build.rs` embeds from
-/// `res/rdpio.rc`), loaded once per process: `.0` = big icon (taskbar button),
-/// `.1` = small icon (title bar). Both are referenced by the registered window
+/// `res/rdpio.rc`), loaded once per process: `big` = taskbar button icon,
+/// `small` = title-bar icon. Both are referenced by the registered window
 /// class for the whole process lifetime, so the handles are intentionally never
 /// destroyed (a deliberate, tiny process-lifetime allocation — one 32×32 and
 /// one 16×16 icon).
-static APP_ICONS: OnceLock<(HICON, HICON)> = OnceLock::new();
+///
+/// `HICON` is `pub struct HICON(pub *mut c_void)` — a raw pointer, which is
+/// neither `Send` nor `Sync`, so it cannot live directly in a `static`. The
+/// handles here are immutable, process-lifetime GDI objects that are never
+/// freed while any reference exists and are only ever handed back to GDI on the
+/// GUI thread, so propagating `Send + Sync` through this plain-data wrapper is
+/// sound.
+#[derive(Clone, Copy)]
+struct AppIcons {
+    big: HICON,
+    small: HICON,
+}
+
+// Soundness: `AppIcons` only contains `HICON`s that (a) are created once and
+// never destroyed for the process lifetime, (b) are immutable after
+// initialization, and (c) are only consumed by GDI functions that have no
+// thread affinity requirement. The `OnceLock` guarantee (write-once, then
+// read-only) therefore makes sharing references across threads safe.
+unsafe impl Send for AppIcons {}
+unsafe impl Sync for AppIcons {}
+
+static APP_ICONS: OnceLock<AppIcons> = OnceLock::new();
 
 /// Load `rdpio.ico` from the module instance. `MAKEINTRESOURCEW(1)` is simply
 /// the pointer value `1` — the icon-group resource id declared in
@@ -104,7 +125,7 @@ static APP_ICONS: OnceLock<(HICON, HICON)> = OnceLock::new();
 /// the taskbar icon; the title-bar icon is loaded at exactly 16×16 so the small
 /// frame from the .ico is used as-is. Any failure degrades gracefully to the
 /// system default icon (null handles).
-fn app_icons(hinstance: HINSTANCE) -> (HICON, HICON) {
+fn app_icons(hinstance: HINSTANCE) -> AppIcons {
     *APP_ICONS.get_or_init(|| unsafe {
         let res_id = PCWSTR(1 as *const u16); // MAKEINTRESOURCEW(1)
         let big = match LoadImageW(Some(hinstance), res_id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE) {
@@ -121,7 +142,7 @@ fn app_icons(hinstance: HINSTANCE) -> (HICON, HICON) {
                 HICON::default()
             }
         };
-        (big, small)
+        AppIcons { big, small }
     })
 }
 
@@ -358,7 +379,7 @@ impl Window {
             let module = GetModuleHandleW(None)?;
             let hinstance = HINSTANCE(module.0);
             let class_name = w!("rdpioWindowClass");
-            let (h_icon, h_icon_sm) = app_icons(hinstance);
+            let icons = app_icons(hinstance);
 
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -371,8 +392,8 @@ impl Window {
                 // rdpio.ico (embedded by build.rs as resource id 1): hIcon feeds
                 // the taskbar button, hIconSm the title bar. Both are referenced
                 // by the class for the process lifetime (never freed).
-                hIcon: h_icon,
-                hIconSm: h_icon_sm,
+                hIcon: icons.big,
+                hIconSm: icons.small,
                 ..Default::default()
             };
             // Registering the same class twice fails; we only ever create one
