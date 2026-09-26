@@ -159,6 +159,12 @@ impl ReverseConnectStream {
     pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> io::Result<()> {
         self.inner.set_read_timeout(dur)
     }
+
+    /// The gateway TCP socket (see [`crate::websocket::WebSocketStream::raw_socket`]).
+    #[cfg(windows)]
+    pub fn raw_socket(&self) -> std::os::windows::io::RawSocket {
+        self.inner.raw_socket()
+    }
 }
 
 impl Read for ReverseConnectStream {

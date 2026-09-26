@@ -55,19 +55,26 @@ impl Transport {
         }
     }
 
-    /// The raw TCP socket underlying this transport, when there is exactly one
-    /// carrying RDP bytes directly (the direct TCP/TLS paths) — what the
-    /// graphics worker registers for event-driven waits. The WebSocket paths
-    /// return `None`: their framing layer buffers whole messages above the
-    /// socket, so socket-level readability wouldn't match "a PDU is available"
-    /// — they keep timeout pacing instead.
+    /// The raw TCP socket underlying this transport — what the graphics worker
+    /// registers for event-driven waits. On the WebSocket paths it is the
+    /// gateway socket beneath the TLS + WebSocket framing; those layers only
+    /// touch the socket once their buffers are drained, so "the stack read
+    /// returned `WouldBlock`" still means "wait for the socket".
+    ///
+    /// The WebSocket paths used to return `None` and pace the worker with a
+    /// 1 ms `SO_RCVTIMEO` instead. Windows documents a timed-out `recv` as
+    /// leaving the socket indeterminate with possible data loss, and at ~1000
+    /// timeouts a second a long session eventually lost gateway TLS bytes — the
+    /// next record then failed `DecryptMessage` (`0x80090330`) and the session
+    /// froze.
     #[cfg(windows)]
     pub fn raw_socket(&self) -> Option<std::os::windows::io::RawSocket> {
         use std::os::windows::io::AsRawSocket;
         match self {
             Transport::Tcp(s) => Some(s.as_raw_socket()),
             Transport::Tls(s) => Some(s.get_ref().as_raw_socket()),
-            Transport::WebSocket(_) | Transport::WebSocketTls(_) => None,
+            Transport::WebSocket(s) => Some(s.raw_socket()),
+            Transport::WebSocketTls(s) => Some(s.get_ref().raw_socket()),
         }
     }
 }

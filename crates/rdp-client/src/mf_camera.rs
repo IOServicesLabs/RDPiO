@@ -11,7 +11,7 @@
 //! executed here; validated on hardware.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -63,6 +63,11 @@ unsafe fn vidcap_attributes() -> windows::core::Result<windows::Win32::Media::Me
 pub struct MfCamera {
     frames: Arc<Mutex<VecDeque<Vec<u8>>>>,
     stop: Arc<AtomicBool>,
+    /// On-demand mode (MS-RDPECAM): frames still owed to the server. The capture
+    /// thread only encodes while this is non-zero, so every encoded H.264 frame
+    /// is sent and the stream stays decodable — frames are skipped before the
+    /// encoder, never after. `None` = free-running (latest frame wins).
+    demand: Option<Arc<AtomicU32>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -105,21 +110,49 @@ impl MfCamera {
         ]
     }
 
-    /// Begin capturing `device_index` at the given media type on a worker thread.
+    /// Begin capturing `device_index` at the given media type on a worker
+    /// thread, free-running: read frames with [`MfCamera::poll_frame`].
     pub fn start(device_index: u32, media: MediaType) -> Self {
+        Self::spawn(device_index, media, None)
+    }
+
+    /// Begin capturing on demand: nothing is produced until
+    /// [`MfCamera::request_frames`] asks for it; read with
+    /// [`MfCamera::next_frame`].
+    pub fn start_on_demand(device_index: u32, media: MediaType) -> Self {
+        Self::spawn(device_index, media, Some(Arc::new(AtomicU32::new(0))))
+    }
+
+    fn spawn(device_index: u32, media: MediaType, demand: Option<Arc<AtomicU32>>) -> Self {
         let frames = Arc::new(Mutex::new(VecDeque::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (frames_w, stop_w) = (frames.clone(), stop.clone());
+        let (frames_w, stop_w, demand_w) = (frames.clone(), stop.clone(), demand.clone());
         let worker = std::thread::spawn(move || unsafe {
-            if let Err(e) = capture_loop(device_index, media, &frames_w, &stop_w) {
+            if let Err(e) =
+                capture_loop(device_index, media, &frames_w, &stop_w, demand_w.as_deref())
+            {
                 tracing::warn!(error = %e, "camera capture loop ended");
             }
         });
         Self {
             frames,
             stop,
+            demand,
             worker: Some(worker),
         }
+    }
+
+    /// On-demand mode: ask the capture thread for `n` more frames.
+    pub fn request_frames(&self, n: u32) {
+        if let Some(d) = self.demand.as_ref() {
+            d.fetch_add(n, Ordering::SeqCst);
+        }
+    }
+
+    /// On-demand mode: the oldest produced frame not yet taken, in capture
+    /// order (every one is owed to the server).
+    pub fn next_frame(&self) -> Option<Vec<u8>> {
+        self.frames.lock().ok()?.pop_front()
     }
 
     /// Drain the most recent captured frame, if any (keeps only the latest to
@@ -142,12 +175,14 @@ impl Drop for MfCamera {
 }
 
 /// Activate `device_index`, configure NV12 at the requested size, and pump
-/// frames into `frames` until `stop` is set. Runs on the capture worker thread.
+/// frames into `frames` until `stop` is set — every frame, or with `demand`
+/// only as many as are owed. Runs on the capture worker thread.
 unsafe fn capture_loop(
     device_index: u32,
     media: MediaType,
     frames: &Arc<Mutex<VecDeque<Vec<u8>>>>,
     stop: &Arc<AtomicBool>,
+    demand: Option<&AtomicU32>,
 ) -> windows::core::Result<()> {
     let attrs = vidcap_attributes()?;
     let mut devices: *mut Option<IMFActivate> = std::ptr::null_mut();
@@ -215,6 +250,9 @@ unsafe fn capture_loop(
         let Some(sample) = sample else {
             continue; // no frame this iteration (e.g. a format change marker)
         };
+        if demand.is_some_and(|d| d.load(Ordering::SeqCst) == 0) {
+            continue; // nothing owed: skip before the encoder sees it
+        }
         let buffer = sample.ConvertToContiguousBuffer()?;
         let mut data: *mut u8 = std::ptr::null_mut();
         let mut max_len = 0u32;
@@ -236,9 +274,16 @@ unsafe fn capture_loop(
             };
             if let Some(frame) = frame {
                 if let Ok(mut q) = frames.lock() {
-                    // Keep the queue shallow: drop stale frames so we always send fresh.
-                    if q.len() > 2 {
-                        q.clear();
+                    match demand {
+                        // Owed frames are kept in order; the demand bounds the queue.
+                        Some(d) => {
+                            let _ = d.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                                v.checked_sub(1)
+                            });
+                        }
+                        // Keep the queue shallow: drop stale frames so we always send fresh.
+                        None if q.len() > 2 => q.clear(),
+                        None => {}
                     }
                     q.push_back(frame);
                 }

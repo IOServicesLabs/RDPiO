@@ -45,6 +45,10 @@ pub struct GraphicsOutput {
     /// Set to `true` in the processing turn where `AUDIO_PLAYBACK_DVC` is created.
     /// The caller should send the client's initial audio formats in response.
     pub audio_output_opened: bool,
+    /// Set in the processing turn where the camera enumerator channel is
+    /// created. The caller must then open MS-RDPECAM version negotiation (the
+    /// client speaks first), after sending `responses`.
+    pub camera_opened: bool,
     /// Complete messages received on the camera enumerator channel, for the
     /// caller's MS-RDPECAM state machine. Empty unless that channel is open.
     pub camera: Vec<Vec<u8>>,
@@ -201,9 +205,10 @@ impl GraphicsChannel {
                     // Accept the camera enumerator; the caller drives MS-RDPECAM.
                     self.camera_channel_id = Some(channel_id);
                     out.responses.push(drdynvc::create_response(channel_id, 0));
+                    out.camera_opened = true;
                     tracing::info!(
                         channel_id,
-                        "opened camera enumerator channel (MS-RDPECAM); awaiting version request"
+                        "opened camera enumerator channel (MS-RDPECAM); negotiating version"
                     );
                 } else if name.starts_with(names::CAMERA_DEVICE_PREFIX) {
                     // A per-device camera channel for a camera we announced.
@@ -625,9 +630,11 @@ mod tests {
         create.push(0);
         let out = gc.process(&create);
         assert_eq!(out.responses, vec![drdynvc::create_response(11, 0)]);
+        assert!(out.camera_opened);
         assert!(gc.camera_open());
-        let out = gc.process(&drdynvc::data(11, &[0x01, 0x03]));
-        assert_eq!(out.camera, vec![vec![0x01, 0x03]]);
+        let out = gc.process(&drdynvc::data(11, &[0x01, 0x04]));
+        assert!(!out.camera_opened);
+        assert_eq!(out.camera, vec![vec![0x01, 0x04]]);
         assert_eq!(gc.wrap_camera(&[0x01, 0x04]).unwrap()[0], 0x30);
     }
 
