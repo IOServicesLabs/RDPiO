@@ -152,6 +152,18 @@ impl WebSocketStream {
         self.ws.get_ref().get_ref().set_read_timeout(dur)
     }
 
+    /// The gateway TCP socket under the TLS + WebSocket layers, for event-driven
+    /// waits ([`crate::net_wait::SocketWait`]). Every layer above it only reads
+    /// the socket once its own buffer can't produce the next unit (TLS record,
+    /// WebSocket frame, binary message), so a stack read that surfaces
+    /// `WouldBlock` means nothing complete is buffered anywhere — the invariant
+    /// the worker's "block until the socket is readable" wait relies on.
+    #[cfg(windows)]
+    pub fn raw_socket(&self) -> std::os::windows::io::RawSocket {
+        use std::os::windows::io::AsRawSocket;
+        self.ws.get_ref().get_ref().as_raw_socket()
+    }
+
     /// Read the next whole inbound **binary** WebSocket message, preserving frame
     /// boundaries. Unlike the [`Read`] impl (which flattens all messages into one
     /// byte stream for the RDP tunnel), the Shortpath rendezvous signaling treats

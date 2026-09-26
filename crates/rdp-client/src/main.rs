@@ -3857,14 +3857,20 @@ mod win {
                     attempts = 0;
                     c
                 }
-                None => match connect::establish_reconnect(&mut config, cookie.as_ref()) {
+                None => match {
+                    refresh_w365_token(args, &mut config);
+                    connect::establish_reconnect(&mut config, cookie.as_ref())
+                } {
                     Ok(c) => {
                         attempts = 0;
                         c
                     }
                     Err(e) => {
                         attempts += 1;
-                        if cookie.is_some() && attempts <= MAX_RECONNECT {
+                        // Getting here means a reconnect was already decided on
+                        // (cookie, network drop or GPU rebuild), so keep trying
+                        // with backoff whether or not there is a cookie.
+                        if attempts <= MAX_RECONNECT {
                             let delay = reconnect_delay(attempts);
                             tracing::warn!(
                                 error = %e,
@@ -3878,9 +3884,9 @@ mod win {
                             window.set_title("Reconnecting… — RDPiO");
                             continue 'session;
                         }
-                        window.set_title("RDPiO");
+                        window.set_title("Disconnected — RDPiO");
                         tracing::info!(error = %e, "auto-reconnect exhausted; window stays open");
-                        idle_until_close(&window, &mut renderer)?;
+                        idle_until_close(&window, &mut renderer, conn_bar.as_ref())?;
                         break 'session;
                     }
                 },
@@ -3966,12 +3972,19 @@ mod win {
             // the window. Set by the UI thread before the join.
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_worker = stop.clone();
-            // Event-driven waits for the worker where the transport exposes its
-            // raw socket (direct TCP/TLS). Registering switches the socket to
-            // non-blocking event notification — the TLS read/write paths ride
-            // that out — and drops the worker's idle wakeups from 60-1000/s
-            // (the old 1 ms poll, a steady battery cost) to ~2/s. Input still
-            // ships instantly: every producer signals the worker's wake event.
+            // Set by the worker when the session died on a transport error the
+            // server gave no reason for (no Set Error Info) — a network drop,
+            // which is worth reconnecting even without an auto-reconnect cookie.
+            // Read after `worker.join()`.
+            let network_drop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let network_drop_worker = network_drop.clone();
+            // Event-driven waits for the worker on the transport's raw socket
+            // (direct TLS, or the gateway socket under W365/AVD's WebSocket).
+            // Registering switches the socket to non-blocking event
+            // notification — the TLS read/write paths ride that out — and drops
+            // the worker's idle wakeups from 60-1000/s (the old 1 ms poll, a
+            // steady battery cost) to ~2/s. Input still ships instantly: every
+            // producer signals the worker's wake event.
             let sock_wait = if graphics_path {
                 transport.raw_socket().and_then(|s| {
                     match crate::net_wait::SocketWait::new(s) {
@@ -3993,7 +4006,7 @@ mod win {
                 let mut transport = transport;
                 let result = if graphics_path {
                     if sock_wait.is_none() {
-                        // No waitable socket (WebSocket paths): fall back to the
+                        // Socket event registration failed: fall back to the
                         // 1 ms read-timeout poll so queued input still ships
                         // promptly between reads.
                         if let Err(e) =
@@ -4096,6 +4109,11 @@ mod win {
                     session::run_session(&mut transport, &mut session, &mut sink)
                 };
                 if let Err(err) = result {
+                    if matches!(err, session::ActivateError::Io(_))
+                        && session::server_error_info() == 0
+                    {
+                        network_drop_worker.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     if !graphics_path {
                         // Legacy Standard RDP Security. A sudden server reset with
                         // no preceding Set Error Info usually means the RC4
@@ -4114,7 +4132,6 @@ mod win {
 
             // Inner UI loop for this connection.
             let mut window_closed = false;
-            let mut reconnect = false;
             let mut worker_alive = true;
             // Pixel blits + frame markers received but not yet applied. We only
             // apply through the last complete frame boundary each pump cycle, so
@@ -4242,11 +4259,10 @@ mod win {
                                     Ok(msg) => pending.push(msg),
                                     Err(TryRecvError::Empty) => break,
                                     Err(TryRecvError::Disconnected) => {
+                                        // Whether to reconnect is decided after
+                                        // the join below, once the worker's
+                                        // `network_drop` verdict is visible.
                                         worker_alive = false;
-                                        // Reconnect if the server gave us a cookie;
-                                        // otherwise keep the window open until close.
-                                        reconnect = cookie.is_some();
-                                        tracing::info!(reconnect, "session worker finished");
                                         break;
                                     }
                                 }
@@ -4338,7 +4354,7 @@ mod win {
                                 }
                             }
                         }
-                        if reconnect {
+                        if !worker_alive {
                             break;
                         }
                         // Carry "a frame is ready to show" across iterations so a
@@ -4434,7 +4450,21 @@ mod win {
             if window_closed {
                 break 'session;
             }
-            // Otherwise the worker dropped with a cookie → loop to reconnect.
+            if !worker_alive && !device_lost {
+                // The session ended on its own. Resume it when the server gave
+                // us a cookie, or when the connection simply dropped: a fresh
+                // logon reattaches the user's still-running session. A session
+                // the server ended for a stated reason stays ended.
+                let dropped = network_drop.load(std::sync::atomic::Ordering::SeqCst);
+                let reconnect = cookie.is_some() || dropped;
+                tracing::info!(reconnect, network_drop = dropped, "session worker finished");
+                if !reconnect {
+                    window.set_title("Disconnected — RDPiO");
+                    idle_until_close(&window, &mut renderer, conn_bar.as_ref())?;
+                    break 'session;
+                }
+                window.set_title("Reconnecting… — RDPiO");
+            }
             tracing::info!("attempting auto-reconnect…");
         }
 
@@ -4454,11 +4484,17 @@ mod win {
     fn idle_until_close(
         window: &Window,
         renderer: &mut Renderer,
+        conn_bar: Option<&crate::connbar::ConnBar>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match window.pump() {
                 Frame::Quit => return Ok(()),
                 Frame::Continue { resize } => {
+                    // Borderless modes close from the connection bar; keep its
+                    // hover reveal working on the dead session too.
+                    if let Some(bar) = conn_bar {
+                        bar.tick();
+                    }
                     if let Some((w, h)) = resize {
                         renderer.resize(w, h)?;
                         renderer.present_frame()?;
@@ -4466,6 +4502,27 @@ mod win {
                     window.wait_for_work(1_000);
                 }
             }
+        }
+    }
+
+    /// Before a W365/AVD reconnect, swap in a current gateway access token. The
+    /// one minted at launch lives about an hour, so a long session that drops
+    /// would otherwise fail ARM brokering on every retry. Silent (cached access
+    /// token, else the cached refresh token); on failure the old token is kept
+    /// and the attempt proceeds as before.
+    fn refresh_w365_token(args: &Args, config: &mut rdp_core::ClientConfig) {
+        if !args.w365 {
+            return;
+        }
+        let Some(rc) = config.reverse_connect.as_mut() else {
+            return;
+        };
+        let tenant = args.tenant.as_deref().unwrap_or("common");
+        match crate::token_cache::load_silent(tenant, args.client_id.as_deref()) {
+            Some(token) => rc.access_token = token.token,
+            None => tracing::warn!(
+                "could not refresh the W365 access token silently; reconnecting with the launch token"
+            ),
         }
     }
 

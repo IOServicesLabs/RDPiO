@@ -43,6 +43,9 @@ pub const INFO_UNICODE: u32 = 0x0000_0010;
 pub const INFO_MAXIMIZESHELL: u32 = 0x0000_0020;
 pub const INFO_LOGONNOTIFY: u32 = 0x0000_0040;
 pub const INFO_ENABLEWINDOWSKEY: u32 = 0x0000_0100;
+/// The client can capture audio (MS-RDPEAI). Without it the server never opens
+/// the `AUDIO_INPUT` dynamic channel, so microphone redirection can't start.
+pub const INFO_AUDIOCAPTURE: u32 = 0x0020_0000;
 
 // TS_EXTENDED_INFO_PACKET.performanceFlags bits (MS-RDPBCGR 2.2.1.11.1.1.1):
 // "disable" bits tell the server not to render an effect, so it never has to
@@ -94,7 +97,8 @@ pub struct ClientInfo {
 }
 
 impl ClientInfo {
-    /// TS_INFO_PACKET flags: Unicode + sensible client defaults, plus AUTOLOGON
+    /// TS_INFO_PACKET flags: Unicode + sensible client defaults (including audio
+    /// capture, so the server offers the microphone channel), plus AUTOLOGON
     /// when a password is supplied.
     pub fn flags(&self) -> u32 {
         let mut flags = INFO_MOUSE
@@ -102,7 +106,8 @@ impl ClientInfo {
             | INFO_UNICODE
             | INFO_MAXIMIZESHELL
             | INFO_ENABLEWINDOWSKEY
-            | INFO_LOGONNOTIFY;
+            | INFO_LOGONNOTIFY
+            | INFO_AUDIOCAPTURE;
         if !self.password.is_empty() {
             flags |= INFO_AUTOLOGON;
         }
@@ -298,6 +303,14 @@ mod tests {
         assert_eq!(&pdu[0..4], &[0x01, 0x00, 0x00, 0x00]);
         assert_eq!(u32::from_le_bytes([pdu[4], pdu[5], pdu[6], pdu[7]]), 72);
         assert_eq!(&pdu[8..], &[0xAA; 72]);
+    }
+
+    #[test]
+    fn advertises_audio_capture() {
+        // Without INFO_AUDIOCAPTURE the server never opens AUDIO_INPUT, so the
+        // microphone channel silently never appears.
+        let flags = ClientInfo::default().flags();
+        assert_eq!(flags & INFO_AUDIOCAPTURE, INFO_AUDIOCAPTURE);
     }
 
     #[test]

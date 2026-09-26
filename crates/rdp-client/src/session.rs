@@ -221,6 +221,19 @@ pub(crate) fn rdpei_active() -> bool {
     RDPEI_ACTIVE.load(Ordering::Relaxed)
 }
 
+/// The last non-zero Set Error Info code the server sent during the running
+/// session (0 = none). A connection that dies without one is a network drop
+/// worth reconnecting; one that carries a reason (logged off, idle timeout,
+/// logged on elsewhere, …) was ended on purpose and must stay ended.
+static SERVER_ERROR_INFO: AtomicU32 = AtomicU32::new(0);
+
+/// See [`SERVER_ERROR_INFO`]. Read by the windowed driver once the session
+/// worker has exited, to decide whether to auto-reconnect.
+#[cfg(windows)]
+pub(crate) fn server_error_info() -> u32 {
+    SERVER_ERROR_INFO.load(Ordering::SeqCst)
+}
+
 /// The server's `TS_INPUT_CAPABILITYSET.inputFlags` from the latest Demand
 /// Active (bit 15 marks "seen", so 0 = not yet known). The UI thread reads this
 /// to decide whether mouse-capture mode may send relative pointer events.
@@ -1629,6 +1642,7 @@ fn note_error_info(plaintext: &[u8]) {
         if code == rdp_pdu::errinfo::ERRINFO_NONE {
             tracing::debug!("server Set Error Info: none");
         } else {
+            SERVER_ERROR_INFO.store(code, Ordering::SeqCst);
             tracing::warn!(
                 code = format_args!("0x{code:08X}"),
                 reason = rdp_pdu::errinfo::describe(code),
@@ -1649,6 +1663,7 @@ pub fn run_session<S: Read + Write, F: FrameSink>(
     // flag swallowing touch-promoted mouse input here.
     #[cfg(windows)]
     RDPEI_ACTIVE.store(false, Ordering::Relaxed);
+    SERVER_ERROR_INFO.store(0, Ordering::SeqCst);
     loop {
         if pump_once(stream, session, sink)? == Pump::Painted {
             sink.present();
@@ -1964,6 +1979,7 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
 
     let io_channel = session.info.io_channel_id;
     let dvc_channel = session.info.channel_ids.first().copied();
+    SERVER_ERROR_INFO.store(0, Ordering::SeqCst);
     tracing::info!(
         io_channel,
         ?dvc_channel,
@@ -1999,12 +2015,17 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     );
     let mut camera = rdp_channels::camera::CameraEnumerator::new(cameras);
     // Per-device camera channels (keyed by DVC channel id) and the active
-    // capture, started when the server begins a stream.
+    // capture — (owning device channel, media type, camera) — started when the
+    // server begins a stream and released when it stops.
     let mut cam_devices: std::collections::HashMap<
         u32,
         rdp_channels::camera::CameraDeviceChannel,
     > = std::collections::HashMap::new();
-    let mut cam_capture: Option<crate::mf_camera::MfCamera> = None;
+    let mut cam_capture: Option<(
+        u32,
+        rdp_channels::camera::MediaType,
+        crate::mf_camera::MfCamera,
+    )> = None;
     // Frames acked so far (the RDPGFX ack carries a running total). Acks are sent
     // here, on the network thread, the instant an EndFrame is parsed — BEFORE the
     // decode thread renders it — so the server's frame clock is no longer gated
@@ -2148,18 +2169,15 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
             }
         }
 
-        // Camera: forward the latest captured frame to every streaming device
-        // channel as a SampleResponse (wrapped DVC data rides the static
+        // Camera: answer the server's outstanding SampleRequests with the frames
+        // captured for them — one SampleResponse each, in capture order —
+        // on the streaming device's channel (wrapped DVC data rides the static
         // drdynvc channel).
-        if let (Some(cap), Some(ch)) = (cam_capture.as_ref(), dvc_channel) {
-            if let Some(frame) = cap.poll_frame() {
-                for (chan_id, dev) in cam_devices.iter() {
-                    if dev.streaming().is_some() {
-                        let pdu = rdp_channels::camera::sample_response(0, &frame);
-                        let wrapped = graphics.wrap_camera_device(*chan_id, &pdu);
-                        session.send_dvc(stream, ch, &wrapped)?;
-                    }
-                }
+        if let (Some((chan_id, _, cap)), Some(ch)) = (cam_capture.as_ref(), dvc_channel) {
+            while let Some(frame) = cap.next_frame() {
+                let pdu = rdp_channels::camera::sample_response(0, &frame);
+                let wrapped = graphics.wrap_camera_device(*chan_id, &pdu);
+                session.send_dvc(stream, ch, &wrapped)?;
             }
         }
 
@@ -2448,6 +2466,15 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         for resp in &out.responses {
             session.send_dvc(stream, channel, resp)?;
         }
+        // The camera enumerator just opened (its create response is out):
+        // MS-RDPECAM version negotiation is ours to begin.
+        if out.camera_opened {
+            for pdu in camera.start() {
+                if let Some(wrapped) = graphics.wrap_camera(&pdu) {
+                    session.send_dvc(stream, channel, &wrapped)?;
+                }
+            }
+        }
         // Drive the microphone (MS-RDPEAI) state machine with any messages that
         // arrived on the AUDIO_INPUT channel, sending its replies back.
         for msg in &out.audio_input {
@@ -2497,16 +2524,40 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                 let wrapped = graphics.wrap_camera_device(*chan_id, &resp);
                 session.send_dvc(stream, channel, &wrapped)?;
             }
-            // The server just started streaming → open the capture device (the
-            // single default webcam; multi-camera selection is a future step).
-            if cam_capture.is_none() {
-                if let Some(media) = dev.streaming() {
-                    cam_capture = Some(crate::mf_camera::MfCamera::start(0, media));
+            // Follow the stream state: open the capture device when the server
+            // starts streaming (the single default webcam; multi-camera
+            // selection is a future step), reopen it on a media-type change,
+            // and release it when the stream stops.
+            let running = cam_capture.as_ref().map(|(id, media, _)| (*id, *media));
+            match (running, dev.streaming()) {
+                (None, Some(media)) => {
+                    cam_capture = Some((
+                        *chan_id,
+                        media,
+                        crate::mf_camera::MfCamera::start_on_demand(0, media),
+                    ));
                     tracing::info!(
                         channel_id = *chan_id,
                         ?media,
                         "camera capture started; streaming frames to the session"
                     );
+                }
+                (Some((owner, media)), streaming)
+                    if owner == *chan_id && streaming != Some(media) =>
+                {
+                    drop(cam_capture.take()); // joins the old capture thread first
+                    cam_capture = streaming.map(|m| {
+                        (owner, m, crate::mf_camera::MfCamera::start_on_demand(0, m))
+                    });
+                    tracing::info!(channel_id = owner, ?streaming, "camera stream changed");
+                }
+                _ => {}
+            }
+            // Ask the capture thread for one frame per SampleRequest received.
+            let owed = dev.take_new_requests();
+            if let Some((owner, _, cap)) = cam_capture.as_ref() {
+                if *owner == *chan_id {
+                    cap.request_frames(owed);
                 }
             }
         }
