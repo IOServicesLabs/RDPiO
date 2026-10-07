@@ -710,9 +710,11 @@ impl Drop for WebRtcRedirector {
     }
 }
 
-/// Find `MsRdcWebRTCAddIn.dll`: next to our exe first (a user-supplied copy), then
-/// the newest WindowsApps package (AVD HostApp / Windows365 / Remote Desktop) that
-/// ships it. `None` if not present or WindowsApps is unreadable.
+/// Find `MsRdcWebRTCAddIn.dll`: the `RDPIO_WEBRTC_ADDIN_DLL` override, next to
+/// our exe (a user-supplied copy), the installed Windows App / AVD HostApp /
+/// Remote Desktop package (located by family, no folder listing needed), an MSI
+/// Remote Desktop install, then a WindowsApps listing as a last resort. `None`
+/// if none of those has it.
 fn resolve_addin_dll() -> Option<PathBuf> {
     const NAME: &str = "MsRdcWebRTCAddIn.dll";
 
@@ -736,6 +738,40 @@ fn resolve_addin_dll() -> Option<PathBuf> {
             if p.exists() {
                 return Some(p);
             }
+        }
+    }
+
+    // Ask Windows where each client package is installed. A normal process can
+    // open a known path inside WindowsApps even though it can't list the folder
+    // (the listing below fails with access denied on most machines), and this
+    // needs no listing at all. Windows App first: it tracks the W365 host.
+    const FAMILIES: [&str; 3] = [
+        "MicrosoftCorporationII.Windows365_8wekyb3d8bbwe",
+        "MicrosoftCorporationII.AzureVirtualDesktopHostApp_8wekyb3d8bbwe",
+        "Microsoft.RemoteDesktop_8wekyb3d8bbwe",
+    ];
+    for family in FAMILIES {
+        for dir in package_dirs(family) {
+            for cand in [dir.join(NAME), dir.join("msrdc").join(NAME)] {
+                if cand.exists() {
+                    tracing::info!(%family, path = %cand.display(), "found Teams WebRTC add-in");
+                    return Some(cand);
+                }
+            }
+        }
+    }
+
+    // MSI installs of the Remote Desktop client (per-machine, then per-user).
+    let msi_dirs = [
+        std::env::var_os("ProgramFiles").map(|p| PathBuf::from(p).join("Remote Desktop")),
+        std::env::var_os("LOCALAPPDATA")
+            .map(|p| PathBuf::from(p).join("Apps").join("Remote Desktop")),
+    ];
+    for dir in msi_dirs.into_iter().flatten() {
+        let cand = dir.join(NAME);
+        if cand.exists() {
+            tracing::info!(path = %cand.display(), "found Teams WebRTC add-in (Remote Desktop MSI)");
+            return Some(cand);
         }
     }
 
@@ -777,4 +813,74 @@ fn resolve_addin_dll() -> Option<PathBuf> {
         None => tracing::warn!("no MsRdcWebRTCAddIn.dll found in any WindowsApps package or next to rdpio.exe"),
     }
     best.map(|(_, p)| p)
+}
+
+/// Install directories of the current user's packages in `family` (e.g.
+/// `MicrosoftCorporationII.Windows365_8wekyb3d8bbwe`); empty if none.
+fn package_dirs(family: &str) -> Vec<PathBuf> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
+    use windows::Win32::Storage::Packaging::Appx::{
+        GetPackagePathByFullName, GetPackagesByPackageFamily,
+    };
+
+    let family: Vec<u16> = family.encode_utf16().chain(std::iter::once(0)).collect();
+    let family = PCWSTR(family.as_ptr());
+    let mut dirs = Vec::new();
+    unsafe {
+        // First call sizes the name array and string buffer.
+        let (mut count, mut buf_len) = (0u32, 0u32);
+        let rc = GetPackagesByPackageFamily(family, &mut count, None, &mut buf_len, None);
+        if rc != ERROR_INSUFFICIENT_BUFFER || count == 0 {
+            return dirs;
+        }
+        let mut names = vec![PWSTR::null(); count as usize];
+        let mut buf = vec![0u16; buf_len as usize];
+        let rc = GetPackagesByPackageFamily(
+            family,
+            &mut count,
+            Some(names.as_mut_ptr()),
+            &mut buf_len,
+            Some(PWSTR(buf.as_mut_ptr())),
+        );
+        if rc != ERROR_SUCCESS {
+            return dirs;
+        }
+        for name in names.iter().take(count as usize) {
+            let mut len = 0u32;
+            let _ = GetPackagePathByFullName(PCWSTR(name.0), &mut len, None);
+            if len == 0 {
+                continue;
+            }
+            let mut path = vec![0u16; len as usize];
+            if GetPackagePathByFullName(PCWSTR(name.0), &mut len, Some(PWSTR(path.as_mut_ptr())))
+                == ERROR_SUCCESS
+            {
+                let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+                dirs.push(PathBuf::from(String::from_utf16_lossy(&path[..end])));
+            }
+        }
+    }
+    dirs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_dirs_of_an_unknown_family_is_empty() {
+        assert!(package_dirs("Contoso.NotInstalled_0000000000000").is_empty());
+    }
+
+    /// Where the lookup finds the add-in on this machine (informational: the
+    /// Windows App may not be installed where the tests run).
+    #[test]
+    fn resolve_addin_dll_reports_its_pick() {
+        eprintln!(
+            "windows365 package dirs: {:?}",
+            package_dirs("MicrosoftCorporationII.Windows365_8wekyb3d8bbwe")
+        );
+        eprintln!("add-in: {:?}", resolve_addin_dll());
+    }
 }

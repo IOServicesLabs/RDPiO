@@ -120,7 +120,7 @@ async fn engine_regenerates_a_teams_style_offer() {
         // shape, not `replaceTrack`, so the exact value is irrelevant as long as it's
         // unique per transceiver).
         engine
-            .add_transceiver(kind, dir, *id, *id + 100_000, false)
+            .add_transceiver(kind, dir, *id, *id + 100_000, &[])
             .await
             .unwrap_or_else(|e| panic!("add_transceiver(kind={kind}, dir={dir}, id={id}) failed: {e:?}"));
     }

@@ -394,6 +394,11 @@ pub struct H264Encoder {
     transform: IMFTransform,
     out_buf_size: usize,
     provides_samples: bool,
+    /// Frames submitted so far and the per-frame duration (100 ns units): each
+    /// input sample carries a real, increasing timestamp. The encoder's rate
+    /// control budgets bits against elapsed time, which a constant 0 starves.
+    frames_in: i64,
+    frame_duration: i64,
 }
 
 impl H264Encoder {
@@ -466,6 +471,8 @@ impl H264Encoder {
                 transform,
                 out_buf_size,
                 provides_samples,
+                frames_in: 0,
+                frame_duration: 10_000_000 / fps.max(1) as i64,
             })
         }
     }
@@ -490,7 +497,9 @@ impl H264Encoder {
 
             let sample = MFCreateSample()?;
             sample.AddBuffer(&buffer)?;
-            sample.SetSampleTime(0)?;
+            sample.SetSampleTime(self.frames_in * self.frame_duration)?;
+            sample.SetSampleDuration(self.frame_duration)?;
+            self.frames_in += 1;
             self.transform.ProcessInput(0, &sample, 0)?;
 
             self.drain()

@@ -373,11 +373,12 @@ impl GraphicsChannel {
         self.audio_in_channel_id.is_some()
     }
 
-    /// Wrap an MS-RDPEAI PDU as DRDYNVC data for the microphone channel, or
-    /// `None` if that channel isn't open.
-    pub fn wrap_audio_input(&self, payload: &[u8]) -> Option<Vec<u8>> {
+    /// Wrap an MS-RDPEAI PDU as DRDYNVC data for the microphone channel — one
+    /// PDU, or a `DATA_FIRST` + `DATA` run when it is too big for one (captured
+    /// PCM usually is) — or `None` if that channel isn't open.
+    pub fn wrap_audio_input(&self, payload: &[u8]) -> Option<Vec<Vec<u8>>> {
         self.audio_in_channel_id
-            .map(|id| drdynvc::data(id, payload))
+            .map(|id| drdynvc::data_message(id, payload))
     }
 
     /// Whether the speaker (`AUDIO_PLAYBACK_DVC`) channel is open.
@@ -386,8 +387,9 @@ impl GraphicsChannel {
     }
 
     /// Wrap an RDPSND PDU (e.g. a wave confirm or formats reply) as DRDYNVC data
-    /// for the speaker channel, or `None` if that channel isn't open.
-    pub fn wrap_audio_output(&self, payload: &[u8]) -> Option<Vec<u8>> {
+    /// for the speaker channel (fragmented if needed), or `None` if that channel
+    /// isn't open.
+    pub fn wrap_audio_output(&self, payload: &[u8]) -> Option<Vec<Vec<u8>>> {
         self.audio_out_channel_id.map(|id| {
             tracing::info!(
                 channel_id = id,
@@ -395,7 +397,7 @@ impl GraphicsChannel {
                 msg_type = format!("{:#04x}", payload.first().copied().unwrap_or(0)),
                 "AUDIO_PLAYBACK_DVC reply"
             );
-            drdynvc::data(id, payload)
+            drdynvc::data_message(id, payload)
         })
     }
 
@@ -404,15 +406,18 @@ impl GraphicsChannel {
         self.camera_channel_id.is_some()
     }
 
-    /// Wrap an MS-RDPECAM PDU as DRDYNVC data for the camera enumerator channel,
-    /// or `None` if that channel isn't open.
-    pub fn wrap_camera(&self, payload: &[u8]) -> Option<Vec<u8>> {
-        self.camera_channel_id.map(|id| drdynvc::data(id, payload))
+    /// Wrap an MS-RDPECAM PDU as DRDYNVC data for the camera enumerator channel
+    /// (fragmented if needed), or `None` if that channel isn't open.
+    pub fn wrap_camera(&self, payload: &[u8]) -> Option<Vec<Vec<u8>>> {
+        self.camera_channel_id.map(|id| drdynvc::data_message(id, payload))
     }
 
-    /// Wrap a PDU as DRDYNVC data for a specific per-device camera channel.
-    pub fn wrap_camera_device(&self, channel_id: u32, payload: &[u8]) -> Vec<u8> {
-        drdynvc::data(channel_id, payload)
+    /// Wrap a PDU as DRDYNVC data for a specific per-device camera channel. A
+    /// video sample is far larger than one DVC PDU, so it goes out as a
+    /// `DATA_FIRST` + `DATA` run — a single oversized `DATA` PDU is not valid
+    /// MS-RDPEDYC and the host drops it.
+    pub fn wrap_camera_device(&self, channel_id: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+        drdynvc::data_message(channel_id, payload)
     }
 
     /// Whether the RDPEI multi-touch/pen input channel is open and ready.
@@ -599,7 +604,29 @@ mod tests {
         assert_eq!(out.audio_input, vec![vec![0x01, 0x00, 0x00, 0x00, 0x01]]);
         // Outbound mic PDUs wrap as DVC data on channel 9.
         let wrapped = gc.wrap_audio_input(&[0x06, 0xAA]).unwrap();
-        assert_eq!(wrapped[0], 0x30); // DATA, cb=0
+        assert_eq!(wrapped, vec![drdynvc::data(9, &[0x06, 0xAA])]); // one DATA PDU
+    }
+
+    #[test]
+    fn large_outbound_messages_are_fragmented() {
+        // A camera sample / mic buffer bigger than one DVC PDU must go out as
+        // DATA_FIRST (carrying the total length) + DATA fragments that each fit
+        // a single static-channel chunk, reassembling to the original bytes.
+        let gc = GraphicsChannel::new();
+        let sample: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+        let pdus = gc.wrap_camera_device(12, &sample);
+        assert!(pdus.len() > 1);
+        assert_eq!(pdus[0][0] >> 4, 0x2, "first fragment is DATA_FIRST");
+        assert!(pdus[1..].iter().all(|p| p[0] >> 4 == 0x3), "the rest are DATA");
+        assert!(pdus.iter().all(|p| p.len() <= 1600));
+        let mut reasm = drdynvc::Reassembler::new();
+        let mut whole = None;
+        for p in &pdus {
+            if let Ok(pdu) = drdynvc::parse(p) {
+                whole = reasm.accept(pdu).or(whole);
+            }
+        }
+        assert_eq!(whole, Some((12, sample)));
     }
 
     #[test]
@@ -618,7 +645,7 @@ mod tests {
         let out = gc.process(&drdynvc::data(16, &[0x07, 0x00, 0x04, 0x00]));
         assert_eq!(out.audio_output, vec![vec![0x07, 0x00, 0x04, 0x00]]);
         // Outbound RDPSND replies (e.g. wave confirm) wrap as DVC data on chan 16.
-        assert_eq!(gc.wrap_audio_output(&[0x05, 0x00]).unwrap()[0], 0x30);
+        assert_eq!(gc.wrap_audio_output(&[0x05, 0x00]).unwrap()[0][0], 0x30);
     }
 
     #[test]
@@ -635,7 +662,7 @@ mod tests {
         let out = gc.process(&drdynvc::data(11, &[0x01, 0x04]));
         assert!(!out.camera_opened);
         assert_eq!(out.camera, vec![vec![0x01, 0x04]]);
-        assert_eq!(gc.wrap_camera(&[0x01, 0x04]).unwrap()[0], 0x30);
+        assert_eq!(gc.wrap_camera(&[0x01, 0x04]).unwrap()[0][0], 0x30);
     }
 
     #[test]

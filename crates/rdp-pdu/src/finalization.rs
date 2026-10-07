@@ -16,6 +16,7 @@ pub const PDUTYPE2_UPDATE: u8 = 2;
 pub const PDUTYPE2_CONTROL: u8 = 20;
 pub const PDUTYPE2_POINTER: u8 = 27;
 pub const PDUTYPE2_SYNCHRONIZE: u8 = 31;
+pub const PDUTYPE2_REFRESH_RECT: u8 = 33;
 pub const PDUTYPE2_SAVE_SESSION_INFO: u8 = 38;
 pub const PDUTYPE2_FONTLIST: u8 = 39;
 pub const PDUTYPE2_FONTMAP: u8 = 40;
@@ -37,6 +38,22 @@ fn put_u16(v: u16, out: &mut Vec<u8>) {
 #[inline]
 fn put_u32(v: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&v.to_le_bytes());
+}
+
+/// A Refresh Rect PDU (MS-RDPBCGR 2.2.11.2.1): ask the server to resend the
+/// given desktop areas. Each rect is `(left, top, right, bottom)` with
+/// right/bottom **inclusive** (TS_RECTANGLE16).
+pub fn refresh_rect_pdu(share_id: u32, user_id: u16, areas: &[(u16, u16, u16, u16)]) -> Vec<u8> {
+    let areas = &areas[..areas.len().min(255)];
+    let mut body = Vec::with_capacity(4 + areas.len() * 8);
+    body.push(areas.len() as u8); // numberOfAreas
+    body.extend_from_slice(&[0, 0, 0]); // pad3Octects
+    for &(l, t, r, b) in areas {
+        for v in [l, t, r, b] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    share_data(share_id, user_id, PDUTYPE2_REFRESH_RECT, &body)
 }
 
 /// Wrap `body` in a Share Data Header for `pdu_type2`.
@@ -106,6 +123,15 @@ mod tests {
         assert_eq!(u16::from_le_bytes([pdu[2], pdu[3]]), PDUTYPE_DATA);
         assert_eq!(pdu[14], expected_type2); // pduType2
         assert_eq!(data_pdu_type2(pdu), Some(expected_type2));
+    }
+
+    #[test]
+    fn refresh_rect_pdu_lists_inclusive_areas() {
+        let pdu = refresh_rect_pdu(0x0001_03EA, 1007, &[(10, 20, 109, 219)]);
+        assert_eq!(data_pdu_type2(&pdu), Some(PDUTYPE2_REFRESH_RECT));
+        let body = &pdu[pdu.len() - 12..];
+        assert_eq!(body[0], 1); // numberOfAreas
+        assert_eq!(&body[4..12], &[10, 0, 20, 0, 109, 0, 219, 0]);
     }
 
     #[test]

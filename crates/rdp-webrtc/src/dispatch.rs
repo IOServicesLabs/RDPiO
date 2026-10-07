@@ -21,18 +21,22 @@
 //! [Result]: crate::rpc::RpcMessageKind::Result
 //! [Event]: crate::rpc::RpcMessageKind::Event
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
 use crate::devices::{DeviceProvider, MediaDevice};
-use crate::engine::WebrtcEngine;
+use crate::engine::{PeerEvent, WebrtcEngine};
 use crate::ice::TurnResolver;
 use crate::objects::ObjectType;
 use crate::rpc::{RpcMessage, RpcMessageKind};
 
 /// `E_FAIL` — the generic failure HRESULT we report when an engine call fails.
 const HR_E_FAIL: i64 = -2147467259; // 0x80004005
+/// `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)` — what the real add-in answers
+/// `rtcSession` with.
+const HR_NOT_SUPPORTED: i64 = -2147024846; // 0x80070032
 
 /// The client's send/receive codec + header-extension capabilities, returned from
 /// `createPeerConnection`. Mirrors what the real add-in reports (a superset of any
@@ -173,6 +177,23 @@ pub struct Redirector {
     /// the `track` events fired after `setRemoteDescription`). Allocated from a high
     /// base so it can't collide with the small ids Teams assigns to its own objects.
     next_obj_id: u64,
+    /// `transceiverRpcObjectId` → the (sender, receiver) object ids Teams assigned
+    /// with it at `addTransceiver`. The `track` events must name these.
+    transceiver_objects: HashMap<u64, (u64, u64)>,
+    /// Whether Teams has applied our offer with `setLocalDescription`. ICE
+    /// candidates and the gathering-complete event are held until then: the add-in
+    /// only starts gathering at `setLocalDescription`, and every candidate event
+    /// carries the local description Teams set.
+    local_offer_set: bool,
+    /// State events held back until `local_offer_set` (see there).
+    held_events: Vec<Value>,
+    /// `MediaStream` rpc id → the capture device its constraints named.
+    stream_devices: HashMap<u64, String>,
+    /// Whether this peer connection's one `negotiationneeded` event has fired.
+    negotiation_needed_sent: bool,
+    /// Every candidate line trickled to Teams for this peer connection, so each
+    /// `icecandidate` event's `desc` carries them all (and the default address).
+    trickled: Vec<String>,
     /// Client display size advertised in the `sessioninfo` handshake (width,
     /// height). Informational for the host's video compositing; defaults to 1080p.
     display: (u32, u32),
@@ -195,6 +216,12 @@ impl Redirector {
             last_offer: None,
             teams_local_offer: None,
             next_obj_id: 0x1_0000_0000,
+            transceiver_objects: HashMap::new(),
+            local_offer_set: false,
+            held_events: Vec::new(),
+            negotiation_needed_sent: false,
+            stream_devices: HashMap::new(),
+            trickled: Vec::new(),
             display: (1920, 1080),
             devices: None,
         }
@@ -226,6 +253,18 @@ impl Redirector {
         self.engine.set_video_source(source);
     }
 
+    /// Install the outbound mic audio source (forwarded to the engine), fed into the
+    /// audio sender's Opus track when Teams `replaceTrack`s the mic.
+    pub fn set_audio_source(&mut self, source: Arc<dyn crate::engine::AudioCaptureSource>) {
+        self.engine.set_audio_source(source);
+    }
+
+    /// Install where inbound remote media goes (forwarded to the engine) — the
+    /// client's decoder/player for the call's audio and video.
+    pub fn set_media_sink(&mut self, sink: Arc<dyn crate::engine::MediaSink>) {
+        self.engine.set_sink(sink);
+    }
+
     /// Handle one inbound message. Non-Calls are ignored (the client doesn't act
     /// on its own results/events). Returns the outbound messages to send back.
     pub async fn handle(&mut self, msg: &RpcMessage) -> Vec<Value> {
@@ -248,6 +287,21 @@ impl Redirector {
             return vec![self.session_info_event()];
         }
 
+        // Right after the handshake the server offers an `rtcSession` (a session
+        // id, a timestamp, a 64-hex token and the shim version). The real add-in
+        // DECLINES it with ERROR_NOT_SUPPORTED — in the reference capture, and
+        // Teams then negotiates full audio + video + data-channel WebRTC media.
+        // Acking it as a success (our old generic ack) claims a capability the
+        // add-in doesn't, before any call exists; every native call since was
+        // answered audio-only. Decline exactly as the add-in does.
+        if otype == ObjectType::Redirector && method == "rtcSession" {
+            tracing::info!("dispatch: rtcSession → declining with ERROR_NOT_SUPPORTED, as the add-in does");
+            return msg
+                .call_id
+                .map(|cid| vec![reply(msg, cid, None, HR_NOT_SUPPORTED)])
+                .unwrap_or_default();
+        }
+
         let a0 = msg
             .args
             .as_ref()
@@ -262,6 +316,11 @@ impl Redirector {
                 self.pc_object_id = msg.object_id_u64();
                 self.last_offer = None;
                 self.teams_local_offer = None;
+                self.transceiver_objects.clear();
+                self.local_offer_set = false;
+                self.held_events.clear();
+                self.negotiation_needed_sent = false;
+                self.trickled.clear();
                 let n_ice = a0
                     .get("iceServers")
                     .and_then(Value::as_array)
@@ -292,6 +351,30 @@ impl Redirector {
                     Err(e) => Err(e.to_string()),
                 }
             }
+            // Teams' media-control protocol rides the data channel (capabilities,
+            // heartbeats, dominant speaker, video subscriptions) — carry its sends
+            // for real. Acking without sending starved Plaza of heartbeats and it
+            // dropped the call ~12 s in.
+            (ObjectType::DataChannel, "send") => {
+                let id = msg.object_id_u64().unwrap_or(0);
+                self.engine
+                    .send_data(id, data_channel_payload(&a0))
+                    .await
+                    .map(|_| ack())
+                    .map_err(|e| e.to_string())
+            }
+            (ObjectType::DataChannel, "close") => {
+                let id = msg.object_id_u64().unwrap_or(0);
+                self.engine
+                    .close_data_channel(id)
+                    .await
+                    .map(|_| ack())
+                    .map_err(|e| e.to_string())
+            }
+            // Teams polls this every second once connected and reads it to decide
+            // the call's media is up (transport DTLS state, selected candidate
+            // pair, inbound/outbound RTP). A bare ack left the call silent.
+            (ObjectType::PeerConnection, "getStats") => Ok(self.engine.stats_report().await),
             (ObjectType::PeerConnection, "close") => {
                 self.last_offer = None;
                 self.teams_local_offer = None;
@@ -306,16 +389,29 @@ impl Redirector {
                 let dir = a0.get("direction").and_then(Value::as_str).unwrap_or("inactive");
                 let id = a0.get("transceiverRpcObjectId").and_then(Value::as_u64).unwrap_or(0);
                 let sender_id = a0.get("senderRpcObjectId").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(receiver_id) = a0.get("receiverRpcObjectId").and_then(Value::as_u64) {
+                    self.transceiver_objects.insert(id, (sender_id, receiver_id));
+                }
                 // Teams marks a *send* (camera) transceiver by supplying `sendEncodings`
                 // (simulcast layers). Those must be created send-capable so `replaceTrack`
                 // can bind the real camera track; receive m-lines stay recvonly.
-                let wants_send = a0
+                let encodings: Vec<crate::engine_api::SendEncoding> = a0
                     .get("sendEncodings")
                     .and_then(Value::as_array)
-                    .map(|a| !a.is_empty())
-                    .unwrap_or(false);
+                    .map(|a| {
+                        a.iter()
+                            .map(|e| crate::engine_api::SendEncoding {
+                                rid: e.get("rid").and_then(Value::as_str).unwrap_or("").to_string(),
+                                scale_resolution_down_by: e
+                                    .get("scaleResolutionDownBy")
+                                    .and_then(Value::as_f64)
+                                    .unwrap_or(1.0),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 self.engine
-                    .add_transceiver(kind, dir, id, sender_id, wants_send)
+                    .add_transceiver(kind, dir, id, sender_id, &encodings)
                     .await
                     .map(|_| ack())
                     .map_err(|e| e.to_string())
@@ -326,6 +422,24 @@ impl Redirector {
             // The camera device is the client's default video source; the exact
             // `sourceId` Teams passed is threaded through the MediaStream constraints,
             // which we don't map yet, so pass the track id as a best-effort hint.
+            // Remember which device each capture stream/track was created for
+            // (`constraints.audio.deviceId` / `video.mandatory.sourceId`), so the
+            // mic and camera open the device Teams picked, not the default.
+            (ObjectType::MediaStream, "createMediaStream") => {
+                if let (Some(id), Some(dev)) = (msg.object_id_u64(), stream_device(&a0)) {
+                    self.stream_devices.insert(id, dev);
+                }
+                Ok(ack())
+            }
+            (ObjectType::MediaStreamTrack, "createMediaStreamTrack") => {
+                let stream = a0.get("mediaStreamRpcObjectId").and_then(Value::as_u64);
+                if let (Some(track), Some(dev)) =
+                    (msg.object_id_u64(), stream.and_then(|s| self.stream_devices.get(&s)))
+                {
+                    self.engine.set_track_device(&track.to_string(), dev);
+                }
+                Ok(ack())
+            }
             (ObjectType::RtpSender, "replaceTrack") => {
                 let sender_id = msg.object_id_u64().unwrap_or(0);
                 let track_id = a0
@@ -339,6 +453,13 @@ impl Redirector {
                     .map(|_| ack())
                     .map_err(|e| e.to_string())
             }
+            // Teams mutes the mic by disabling its track.
+            (ObjectType::MediaStreamTrack, "onEnabledAttributeChanged") => {
+                if let (Some(id), Some(enabled)) = (msg.object_id_u64(), a0.as_bool()) {
+                    self.engine.set_track_enabled(&id.to_string(), enabled);
+                }
+                Ok(ack())
+            }
             (ObjectType::RtpTransceiver, "setDirection") => {
                 let id = msg.object_id_u64().unwrap_or(0);
                 let dir = a0.get("direction").and_then(Value::as_str).unwrap_or("inactive");
@@ -350,6 +471,7 @@ impl Redirector {
             }
             (ObjectType::PeerConnection, "createOffer") => match self.engine.create_offer().await {
                 Ok(sdp) => {
+                    self.local_offer_set = false;
                     tracing::info!(sdp_len = sdp.len(), "dispatch: generated local offer");
                     // `setLocalDescription` must apply webrtc-rs's EXACT offer, so
                     // keep the original for that (`last_offer`); but Teams' media
@@ -357,7 +479,13 @@ impl Redirector {
                     // an enriched copy. The additions are session-level / negotiated,
                     // so Teams' answer still applies cleanly to the original.
                     self.last_offer = Some(sdp.clone());
-                    let sent = slim_video_offer(&enrich_offer(&sdp));
+                    // libwebrtc's offer is already what the add-in sends; only
+                    // webrtc-rs's needs enriching.
+                    let sent = if crate::engine::NATIVE_JSEP {
+                        sdp.clone()
+                    } else {
+                        with_default_address(&slim_video_offer(&enrich_offer(&sdp)), &[])
+                    };
                     Ok(json!({ "desc": { "type": "offer", "sdp": sent } }))
                 }
                 Err(e) => Err(e.to_string()),
@@ -382,6 +510,8 @@ impl Redirector {
                 // webrtc-rs requires and semantically correct: the answer's codecs are
                 // always a subset of what we offered, so it still matches our offer.
                 let sdp = match &self.last_offer {
+                    // libwebrtc applies Teams' munged offer as given, like the add-in.
+                    _ if crate::engine::NATIVE_JSEP && !sdp_arg.is_empty() => sdp_arg.to_string(),
                     Some(o) => {
                         if !sdp_arg.is_empty() && sdp_arg != o.as_str() {
                             tracing::info!(
@@ -424,7 +554,11 @@ impl Redirector {
                 // aborts the whole setRemoteDescription with "payload type not found"
                 // on it; repair the answer so parsing completes (the m-line stays
                 // rejected). Without this the just-answered call is torn down.
-                let sanitized = sanitize_remote_sdp(sdp_arg);
+                let sanitized = if crate::engine::NATIVE_JSEP {
+                    sdp_arg.to_string()
+                } else {
+                    sanitize_remote_sdp(sdp_arg)
+                };
                 let sdp_in = sanitized.as_str();
                 let r = if is_offer {
                     self.engine.set_remote_offer(sdp_in).await
@@ -443,7 +577,12 @@ impl Redirector {
                         "dispatch: setRemoteDescription failed"
                     ),
                 }
-                r.map(|_| ack()).map_err(|e| e.to_string())
+                // Same transceivers result as setLocalDescription — the add-in
+                // reports them after the answer too, and Teams re-reads its
+                // transceiver mirror from it. A bare ack leaves that mirror empty
+                // right as the call is being set up.
+                r.map(|_| json!({ "transceivers": self.engine.transceiver_states() }))
+                    .map_err(|e| e.to_string())
             }
             // The client's real cameras/mics/speakers. Teams gates optimization on
             // this: an endpoint reporting no devices can't host the media, so Teams
@@ -484,7 +623,22 @@ impl Redirector {
         };
         match outcome {
             Ok(result) => {
-                let mut out = vec![reply(msg, cid, Some(result), 0)];
+                let mut out = Vec::new();
+                // The add-in fires `negotiationneeded` once, when the first data
+                // channel makes the new peer connection negotiable — just ahead of
+                // the createDataChannel reply (reference capture).
+                if otype == ObjectType::PeerConnection
+                    && method == "createDataChannel"
+                    && !self.negotiation_needed_sent
+                {
+                    self.negotiation_needed_sent = true;
+                    out.push(json!({
+                        "rpcEventTarget": { "rpcObjectType": "RTCPeerConnection", "rpcObjectId": self.pc_object_id },
+                        "rpcEventName": "negotiationneeded",
+                        "hr": 0,
+                    }));
+                }
+                out.push(reply(msg, cid, Some(result), 0));
                 // After setLocalDescription the add-in also fires the standard
                 // RTCPeerConnection state events; Teams' JS advances its call-setup
                 // state machine on them (and on the transceivers result above) before
@@ -492,6 +646,9 @@ impl Redirector {
                 if otype == ObjectType::PeerConnection && method == "setLocalDescription" {
                     out.push(self.pc_state_event("signalingstatechange", "have-local-offer"));
                     out.push(self.pc_state_event("icegatheringstatechange", "gathering"));
+                    // Candidates gathered since createOffer, then any held
+                    // gathering-complete event, now follow (see `local_offer_set`).
+                    self.local_offer_set = true;
                 }
                 // After the answer applies, the add-in fires signaling/ICE state
                 // events and — crucially — a `track` event per negotiated transceiver.
@@ -506,7 +663,8 @@ impl Redirector {
                     // answer SDP rather than webrtc-rs's `current_direction`, which isn't
                     // set synchronously on the offerer right after `set_remote_answer`.
                     let accepted = accepted_mids(sdp_arg);
-                    let tracks = self.track_events(&accepted);
+                    let streams = remote_stream_ids(sdp_arg);
+                    let tracks = self.track_events(&accepted, &streams);
                     tracing::info!(
                         tracks = tracks.len(),
                         accepted_mlines = accepted.len(),
@@ -549,11 +707,21 @@ impl Redirector {
     /// Fire an `ontrack` event for every negotiated transceiver, mirroring the
     /// add-in: after `setRemoteDescription` Teams expects one `track` event per
     /// transceiver describing the remote receiver/track/stream it should wire to a
-    /// media element. We synthesize the receiver/sender/track/stream object ids (from
-    /// our own high-range id space) and report the transceiver's Teams id + mid +
-    /// direction so Teams can correlate. Missing these is what made Teams close the
-    /// call ~120 ms after applying the answer.
-    fn track_events(&mut self, accepted_mids: &std::collections::HashSet<String>) -> Vec<Value> {
+    /// media element. Missing these is what made Teams close the call ~120 ms after
+    /// applying the answer.
+    ///
+    /// The ids must be the ones Teams can resolve, exactly as the add-in reports
+    /// them: the receiver and sender are the objects Teams itself created at
+    /// `addTransceiver`, and the stream id is the msid the media server announced
+    /// for that m-line (`mainAudio-1000`, `mainVideo-1001`, …). Teams keys the
+    /// remote participant streams by that msid; with made-up stream names it never
+    /// attached the remote audio to its audio element, and the media server never
+    /// sent the call's audio. Only the remote stream and track objects are ours.
+    fn track_events(
+        &mut self,
+        accepted_mids: &std::collections::HashSet<String>,
+        stream_ids: &HashMap<String, String>,
+    ) -> Vec<Value> {
         let states = self.engine.transceiver_states();
         let mut out = Vec::with_capacity(states.len());
         for tx in &states {
@@ -570,12 +738,21 @@ impl Redirector {
             if !in_answer {
                 continue;
             }
-            let (receiver, sender, track, stream) =
-                (self.alloc_obj_id(), self.alloc_obj_id(), self.alloc_obj_id(), self.alloc_obj_id());
+            let tx_id = tx.get("rpcObjectId").and_then(Value::as_u64).unwrap_or(0);
+            let (sender, receiver) = match self.transceiver_objects.get(&tx_id).copied() {
+                Some(ids) => ids,
+                None => (self.alloc_obj_id(), self.alloc_obj_id()),
+            };
+            // The add-in numbers the remote stream first, then its track.
+            let (stream, track) = (self.alloc_obj_id(), self.alloc_obj_id());
             let kind = tx.get("kind").and_then(Value::as_str).unwrap_or("audio");
             let mid = tx.get("mid").and_then(Value::as_str).unwrap_or("0");
-            let stream_name =
-                format!("native{}-{mid}", if kind == "video" { "Video" } else { "Audio" });
+            let stream_name = stream_ids.get(mid).cloned().unwrap_or_else(|| {
+                format!("native{}-{mid}", if kind == "video" { "Video" } else { "Audio" })
+            });
+            // The host draws a remote stream into whichever element Teams sets
+            // this rpc id as `srcObject` on.
+            self.engine.announce_remote_stream(stream, &stream_name);
             out.push(json!({
                 "rpcEventArgs": {
                     "receiver": { "rpcObjectId": receiver, "kind": kind },
@@ -639,10 +816,63 @@ impl Redirector {
         })
     }
 
+    /// Relay the engine's connection-state and data-channel events, in the
+    /// add-in's shapes (reference capture): `{state}` on the peer connection for
+    /// state changes; `{id}` (`open`/`closing`) and `{id, base64MessageData}`
+    /// (`message`) on the data channel's remoted object.
+    pub fn drain_events(&mut self) -> Vec<Value> {
+        use base64::Engine as _;
+        let dc_event = |object_id: u64, name: &str, args: Value| {
+            json!({
+                "rpcEventArgs": args,
+                "rpcEventTarget": { "rpcObjectType": "RTCDataChannel", "rpcObjectId": object_id },
+                "rpcEventName": name,
+                "hr": 0,
+            })
+        };
+        let mut out = Vec::new();
+        if self.local_offer_set {
+            out.append(&mut self.held_events);
+        }
+        for e in self.engine.take_events() {
+            let ev = match e {
+                PeerEvent::State { event, state } => {
+                    let ev = self.pc_state_event(event, &state);
+                    if event == "icegatheringstatechange" && !self.local_offer_set {
+                        self.held_events.push(ev);
+                        continue;
+                    }
+                    ev
+                }
+                PeerEvent::ChannelOpen { object_id, stream_id } => {
+                    tracing::info!(object_id, stream_id, "dispatch: data channel open — Teams' media control can start");
+                    dc_event(object_id, "open", json!({ "id": stream_id }))
+                }
+                PeerEvent::ChannelClosing { object_id, stream_id } => {
+                    dc_event(object_id, "closing", json!({ "id": stream_id }))
+                }
+                PeerEvent::ChannelMessage { object_id, stream_id, data } => dc_event(
+                    object_id,
+                    "message",
+                    json!({
+                        "id": stream_id,
+                        "base64MessageData": base64::engine::general_purpose::STANDARD.encode(data),
+                    }),
+                ),
+            };
+            out.push(ev);
+        }
+        out
+    }
+
     /// Emit a trickle-ICE event for each candidate gathered since the last drain.
     /// Matches the add-in's `icecandidate` event: the individual `candidate`
     /// object plus the updated local `desc`, targeting the peer connection.
     pub async fn drain_ice(&mut self) -> Vec<Value> {
+        // Held in the engine until Teams has set our offer (see `local_offer_set`).
+        if !self.local_offer_set {
+            return Vec::new();
+        }
         let candidates = self.engine.take_candidates();
         if candidates.is_empty() {
             return Vec::new();
@@ -652,8 +882,16 @@ impl Redirector {
         // handing Teams a `desc` that doesn't match the SDP it set makes it abort the
         // call within ~100 ms. Fall back to webrtc-rs's only if Teams never set one
         // (capture replay).
+        self.trickled.extend(
+            candidates
+                .iter()
+                .filter_map(|c| c.get("candidate").and_then(Value::as_str))
+                .map(str::to_owned),
+        );
+        // …with our real address as its default destination, like libwebrtc's
+        // updated localDescription (see `with_default_address`).
         let sdp = match &self.teams_local_offer {
-            Some(s) => Some(s.clone()),
+            Some(s) => Some(with_default_address(s, &self.trickled)),
             None => self.engine.local_description().await,
         };
         candidates
@@ -675,6 +913,26 @@ impl Redirector {
                 })
             })
             .collect()
+    }
+}
+
+/// The bytes of an `RTCDataChannel.send`: Teams passes them as a JSON array of
+/// byte values (`{"data":[16,15,…]}`); a base64 or plain-string form is accepted
+/// too.
+fn data_channel_payload(arg: &Value) -> Vec<u8> {
+    use base64::Engine as _;
+    match arg.get("data") {
+        Some(Value::Array(bytes)) => bytes
+            .iter()
+            .filter_map(Value::as_u64)
+            .map(|b| b as u8)
+            .collect(),
+        Some(Value::String(s)) => s.as_bytes().to_vec(),
+        _ => arg
+            .get("base64MessageData")
+            .and_then(Value::as_str)
+            .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+            .unwrap_or_default(),
     }
 }
 
@@ -714,6 +972,45 @@ fn accepted_mids(answer: &str) -> std::collections::HashSet<String> {
         }
     }
     commit(port_nonzero, inactive, &mut mid, &mut out);
+    out
+}
+
+/// Each m-line's remote stream id, by `mid`: the msid stream the answer declares
+/// for it, from `a=msid:<stream> <track>` or (Plaza's form) the first
+/// `a=ssrc:<n> msid:<stream> <track>`. Plaza names them after the SSRC —
+/// `mainAudio-1000`, `mainVideo-1001`, … — and Teams looks its remote streams up
+/// by that name.
+fn remote_stream_ids(answer: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut mid: Option<String> = None;
+    let mut stream: Option<String> = None;
+    let mut commit = |mid: &mut Option<String>, stream: &mut Option<String>| {
+        if let (Some(m), Some(s)) = (mid.take(), stream.take()) {
+            out.insert(m, s);
+        }
+        *mid = None;
+        *stream = None;
+    };
+    for line in answer.lines() {
+        let t = line.trim();
+        if t.starts_with("m=") {
+            commit(&mut mid, &mut stream);
+        } else if let Some(m) = t.strip_prefix("a=mid:") {
+            mid = Some(m.to_string());
+        } else if stream.is_none() {
+            let msid = t.strip_prefix("a=msid:").or_else(|| {
+                t.strip_prefix("a=ssrc:")
+                    .and_then(|rest| rest.split_once(' '))
+                    .and_then(|(_, attr)| attr.strip_prefix("msid:"))
+            });
+            if let Some(s) = msid.and_then(|v| v.split_whitespace().next()) {
+                if s != "-" {
+                    stream = Some(s.to_string());
+                }
+            }
+        }
+    }
+    commit(&mut mid, &mut stream);
     out
 }
 
@@ -790,6 +1087,21 @@ fn sanitize_remote_sdp(sdp: &str) -> String {
                 continue;
             }
             kept.push(t.to_string());
+        }
+        // An RTP m-section without a direction attribute is sendrecv (RFC 4566
+        // §6); Plaza's audio answer is written that way. webrtc-rs instead treats
+        // it as "unspecified": it never sets the audio transceiver's negotiated
+        // direction, and on the next createOffer (Teams renegotiates the moment
+        // the camera turns on) it skips that m-section and appends audio *last* —
+        // an m-line reorder Teams answers by closing the call. State the default.
+        let is_rtp_media = kept
+            .first()
+            .is_some_and(|m| m.starts_with("m=audio") || m.starts_with("m=video"));
+        let has_direction = kept.iter().any(|l| {
+            matches!(l.as_str(), "a=sendrecv" | "a=sendonly" | "a=recvonly" | "a=inactive")
+        });
+        if is_rtp_media && !has_direction {
+            kept.push("a=sendrecv".to_string());
         }
         for line in &kept {
             out.push_str(line);
@@ -1170,6 +1482,133 @@ fn slim_video_offer(sdp: &str) -> String {
     out
 }
 
+/// The capture device a `createMediaStream` call's constraints name: audio
+/// `deviceId` (a string or `{exact: …}`), or video `mandatory.sourceId` /
+/// `deviceId`.
+fn stream_device(args: &Value) -> Option<String> {
+    let c = args.get("constraints")?;
+    let pick = |v: Option<&Value>| -> Option<String> {
+        match v? {
+            Value::String(s) => Some(s.clone()),
+            Value::Object(o) => o.get("exact").or_else(|| o.get("ideal")).and_then(Value::as_str).map(str::to_owned),
+            _ => None,
+        }
+    };
+    pick(c.pointer("/audio/deviceId"))
+        .or_else(|| pick(c.pointer("/video/mandatory/sourceId")))
+        .or_else(|| pick(c.pointer("/video/deviceId")))
+}
+
+/// Put our real transport address on the offer, as libwebrtc does.
+///
+/// webrtc-rs always writes the bundle m-line as `m=audio 9 …` / `c=IN IP4
+/// 0.0.0.0` and never updates it, even with every candidate gathered. libwebrtc
+/// (the add-in) rewrites the first m-section's port and `c=` line to its
+/// *default candidate* as candidates arrive — reference capture: `62088/10.2.2.20`
+/// (host) → `…/203.0.113.5` (srflx) → `52217/52.115.154.49` (relay). Teams hands
+/// that SDP to its media server, and to a SIP-lineage media stack `c=0.0.0.0` is
+/// the RFC 2543 way of saying "on hold, send me nothing": the server took our
+/// audio (it flagged us as the active speaker) yet never sent the call's audio
+/// back.
+///
+/// The default candidate follows libwebrtc's `UpdateConnectionAddress`: RTP
+/// component, UDP only, relay over srflx/prflx over host, IPv4 over IPv6.
+/// `extra` are candidate lines gathered after the SDP was made (trickled); any
+/// not already present are added to the first m-section.
+fn with_default_address(sdp: &str, extra: &[String]) -> String {
+    let lines: Vec<&str> = sdp.split("\r\n").flat_map(|l| l.split('\n')).collect();
+    let Some(first_m) = lines.iter().position(|l| l.starts_with("m=")) else {
+        return sdp.to_string();
+    };
+    let section_end = lines[first_m + 1..]
+        .iter()
+        .position(|l| l.starts_with("m="))
+        .map(|i| first_m + 1 + i)
+        .unwrap_or(lines.len());
+    let present: Vec<&str> = lines[first_m..section_end]
+        .iter()
+        .filter_map(|l| l.strip_prefix("a="))
+        .filter(|l| l.starts_with("candidate:"))
+        .collect();
+    let missing: Vec<&str> = extra
+        .iter()
+        .map(|c| c.strip_prefix("a=").unwrap_or(c))
+        .filter(|c| c.starts_with("candidate:") && !present.contains(c))
+        .collect();
+
+    // (preference, is_ipv4, ip, port) of the best candidate so far.
+    let mut best: Option<(u8, bool, String, u16)> = None;
+    for cand in present.iter().chain(missing.iter()) {
+        // candidate:<foundation> <component> <transport> <priority> <ip> <port> typ <type> …
+        let f: Vec<&str> = cand.split_whitespace().collect();
+        if f.len() < 8 || f[1] != "1" || !f[2].eq_ignore_ascii_case("udp") || f[6] != "typ" {
+            continue;
+        }
+        let Ok(port) = f[5].parse::<u16>() else { continue };
+        let preference = match f[7] {
+            "relay" => 3,
+            "srflx" | "prflx" => 2,
+            "host" => 1,
+            _ => continue,
+        };
+        let ipv4 = !f[4].contains(':');
+        let replace = match &best {
+            None => true,
+            Some((p, v4, _, _)) => {
+                if *v4 == ipv4 {
+                    preference > *p
+                } else {
+                    ipv4 // an IPv4 candidate beats any IPv6 one
+                }
+            }
+        };
+        if replace {
+            best = Some((preference, ipv4, f[4].to_string(), port));
+        }
+    }
+    let Some((_, ipv4, ip, port)) = best else {
+        return sdp.to_string();
+    };
+
+    // Trickled candidates join the others: before `a=end-of-candidates`, else at
+    // the end of the first m-section (before a trailing empty line).
+    let insert_at = lines[first_m..section_end]
+        .iter()
+        .position(|l| *l == "a=end-of-candidates")
+        .map(|i| first_m + i)
+        .unwrap_or_else(|| {
+            if section_end == lines.len() && lines.last() == Some(&"") {
+                section_end - 1
+            } else {
+                section_end
+            }
+        });
+
+    let eol = if sdp.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + missing.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i == insert_at {
+            out.extend(missing.iter().map(|c| format!("a={c}")));
+        }
+        let in_first = i >= first_m && i < section_end;
+        if i == first_m {
+            let f: Vec<&str> = line.splitn(3, ' ').collect();
+            if f.len() == 3 {
+                out.push(format!("{} {port} {}", f[0], f[2]));
+                continue;
+            }
+        } else if in_first && line.starts_with("c=") {
+            out.push(format!("c=IN {} {ip}", if ipv4 { "IP4" } else { "IP6" }));
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    if insert_at == lines.len() {
+        out.extend(missing.iter().map(|c| format!("a={c}")));
+    }
+    out.join(eol)
+}
+
 /// Whether two SDPs belong to the same peer connection, by their DTLS fingerprint.
 ///
 /// The fingerprint is generated per peer connection and is *not* touched by SDP
@@ -1243,6 +1682,195 @@ mod tests {
         assert!(ev.pointer("/rpcEventArgs/display/width").is_some());
     }
 
+    /// The first answer Teams' media server fully accepted (audio + 9 video +
+    /// data, captured live): every payload type it will send audio with must be
+    /// negotiated, or webrtc-rs discards the inbound audio track at its first
+    /// packet ("Could not determine PayloadType … codec not found").
+    // webrtc-rs SDP workarounds / answers made for its offers.
+    #[cfg(not(feature = "libwebrtc"))]
+    #[tokio::test]
+    async fn full_media_answer_negotiates_every_audio_payload_type() {
+        let answer = include_str!("../tests/fixtures/full_media_answer.sdp");
+        let mut r = Redirector::new();
+        let call = |json: String| RpcMessage::parse(json.as_bytes()).unwrap();
+        r.handle(&call(r#"{"rpcObjectType":"RTCPeerConnection","rpcObjectId":1,"rpcName":"createPeerConnection","rpcArgs":[{"iceServers":[]}],"rpcCallId":1}"#.into())).await;
+        let out = r.handle(&call(r#"{"rpcObjectType":"RTCPeerConnection","rpcObjectId":1,"rpcName":"createDataChannel","rpcArgs":[{"label":"main-channel","rpcObjectId":10}],"rpcCallId":2}"#.into())).await;
+        // Like the add-in: `negotiationneeded` once, ahead of the reply.
+        assert_eq!(out[0].get("rpcEventName").and_then(Value::as_str), Some("negotiationneeded"));
+        assert_eq!(out[1].get("rpcCallId").and_then(Value::as_u64), Some(2));
+        r.handle(&call(r#"{"rpcObjectType":"RTCPeerConnection","rpcObjectId":1,"rpcName":"addTransceiver","rpcArgs":[{"kind":"audio","direction":"inactive","transceiverRpcObjectId":11,"senderRpcObjectId":12,"receiverRpcObjectId":13}],"rpcCallId":3}"#.into())).await;
+        r.handle(&call(r#"{"rpcObjectType":"RTCRtpTransceiver","rpcObjectId":11,"rpcName":"setDirection","rpcArgs":[{"direction":"sendrecv"}],"rpcCallId":4}"#.into())).await;
+        for i in 0..9u64 {
+            let (id, cid) = (20 + 3 * i, 5 + i);
+            let (sender, receiver) = (id + 1, id + 2);
+            r.handle(&call(format!(
+                r#"{{"rpcObjectType":"RTCPeerConnection","rpcObjectId":1,"rpcName":"addTransceiver","rpcArgs":[{{"kind":"video","direction":"recvonly","transceiverRpcObjectId":{id},"senderRpcObjectId":{sender},"receiverRpcObjectId":{receiver}}}],"rpcCallId":{cid}}}"#
+            ))).await;
+        }
+        let out = r
+            .handle(&call(r#"{"rpcObjectType":"RTCPeerConnection","rpcObjectId":1,"rpcName":"createOffer","rpcArgs":[{}],"rpcCallId":20}"#.into()))
+            .await;
+        let offer = out[0].pointer("/result/desc/sdp").and_then(Value::as_str).expect("offer").to_string();
+        // No candidate or gathering-complete event before Teams sets the offer.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(r.drain_ice().await.is_empty(), "candidates must wait for setLocalDescription");
+        assert!(
+            !r.drain_events().iter().any(|e| e.get("rpcEventName").and_then(Value::as_str) == Some("icegatheringstatechange")),
+            "gathering state must wait for setLocalDescription"
+        );
+        r.handle(&call(format!(
+            r#"{{"rpcObjectType":"RTCPeerConnection","rpcObjectId":1,"rpcName":"setLocalDescription","rpcArgs":[{{"type":"offer","sdp":{}}}],"rpcCallId":21}}"#,
+            serde_json::to_string(&offer).unwrap()
+        ))).await;
+        let out = r
+            .handle(&call(format!(
+                r#"{{"rpcObjectType":"RTCPeerConnection","rpcObjectId":1,"rpcName":"setRemoteDescription","rpcArgs":[{{"type":"answer","sdp":{}}}],"rpcCallId":22}}"#,
+                serde_json::to_string(answer).unwrap()
+            )))
+            .await;
+        assert_eq!(out[0].get("hr").and_then(Value::as_i64), Some(0), "answer must apply: {:?}", out[0]);
+        // Held candidates follow once the offer is set.
+        assert!(!r.drain_ice().await.is_empty(), "held candidates must be released");
+
+        // Each track event names Teams' own receiver/sender and the stream msid
+        // the answer declared — as the add-in reports them (reference capture:
+        // receiver 15 / sender 14 / stream "mainAudio-1000" for transceiver 13).
+        let track = |mid: &str| {
+            out.iter()
+                .find(|m| {
+                    m.get("rpcEventName").and_then(Value::as_str) == Some("track")
+                        && m.pointer("/rpcEventArgs/transceiver/mid").and_then(Value::as_str) == Some(mid)
+                })
+                .unwrap_or_else(|| panic!("no track event for mid {mid}: {out:#?}"))
+                .get("rpcEventArgs")
+                .cloned()
+                .unwrap()
+        };
+        let audio_track = track("0");
+        assert_eq!(audio_track.pointer("/stream/id").and_then(Value::as_str), Some("mainAudio-1000"));
+        assert_eq!(audio_track.pointer("/receiver/rpcObjectId").and_then(Value::as_u64), Some(13));
+        assert_eq!(audio_track.pointer("/sender/rpcObjectId").and_then(Value::as_u64), Some(12));
+        assert_eq!(audio_track.pointer("/transceiver/rpcObjectId").and_then(Value::as_u64), Some(11));
+        let video_track = track("1");
+        assert_eq!(video_track.pointer("/stream/id").and_then(Value::as_str), Some("mainVideo-1001"));
+        assert_eq!(video_track.pointer("/receiver/rpcObjectId").and_then(Value::as_u64), Some(22));
+        assert_eq!(track("9").pointer("/stream/id").and_then(Value::as_str), Some("applicationsharingVideo-1801"));
+
+        // Teams renegotiates as soon as the camera turns on: the next offer must
+        // keep the m-line order (audio first) — the answer's direction-less audio
+        // section made webrtc-rs move it last, and Teams dropped the call.
+        let reoffer = r
+            .handle(&call(r#"{"rpcObjectType":"RTCPeerConnection","rpcObjectId":1,"rpcName":"createOffer","rpcArgs":[{}],"rpcCallId":30}"#.into()))
+            .await;
+        let reoffer = reoffer[0].pointer("/result/desc/sdp").and_then(Value::as_str).expect("re-offer").to_string();
+        let mids: Vec<&str> = reoffer.lines().filter_map(|l| l.strip_prefix("a=mid:")).collect();
+        assert_eq!(mids, ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"], "re-offer reordered m-lines");
+        assert!(reoffer.lines().any(|l| l.starts_with("a=group:BUNDLE 0 1 ")), "bundle group reordered");
+
+        let audio = r.engine.negotiated_codecs("audio").await;
+        eprintln!("negotiated audio: {audio:?}");
+        eprintln!("negotiated video: {:?}", r.engine.negotiated_codecs("video").await);
+        for pt in [111u8, 9, 0, 8, 120, 13] {
+            assert!(audio.iter().any(|(p, _)| *p == pt), "audio PT {pt} not negotiated: {audio:?}");
+        }
+    }
+
+    /// Our real address goes on the bundle m-line like libwebrtc's default
+    /// candidate (UDP, relay > srflx > host, IPv4 first) — never `0.0.0.0`, which a
+    /// SIP-lineage media server reads as "on hold".
+    #[test]
+    fn offer_carries_the_default_candidate_address() {
+        let sdp = [
+            "v=0",
+            "o=- 1 2 IN IP4 0.0.0.0",
+            "a=group:BUNDLE 0 1",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "c=IN IP4 0.0.0.0",
+            "a=mid:0",
+            "a=candidate:1 1 udp 2130706431 10.0.0.144 51436 typ host",
+            "a=candidate:1 2 udp 2130706431 10.0.0.144 51436 typ host",
+            "a=candidate:2 1 udp 1694498815 76.27.131.205 51431 typ srflx raddr 0.0.0.0 rport 51431",
+            "a=candidate:3 1 udp 16777215 52.115.170.224 58746 typ relay raddr 0.0.0.0 rport 51430",
+            "a=candidate:4 1 tcp 16777000 52.115.170.225 443 typ relay raddr 0.0.0.0 rport 51430",
+            "a=candidate:5 1 udp 16777215 2603:1063::5 3478 typ relay raddr :: rport 0",
+            "a=end-of-candidates",
+            "m=video 9 UDP/TLS/RTP/SAVPF 107",
+            "c=IN IP4 0.0.0.0",
+            "a=mid:1",
+            "",
+        ]
+        .join("\r\n");
+        let out = with_default_address(&sdp, &[]);
+        let lines: Vec<&str> = out.split("\r\n").collect();
+        assert_eq!(lines[3], "m=audio 58746 UDP/TLS/RTP/SAVPF 111", "UDP IPv4 relay wins:\n{out}");
+        assert_eq!(lines[4], "c=IN IP4 52.115.170.224");
+        // Only the bundle (first) m-section changes.
+        assert!(out.contains("m=video 9 UDP/TLS/RTP/SAVPF 107\r\nc=IN IP4 0.0.0.0\r\n"));
+        assert!(out.ends_with("a=mid:1\r\n"), "trailing CRLF kept:\n{out:?}");
+
+        // Trickled candidates are added (before end-of-candidates) and count.
+        let host_only = sdp
+            .lines()
+            .filter(|l| !l.contains("typ srflx") && !l.contains("typ relay"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let extra = vec!["candidate:9 1 udp 1694498815 76.27.131.205 51431 typ srflx raddr 0.0.0.0 rport 51431".to_string()];
+        let out = with_default_address(&host_only, &extra);
+        assert!(out.contains("m=audio 51431 "), "trickled srflx beats host:\n{out}");
+        assert!(out.contains("c=IN IP4 76.27.131.205"));
+        assert!(
+            out.contains("typ srflx raddr 0.0.0.0 rport 51431\r\na=end-of-candidates"),
+            "trickled candidate inserted before end-of-candidates:\n{out}"
+        );
+        // Re-applying adds nothing twice.
+        assert_eq!(with_default_address(&out, &extra), out);
+
+        // No candidates → untouched.
+        let bare = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\n";
+        assert_eq!(with_default_address(bare, &[]), bare);
+    }
+
+    /// The mic/camera device comes from the stream's constraints, in each form
+    /// Teams uses (reference capture: `{"audio":{"deviceId":"rdpio-audioinput-3"}}`,
+    /// `{"video":{"mandatory":{"sourceId":"rdpio-videoinput-1",…}}}`).
+    #[test]
+    fn capture_device_is_read_from_stream_constraints() {
+        let audio = json!({ "id": "s", "constraints": { "audio": { "deviceId": "rdpio-audioinput-3" } } });
+        assert_eq!(stream_device(&audio).as_deref(), Some("rdpio-audioinput-3"));
+        let exact = json!({ "constraints": { "audio": { "deviceId": { "exact": "rdpio-audioinput-1" } } } });
+        assert_eq!(stream_device(&exact).as_deref(), Some("rdpio-audioinput-1"));
+        let video = json!({ "constraints": { "video": { "mandatory": { "sourceId": "rdpio-videoinput-1", "minWidth": 1280 } } } });
+        assert_eq!(stream_device(&video).as_deref(), Some("rdpio-videoinput-1"));
+        assert_eq!(stream_device(&json!({ "id": "remote" })), None);
+    }
+
+    #[test]
+    fn data_channel_payload_reads_teams_byte_arrays() {
+        // Teams' send carries the bytes as a JSON array (reference capture).
+        let arg = json!({ "data": [16, 15, 146, 0, 91, 93] });
+        assert_eq!(data_channel_payload(&arg), vec![16, 15, 146, 0, 91, 93]);
+        let b64 = json!({ "base64MessageData": "EA+SAA==" });
+        assert_eq!(data_channel_payload(&b64), vec![0x10, 0x0F, 0x92, 0x00]);
+        assert!(data_channel_payload(&json!({})).is_empty());
+    }
+
+    /// The add-in declines `rtcSession` with ERROR_NOT_SUPPORTED and no result
+    /// (reference capture: `{"rpcName":"rtcSession","rpcCallId":342,
+    /// "hr":-2147024846}`); we must answer identically, not with a success ack.
+    #[tokio::test]
+    async fn rtc_session_is_declined_like_the_add_in() {
+        let mut r = Redirector::new();
+        let call = RpcMessage::parse(
+            br#"{"rpcObjectType":"RDWebRTCRedirector","rpcName":"rtcSession","rpcArgs":["7caba3e35f6a4b99bbbc5ff78290413b","1783829691630","32d3e98022738bb282427c9dd05e1ac1a8f48a7c231feeefe0673d31310c3ff4","1.1.2602.23001"],"rpcCallId":342}"#,
+        )
+        .unwrap();
+        let out = r.handle(&call).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get("rpcCallId").and_then(Value::as_u64), Some(342));
+        assert_eq!(out[0].get("hr").and_then(Value::as_i64), Some(HR_NOT_SUPPORTED));
+        assert!(out[0].get("result").is_none(), "decline carries no result: {}", out[0]);
+    }
+
     #[test]
     fn munged_offer_is_recognized_by_its_fingerprint() {
         let ours = "v=0\r\na=ice-ufrag:abcd\r\na=fingerprint:sha-256 AA:BB:CC\r\nm=video 9 RTP 96 97\r\n";
@@ -1262,6 +1890,8 @@ mod tests {
     /// down — so the dispatcher must apply our *own* stored offer, not the munged
     /// arg. Drive the whole offerer handshake and assert the munged
     /// setLocalDescription still returns success (hr 0).
+    // webrtc-rs SDP workarounds / answers made for its offers.
+    #[cfg(not(feature = "libwebrtc"))]
     #[tokio::test]
     async fn munged_set_local_description_applies_our_own_offer() {
         let mut r = Redirector::new();
@@ -1401,6 +2031,8 @@ mod tests {
     /// sanitizer this aborted `setRemoteDescription` with "payload type not found",
     /// tearing the just-answered call down ~1.8 s in. Drive the full public path and
     /// assert the answer now applies (hr 0).
+    // webrtc-rs SDP workarounds / answers made for its offers.
+    #[cfg(not(feature = "libwebrtc"))]
     #[tokio::test]
     async fn applies_the_real_audio_only_answer_from_teams() {
         let answer = include_str!("../tests/fixtures/audio_only_answer.sdp");
@@ -1439,6 +2071,14 @@ mod tests {
             "real audio-only answer must apply after sanitizing: {:?}",
             out[0]
         );
+        // Like the add-in, the result lists every transceiver with its mid — not a
+        // bare ack.
+        let tx = out[0]
+            .pointer("/result/transceivers")
+            .and_then(Value::as_array)
+            .expect("setRemoteDescription result must list transceivers");
+        assert_eq!(tx.len(), 10);
+        assert!(tx.iter().all(|t| t.get("mid").is_some() && t.get("kind").is_some()));
         // The add-in fires an `ontrack` event only for the transceivers the answer
         // negotiated as receiving. This answer accepts audio and rejects all 9 video
         // m-lines (port 0 / inactive), so exactly ONE track event (the audio receiver)

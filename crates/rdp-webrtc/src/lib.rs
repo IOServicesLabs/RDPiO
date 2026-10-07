@@ -29,18 +29,25 @@
 //! The protocol schema this encodes is documented in the `rdpio-webrtc1-protocol`
 //! project memory, reversed from a live optimized Teams call.
 
-#[cfg(feature = "engine")]
+#[cfg(any(feature = "engine", feature = "libwebrtc"))]
 pub mod bridge;
 pub mod capture;
 pub mod devices;
-#[cfg(feature = "engine")]
+#[cfg(any(feature = "engine", feature = "libwebrtc"))]
 pub mod dispatch;
-#[cfg(feature = "engine")]
+#[cfg(all(feature = "engine", not(feature = "libwebrtc")))]
 pub mod engine;
+#[cfg(feature = "libwebrtc")]
+#[path = "engine_lw.rs"]
+pub mod engine;
+#[cfg(any(feature = "engine", feature = "libwebrtc"))]
+pub mod engine_api;
 pub mod framing;
 pub mod ice;
 pub mod objects;
 pub mod presentation;
+#[cfg(all(feature = "engine", not(feature = "libwebrtc")))]
+pub mod probe;
 pub mod rpc;
 pub mod session;
 
@@ -52,9 +59,11 @@ pub use presentation::{MediaElement, PresentationModel, Rect};
 pub use rpc::{RpcMessage, RpcMessageKind};
 pub use session::{RedirectorModel, SessionError};
 
-#[cfg(feature = "engine")]
-pub use bridge::{NativeRedirector, CHANNEL_NAME};
-#[cfg(feature = "engine")]
+#[cfg(any(feature = "engine", feature = "libwebrtc"))]
+pub use bridge::{HostMedia, NativeRedirector, CHANNEL_NAME};
+#[cfg(any(feature = "engine", feature = "libwebrtc"))]
 pub use dispatch::Redirector;
-#[cfg(feature = "engine")]
-pub use engine::{EngineError, MediaSink, VideoCaptureSource, WebrtcEngine};
+#[cfg(any(feature = "engine", feature = "libwebrtc"))]
+pub use engine::{EngineError, WebrtcEngine};
+#[cfg(any(feature = "engine", feature = "libwebrtc"))]
+pub use engine_api::{AudioCaptureSource, I420Frame, MediaSink, VideoCaptureSource};

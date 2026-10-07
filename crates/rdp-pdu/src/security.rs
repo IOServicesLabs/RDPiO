@@ -94,6 +94,56 @@ pub struct ClientInfo {
     /// Server redirection session id; written into the extended info packet's
     /// `clientSessionId` when non-zero.
     pub redirected_session_id: u32,
+    /// The client's time zone, for the server's time zone redirection. `None`
+    /// sends a zeroed `clientTimeZone` (the server keeps its own zone).
+    pub time_zone: Option<TimeZone>,
+}
+
+/// The client's time zone as Windows describes it (`DYNAMIC_TIME_ZONE_INFORMATION`):
+/// encoded as the extended info packet's `clientTimeZone`
+/// (TS_TIME_ZONE_INFORMATION, MS-RDPBCGR 2.2.1.11.1.1.1) plus its
+/// `dynamicDSTTimeZoneKeyName`, which newer servers use to pick the exact zone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TimeZone {
+    /// Minutes to add to local time to get UTC (e.g. 360 for US Central).
+    pub bias: i32,
+    pub standard_name: String,
+    /// When standard time starts, as a SYSTEMTIME (year, month, day-of-week,
+    /// day, hour, minute, second, ms) in Windows' "nth weekday" form.
+    pub standard_date: [u16; 8],
+    pub standard_bias: i32,
+    pub daylight_name: String,
+    pub daylight_date: [u16; 8],
+    pub daylight_bias: i32,
+    /// The registry key name, e.g. "Central Standard Time".
+    pub key_name: String,
+    pub dynamic_daylight_disabled: bool,
+}
+
+impl TimeZone {
+    /// The 172-byte TS_TIME_ZONE_INFORMATION.
+    fn encode_info(&self, out: &mut Vec<u8>) {
+        let name = |n: &str, out: &mut Vec<u8>| {
+            // 32 WCHARs, NUL-terminated.
+            let mut w: Vec<u16> = n.encode_utf16().take(31).collect();
+            w.resize(32, 0);
+            for c in w {
+                out.extend_from_slice(&c.to_le_bytes());
+            }
+        };
+        let date = |d: &[u16; 8], out: &mut Vec<u8>| {
+            for v in d {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        };
+        out.extend_from_slice(&self.bias.to_le_bytes());
+        name(&self.standard_name, out);
+        date(&self.standard_date, out);
+        out.extend_from_slice(&self.standard_bias.to_le_bytes());
+        name(&self.daylight_name, out);
+        date(&self.daylight_date, out);
+        out.extend_from_slice(&self.daylight_bias.to_le_bytes());
+    }
 }
 
 impl ClientInfo {
@@ -153,6 +203,7 @@ pub fn client_info_payload(info: &ClientInfo) -> Vec<u8> {
         PERF_BALANCED,
         None,
         info.redirected_session_id,
+        info.time_zone.as_ref(),
     ));
     out
 }
@@ -179,6 +230,7 @@ pub fn extended_info_packet(
     performance_flags: u32,
     cookie: Option<&[u8; 28]>,
     redirected_session_id: u32,
+    time_zone: Option<&TimeZone>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     put_u16(0x0002, &mut out); // clientAddressFamily = AF_INET
@@ -186,7 +238,10 @@ pub fn extended_info_packet(
     put_u16(0, &mut out); // clientAddress = L""
     put_u16(2, &mut out); // cbClientDir
     put_u16(0, &mut out); // clientDir = L""
-    out.extend_from_slice(&[0u8; 172]); // clientTimeZone (TIME_ZONE_INFORMATION, zeroed)
+    match time_zone {
+        Some(tz) => tz.encode_info(&mut out), // clientTimeZone
+        None => out.extend_from_slice(&[0u8; 172]), // clientTimeZone (zeroed)
+    }
     put_u32(redirected_session_id, &mut out); // clientSessionId
     put_u32(performance_flags, &mut out); // performanceFlags
     match cookie {
@@ -195,6 +250,14 @@ pub fn extended_info_packet(
             out.extend_from_slice(c); // autoReconnectCookie (ARC_CS_PRIVATE_PACKET)
         }
         None => put_u16(0, &mut out), // cbAutoReconnectCookie = 0
+    }
+    if let Some(tz) = time_zone {
+        put_u16(0, &mut out); // reserved1
+        put_u16(0, &mut out); // reserved2
+        let key = utf16(&tz.key_name);
+        put_u16(key.len() as u16, &mut out); // cbDynamicDSTTimeZoneKeyName
+        out.extend_from_slice(&key); // dynamicDSTTimeZoneKeyName
+        put_u16(tz.dynamic_daylight_disabled as u16, &mut out); // dynamicDaylightTimeDisabled
     }
     out
 }
@@ -211,6 +274,7 @@ pub fn client_info_payload_reconnect(info: &ClientInfo, cookie: &[u8; 28]) -> Ve
         PERF_BALANCED,
         Some(cookie),
         info.redirected_session_id,
+        info.time_zone.as_ref(),
     ));
     out
 }
@@ -347,11 +411,42 @@ mod tests {
 
     #[test]
     fn extended_info_carries_redirected_session_id() {
-        let out = extended_info_packet(PERF_BALANCED, None, 0x1234_5678);
+        let out = extended_info_packet(PERF_BALANCED, None, 0x1234_5678, None);
         // clientSessionId sits at offset 182 (2+2+2+2+2+172).
         assert_eq!(
             u32::from_le_bytes([out[182], out[183], out[184], out[185]]),
             0x1234_5678
         );
+    }
+
+    #[test]
+    fn extended_info_carries_the_client_time_zone() {
+        let tz = TimeZone {
+            bias: 360,
+            standard_name: "Central Standard Time".into(),
+            standard_date: [0, 11, 0, 1, 2, 0, 0, 0],
+            standard_bias: 0,
+            daylight_name: "Central Daylight Time".into(),
+            daylight_date: [0, 3, 0, 2, 2, 0, 0, 0],
+            daylight_bias: -60,
+            key_name: "Central Standard Time".into(),
+            dynamic_daylight_disabled: false,
+        };
+        let out = extended_info_packet(PERF_BALANCED, None, 0, Some(&tz));
+        // clientTimeZone starts at offset 10: Bias, then StandardName.
+        assert_eq!(i32::from_le_bytes([out[10], out[11], out[12], out[13]]), 360);
+        assert_eq!(&out[14..16], &[b'C', 0]);
+        // StandardDate follows the 64-byte name: its month is 11.
+        assert_eq!(u16::from_le_bytes([out[80], out[81]]), 11);
+        // DaylightBias is the last field of the 172-byte block.
+        assert_eq!(i32::from_le_bytes([out[178], out[179], out[180], out[181]]), -60);
+        // After clientSessionId, performanceFlags, cbAutoReconnectCookie:
+        // reserved1/2, then the key name and dynamicDaylightTimeDisabled.
+        let tail = &out[10 + 172 + 4 + 4 + 2..];
+        assert_eq!(&tail[..4], &[0, 0, 0, 0]);
+        let cb = u16::from_le_bytes([tail[4], tail[5]]) as usize;
+        assert_eq!(cb, "Central Standard Time".len() * 2);
+        assert_eq!(&tail[6..8], &[b'C', 0]);
+        assert_eq!(&tail[6 + cb..], &[0, 0]);
     }
 }

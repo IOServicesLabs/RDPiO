@@ -23,6 +23,8 @@ const NUM_BUFFERS: usize = 4;
 /// A `waveIn` capture device exposed as a [`MicSource`].
 pub struct Win32Mic {
     handle: Option<HWAVEIN>,
+    /// waveIn device to open (`None` = the system default via `WAVE_MAPPER`).
+    device: Option<u32>,
     /// Queued recording buffers: the boxed `WAVEHDR` (stable address for the
     /// device) and the backing PCM bytes it records into.
     buffers: Vec<(Box<WAVEHDR>, Vec<u8>)>,
@@ -50,8 +52,16 @@ impl Win32Mic {
         }
         Some(Self {
             handle: None,
+            device: None,
             buffers: Vec::new(),
         })
+    }
+
+    /// Capture from waveIn device `index` instead of the system default — the
+    /// Teams call uses the mic the user picked in Teams (`rdpio-audioinput-N`).
+    pub fn with_device(mut self, index: Option<u32>) -> Self {
+        self.device = index;
+        self
     }
 
     /// Stop, drain, and close the device (if open), freeing its buffers.
@@ -83,7 +93,13 @@ impl MicSource for Win32Mic {
                 cbSize: 0,
             };
             let mut h = HWAVEIN::default();
-            if waveInOpen(Some(&mut h), WAVE_MAPPER, &wfx, None, None, CALLBACK_NULL) != MM_OK {
+            let device = self.device.unwrap_or(WAVE_MAPPER);
+            let mut opened = waveInOpen(Some(&mut h), device, &wfx, None, None, CALLBACK_NULL) == MM_OK;
+            if !opened && device != WAVE_MAPPER {
+                tracing::warn!(device, "waveInOpen on the chosen mic failed; using the default device");
+                opened = waveInOpen(Some(&mut h), WAVE_MAPPER, &wfx, None, None, CALLBACK_NULL) == MM_OK;
+            }
+            if !opened {
                 tracing::warn!("waveInOpen failed; microphone disabled");
                 return;
             }

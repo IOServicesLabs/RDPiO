@@ -20,13 +20,39 @@ fn build() -> PresentationModel {
     model
 }
 
+/// The ids of the video elements the capture created, and of those it shut down.
+fn video_element_lifecycle() -> (Vec<u64>, Vec<u64>) {
+    let records = parse_capture(FIXTURE).expect("capture parses");
+    let (mut created, mut shut) = (Vec::new(), Vec::new());
+    for r in &records {
+        let Ok(msg) = RpcMessage::parse(message_json(&r.payload)) else { continue };
+        let first_arg = msg.args.as_ref().and_then(|a| a.get(0)).and_then(|v| v.as_str());
+        match (msg.name.as_deref(), msg.object_id_u64()) {
+            (Some("createMediaElement"), Some(id)) if first_arg == Some("video") => created.push(id),
+            (Some("shutdown"), Some(id)) if msg.object_type.as_deref() == Some("MediaElement") => {
+                shut.push(id)
+            }
+            _ => {}
+        }
+    }
+    (created, shut)
+}
+
 #[test]
 fn reconstructs_the_media_surfaces() {
     let model = build();
 
-    // The call presented several video elements (self-view + participants).
-    let video_elements = model.elements.values().filter(|e| e.kind == "video").count();
-    assert!(video_elements >= 3, "expected multiple video elements, got {video_elements}");
+    // The call presented several video elements (self-view + participants),
+    // and the ones Teams shut down are gone from the model (never drawn again).
+    let (created, shut) = video_element_lifecycle();
+    assert!(created.len() >= 3, "expected multiple video elements, got {created:?}");
+    for id in &shut {
+        assert!(!model.elements.contains_key(id), "shut-down element {id} still present");
+    }
+    assert!(
+        created.iter().any(|id| model.elements.contains_key(id)),
+        "no live video element left at the end of the capture"
+    );
 
     // Every video element is bound to a source stream.
     for (id, e) in model.elements.iter().filter(|(_, e)| e.kind == "video") {
