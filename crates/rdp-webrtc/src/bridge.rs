@@ -35,7 +35,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::devices::DeviceProvider;
 use crate::dispatch::Redirector;
-use crate::engine::VideoCaptureSource;
+use crate::engine::{AudioCaptureSource, MediaSink, VideoCaptureSource};
 use crate::framing;
 use crate::ice::TurnResolver;
 use crate::rpc::RpcMessage;
@@ -129,6 +129,24 @@ enum Inbound {
     Shutdown,
 }
 
+/// The client's media capabilities the engine borrows for every call. All
+/// optional: `None` just means that part of a call does nothing.
+#[derive(Clone, Default)]
+pub struct HostMedia {
+    /// The client's real cameras/mics/speakers. Teams refuses to optimize a call
+    /// on an endpoint that reports no devices.
+    pub devices: Option<Arc<dyn DeviceProvider>>,
+    /// Follows the TURN `300 Try Alternate` webrtc-rs can't (needed for any relay
+    /// candidate on Teams' anycast relays).
+    pub turn_resolver: Option<Arc<dyn TurnResolver>>,
+    /// Outbound camera video (H.264).
+    pub video_source: Option<Arc<dyn VideoCaptureSource>>,
+    /// Outbound mic audio (Opus).
+    pub audio_source: Option<Arc<dyn AudioCaptureSource>>,
+    /// Where the call's inbound audio/video goes (decode + play/render).
+    pub sink: Option<Arc<dyn MediaSink>>,
+}
+
 /// Handle the mux holds. `Send`; all async/media work happens on the owned
 /// runtime thread. Cheap, non-blocking methods that only enqueue or drain.
 pub struct NativeRedirector {
@@ -141,19 +159,10 @@ pub struct NativeRedirector {
 }
 
 impl NativeRedirector {
-    /// Spin up the runtime thread and the native engine. Fails only if the OS
-    /// refuses to spawn the thread.
-    ///
-    /// `devices` supplies the client's real cameras/mics/speakers. Pass `None` only
-    /// where they genuinely don't exist: Teams refuses to optimize a call on an
-    /// endpoint that reports no devices. `turn_resolver` follows the TURN `300 Try
-    /// Alternate` webrtc-rs can't (needed for any relay candidate on Teams' anycast
-    /// relays); `None` leaves the URLs untouched.
-    pub fn new(
-        devices: Option<Arc<dyn DeviceProvider>>,
-        turn_resolver: Option<Arc<dyn TurnResolver>>,
-        video_source: Option<Arc<dyn VideoCaptureSource>>,
-    ) -> std::io::Result<Self> {
+    /// Spin up the runtime thread and the native engine with the client's media
+    /// capabilities ([`HostMedia`]). Fails only if the OS refuses to spawn the
+    /// thread.
+    pub fn new(host: HostMedia) -> std::io::Result<Self> {
         let outbound: Outbound = Arc::new(Mutex::new(VecDeque::new()));
         let (tx, rx) = mpsc::unbounded_channel();
         let capture = Capture::from_env();
@@ -169,7 +178,7 @@ impl NativeRedirector {
                         return;
                     }
                 };
-                rt.block_on(run(rx, out_thread, cap_thread, devices, turn_resolver, video_source));
+                rt.block_on(run(rx, out_thread, cap_thread, host));
             })?;
         Ok(Self { tx, outbound, capture, thread: Some(thread) })
     }
@@ -238,22 +247,26 @@ async fn run(
     mut rx: UnboundedReceiver<Inbound>,
     outbound: Outbound,
     capture: Option<Capture>,
-    devices: Option<Arc<dyn DeviceProvider>>,
-    turn_resolver: Option<Arc<dyn TurnResolver>>,
-    video_source: Option<Arc<dyn VideoCaptureSource>>,
+    host: HostMedia,
 ) {
-    // Each channel (call) gets a fresh redirector; the device provider, TURN resolver
-    // and camera source are long-lived host capabilities, so re-attach them to each.
+    // Each channel (call) gets a fresh redirector; the host's media capabilities are
+    // long-lived, so re-attach them to each.
     let new_redirector = || {
         let mut r = Redirector::new();
-        if let Some(d) = &devices {
+        if let Some(d) = &host.devices {
             r.set_device_provider(d.clone());
         }
-        if let Some(t) = &turn_resolver {
+        if let Some(t) = &host.turn_resolver {
             r.set_turn_resolver(t.clone());
         }
-        if let Some(v) = &video_source {
+        if let Some(v) = &host.video_source {
             r.set_video_source(v.clone());
+        }
+        if let Some(a) = &host.audio_source {
+            r.set_audio_source(a.clone());
+        }
+        if let Some(s) = &host.sink {
+            r.set_media_sink(s.clone());
         }
         r
     };
@@ -293,6 +306,8 @@ async fn run(
                             // setLocalDescription; the ticker catches the rest.
                             let ice = redirector.drain_ice().await;
                             push_framed(&outbound, &capture, channel_id, &ice);
+                            let events = redirector.drain_events();
+                            push_framed(&outbound, &capture, channel_id, &events);
                         }
                         Err(e) => tracing::warn!(
                             channel_id,
@@ -317,6 +332,10 @@ async fn run(
                         tracing::debug!(channel_id = ch, n = ice.len(), "webrtc-native: trickle ICE update");
                     }
                     push_framed(&outbound, &capture, ch, &ice);
+                    // Connection states and data-channel traffic (Teams' media
+                    // control protocol) arrive on their own schedule too.
+                    let events = redirector.drain_events();
+                    push_framed(&outbound, &capture, ch, &events);
                 }
             }
         }

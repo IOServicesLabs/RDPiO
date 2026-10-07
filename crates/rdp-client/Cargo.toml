@@ -44,7 +44,12 @@ webpki-roots = "0.26"
 # now because it's wired into the Windows graphics session; the crate itself is
 # platform-neutral and will move to a general dependency when the Linux path
 # consumes it. `engine` pulls in webrtc-rs/tokio.
-rdp-webrtc = { path = "../rdp-webrtc", features = ["engine"] }
+# The Teams-native engine runs on libwebrtc (what Microsoft's own add-in uses);
+# `features = ["engine"]` would select the older webrtc-rs engine instead.
+rdp-webrtc = { path = "../rdp-webrtc", features = ["libwebrtc"] }
+# Teams-native call audio: Opus decode (remote → speakers) and encode (mic →
+# call), via the official libopus (built from source; see .cargo/config.toml).
+opus = "0.3"
 webview2-com.workspace = true
 # Direct dependency so the `#[implement]` macro's generated `windows_core::…`
 # paths (COM object vtables for the WebRTC add-in host) resolve. Version tracks
@@ -75,6 +80,9 @@ windows = { workspace = true, features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_RemoteDesktop",
+    # Resolve the Windows App's install dir (for the Teams WebRTC add-in) by
+    # package family, since normal processes can't list WindowsApps.
+    "Win32_Storage_Packaging_Appx",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
     "Win32_System_WinRT",

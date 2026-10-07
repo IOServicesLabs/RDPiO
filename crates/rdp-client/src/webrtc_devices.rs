@@ -20,7 +20,6 @@
 
 use std::sync::Mutex;
 
-use rdp_channels::camera::{CamFormat, MediaType};
 use rdp_webrtc::{DeviceKind, DeviceProvider, MediaDevice, VideoCaptureSource, NO_GROUP};
 
 use windows::Win32::Media::Audio::{
@@ -170,43 +169,53 @@ impl DeviceProvider for WinDeviceProvider {
 /// media session. Capture only runs while a call is holding a track (`start`/`stop`).
 #[derive(Default)]
 pub struct CameraVideoSource {
-    cam: Mutex<Option<MfCamera>>,
+    /// The camera lease while a call holds the track, and the last frame
+    /// sequence number handed out.
+    lease: Mutex<Option<(crate::camera_hub::CameraLease, u64)>>,
 }
 
 impl VideoCaptureSource for CameraVideoSource {
     fn start(&self, source_id: &str) -> bool {
-        // Teams normally hands back one of our `rdpio-videoinput-{index}` deviceIds as
-        // the sourceId; fall back to the first camera when it passes something else
-        // (e.g. a track id, until the MediaStream→sourceId mapping is threaded through).
+        // Teams hands back one of our `rdpio-videoinput-{index}` deviceIds (via
+        // the stream's constraints); fall back to the first camera otherwise.
         let index = source_id
             .strip_prefix("rdpio-videoinput-")
             .and_then(|n| n.parse::<u32>().ok())
             .unwrap_or(0);
-        // 720p30 H.264: MfCamera captures NV12 and encodes to Annex-B on its worker.
-        let media = MediaType {
-            format: CamFormat::H264,
-            width: 1280,
-            height: 720,
-            fps_num: 30,
-            fps_den: 1,
-        };
-        match self.cam.lock() {
+        match self.lease.lock() {
             Ok(mut slot) => {
-                *slot = Some(MfCamera::start(index, media));
-                tracing::info!(index, "native camera capture started for Teams send");
+                // Shared with the on-screen self-view: one capture per camera.
+                *slot = Some((crate::camera_hub::acquire(index), 0));
+                tracing::info!(index, "camera capture started for Teams send");
                 true
             }
             Err(_) => false,
         }
     }
 
+    /// The webrtc-rs engine's H.264 path; the libwebrtc engine encodes itself.
     fn poll_frame(&self) -> Option<Vec<u8>> {
-        self.cam.lock().ok()?.as_ref()?.poll_frame()
+        None
+    }
+
+    fn poll_nv12(&self) -> Option<rdp_webrtc::engine_api::Nv12Frame> {
+        let mut slot = self.lease.lock().ok()?;
+        let (lease, last) = slot.as_mut()?;
+        let (seq, frame) = crate::camera_hub::latest(lease.index())?;
+        if seq == *last {
+            return None;
+        }
+        *last = seq;
+        Some(rdp_webrtc::engine_api::Nv12Frame {
+            width: crate::camera_hub::WIDTH as u32,
+            height: crate::camera_hub::HEIGHT as u32,
+            data: frame,
+        })
     }
 
     fn stop(&self) {
-        if let Ok(mut slot) = self.cam.lock() {
-            slot.take(); // dropping MfCamera signals + joins the capture worker
+        if let Ok(mut slot) = self.lease.lock() {
+            slot.take(); // the hub stops the capture when nobody else holds it
         }
     }
 }
