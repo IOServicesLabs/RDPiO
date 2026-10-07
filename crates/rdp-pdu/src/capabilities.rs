@@ -69,7 +69,9 @@ fn general_caps(fastpath_output: bool) -> Vec<u8> {
     put_u16(0, &mut p); // updateCapabilityFlag
     put_u16(0, &mut p); // remoteUnshareFlag
     put_u16(0, &mut p); // generalCompressionLevel
-    p.push(0); // refreshRectSupport
+    // We send Refresh Rect PDUs (to repaint where Teams video was drawn), so
+    // advertise them, as mstsc does.
+    p.push(1); // refreshRectSupport
     p.push(0); // suppressOutputSupport
     cap_set(CAPSET_GENERAL, &p)
 }

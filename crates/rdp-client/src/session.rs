@@ -667,6 +667,8 @@ pub fn activate<S: Read + Write>(
         password: config.credentials.password.clone(),
         load_balance_info: config.load_balance_info.clone().unwrap_or_default(),
         redirected_session_id: config.redirected_session_id.unwrap_or_default(),
+        // Time zone redirection: the session shows the client's local time.
+        time_zone: crate::timezone::local_time_zone(),
         ..Default::default()
     };
     // On reconnect over Standard RDP Security, attach the auto-reconnect cookie
@@ -691,6 +693,7 @@ pub fn activate<S: Read + Write>(
                 security::PERF_BALANCED,
                 arc_cookie.as_ref(),
                 info.redirected_session_id,
+                info.time_zone.as_ref(),
             ));
             s.wrap(security::SEC_INFO_PKT, &ts)
         }
@@ -1155,6 +1158,32 @@ impl ActiveSession {
         }
     }
 
+    /// Ask the server to repaint desktop `areas` (Refresh Rect PDU, slow path),
+    /// `(left, top, right, bottom)` inclusive.
+    #[cfg(windows)]
+    pub fn send_refresh_rect<S: Write>(
+        &mut self,
+        stream: &mut S,
+        areas: &[(u16, u16, u16, u16)],
+    ) -> Result<(), ActivateError> {
+        if areas.is_empty() {
+            return Ok(());
+        }
+        let share = rdp_pdu::finalization::refresh_rect_pdu(
+            self.info.share_id,
+            self.info.user_channel_id,
+            areas,
+        );
+        match self.outbound.as_ref() {
+            Some(c) => {
+                let mut c = lock_outbound(c);
+                let payload = c.wrap(0, &share);
+                send_payload(stream, self.info.user_channel_id, self.info.io_channel_id, &payload)
+            }
+            None => send_payload(stream, self.info.user_channel_id, self.info.io_channel_id, &share),
+        }
+    }
+
     /// If `plaintext` is a slow-path Pointer Update PDU, decode it and forward a
     /// [`CursorUpdate`] to `sink`, maintaining the shape cache that `Cached`
     /// updates reference. Returns whether it was a recognised pointer update.
@@ -1306,6 +1335,30 @@ fn cursor_update_from_shape(s: &rdp_graphics::pointer::CursorShape) -> CursorUpd
         hot_y: s.hot_y,
         rgba: s.rgba.clone(),
     }
+}
+
+/// Desktop areas the UI side wants repainted by the server, `(left, top, right,
+/// bottom)` inclusive; drained and sent by the session worker. Used where Teams
+/// video was drawn into the session image and has since moved or gone away.
+static REFRESH_REQUESTS: std::sync::Mutex<Vec<(u16, u16, u16, u16)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Queue a server repaint of the desktop area at `(x, y)`, `w`×`h` (clipped at
+/// the origin; the server clips the far edges).
+pub fn request_refresh(x: i32, y: i32, w: u32, h: u32) {
+    let (l, t) = (x.max(0), y.max(0));
+    let (r, b) = (x + w as i32 - 1, y + h as i32 - 1);
+    if r < l || b < t {
+        return;
+    }
+    let clamp = |v: i32| v.min(u16::MAX as i32) as u16;
+    if let Ok(mut q) = REFRESH_REQUESTS.lock() {
+        q.push((clamp(l), clamp(t), clamp(r), clamp(b)));
+    }
+}
+
+fn take_refresh_requests() -> Vec<(u16, u16, u16, u16)> {
+    REFRESH_REQUESTS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
 }
 
 /// Sends client input (slow-path Input Event PDUs) to the server, RC4/MAC-
@@ -2077,6 +2130,10 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         while let Ok(events) = input_rx.try_recv() {
             session.send_input(stream, &events)?;
         }
+        let refresh = take_refresh_requests();
+        if !refresh.is_empty() {
+            session.send_refresh_rect(stream, &refresh)?;
+        }
 
         // Push any local clipboard change to the server (we wake ~60x/sec).
         if take_clipboard_changed() {
@@ -2162,8 +2219,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                 }
                 let pcm = m.poll();
                 for pdu in audio_in.data_pdus(&pcm) {
-                    if let Some(wrapped) = graphics.wrap_audio_input(&pdu) {
-                        session.send_dvc(stream, ch, &wrapped)?;
+                    for piece in graphics.wrap_audio_input(&pdu).into_iter().flatten() {
+                        session.send_dvc(stream, ch, &piece)?;
                     }
                 }
             }
@@ -2176,8 +2233,9 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         if let (Some((chan_id, _, cap)), Some(ch)) = (cam_capture.as_ref(), dvc_channel) {
             while let Some(frame) = cap.next_frame() {
                 let pdu = rdp_channels::camera::sample_response(0, &frame);
-                let wrapped = graphics.wrap_camera_device(*chan_id, &pdu);
-                session.send_dvc(stream, ch, &wrapped)?;
+                for piece in graphics.wrap_camera_device(*chan_id, &pdu) {
+                    session.send_dvc(stream, ch, &piece)?;
+                }
             }
         }
 
@@ -2221,8 +2279,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                     // server soft-syncs the channel onto.
                     for msg in &out.audio_output {
                         for resp in session.process_audio_dvc(msg) {
-                            if let Some(wrapped) = udp_graphics.wrap_audio_output(&resp) {
-                                let _ = tunnel.send(&wrapped);
+                            for piece in udp_graphics.wrap_audio_output(&resp).into_iter().flatten() {
+                                let _ = tunnel.send(&piece);
                             }
                         }
                     }
@@ -2470,8 +2528,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         // MS-RDPECAM version negotiation is ours to begin.
         if out.camera_opened {
             for pdu in camera.start() {
-                if let Some(wrapped) = graphics.wrap_camera(&pdu) {
-                    session.send_dvc(stream, channel, &wrapped)?;
+                for piece in graphics.wrap_camera(&pdu).into_iter().flatten() {
+                    session.send_dvc(stream, channel, &piece)?;
                 }
             }
         }
@@ -2479,8 +2537,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         // arrived on the AUDIO_INPUT channel, sending its replies back.
         for msg in &out.audio_input {
             for resp in audio_in.process(msg) {
-                if let Some(wrapped) = graphics.wrap_audio_input(&resp) {
-                    session.send_dvc(stream, channel, &wrapped)?;
+                for piece in graphics.wrap_audio_input(&resp).into_iter().flatten() {
+                    session.send_dvc(stream, channel, &piece)?;
                 }
             }
         }
@@ -2490,8 +2548,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         // sink (shared with the static path) and ack back on the dynamic channel.
         for msg in &out.audio_output {
             for resp in session.process_audio_dvc(msg) {
-                if let Some(wrapped) = graphics.wrap_audio_output(&resp) {
-                    session.send_dvc(stream, channel, &wrapped)?;
+                for piece in graphics.wrap_audio_output(&resp).into_iter().flatten() {
+                    session.send_dvc(stream, channel, &piece)?;
                 }
             }
         }
@@ -2507,8 +2565,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         // Drive the camera (MS-RDPECAM) enumerator likewise.
         for msg in &out.camera {
             for resp in camera.process(msg) {
-                if let Some(wrapped) = graphics.wrap_camera(&resp) {
-                    session.send_dvc(stream, channel, &wrapped)?;
+                for piece in graphics.wrap_camera(&resp).into_iter().flatten() {
+                    session.send_dvc(stream, channel, &piece)?;
                 }
             }
         }
@@ -2521,8 +2579,9 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                 )
             });
             for resp in dev.process(msg) {
-                let wrapped = graphics.wrap_camera_device(*chan_id, &resp);
-                session.send_dvc(stream, channel, &wrapped)?;
+                for piece in graphics.wrap_camera_device(*chan_id, &resp) {
+                    session.send_dvc(stream, channel, &piece)?;
+                }
             }
             // Follow the stream state: open the capture device when the server
             // starts streaming (the single default webcam; multi-camera

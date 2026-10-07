@@ -12,7 +12,12 @@ default = []
 # The real WebRTC engine (webrtc-rs). Kept behind a feature so the protocol
 # layers (framing/capture/rpc/objects/session) stay pure and quick to build; the
 # heavy async/media tree is only pulled when you want a live engine.
-engine = ["dep:webrtc", "dep:tokio", "dep:bytes"]
+engine = ["dep:webrtc", "dep:tokio", "dep:bytes", "dep:base64", "dep:async-trait"]
+# The same protocol layer over Google's libwebrtc (LiveKit's prebuilt build) — the
+# engine Microsoft's own add-in runs, so Teams' media server sees an identical
+# endpoint. Replaces the webrtc-rs engine when both features are on. Windows
+# builds need the static CRT (see .cargo/config.toml).
+libwebrtc = ["dep:libwebrtc", "dep:tokio", "dep:tokio-stream", "dep:bytes", "dep:base64"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -32,6 +37,14 @@ tokio = { version = "1", features = [
     "net",
 ], optional = true }
 bytes = { version = "1", optional = true }
+# Data-channel messages cross webrtc.1 as base64 (`base64MessageData`).
+base64 = { version = "0.22", optional = true }
+# The RTP probe interceptor implements webrtc-rs' async interceptor traits.
+async-trait = { version = "0.1", optional = true }
+# Vendored with two additions (transceiver `set_direction`, raw stats JSON) —
+# see the workspace `[patch.crates-io]`.
+libwebrtc = { version = "0.3.50", optional = true }
+tokio-stream = { version = "0.1", optional = true }
 
 [dev-dependencies]
 # For the async engine tests (#[tokio::test]); always available to tests.

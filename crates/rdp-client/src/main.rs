@@ -37,6 +37,9 @@ mod gateway;
 mod metrics;
 mod rng;
 mod session;
+mod timezone;
+#[cfg(windows)]
+mod camera_hub;
 mod transport;
 mod w365;
 // W365/AVD Reverse Connect (RDSTLS over a TLS WebSocket) + its Windows-only UI
@@ -502,6 +505,28 @@ fn scale_monitor_layout(
         .collect();
     let size = ((max_x - min_x).max(0) as u32, (max_y - min_y).max(0) as u32);
     (defs, size, slices)
+}
+
+/// Whether a connect error is the server rejecting the logon credentials
+/// (RDSTLS LOGON_FAILURE and friends). That is never transient: retrying the
+/// same password only counts toward the account's lockout threshold.
+fn is_logon_rejection(e: &dyn std::error::Error) -> bool {
+    e.to_string().contains("RDSTLS authentication rejected")
+}
+
+/// Handle a rejected logon: drop the saved RDSTLS password (unless it came from
+/// `--password`) so the next launch asks for it again, and say so.
+fn forget_rejected_password(args: &Args) {
+    #[cfg(windows)]
+    if args.password.is_none() {
+        let _ = crate::password_cache::clear();
+        tracing::error!(
+            "the Cloud PC rejected the saved account password (changed or expired?) — \
+             cleared it; rdpio will ask for it on the next launch"
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = args;
 }
 
 /// Exponential backoff with jitter for auto-reconnect retries.
@@ -1392,6 +1417,16 @@ mod webrtc_native;
 #[cfg(windows)]
 mod webrtc_devices;
 
+// Call audio for the native webrtc.1 engine: the remote side's Opus decoded to
+// the speakers, the mic encoded to Opus.
+#[cfg(windows)]
+mod webrtc_media;
+
+// Draws Teams' video elements (for now the local camera preview/self-view) at
+// the desktop rectangles the MS-RDPEGT geometry channel tracks for them.
+#[cfg(windows)]
+mod teams_video;
+
 // Follows the TURN `300 Try Alternate` redirect for the native webrtc.1 engine
 // (webrtc-rs can't), reusing rdpio's own STUN/TURN client (`stun`). Without it no
 // relay candidate can be allocated on Teams' anycast relays.
@@ -1517,6 +1552,11 @@ mod win {
         Cookie(rdp_pdu::logon::ReconnectCookie),
         /// The server reset the desktop size (after a Display Control resize).
         Resize(u16, u16),
+        /// Teams video (native engine) to draw at desktop `(x, y)`, possibly past
+        /// the desktop's edges. Applied on arrival, not held for a frame boundary:
+        /// it lands on the last complete desktop frame, and never shows a
+        /// half-received one.
+        Overlay(crate::teams_video::Overlay),
     }
 
     /// [`session::FrameSink`] that ships decoded rectangles to the UI thread.
@@ -3654,6 +3694,10 @@ mod win {
                     persisted_cookie.as_ref()
                 ) {
                     Ok(c) => break c,
+                    Err(e) if crate::is_logon_rejection(e.as_ref()) => {
+                        crate::forget_rejected_password(args);
+                        return Err(e);
+                    }
                     Err(e) if attempt < INITIAL_RETRIES => {
                         attempt += 1;
                         let delay = crate::reconnect_delay(attempt);
@@ -3867,10 +3911,15 @@ mod win {
                     }
                     Err(e) => {
                         attempts += 1;
+                        let rejected = crate::is_logon_rejection(e.as_ref());
+                        if rejected {
+                            crate::forget_rejected_password(args);
+                        }
                         // Getting here means a reconnect was already decided on
                         // (cookie, network drop or GPU rebuild), so keep trying
-                        // with backoff whether or not there is a cookie.
-                        if attempts <= MAX_RECONNECT {
+                        // with backoff whether or not there is a cookie — unless
+                        // the password itself was rejected.
+                        if attempts <= MAX_RECONNECT && !rejected {
                             let delay = reconnect_delay(attempts);
                             tracing::warn!(
                                 error = %e,
@@ -4027,6 +4076,7 @@ mod win {
                     let backlog = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                     let decode_backlog = backlog.clone();
                     let decode_sink_tx = tx.clone();
+                    let overlay_tx = tx.clone();
                     let decode_metrics = worker_metrics.clone();
                     let decode = std::thread::spawn(move || {
                         let mut renderer = MfRenderer::new(width, height, gpu_device);
@@ -4067,7 +4117,14 @@ mod win {
                     let redirector: Option<Box<dyn rdp_graphics::redirect::DvcRedirector>> =
                         if teams_native {
                             tracing::info!("--teams-native: bringing up rdpio's native WebRTC engine");
-                            let r = crate::webrtc_native::NativeWebRtcRedirector::new();
+                            // Teams video goes to the UI thread as overlays drawn
+                            // straight onto the current desktop frame.
+                            let overlay: crate::teams_video::OverlayOut =
+                                Box::new(move |o: crate::teams_video::Overlay| {
+                                    let _ = overlay_tx.send(FrameMsg::Overlay(o));
+                                    crate::window::signal_frame();
+                                });
+                            let r = crate::webrtc_native::NativeWebRtcRedirector::new(overlay);
                             tracing::info!(active = r.is_some(), "native Teams WebRTC engine status");
                             r.map(|r| Box::new(r) as Box<dyn rdp_graphics::redirect::DvcRedirector>)
                         } else if teams {
@@ -4250,6 +4307,11 @@ mod win {
                             loop {
                                 match rx.try_recv() {
                                     Ok(FrameMsg::Cursor(update)) => window.set_cursor(update),
+                                    Ok(FrameMsg::Overlay(o)) => {
+                                        if draw_overlay(&mut renderer, desktop, o) {
+                                            dirty = true;
+                                        }
+                                    }
                                     Ok(FrameMsg::Cookie(c)) => {
                                     cookie = Some(c);
                                     if let Err(e) = save_reconnect_cookie(&config.hostname, &c) {
@@ -4349,7 +4411,9 @@ mod win {
                                             dirty = true;
                                         }
                                         // Handled during drain; never queued.
-                                        FrameMsg::Cursor(_) | FrameMsg::Cookie(_) => {}
+                                        FrameMsg::Cursor(_)
+                                        | FrameMsg::Cookie(_)
+                                        | FrameMsg::Overlay(_) => {}
                                     }
                                 }
                             }
@@ -4503,6 +4567,36 @@ mod win {
                 }
             }
         }
+    }
+
+    /// Draw a Teams video overlay into the framebuffer, cropped to the desktop:
+    /// `update_rect` clips the right/bottom edges, the left/top are cropped here.
+    /// Returns false when none of it is on the desktop.
+    fn draw_overlay(
+        renderer: &mut Renderer,
+        desktop: (u32, u32),
+        o: crate::teams_video::Overlay,
+    ) -> bool {
+        let (x0, y0, w, h) = (o.x as i64, o.y as i64, o.w as i64, o.h as i64);
+        let (cx0, cy0) = (x0.max(0), y0.max(0));
+        let (cx1, cy1) = ((x0 + w).min(desktop.0 as i64), (y0 + h).min(desktop.1 as i64));
+        if cx1 <= cx0 || cy1 <= cy0 || o.rgba.len() < (w * h * 4) as usize {
+            return false;
+        }
+        let (cw, ch) = ((cx1 - cx0) as usize, (cy1 - cy0) as usize);
+        let rgba = if (cw as i64, ch as i64) == (w, h) {
+            o.rgba
+        } else {
+            let (sx, sy) = ((cx0 - x0) as usize, (cy0 - y0) as usize);
+            let mut v = Vec::with_capacity(cw * ch * 4);
+            for row in sy..sy + ch {
+                let start = (row * o.w as usize + sx) * 4;
+                v.extend_from_slice(&o.rgba[start..start + cw * 4]);
+            }
+            v
+        };
+        renderer.update_rect(cx0 as u16, cy0 as u16, cw as u16, ch as u16, &rgba);
+        true
     }
 
     /// Before a W365/AVD reconnect, swap in a current gateway access token. The

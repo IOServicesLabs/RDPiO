@@ -19,8 +19,14 @@
 # repeat the flag rather than relying on a shared `[build]` section.
 
 # Native Windows (MSVC) — the primary target.
+#
+# `+crt-static`: the Teams-native engine links LiveKit's prebuilt libwebrtc,
+# which is compiled against the static MSVC runtime (/MT). Mixing it with the
+# default dynamic runtime (/MD) fails the link with hundreds of LNK2005/LNK2038
+# runtime-mismatch errors, so the whole binary uses the static CRT. (It also
+# makes rdpio.exe independent of the VC++ redistributable.)
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static"]
 
 # Cross-build for the LLVM-MinGW Windows target.
 #
@@ -41,3 +47,10 @@ rustflags = [
 # Linux (the staged port; the sans-I/O protocol crates run here today).
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# The Teams-native audio path links the official libopus, which the `opus` crate
+# (via audiopus_sys) builds from bundled source with CMake. That source declares
+# `cmake_minimum_required` below 3.5, which CMake 4 refuses outright; this is
+# CMake's own documented override for exactly that.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

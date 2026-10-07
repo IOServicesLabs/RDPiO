@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT OR Apache-2.0"
@@ -23,14 +23,14 @@ description = "GPU-accelerated RDP client in Rust"
 
 [workspace.dependencies]
 # Internal crates
-rdp-asn1 = { path = "crates/rdp-asn1", version = "0.0.1" }
-rdp-crypto = { path = "crates/rdp-crypto", version = "0.0.1" }
-rdp-pdu = { path = "crates/rdp-pdu", version = "0.0.1" }
-rdp-core = { path = "crates/rdp-core", version = "0.0.1" }
-rdp-nla = { path = "crates/rdp-nla", version = "0.0.1" }
-rdp-channels = { path = "crates/rdp-channels", version = "0.0.1" }
-rdp-graphics = { path = "crates/rdp-graphics", version = "0.0.1" }
-rdp-gpu = { path = "crates/rdp-gpu", version = "0.0.1" }
+rdp-asn1 = { path = "crates/rdp-asn1", version = "0.1.0" }
+rdp-crypto = { path = "crates/rdp-crypto", version = "0.1.0" }
+rdp-pdu = { path = "crates/rdp-pdu", version = "0.1.0" }
+rdp-core = { path = "crates/rdp-core", version = "0.1.0" }
+rdp-nla = { path = "crates/rdp-nla", version = "0.1.0" }
+rdp-channels = { path = "crates/rdp-channels", version = "0.1.0" }
+rdp-graphics = { path = "crates/rdp-graphics", version = "0.1.0" }
+rdp-gpu = { path = "crates/rdp-gpu", version = "0.1.0" }
 
 # Third-party, pure and cross-platform
 thiserror = "1.0"
@@ -79,3 +79,18 @@ opt-level = 3
 # between rdp-graphics and rdp-client.
 codegen-units = 1
 panic = "abort"
+
+# webrtc-rs' DTLS picked its signature verifier from the hash alone (ECDSA
+# SHA-256 → P-256, SHA-384 → P-384; no RSA SHA-384 below 2048 bits), so a Teams
+# media server whose certificate key didn't fit that guess failed every call's
+# DTLS handshake with `ring::error::Unspecified`. The vendored copy verifies by
+# the certificate's actual key — see `verify_signature` in
+# vendor/dtls/src/crypto/mod.rs (the only change, plus its tests).
+[patch.crates-io]
+dtls = { path = "vendor/dtls" }
+# LiveKit's libwebrtc bindings (the `libwebrtc` engine of rdp-webrtc), plus
+# `RtpTransceiver::set_direction` and `PeerConnection::get_stats_json`, which the
+# Teams protocol needs and the published crate doesn't expose.
+libwebrtc = { path = "vendor/libwebrtc" }
+# Its C++ glue, patched to request max-bundle/rtcp-mux like Teams' own config.
+webrtc-sys = { path = "vendor/webrtc-sys" }

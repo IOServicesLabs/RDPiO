@@ -82,6 +82,8 @@ pub mod emt;
 
 pub mod camera;
 
+pub mod geometry;
+
 pub mod rdpei;
 
 pub mod serial;
