@@ -18,7 +18,7 @@ use core::mem::ManuallyDrop;
 
 use windows::core::{Interface, Result as WinResult};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_DECODER, D3D11_BIND_SHADER_RESOURCE,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
@@ -32,9 +32,43 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT,
     MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
-    MF_VERSION,
+    MF_SA_D3D11_BINDFLAGS, MF_VERSION,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
+
+
+/// A video codec the Media Foundation transforms here handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    H264,
+    /// H.265 — about a third smaller than H.264 at the same quality. Decoding
+    /// needs Windows' HEVC decoder (the "HEVC Video Extensions").
+    Hevc,
+}
+
+impl Codec {
+    pub fn subtype(self) -> windows::core::GUID {
+        match self {
+            Self::H264 => MFVideoFormat_H264,
+            Self::Hevc => windows::Win32::Media::MediaFoundation::MFVideoFormat_HEVC,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "h264" => Some(Self::H264),
+            "hevc" => Some(Self::Hevc),
+            _ => None,
+        }
+    }
+}
 
 /// Put a freshly-activated MFT into low-latency mode so it emits each frame as
 /// soon as it's decoded instead of holding a reorder/lookahead buffer — the
@@ -149,12 +183,17 @@ impl H264Decoder {
     /// Create a decoder for `width`x`height` H.264 (the size is a hint; the
     /// stream's own SPS may trigger a one-time output renegotiation).
     pub fn new(width: u32, height: u32) -> WinResult<Self> {
+        Self::with_codec(width, height, Codec::H264)
+    }
+
+    /// A decoder for `codec` (H.264 or HEVC).
+    pub fn with_codec(width: u32, height: u32, codec: Codec) -> WinResult<Self> {
         unsafe {
             MFStartup(MF_VERSION, MFSTARTUP_LITE)?;
 
             let in_info = MFT_REGISTER_TYPE_INFO {
                 guidMajorType: MFMediaType_Video,
-                guidSubtype: MFVideoFormat_H264,
+                guidSubtype: codec.subtype(),
             };
             let out_info = MFT_REGISTER_TYPE_INFO {
                 guidMajorType: MFMediaType_Video,
@@ -191,7 +230,7 @@ impl H264Decoder {
             let frame_size = ((width as u64) << 32) | height as u64;
             let input = MFCreateMediaType()?;
             input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            input.SetGUID(&MF_MT_SUBTYPE, &codec.subtype())?;
             input.SetUINT64(&MF_MT_FRAME_SIZE, frame_size)?;
             input.SetUINT32(&MF_MT_INTERLACE_MODE, MF_MT_INTERLACE_PROGRESSIVE)?;
             transform.SetInputType(0, &input, 0)?;
@@ -559,10 +598,16 @@ impl H264Encoder {
 /// the renderer's video processor — no system-memory copy, no CPU conversion.
 pub struct DecodedTexture {
     pub texture: ID3D11Texture2D,
+    /// The picture's slice when `texture` is an array (the decoder's own
+    /// surfaces, read in place); 0 otherwise.
+    pub slice: u32,
     pub width: u32,
     pub height: u32,
     /// Input-unit tag echoed by the MFT (see [`DecodedFrame::unit_id`]).
     pub unit_id: i64,
+    /// Read in place: the decoder's sample, held so it doesn't reuse the
+    /// surface until this picture is dropped.
+    pub held: Option<IMFSample>,
 }
 
 /// A DXVA (GPU) H.264 decoder: the system decoder MFT bound to the caller's
@@ -587,6 +632,11 @@ pub struct H264GpuDecoder {
     pool: Vec<(u32, u32, ID3D11Texture2D)>,
     /// Tag for the next input unit (see [`H264Decoder::next_unit_id`]).
     next_unit_id: i64,
+    /// Hand out the decoder's own surfaces (no copy) where they can be read
+    /// by a shader (see [`H264GpuDecoder::with_codec_in_place`]).
+    in_place: bool,
+    /// Whether in-place reading was reported (once).
+    in_place_logged: bool,
 }
 
 /// How many output textures the decoder retains for reuse. Matches the
@@ -618,6 +668,44 @@ impl H264GpuDecoder {
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
     ) -> WinResult<Self> {
+        Self::with_codec(width, height, device, context, Codec::H264)
+    }
+
+    /// A GPU decoder for `codec` (H.264 or HEVC).
+    pub fn with_codec(
+        width: u32,
+        height: u32,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        codec: Codec,
+    ) -> WinResult<Self> {
+        Self::create(width, height, device, context, codec, false)
+    }
+
+    /// [`with_codec`](Self::with_codec), its pictures handed out in place —
+    /// the decoder's own surfaces, made shader-readable, not copied out (a
+    /// frame's worth of memory traffic less, which an integrated GPU's shared
+    /// memory feels). Each picture holds its surface until dropped: draw it
+    /// and drop it, don't queue them. Where the driver won't make them
+    /// readable, pictures are copied as usual.
+    pub fn with_codec_in_place(
+        width: u32,
+        height: u32,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        codec: Codec,
+    ) -> WinResult<Self> {
+        Self::create(width, height, device, context, codec, true)
+    }
+
+    fn create(
+        width: u32,
+        height: u32,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        codec: Codec,
+        in_place: bool,
+    ) -> WinResult<Self> {
         unsafe {
             MFStartup(MF_VERSION, MFSTARTUP_LITE)?;
 
@@ -628,10 +716,10 @@ impl H264GpuDecoder {
             let manager = manager.ok_or_else(windows::core::Error::from_thread)?;
             manager.ResetDevice(device, token)?;
 
-            // The system H.264 decoder MFT (H.264 → NV12).
+            // The system decoder MFT (H.264/HEVC → NV12).
             let in_info = MFT_REGISTER_TYPE_INFO {
                 guidMajorType: MFMediaType_Video,
-                guidSubtype: MFVideoFormat_H264,
+                guidSubtype: codec.subtype(),
             };
             let out_info = MFT_REGISTER_TYPE_INFO {
                 guidMajorType: MFMediaType_Video,
@@ -667,10 +755,18 @@ impl H264GpuDecoder {
             let frame_size = ((width as u64) << 32) | height as u64;
             let input = MFCreateMediaType()?;
             input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            input.SetGUID(&MF_MT_SUBTYPE, &codec.subtype())?;
             input.SetUINT64(&MF_MT_FRAME_SIZE, frame_size)?;
             input.SetUINT32(&MF_MT_INTERLACE_MODE, MF_MT_INTERLACE_PROGRESSIVE)?;
             transform.SetInputType(0, &input, 0)?;
+
+            // Its surfaces readable by a shader too (before it allocates them,
+            // on the output type).
+            if in_place {
+                if let Ok(attributes) = transform.GetOutputStreamAttributes(0) {
+                    let _ = attributes.SetUINT32(&MF_SA_D3D11_BINDFLAGS, (D3D11_BIND_DECODER.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32);
+                }
+            }
 
             let output = MFCreateMediaType()?;
             output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -691,6 +787,8 @@ impl H264GpuDecoder {
                 height,
                 pool: Vec::new(),
                 next_unit_id: 0,
+                in_place,
+                in_place_logged: false,
             })
         }
     }
@@ -839,15 +937,36 @@ impl H264GpuDecoder {
         // to their own alignment, which can exceed the display/macroblock size.
         let mut pool_desc: D3D11_TEXTURE2D_DESC = core::mem::zeroed();
         pool_tex.GetDesc(&mut pool_desc);
+        // Read in place where the surface is shader-readable: the sample
+        // goes along, so the decoder doesn't reuse it meanwhile.
+        if self.in_place {
+            let readable = pool_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE.0 as u32 != 0;
+            if !std::mem::replace(&mut self.in_place_logged, true) {
+                tracing::info!(readable, slices = pool_desc.ArraySize, "decoded pictures read in place (no copy)");
+            }
+            if readable {
+                return Ok(Some(DecodedTexture {
+                    texture: pool_tex,
+                    slice: subresource / pool_desc.MipLevels.max(1),
+                    width: self.width,
+                    height: self.height,
+                    unit_id: sample.GetSampleTime().unwrap_or(-1),
+                    held: Some(sample.clone()),
+                }));
+            }
+            self.in_place = false;
+        }
         let dest = self.acquire_texture(pool_desc.Width, pool_desc.Height)?;
         // Copy just this frame's array slice out of the shared decoder pool.
         self.context
             .CopySubresourceRegion(&dest, 0, 0, 0, 0, &pool_tex, subresource, None);
         Ok(Some(DecodedTexture {
             texture: dest,
+            slice: 0,
             width: self.width,
             height: self.height,
             unit_id: sample.GetSampleTime().unwrap_or(-1),
+            held: None,
         }))
     }
 }

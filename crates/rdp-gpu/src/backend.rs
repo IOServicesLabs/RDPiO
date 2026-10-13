@@ -40,6 +40,61 @@ impl Renderer {
         }
     }
 
+    /// Keep the picture's aspect ratio in a window of another shape (scaled
+    /// to fit, black around it). Direct3D 11 only: the D3D12 backend stretches.
+    pub fn set_keep_aspect(&mut self, on: bool) {
+        if let Self::D3D11(r) = self {
+            r.set_keep_aspect(on);
+        }
+    }
+
+    /// Whether the picture keeps its aspect ratio (see [`Self::set_keep_aspect`]).
+    pub fn keeps_aspect(&self) -> bool {
+        matches!(self, Self::D3D11(r) if r.keeps_aspect())
+    }
+
+    /// A Direct3D 11 renderer on Windows' software rasterizer (WARP), as a PC
+    /// without a working GPU driver gets.
+    pub fn new_software(hwnd_raw: isize, width: u32, height: u32) -> windows::core::Result<Self> {
+        Ok(Self::D3D11(D3D11Renderer::new_software(hwnd_raw, width, height)?))
+    }
+
+    /// Whether a present now goes out without waiting (see
+    /// [`D3D11Renderer::frame_ready`](crate::d3d11::D3D11Renderer::frame_ready)).
+    /// Direct3D 12: always.
+    pub fn frame_ready(&mut self) -> bool {
+        match self {
+            Self::D3D11(r) => r.frame_ready(),
+            Self::D3D12(_) => true,
+        }
+    }
+
+    /// The swapchain's "room for a frame" signal (raw handle), to wait on;
+    /// when it fires, call [`Self::note_frame_ready`].
+    pub fn frame_ready_handle(&self) -> Option<isize> {
+        match self {
+            Self::D3D11(r) => r.frame_ready_handle().map(|h| h.0 as isize),
+            Self::D3D12(_) => None,
+        }
+    }
+
+    pub fn note_frame_ready(&mut self) {
+        if let Self::D3D11(r) = self {
+            r.note_frame_ready();
+        }
+    }
+
+    /// Made again on the GPU now chosen (see
+    /// [`prefer_display_adapter`](crate::d3d11::prefer_display_adapter)),
+    /// settings kept, picture gone. `false`: not done (Direct3D 12, or
+    /// per-monitor mode).
+    pub fn rebuild(&mut self) -> windows::core::Result<bool> {
+        match self {
+            Self::D3D11(r) => r.rebuild(),
+            Self::D3D12(_) => Ok(false),
+        }
+    }
+
     /// Enable (or disable) the no-vsync tearing present path.
     pub fn set_low_latency(&mut self, on: bool) {
         match self {
@@ -171,6 +226,25 @@ impl Renderer {
     ) -> bool {
         match self {
             Self::D3D11(r) => r.blit_texture(dest_x, dest_y, w, h, tex, regions),
+            Self::D3D12(_r) => false,
+        }
+    }
+
+    /// [`Self::blit_texture`] of one slice of a texture array (a decoder's own
+    /// surfaces, read in place). `false` where it can't (then copy instead).
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_texture_slice(
+        &mut self,
+        dest_x: u32,
+        dest_y: u32,
+        w: u32,
+        h: u32,
+        tex: &ID3D11Texture2D,
+        slice: u32,
+        regions: &[(u32, u32, u32, u32)],
+    ) -> bool {
+        match self {
+            Self::D3D11(r) => r.blit_texture_slice(dest_x, dest_y, w, h, tex, slice, regions),
             Self::D3D12(_r) => false,
         }
     }

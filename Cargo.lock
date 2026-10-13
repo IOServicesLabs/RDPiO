@@ -534,6 +534,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
  "fiat-crypto",
+ "rand_core 0.6.4",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -2005,14 +2006,14 @@ dependencies = [
 
 [[package]]
 name = "rdp-asn1"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "rdp-channels"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rdp-pdu",
  "thiserror 1.0.69",
@@ -2021,7 +2022,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "embed-resource",
@@ -2033,6 +2034,7 @@ dependencies = [
  "rdp-crypto",
  "rdp-gpu",
  "rdp-graphics",
+ "rdp-hyper",
  "rdp-nla",
  "rdp-pdu",
  "rdp-webrtc",
@@ -2055,7 +2057,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rdp-channels",
  "rdp-pdu",
@@ -2065,21 +2067,23 @@ dependencies = [
 
 [[package]]
 name = "rdp-crypto"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "rdp-gpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "cc",
  "rdp-graphics",
  "thiserror 1.0.69",
  "tracing",
+ "tracing-subscriber",
  "windows",
 ]
 
 [[package]]
 name = "rdp-graphics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rdp-channels",
  "rdp-pdu",
@@ -2089,8 +2093,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdp-hyper"
+version = "0.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "ring",
+ "serde",
+ "serde_json",
+ "spake2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rdp-nla"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rdp-asn1",
  "rdp-crypto",
@@ -2102,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-pdu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitflags 2.12.1",
  "byteorder",
@@ -2112,7 +2128,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-webrtc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2652,6 +2668,18 @@ checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spake2"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5482afe85a0b6ce956c945401598dbc527593c77ba51d0a87a586938b1b893a"
+dependencies = [
+ "curve25519-dalek",
+ "hkdf",
+ "rand_core 0.6.4",
+ "sha2",
 ]
 
 [[package]]

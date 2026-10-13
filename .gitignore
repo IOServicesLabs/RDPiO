@@ -26,3 +26,7 @@ token_cache*.json
 password_cache*.json
 password_cache*.bin
 w365_password.bin
+
+# The launcher's brand fonts: licensed, not published (builds without them
+# fall back to Segoe UI; see crates/rdp-client/src/launcher/mod.rs).
+crates/rdp-client/src/launcher/fonts/

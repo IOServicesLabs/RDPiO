@@ -62,6 +62,10 @@ rdpio --host 192.168.1.50 --user alice --password 'hunter2' --insecure --gaming 
 
 More recipes in [Run it](#run-it); every flag is listed under [Options](#options).
 
+**Gaming beyond RDP's 60 fps:** the Hyper Accelerator streams a gaming PC's real
+monitor at up to its full refresh rate over encrypted UDP, with its own password
+(no Windows sign-in needed) — see [docs/hyper.md](docs/hyper.md).
+
 ---
 
 ## What you can run today

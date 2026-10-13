@@ -1,13 +1,15 @@
 //! Direct3D 11 renderer (Windows).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use windows::core::{Interface, PCSTR, Result as WinResult};
 use windows::Win32::Foundation::{HANDLE, HMODULE, HWND, RECT};
 use windows::Win32::System::Threading::WaitForSingleObjectEx;
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
+    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
     D3D_FEATURE_LEVEL_11_1, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2D,
+    D3D_SRV_DIMENSION_TEXTURE2DARRAY,
     ID3DBlob,
 };
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -23,7 +25,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_MAP_READ, D3D11_QUERY, D3D11_QUERY_DATA_TIMESTAMP_DISJOINT, D3D11_QUERY_DESC,
     D3D11_QUERY_TIMESTAMP, D3D11_QUERY_TIMESTAMP_DISJOINT, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
     D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_SUBRESOURCE_DATA,
-    D3D11_TEX2D_SRV, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
+    D3D11_TEX2D_ARRAY_SRV, D3D11_TEX2D_SRV, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
     D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE,
     D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
@@ -41,14 +43,91 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGIFactory6, IDXGISwapChain,
-    IDXGISwapChain1, IDXGISwapChain2, DXGI_CREATE_FACTORY_FLAGS,
-    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING,
+    CreateDXGIFactory2, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory2, IDXGIFactory6, IDXGISwapChain,
+    IDXGISwapChain1, IDXGISwapChain2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
+    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, DXGI_GPU_PREFERENCE_MINIMUM_POWER, DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING,
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
     DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
+
+/// Decode and present on the GPU the display is attached to rather than the
+/// fastest one (see [`prefer_display_adapter`]).
+static PREFER_DISPLAY_ADAPTER: AtomicBool = AtomicBool::new(false);
+
+/// The adapter last logged as chosen (its LUID), so a choice is logged once.
+static LOGGED_ADAPTER: AtomicI64 = AtomicI64::new(0);
+
+/// Renderers (and decoder probes) made from now on use the GPU that drives the
+/// display (on a hybrid laptop, the integrated one: the discrete GPU can then
+/// power off, and no frame is copied across to the display's GPU) instead of
+/// the fastest one. For running on battery.
+pub fn prefer_display_adapter(on: bool) {
+    PREFER_DISPLAY_ADAPTER.store(on, Ordering::Relaxed);
+}
+
+/// Whether [`prefer_display_adapter`] is on.
+pub fn prefers_display_adapter() -> bool {
+    PREFER_DISPLAY_ADAPTER.load(Ordering::Relaxed)
+}
+
+fn luid_of(adapter: &IDXGIAdapter) -> Option<i64> {
+    unsafe { adapter.GetDesc().ok().map(|d| ((d.AdapterLuid.HighPart as i64) << 32) | d.AdapterLuid.LowPart as i64) }
+}
+
+fn adapter_name(adapter: &IDXGIAdapter) -> String {
+    unsafe {
+        adapter.GetDesc().map_or_else(
+            |_| "?".into(),
+            |d| {
+                let end = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                String::from_utf16_lossy(&d.Description[..end])
+            },
+        )
+    }
+}
+
+/// The hardware adapter a monitor is attached to, the most frugal first.
+fn display_adapter() -> Option<IDXGIAdapter> {
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        for i in 0..8 {
+            let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(i, DXGI_GPU_PREFERENCE_MINIMUM_POWER) else {
+                break;
+            };
+            let software = adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
+            if !software && adapter.EnumOutputs(0).is_ok() {
+                return adapter.cast().ok();
+            }
+        }
+        None
+    }
+}
+
+/// The adapter renderers are made on: the display's (when preferred and
+/// found) or the fastest. `None`: the runtime's default.
+pub(crate) fn chosen_adapter() -> Option<IDXGIAdapter> {
+    let want_display = prefers_display_adapter();
+    let adapter = if want_display { display_adapter() } else { None }.or_else(D3D11Renderer::high_performance_adapter);
+    if let Some(a) = &adapter {
+        let luid = luid_of(a).unwrap_or(0);
+        if LOGGED_ADAPTER.swap(luid, Ordering::Relaxed) != luid {
+            tracing::info!(adapter = %adapter_name(a), display_gpu = want_display, "GPU for decoding and presenting");
+        }
+    }
+    adapter
+}
+
+/// The LUID of the adapter [`chosen_adapter`] picks now.
+pub fn chosen_adapter_luid() -> Option<i64> {
+    chosen_adapter().as_ref().and_then(luid_of)
+}
+
+/// The LUID of the adapter `device` runs on.
+pub fn device_adapter_luid(device: &ID3D11Device) -> Option<i64> {
+    unsafe { device.cast::<IDXGIDevice>().ok()?.GetAdapter().ok().as_ref().and_then(luid_of) }
+}
 
 /// Lightweight D3D11 timestamp-query pair for one GPU operation per frame.
 /// D3D11 timestamps are asynchronous: `begin`/`end` issue commands, and
@@ -190,6 +269,10 @@ pub struct D3D11Renderer {
     /// most ~1 refresh old instead of DXGI's default of up to 3 — the latency
     /// edge that matters for interactive + gaming use.
     frame_wait: Option<HANDLE>,
+    /// `frame_wait`'s signal was already taken (by [`frame_ready`](Self::frame_ready)
+    /// or [`note_frame_ready`](Self::note_frame_ready)): the next present
+    /// doesn't wait for it again.
+    frame_slot: bool,
     /// NV12→RGBA pixel-shader converter — the primary colour-conversion path for
     /// GPU-decoded frames, built lazily on first use.
     nv12_shader: Option<Nv12Shader>,
@@ -226,6 +309,11 @@ pub struct D3D11Renderer {
     /// mode. `None` = same as the swapchain (1:1); `Some(smaller)` under
     /// render-scale, where the slice is upscaled on present.
     primary_src_size: Option<(u32, u32)>,
+    /// Keep the framebuffer's aspect ratio in a window of another shape:
+    /// scaled to fit, black around it (single-window path).
+    keep_aspect: bool,
+    /// What a kept-aspect picture is scaled into, and its size.
+    boxed: Option<(ID3D11Texture2D, (u32, u32))>,
     /// Optional GPU timing callback; receives `(label, microseconds)` for
     /// completed D3D11 timestamp queries. Wired up by the client to the telemetry
     /// module.
@@ -282,15 +370,6 @@ impl D3D11Renderer {
             let adapter: IDXGIAdapter = factory
                 .EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
                 .ok()?;
-            if let Ok(desc) = adapter.GetDesc() {
-                let end = desc
-                    .Description
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(desc.Description.len());
-                let name = String::from_utf16_lossy(&desc.Description[..end]);
-                tracing::info!(adapter = %name, "selecting high-performance GPU adapter");
-            }
             Some(adapter)
         }
     }
@@ -303,6 +382,18 @@ impl D3D11Renderer {
     /// waitable object plus max-frame-latency 1 is what gives us a tighter
     /// present-to-photon path than the stock DXGI queue every other client uses.
     pub fn new(hwnd_raw: isize, width: u32, height: u32) -> WinResult<Self> {
+        // RDPIO_WARP=1: render in software, as a PC without a GPU driver does.
+        Self::create(hwnd_raw, width, height, std::env::var_os("RDPIO_WARP").is_some())
+    }
+
+    /// [`new`](Self::new) on Windows' software rasterizer (WARP): what a PC
+    /// without a working GPU driver renders with. No video decoder or video
+    /// processor there — everything takes the CPU paths.
+    pub fn new_software(hwnd_raw: isize, width: u32, height: u32) -> WinResult<Self> {
+        Self::create(hwnd_raw, width, height, true)
+    }
+
+    fn create(hwnd_raw: isize, width: u32, height: u32, software: bool) -> WinResult<Self> {
         unsafe {
             let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
             // BGRA support is required for later Direct2D / Media Foundation interop.
@@ -346,11 +437,20 @@ impl D3D11Renderer {
 
             // Prefer the discrete GPU on hybrid (laptop) systems: the default
             // adapter is often the power-saving integrated GPU, which decodes
-            // H.264 and runs the video processor far slower. `None` → fall back
-            // to the runtime's default adapter (driver type HARDWARE). When an
-            // explicit adapter is supplied, the driver type must be UNKNOWN.
-            let hp_adapter = Self::high_performance_adapter();
-            let driver_type = if hp_adapter.is_some() {
+            // H.264 and runs the video processor far slower — unless the
+            // display's GPU is asked for (on battery; see
+            // `prefer_display_adapter`). `None` → fall back to the runtime's
+            // default adapter (driver type HARDWARE). When an explicit adapter
+            // is supplied, the driver type must be UNKNOWN.
+            let hp_adapter = if software {
+                tracing::info!("rendering in software (WARP)");
+                None
+            } else {
+                chosen_adapter()
+            };
+            let driver_type = if software {
+                D3D_DRIVER_TYPE_WARP
+            } else if hp_adapter.is_some() {
                 D3D_DRIVER_TYPE_UNKNOWN
             } else {
                 D3D_DRIVER_TYPE_HARDWARE
@@ -436,6 +536,7 @@ impl D3D11Renderer {
                 upscaler: Upscaler::default(),
                 sharpen: 0.0,
                 frame_wait,
+                frame_slot: false,
                 tearing,
                 low_latency: false,
                 sc_flags,
@@ -444,6 +545,8 @@ impl D3D11Renderer {
                 extra_targets: Vec::new(),
                 primary_src: (0, 0),
                 primary_src_size: None,
+                keep_aspect: false,
+                boxed: None,
                 gpu_timing_cb: None,
                 present_timer: None,
                 frame_dirty: None,
@@ -465,6 +568,47 @@ impl D3D11Renderer {
             );
             Ok(renderer)
         }
+    }
+
+    /// The same renderer made again on the adapter [`chosen_adapter`] picks
+    /// now (on battery or not), with its settings; the framebuffer's contents
+    /// are gone (the caller paints a fresh picture). Not for per-monitor mode
+    /// (`false`: nothing done).
+    pub fn rebuild(&mut self) -> WinResult<bool> {
+        if !self.extra_targets.is_empty() {
+            return Ok(false);
+        }
+        let hwnd = unsafe { self.swap_chain.GetDesc()?.OutputWindow };
+        let (w, h) = (self.sc_width, self.sc_height);
+        let (fb, low_latency, upscaler, sharpen, keep_aspect) =
+            ((self.fb_width, self.fb_height), self.low_latency, self.upscaler, self.sharpen, self.keep_aspect);
+        let timing = self.gpu_timing_cb.take();
+        // A window takes one flip-model swapchain at a time: this renderer
+        // goes before its successor is made. Nothing between the two may
+        // unwind (it would drop this one twice): a panic aborts, and a GPU
+        // that refuses leaves a software renderer.
+        unsafe {
+            let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::ptr::drop_in_place(self as *mut Self);
+                Self::create(hwnd.0 as isize, w, h, false).or_else(|e| {
+                    tracing::warn!(error = %e, "no renderer on the chosen GPU; rendering in software");
+                    Self::create(hwnd.0 as isize, w, h, true)
+                })
+            }));
+            match made {
+                Ok(Ok(r)) => std::ptr::write(self as *mut Self, r),
+                _ => std::process::abort(),
+            }
+        }
+        self.low_latency = low_latency && self.tearing;
+        self.upscaler = upscaler;
+        self.sharpen = sharpen;
+        self.keep_aspect = keep_aspect;
+        self.gpu_timing_cb = timing;
+        if fb.0 > 0 && fb.1 > 0 {
+            self.ensure_framebuffer(fb.0, fb.1)?;
+        }
+        Ok(true)
     }
 
     /// Enable (or disable) the no-vsync tearing present path — absolute-minimum
@@ -490,6 +634,18 @@ impl D3D11Renderer {
             t.pipeline.reset();
         }
         tracing::info!(?mode, "client upscaler selected");
+    }
+
+    /// Keep the picture's aspect ratio when the window has another shape:
+    /// scaled to fit and centred, black around it (see [`crate::fit_rect`]),
+    /// instead of stretched to fill.
+    pub fn set_keep_aspect(&mut self, on: bool) {
+        self.keep_aspect = on;
+    }
+
+    /// Whether [`set_keep_aspect`](Self::set_keep_aspect) is on.
+    pub fn keeps_aspect(&self) -> bool {
+        self.keep_aspect
     }
 
     /// Set the RCAS adaptive-sharpen strength (`0.0` = off, `1.0` = maximum)
@@ -527,7 +683,10 @@ impl D3D11Renderer {
     /// Wait on the frame-latency object (if any) so we never queue more than one
     /// frame ahead of the display. Bounded so a lost/abandoned signal can't hang
     /// the UI thread.
-    fn wait_for_frame(&self) {
+    fn wait_for_frame(&mut self) {
+        if std::mem::take(&mut self.frame_slot) {
+            return;
+        }
         if let Some(h) = self.frame_wait {
             // Non-alertable: only the frame signal (or the 100 ms guard) wakes us,
             // so an APC can't slip an extra frame past the latency cap.
@@ -535,6 +694,33 @@ impl D3D11Renderer {
                 let _ = WaitForSingleObjectEx(h, 100, false);
             }
         }
+    }
+
+    /// Whether a present now goes out without waiting (the swapchain has room
+    /// for a frame). Never blocks: a caller with other work (decoding, input)
+    /// keeps its newest picture and presents once this says so — waiting
+    /// instead, on a display Windows composes, stalls it a refresh or two per
+    /// frame.
+    pub fn frame_ready(&mut self) -> bool {
+        if self.frame_slot {
+            return true;
+        }
+        let Some(h) = self.frame_wait else { return true };
+        if unsafe { WaitForSingleObjectEx(h, 0, false) } == windows::Win32::Foundation::WAIT_OBJECT_0 {
+            self.frame_slot = true;
+        }
+        self.frame_slot
+    }
+
+    /// The swapchain's "room for a frame" signal, to wait on alongside other
+    /// work. Taking it consumes it: say so with [`note_frame_ready`](Self::note_frame_ready).
+    pub fn frame_ready_handle(&self) -> Option<HANDLE> {
+        self.frame_wait
+    }
+
+    /// [`frame_ready_handle`](Self::frame_ready_handle) was waited on and fired.
+    pub fn note_frame_ready(&mut self) {
+        self.frame_slot = true;
     }
 
     /// The `(SyncInterval, Flags)` pair for `Present`: tear with no vsync in
@@ -1224,6 +1410,19 @@ impl D3D11Renderer {
         self.wait_for_frame();
         let (fb_w, fb_h) = (self.fb_width, self.fb_height);
         let (sc_w, sc_h) = (self.sc_width, self.sc_height);
+        // A picture of another shape than the window, its aspect kept.
+        if let Some(rect) = self
+            .keep_aspect
+            .then(|| crate::fit_rect((fb_w, fb_h), (sc_w, sc_h)))
+            .filter(|&r| r != (0, 0, sc_w, sc_h))
+        {
+            let res = self.present_boxed(rect);
+            self.rotate_dirty(true);
+            if let Some(timer) = self.present_timer.as_mut() {
+                timer.end();
+            }
+            return res;
+        }
         let mut painted = false;
         if (fb_w, fb_h) != (sc_w, sc_h) || self.sharpen > 0.0 {
             let device = self.device.clone();
@@ -1345,6 +1544,68 @@ impl D3D11Renderer {
         self.recent_dirty.push_front(this);
         self.recent_dirty.truncate(2); // BufferCount - 1
         self.frame_dirty = Some(Vec::new());
+    }
+
+    /// Present the framebuffer into `rect` of the backbuffer — scaled when it
+    /// isn't that size — with black around it (see `set_keep_aspect`).
+    fn present_boxed(&mut self, (x, y, w, h): (u32, u32, u32, u32)) -> WinResult<()> {
+        let (fb_w, fb_h) = (self.fb_width, self.fb_height);
+        let fb = self.framebuffer.clone().expect("framebuffer present");
+        let (mode, sharpen) = (self.upscaler, self.sharpen);
+        unsafe {
+            let back_buffer: ID3D11Texture2D = self.swap_chain.GetBuffer(0)?;
+            if let Some(rtv) = self.rtv.as_ref() {
+                self.context.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
+            }
+            // The picture at its size in the window: the framebuffer itself at
+            // 1:1, else scaled into a texture that size.
+            let scaled = if (w, h) == (fb_w, fb_h) && sharpen <= 0.0 {
+                None
+            } else {
+                let (device, context) = (self.device.clone(), self.context.clone());
+                self.boxed_texture((w, h)).filter(|t| {
+                    self.pipeline.run(&device, &context, mode, sharpen, &fb, (fb_w, fb_h), (0, 0, fb_w, fb_h), t, (w, h))
+                })
+            };
+            // (With no scaler working: the picture's top-left, uncropped size.)
+            let (src, sw, sh) = match &scaled {
+                Some(t) => (t, w, h),
+                None => (&fb, fb_w.min(w), fb_h.min(h)),
+            };
+            let src_box = D3D11_BOX { left: 0, top: 0, front: 0, right: sw, bottom: sh, back: 1 };
+            self.context.CopySubresourceRegion(&back_buffer, 0, x, y, 0, src, 0, Some(&src_box));
+            let (sync, flags) = self.present_params();
+            self.present_with_rects(sync, flags, None)
+        }
+    }
+
+    /// The texture a kept-aspect picture is scaled into (kept while its size
+    /// holds).
+    fn boxed_texture(&mut self, size: (u32, u32)) -> Option<ID3D11Texture2D> {
+        if let Some((tex, s)) = &self.boxed {
+            if *s == size {
+                return Some(tex.clone());
+            }
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: size.0,
+            Height: size.1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        unsafe {
+            let mut tex: Option<ID3D11Texture2D> = None;
+            self.device.CreateTexture2D(&desc, None, Some(&mut tex)).ok()?;
+            let tex = tex?;
+            self.boxed = Some((tex.clone(), size));
+            Some(tex)
+        }
     }
 
     /// Present, attaching the frame's dirty rects when they are known and
@@ -1471,6 +1732,31 @@ impl D3D11Renderer {
         tex: &ID3D11Texture2D,
         regions: &[(u32, u32, u32, u32)],
     ) -> bool {
+        self.blit_texture_slice(dest_x, dest_y, w, h, tex, 0, regions)
+    }
+
+    /// [`blit_texture`](Self::blit_texture) of one slice of a texture array
+    /// (a decoder's own surfaces, read in place). Only the shader converts
+    /// those: `false` without it, and nothing latched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_texture_slice(
+        &mut self,
+        dest_x: u32,
+        dest_y: u32,
+        w: u32,
+        h: u32,
+        tex: &ID3D11Texture2D,
+        slice: u32,
+        regions: &[(u32, u32, u32, u32)],
+    ) -> bool {
+        let array = unsafe {
+            let mut td: D3D11_TEXTURE2D_DESC = core::mem::zeroed();
+            tex.GetDesc(&mut td);
+            td.ArraySize > 1
+        };
+        if array && (self.nv12_shader_failed || self.nv12_shader.as_ref().is_some_and(|s| s.ps_slice.is_none())) {
+            return false;
+        }
         // Deliberately NOT gated on `video_disabled`: that latch records a
         // *video processor* failure, and the shader path below doesn't use the
         // video processor. Gating the whole method on it sent every DXVA frame
@@ -1507,11 +1793,13 @@ impl D3D11Renderer {
                 }
             }
             if let Some(s) = self.nv12_shader.as_mut() {
-                match s.blit(&fb, tex, dest_x, dest_y, w, h, (fb_w, fb_h), regions) {
+                match s.blit(&fb, tex, slice, dest_x, dest_y, w, h, (fb_w, fb_h), regions) {
                     Ok(()) => {
                         self.note_dirty(dest_x, dest_y, w, h);
                         return true;
                     }
+                    // (A slice the shader can't take isn't the shader failing.)
+                    Err(_) if array => return false,
                     Err(e) => {
                         tracing::warn!(error = %e, "NV12 shader blit failed; trying the video processor");
                         self.nv12_shader_failed = true;
@@ -2764,12 +3052,7 @@ VSOut vs_main(uint vid : SV_VertexID) {
     return o;
 }
 
-float4 ps_nv12(VSOut i) : SV_Target {
-    // One normalised coordinate serves both planes: the chroma plane view is
-    // half-size, so the sampler's bilinear filter does the 4:2:0 upsample.
-    float2 uv = src_off + i.uv * src_scale;
-    float  y  = Luma.Sample(samp, uv);
-    float2 c  = Chroma.Sample(samp, uv);
+float4 to_rgb(float y, float2 c) {
     float  yy = 1.1640625 * (y - 0.0627451);   // 298/256, 16/255
     float  u  = c.x - 0.5019608;               // 128/255
     float  v  = c.y - 0.5019608;
@@ -2778,6 +3061,23 @@ float4 ps_nv12(VSOut i) : SV_Target {
         saturate(yy - 0.2148438 * u - 0.5312500 * v),       // 55/256, 136/256
         saturate(yy + 2.1132813 * u),                       // 541/256
         1.0);
+}
+
+float4 ps_nv12(VSOut i) : SV_Target {
+    // One normalised coordinate serves both planes: the chroma plane view is
+    // half-size, so the sampler's bilinear filter does the 4:2:0 upsample.
+    float2 uv = src_off + i.uv * src_scale;
+    return to_rgb(Luma.Sample(samp, uv), Chroma.Sample(samp, uv));
+}
+
+// The same from one slice of a texture array (a decoder's own surfaces, read
+// in place): each view holds just that slice.
+Texture2DArray<float>  LumaSlice   : register(t2);
+Texture2DArray<float2> ChromaSlice : register(t3);
+
+float4 ps_nv12_slice(VSOut i) : SV_Target {
+    float2 uv = src_off + i.uv * src_scale;
+    return to_rgb(LumaSlice.Sample(samp, float3(uv, 0)), ChromaSlice.Sample(samp, float3(uv, 0)));
 }
 "#;
 
@@ -2809,6 +3109,9 @@ struct Nv12Shader {
     context: ID3D11DeviceContext,
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
+    /// For a slice of a texture array (`None`: it didn't compile, and such
+    /// textures aren't drawn here).
+    ps_slice: Option<ID3D11PixelShader>,
     sampler: ID3D11SamplerState,
     params: ID3D11Buffer,
     /// Render target view on the desktop framebuffer. Cached across frames and
@@ -2843,6 +3146,19 @@ impl Nv12Shader {
             device.CreateVertexShader(vs_code, None, Some(&mut vs))?;
             let mut ps: Option<ID3D11PixelShader> = None;
             device.CreatePixelShader(ps_code, None, Some(&mut ps))?;
+            let ps_slice = compile_hlsl(
+                NV12_HLSL,
+                windows::core::s!("nv12.hlsl"),
+                windows::core::s!("ps_nv12_slice"),
+                windows::core::s!("ps_5_0"),
+            )
+            .ok()
+            .and_then(|blob| {
+                let code = core::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+                let mut ps: Option<ID3D11PixelShader> = None;
+                device.CreatePixelShader(code, None, Some(&mut ps)).ok()?;
+                ps
+            });
 
             let sd = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -2875,6 +3191,7 @@ impl Nv12Shader {
                 context: context.clone(),
                 vs: vs.expect("nv12 vertex shader"),
                 ps: ps.expect("nv12 pixel shader"),
+                ps_slice,
                 sampler: sampler.expect("nv12 sampler"),
                 params: cb.expect("nv12 constant buffer"),
                 rtv: None,
@@ -2884,18 +3201,34 @@ impl Nv12Shader {
 
     /// A single-plane view onto an NV12 texture: `R8_UNORM` selects the luma
     /// plane, `R8G8_UNORM` the (half-resolution) interleaved chroma plane.
+    /// `slice`: of a texture array, the one slice viewed.
     unsafe fn plane_srv(
         &self,
         tex: &ID3D11Texture2D,
         format: DXGI_FORMAT,
+        slice: Option<u32>,
     ) -> WinResult<ID3D11ShaderResourceView> {
-        let desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-            Format: format,
-            ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_SRV {
-                    MostDetailedMip: 0,
-                    MipLevels: 1,
+        let desc = match slice {
+            None => D3D11_SHADER_RESOURCE_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                    },
+                },
+            },
+            Some(slice) => D3D11_SHADER_RESOURCE_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D_SRV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                        FirstArraySlice: slice,
+                        ArraySize: 1,
+                    },
                 },
             },
         };
@@ -2912,6 +3245,7 @@ impl Nv12Shader {
         &mut self,
         framebuffer: &ID3D11Texture2D,
         tex: &ID3D11Texture2D,
+        slice: u32,
         dest_x: u32,
         dest_y: u32,
         w: u32,
@@ -2922,6 +3256,13 @@ impl Nv12Shader {
         unsafe {
             let mut td: D3D11_TEXTURE2D_DESC = core::mem::zeroed();
             tex.GetDesc(&mut td);
+            // A texture array (a decoder's surfaces read in place): views of
+            // the one slice, and the shader that samples them.
+            let array = (td.ArraySize > 1).then_some(slice);
+            let ps = match array {
+                None => self.ps.clone(),
+                Some(_) => self.ps_slice.clone().ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_NOTIMPL))?,
+            };
             // The decoder's surface is macroblock-padded, so normalise against
             // its real size — the display region is a sub-rect of it.
             let (tw, th) = (td.Width.max(1) as f32, td.Height.max(1) as f32);
@@ -2933,17 +3274,18 @@ impl Nv12Shader {
                 self.rtv = rtv;
             }
             let rtv = self.rtv.clone().expect("nv12 render target view");
-            let luma = self.plane_srv(tex, DXGI_FORMAT_R8_UNORM)?;
-            let chroma = self.plane_srv(tex, DXGI_FORMAT_R8G8_UNORM)?;
+            let luma = self.plane_srv(tex, DXGI_FORMAT_R8_UNORM, array)?;
+            let chroma = self.plane_srv(tex, DXGI_FORMAT_R8G8_UNORM, array)?;
 
             let ctx = &self.context;
             let rtvs = [Some(rtv)];
             ctx.OMSetRenderTargets(Some(&rtvs), None);
             ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx.VSSetShader(&self.vs, None);
-            ctx.PSSetShader(&self.ps, None);
+            ctx.PSSetShader(&ps, None);
             let srvs = [Some(luma), Some(chroma)];
-            ctx.PSSetShaderResources(0, Some(&srvs));
+            // (Slices bind at t2/t3, beside the plain views' t0/t1.)
+            ctx.PSSetShaderResources(if array.is_some() { 2 } else { 0 }, Some(&srvs));
             let samplers = [Some(self.sampler.clone())];
             ctx.PSSetSamplers(0, Some(&samplers));
             let cbs = [Some(self.params.clone())];
@@ -2988,7 +3330,7 @@ impl Nv12Shader {
 
             // Unbind so the next framebuffer write (a bitmap update, a cache
             // blit) can't collide with a stale SRV/RTV binding.
-            let no_srv: [Option<ID3D11ShaderResourceView>; 2] = [None, None];
+            let no_srv: [Option<ID3D11ShaderResourceView>; 4] = [None, None, None, None];
             ctx.PSSetShaderResources(0, Some(&no_srv));
             let no_rtv: [Option<ID3D11RenderTargetView>; 1] = [None];
             ctx.OMSetRenderTargets(Some(&no_rtv), None);

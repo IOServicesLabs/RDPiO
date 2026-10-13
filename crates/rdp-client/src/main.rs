@@ -106,19 +106,207 @@ static GLOBAL_ALLOC: allocator::TrackingAllocator = allocator::TrackingAllocator
 use rdp_core::{ClientConfig, Credentials};
 
 fn main() {
+    // Started by the Hyper agent, as the signed-in user, to lock their session
+    // (SYSTEM's own LockWorkStation reports success without locking).
+    // Run by the Hyper agent as the signed-in user: set this session's font
+    // smoothing type (office mode); the exit code is the previous one.
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("--hyper-font-smoothing") {
+        let kind = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(2);
+        std::process::exit(hyper_host::font_smoothing_here(kind).unwrap_or(0) as i32);
+    }
+    // Run by the Hyper agent as the signed-in user: the virtual monitor's
+    // display scale (the user's setting). Exit code 0 when set.
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("--hyper-display-scale") {
+        let name = std::env::args().nth(2).unwrap_or_default();
+        let percent = std::env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(0);
+        std::process::exit(if virtual_display::set_scale_here(&name, percent) { 0 } else { 1 });
+    }
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("--hyper-lock-session") {
+        unsafe {
+            let _ = windows::Win32::System::Shutdown::LockWorkStation();
+        }
+        return;
+    }
+    // A staged update putting itself in place (see `updater`), and the release
+    // pipeline signing a build: neither takes the usual options.
+    #[cfg(windows)]
+    {
+        let first = std::env::args().nth(1);
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        let job: Option<fn(&[String]) -> Result<(), Box<dyn std::error::Error>>> = match first.as_deref() {
+            Some("--finish-update") => Some(updater::finish_update),
+            Some("--release-sign") => Some(updater::release_sign),
+            _ => None,
+        };
+        if let Some(job) = job {
+            let log = crate::hub::store::data_dir().ok().map(|d| d.join("update.log").to_string_lossy().into_owned());
+            init_tracing(log.as_deref().filter(|_| first.as_deref() == Some("--finish-update")));
+            match job(&rest) {
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::error!(error = %e, "{}", first.unwrap_or_default());
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
     // Must precede any window/monitor API so Win32 reports true physical geometry
     // on mixed-DPI multi-monitor setups (see `window::set_process_dpi_aware`).
     #[cfg(windows)]
     crate::window::set_process_dpi_aware();
     let args = Args::from_env();
+    // The Hyper service and its agent log into %ProgramData%\rdpio as SYSTEM:
+    // that folder is locked down before anything is written there.
+    #[cfg(windows)]
+    if std::env::args().any(|a| a == "--hyper-service" || a == "--hyper-console-agent" || a == "--hyper-host") {
+        let _ = hyper_direct::data_dir();
+    }
     init_tracing(args.log_file.as_deref());
+    #[cfg(windows)]
+    if let Some(note) = hyper_direct::data_dir_note() {
+        tracing::warn!("rdpio data folder: {note}");
+    }
     // First line of every log: which build produced it. Field reports from a
     // stale rdpio.exe are indistinguishable from current ones without this.
-    tracing::info!(build = env!("RDPIO_BUILD"), "rdpio starting");
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), build = env!("RDPIO_BUILD"), "rdpio starting");
     // Log the faulting module on any native crash (e.g. inside a hosted add-in),
     // so a hard crash is diagnosable instead of a silently-truncated log.
     #[cfg(windows)]
     crate::crash::install();
+
+    // An administrator action the launcher started (elevated): the new Hyper
+    // password, if any, comes over its pipe, and a failure goes back on it.
+    #[cfg(windows)]
+    let mut launcher_pipe = match std::env::args().skip_while(|a| a != "--launcher-pipe").nth(1) {
+        Some(name) => match launcher::LauncherPipe::open(&name) {
+            Ok((pipe, password)) => {
+                if let Some(pw) = password {
+                    hyper_direct::set_launcher_password(pw);
+                }
+                Some(pipe)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "could not read the launcher's pipe");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    #[cfg(windows)]
+    if args.hyper_install || args.hyper_uninstall {
+        if let Err(e) = hyper_host::install(args.hyper_uninstall, args.hyper_port) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(secs) = std::env::args().skip_while(|a| a != "--hyper-selftest").nth(1).map(|v| v.parse().unwrap_or(5)).or_else(|| std::env::args().any(|a| a == "--hyper-selftest").then_some(5)) {
+        if let Err(e) = hyper_host::selftest(secs) {
+            eprintln!("Hyper selftest failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let flag = |f: &str| std::env::args().any(|a| a == f);
+        let opts = hyper_host::HostOptions {
+            port: args.hyper_port,
+            max_fps: args.hyper_fps,
+            max_mbps: args.hyper_mbps,
+            stream_size: args.hyper_size,
+            fit_to: None,
+            office: false,
+            fast_text: false,
+            keep_monitors: args.hyper_keep_monitors,
+        };
+        let result: Option<Result<(), Box<dyn std::error::Error>>> = if flag("--hyper-display-install") || flag("--hyper-display-uninstall") {
+            Some(virtual_display::install(flag("--hyper-display-uninstall")).map(|note| println!("{note}")))
+        } else if flag("--hyper-set-password") {
+            Some(hyper_direct::set_password())
+        } else if flag("--hyper-host-settings") {
+            Some(hyper_direct::save_host_settings())
+        } else if flag("--hyper-service-install") || flag("--hyper-service-uninstall") {
+            Some(hyper_direct::install_service(flag("--hyper-service-uninstall"), &opts))
+        } else if flag("--hyper-service") {
+            Some(hyper_direct::run_service(opts))
+        } else if flag("--hyper-console-agent") {
+            Some(hyper_direct::run_console_agent(opts))
+        } else if args.hyper_direct {
+            hyper_client::set_vsync(args.hyper_vsync);
+            hyper_client::set_fast_text(args.hyper_fast_text);
+            hyper_client::set_gpu_choice(&args.hyper_gpu);
+            crate::window::set_system_keys_local(args.hyper_local_keys);
+            match args.host.clone() {
+                Some(host) => Some(hyper_client::run_direct(
+                    &host,
+                    args.hyper_port,
+                    args.hyper_password.clone(),
+                    args.hyper_fps,
+                    args.fullscreen,
+                    args.width.zip(args.height).map(|(w, h)| (w as u32, h as u32)),
+                    args.low_latency,
+                    args.upscale,
+                    args.backend,
+                    args.hyper_codec,
+                    args.hyper_office,
+                )),
+                None => Some(Err("--direct needs --host".into())),
+            }
+        } else {
+            None
+        };
+        if let Some(r) = result {
+            if let Err(e) = r {
+                tracing::error!(error = %e, "Hyper failed");
+                eprintln!("{e}");
+                if let Some(p) = launcher_pipe.as_mut() {
+                    p.report(&e.to_string());
+                }
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
+    #[cfg(windows)]
+    if std::env::args().any(|a| a == "--hyper-audio-test") {
+        if let Err(e) = hyper_audio::selftest() {
+            eprintln!("Hyper audio test failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[cfg(windows)]
+    if args.hyper_host {
+        // Started by the logon task, the agent would otherwise sit in a console
+        // window whose close button kills it. It logs to --log-file instead.
+        if args.log_file.is_some() {
+            unsafe {
+                let _ = windows::Win32::System::Console::FreeConsole();
+            }
+        }
+        let opts = hyper_host::HostOptions {
+            port: args.hyper_port,
+            max_fps: args.hyper_fps,
+            max_mbps: args.hyper_mbps,
+            stream_size: args.hyper_size,
+            fit_to: None,
+            office: false,
+            fast_text: false,
+            keep_monitors: args.hyper_keep_monitors,
+        };
+        if let Err(e) = hyper_host::run(opts) {
+            tracing::error!(error = %e, "Hyper host agent failed");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Diagnostic: offline-replay a captured EGFX stream (no server).
     if let Some(path) = args.replay_gfx.clone() {
@@ -160,6 +348,13 @@ fn main() {
         // hub. Selecting a Recent or Saved entry returns a ConnectionTarget that
         // is handed to the exact same bootstrap the CLI `--host` path uses;
         // closing the hub with no selection exits 0.
+        // The launcher first; the hub when WebView2 is missing (or asked for).
+        if !std::env::args().any(|a| a == "--classic-hub") {
+            match launcher::run() {
+                Ok(()) => return,
+                Err(e) => tracing::warn!(error = %e, "the launcher could not open; using the classic hub"),
+            }
+        }
         match hub::run() {
             Ok(Some(target)) => {
                 let args = args_from_target(&args, &target);
@@ -782,6 +977,11 @@ impl Default for QualityPreset {
     }
 }
 
+/// The session's RDP password, from the launcher (see `launcher`).
+pub(crate) const PASSWORD_ENV: &str = "RDPIO_PASSWORD";
+/// The session's Hyper password, from the launcher.
+pub(crate) const HYPER_PASSWORD_ENV: &str = "RDPIO_HYPER_PASSWORD";
+
 /// Minimal command-line arguments (no external arg-parsing dependency).
 ///
 /// `Clone` is derived so the hub hand-off (step-8) can carry any session flags
@@ -928,6 +1128,48 @@ struct Args {
     /// needs no Microsoft binary, and is the path that will run on Linux. Takes
     /// precedence over `--teams` when both are set.
     teams_native: bool,
+    /// Hyper Accelerator client (`--hyper`): sign in over RDP, then switch to
+    /// rdpio's own low-latency stream if the host agent is running.
+    hyper: bool,
+    /// Run the Hyper host agent (`--hyper-host`) instead of connecting.
+    hyper_host: bool,
+    /// Register / remove the elevated logon task for the agent
+    /// (`--hyper-install` / `--hyper-uninstall`).
+    hyper_install: bool,
+    hyper_uninstall: bool,
+    /// Agent UDP port (`--hyper-port`).
+    hyper_port: u16,
+    /// Frame rate to ask the host for (`--hyper-fps`); default: this display's.
+    hyper_fps: Option<u32>,
+    /// Bitrate ceiling in Mbps (`--hyper-mbps`, host side).
+    hyper_mbps: u32,
+    /// Stream size if smaller than the host desktop (`--hyper-size WxH`, host).
+    hyper_size: Option<(u32, u32)>,
+    /// Direct mode (`--direct`): sign in to the Hyper agent with the Hyper
+    /// password instead of over RDP.
+    hyper_direct: bool,
+    /// The Hyper password (`--hyper-password`); prompted (and remembered) if absent.
+    hyper_password: Option<String>,
+    /// Host: don't turn off extra monitors for a client with fewer
+    /// (`--hyper-keep-monitors`).
+    hyper_keep_monitors: bool,
+    /// Client: force a codec (`--hyper-codec h264|hevc`); default HEVC when this
+    /// machine decodes it, else H.264.
+    hyper_codec: Option<rdp_gpu::h264::Codec>,
+    /// Client: present Hyper frames on vblank (`--hyper-vsync`) instead of
+    /// immediately.
+    hyper_vsync: bool,
+    /// Client: start Hyper in office mode (`--hyper-office`; Ctrl+Shift+O
+    /// switches).
+    hyper_office: bool,
+    /// Client: office text with the fast preset (the default; `--hyper-text
+    /// best` turns it off).
+    hyper_fast_text: bool,
+    /// Client (direct): which GPU decodes and presents (`--hyper-gpu
+    /// auto|performance|display`; auto: the display's on battery).
+    hyper_gpu: String,
+    /// Client: Win, Alt+Tab, Alt+F4 start on this PC (`--hyper-local-keys`).
+    hyper_local_keys: bool,
     /// Display name of the connection selected in the hub (hub launches only);
     /// recorded on the MRU entry. `None` for plain CLI launches.
     hub_display_name: Option<String>,
@@ -985,6 +1227,23 @@ impl Args {
             rdp_file: None,
             teams: false,
             teams_native: false,
+            hyper: false,
+            hyper_host: false,
+            hyper_install: false,
+            hyper_uninstall: false,
+            hyper_port: rdp_hyper::DEFAULT_PORT,
+            hyper_fps: None,
+            hyper_mbps: 80,
+            hyper_size: None,
+            hyper_direct: false,
+            hyper_password: None,
+            hyper_keep_monitors: false,
+            hyper_codec: None,
+            hyper_vsync: false,
+            hyper_office: false,
+            hyper_fast_text: true,
+            hyper_gpu: "auto".into(),
+            hyper_local_keys: false,
         };
         // Preset defaults must not silently override something the user asked for
         // by name, so track which of the presettable knobs were set explicitly.
@@ -1001,7 +1260,7 @@ impl Args {
                     std::process::exit(0);
                 }
                 "--version" | "-V" => {
-                    println!("rdpio {}", env!("CARGO_PKG_VERSION"));
+                    println!("rdpio {} (build {})", env!("CARGO_PKG_VERSION"), env!("RDPIO_BUILD"));
                     std::process::exit(0);
                 }
                 "--host" | "-h" => args.host = it.next(),
@@ -1031,7 +1290,10 @@ impl Args {
                 // Deliberately does NOT imply --low-latency: tearing presents are
                 // an artifact trade-off the user must opt into by name.
                 "--gaming" => args.quality = QualityPreset::Gaming,
-                "--office" => args.quality = QualityPreset::Office,
+                "--office" => {
+                    args.quality = QualityPreset::Office;
+                    args.hyper_office = true;
+                }
                 "--quality" => {
                     if let Some(v) = it.next() {
                         args.quality = match v.trim().to_ascii_lowercase().as_str() {
@@ -1118,6 +1380,64 @@ impl Args {
                 "--tenant" => args.tenant = it.next(),
                 "--client-id" => args.client_id = it.next(),
                 "--rdp-file" => args.rdp_file = it.next(),
+                "--hyper" => args.hyper = true,
+                "--direct" | "--hyper-direct" => {
+                    args.hyper = true;
+                    args.hyper_direct = true;
+                }
+                "--hyper-password" => args.hyper_password = it.next(),
+                // From the launcher: the history entry's name and saved
+                // connection (its password pipe is read before this).
+                "--launcher-name" => args.hub_display_name = it.next(),
+                "--launcher-id" => args.hub_connection_id = it.next().and_then(|v| v.parse().ok()),
+                "--launcher-pipe" | "--classic-hub" => {
+                    if flag == "--launcher-pipe" {
+                        let _ = it.next();
+                    }
+                }
+                "--hyper-keep-monitors" => args.hyper_keep_monitors = true,
+                "--hyper-vsync" => args.hyper_vsync = true,
+            "--hyper-office" => args.hyper_office = true,
+            "--hyper-text" => args.hyper_fast_text = it.next().as_deref() != Some("best"),
+                "--hyper-gpu" => {
+                    if let Some(v) = it.next().filter(|v| matches!(v.as_str(), "auto" | "performance" | "display")) {
+                        args.hyper_gpu = v;
+                    }
+                }
+                "--hyper-local-keys" => args.hyper_local_keys = true,
+                "--hyper-host-settings" => {
+                    let _ = it.next();
+                }
+                "--hyper-codec" => {
+                    args.hyper_codec = it.next().and_then(|v| rdp_gpu::h264::Codec::from_name(&v.to_ascii_lowercase()));
+                }
+                "--hyper-set-password" | "--hyper-service-install" | "--hyper-service-uninstall" | "--hyper-service"
+                | "--hyper-display-install" | "--hyper-display-uninstall"
+                | "--hyper-console-agent" => {}
+                "--hyper-host" => args.hyper_host = true,
+                "--hyper-audio-test" => {}
+                "--hyper-selftest" => {
+                    let _ = it.next();
+                }
+                "--hyper-install" => args.hyper_install = true,
+                "--hyper-uninstall" => args.hyper_uninstall = true,
+                "--hyper-port" => {
+                    if let Some(p) = it.next().and_then(|v| v.parse().ok()) {
+                        args.hyper_port = p;
+                    }
+                }
+                "--hyper-fps" => args.hyper_fps = it.next().and_then(|v| v.parse().ok()),
+                "--hyper-mbps" => {
+                    if let Some(m) = it.next().and_then(|v| v.parse().ok()) {
+                        args.hyper_mbps = m;
+                    }
+                }
+                "--hyper-size" => {
+                    args.hyper_size = it.next().and_then(|v| {
+                        let (w, h) = v.split_once(['x', 'X'])?;
+                        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+                    });
+                }
                 "--size" => {
                     // "WxH" (or "W,H") → width + height.
                     if let Some(v) = it.next() {
@@ -1142,6 +1462,17 @@ impl Args {
         //   that goes first.
         // - bicubic, because FSR's edge reconstruction plus RCAS sharpening is
         //   tuned for rendered game frames and rings on glyph edges.
+        // Passwords from the launcher come by environment (a command line is
+        // readable by other programs); taken out so nothing started from here
+        // inherits them.
+        if args.password.is_none() {
+            args.password = std::env::var(PASSWORD_ENV).ok();
+        }
+        if args.hyper_password.is_none() {
+            args.hyper_password = std::env::var(HYPER_PASSWORD_ENV).ok();
+        }
+        std::env::remove_var(PASSWORD_ENV);
+        std::env::remove_var(HYPER_PASSWORD_ENV);
         if args.quality == QualityPreset::Office {
             if !low_latency_explicit {
                 args.low_latency = false;
@@ -1251,6 +1582,60 @@ REDIRECTION
     --teams-native         Native WebRTC engine for Teams media optimization.
     --teams                Teams optimization via the Microsoft add-in DLL.
 
+HYPER ACCELERATOR (low-latency game streaming beside RDP)
+    --hyper                Client: sign in over RDP, then switch to rdpio's own
+                           GPU stream (up to the host monitor's refresh rate,
+                           e.g. 120/144 Hz) if the host agent is running. Falls
+                           back to plain RDP if it isn't. Add --low-latency.
+    --hyper-fps <N>        Frame rate to ask the host for. Default: this
+                           display's refresh rate.
+    --hyper-codec <C>      h264 or hevc. Default: HEVC when this PC can decode
+                           it (a third less bandwidth for the same picture —
+                           best over the internet), else H.264 (≈1 ms less
+                           encode time; force it on a LAN for the last ms).
+    --hyper-office         Start Hyper in office mode: crisp text (60 fps, frames
+                           as large as new text needs, HEVC when the GPU decodes
+                           it, greyscale font smoothing on the host) — video still
+                           plays. Ctrl+Shift+O switches office/game mid-stream.
+    --hyper-text fast|best Office mode's text: fast (default; the fast preset,
+                           a still picture re-sent sharper for up to a second)
+                           or best (the quality preset: new text sharp at
+                           once, ~8 ms more latency on every frame).
+    --hyper-gpu auto|performance|display
+                           Which GPU decodes and presents (Hyper Direct). auto
+                           (default): the one the screen is on while on battery
+                           (a laptop's discrete GPU can then power off), the
+                           fastest plugged in.
+    --hyper-local-keys     Win, Alt+Tab, Alt+F4 start on this PC, not the host
+                           (Ctrl+Shift+K switches mid-stream).
+    --hyper-host-settings <name=0|1,...>
+                           Host (elevated): virtual_display, match_resolution,
+                           fast_refresh, keep_monitors.
+    --hyper-vsync          Present frames on vblank. Default: immediately (the
+                           lowest latency; no visible tearing on G-Sync /
+                           FreeSync displays).
+    --direct               With --hyper: skip RDP and Windows sign-in; sign in to
+                           the host's Hyper service with the Hyper password
+                           (asked once, then remembered for this host).
+    --hyper-password <PW>  The Hyper password (otherwise prompted).
+    --hyper-set-password   Host, as administrator: set the Hyper password.
+    --hyper-service-install
+                           Host, as administrator: install the Hyper service
+                           (direct mode; streams the console incl. the lock
+                           screen and UAC). --hyper-service-uninstall removes.
+    --hyper-host           Run the RDP-handoff host agent (on the gaming PC).
+    --hyper-install        On the host, as administrator: start the agent
+                           elevated at every sign-in (--hyper-uninstall removes).
+    --hyper-port <PORT>    Agent UDP port. Default 47998 (allow it through the
+                           host's firewall).
+    --hyper-mbps <N>       Host: bitrate ceiling. Default 80.
+    --hyper-size <WxH>     Host: stream at this size (GPU-scaled) to save
+                           bandwidth, e.g. 1920x1080 over the internet.
+    --hyper-keep-monitors  Host: keep every monitor on. By default, when the
+                           client has fewer screens, the host's extra monitors
+                           turn off for the stream so windows gather on the
+                           streamed one (your layout returns afterwards).
+
 WINDOWS 365 / CLOUD PC
     --w365                 Sign in to Windows 365 and connect to a Cloud PC.
     --w365-device-code     Use device-code sign-in (no local browser).
@@ -1348,7 +1733,23 @@ fn init_tracing(log_file: Option<&str>) {
     // `--log-file` writes straight to a file (flushed per line), the reliable way
     // to capture the GUI app — its stdout redirection often comes back empty.
     if let Some(path) = log_file {
-        match std::fs::File::create(path) {
+        // Keep the previous run's log: when the Hyper service restarts a
+        // crashed agent, the evidence of the crash would otherwise be the first
+        // thing the new process overwrites.
+        // The host's service and agent restart with every console session
+        // change: they add to their log (kept to ~8 MB) instead, so what led
+        // up to a restart is still there.
+        let host_side = std::env::args().any(|a| a == "--hyper-service" || a == "--hyper-console-agent" || a == "--hyper-host");
+        let size = std::fs::metadata(path).map_or(0, |m| m.len());
+        if size > 0 && (!host_side || size > 8 << 20) {
+            let _ = std::fs::rename(path, format!("{path}.prev"));
+        }
+        let opened = if host_side {
+            std::fs::OpenOptions::new().create(true).append(true).open(path)
+        } else {
+            std::fs::File::create(path)
+        };
+        match opened {
             Ok(file) => {
                 tracing_subscriber::fmt()
                     .with_env_filter(mk_filter())
@@ -1450,6 +1851,11 @@ mod connbar;
 #[cfg(windows)]
 mod hub;
 
+// The start window (WebView2): connections, their options, this PC's Hyper
+// host setup. Falls back to the hub above without WebView2.
+#[cfg(windows)]
+mod launcher;
+
 #[cfg(windows)]
 mod clipboard;
 
@@ -1461,6 +1867,33 @@ mod mic;
 
 #[cfg(windows)]
 mod udp;
+
+// Hyper Accelerator: low-latency game streaming beside RDP (`--hyper` on the
+// client, `--hyper-host` agent on the host).
+#[cfg(windows)]
+mod hyper_client;
+#[cfg(windows)]
+mod updater;
+#[cfg(windows)]
+mod hyper_audio;
+#[cfg(windows)]
+mod hyper_direct;
+#[cfg(windows)]
+mod hyper_link;
+mod net_tune;
+mod udp_batch;
+#[cfg(windows)]
+mod hyper_clipboard;
+#[cfg(windows)]
+mod hyper_overlay;
+#[cfg(windows)]
+mod wasapi;
+#[cfg(windows)]
+mod hyper_host;
+// The Hyper virtual display (drivers/rdpio-display): a monitor at the
+// client's own resolution.
+#[cfg(windows)]
+mod virtual_display;
 
 #[cfg(windows)]
 mod mf_camera;
@@ -4012,6 +4445,44 @@ mod win {
             let no_seed = args.no_seed;
             let teams = args.teams;
             let teams_native = args.teams_native;
+            // Hyper: answer the host agent on its side channel (direct hosts only:
+            // the stream goes straight to the RDP server's address).
+            // Per-monitor windows render through their own swapchains; the
+            // Hyper stream plays in one window, so it isn't offered there.
+            // (And only on the Direct3D 11 renderer, the one that decodes video
+            // on the GPU.)
+            if args.hyper && args.backend != rdp_gpu::Backend::D3D11 {
+                tracing::info!("--hyper needs the Direct3D 11 renderer; staying on RDP with --backend d3d12");
+            }
+            let hyper = if args.hyper && !w365 && !args.per_monitor && args.backend == rdp_gpu::Backend::D3D11 {
+                crate::hyper_client::set_vsync(args.hyper_vsync);
+        crate::window::set_system_keys_local(args.hyper_local_keys);
+                crate::window::set_office_mode(args.hyper_office);
+                crate::hyper_client::set_fast_text(args.hyper_fast_text);
+                match crate::hyper_client::resolve(&config.hostname, config.port).ok() {
+                    Some(addr) => {
+                        let fps = args.hyper_fps.unwrap_or_else(crate::hyper_client::local_refresh_hz);
+                        tracing::info!(host = %addr.ip(), fps, "--hyper: will offer to switch to the Hyper stream");
+                        // The stream is sized to this screen (as in direct mode),
+                        // not to the window it starts in.
+                        let screen = crate::window::enumerate_monitors()
+                            .primary_rect()
+                            .map_or((client.0 as u32, client.1 as u32), |p| ((p.right - p.left) as u32, (p.bottom - p.top) as u32));
+                        Some(crate::hyper_client::HyperRedirector::new(addr.ip(), screen.0, screen.1, fps, args.hyper_codec))
+                    }
+                    None => {
+                        tracing::warn!("--hyper: could not resolve the host address; staying on RDP");
+                        None
+                    }
+                }
+            } else {
+                if args.hyper && args.per_monitor {
+                    tracing::warn!("--hyper doesn't combine with --per-monitor; staying on RDP");
+                } else if args.hyper {
+                    tracing::warn!("--hyper needs a direct host (not Windows 365); staying on RDP");
+                }
+                None
+            };
             let (tx, rx) = mpsc::channel::<FrameMsg>();
             let worker_metrics = metrics.clone();
             // Explicit stop flag so closing the window unblocks the worker on
@@ -4138,6 +4609,14 @@ mod win {
                                  (pass --teams-native for the native engine, or --teams for the DLL)"
                             );
                             None
+                        };
+                    let redirector: Option<Box<dyn rdp_graphics::redirect::DvcRedirector>> =
+                        match (redirector, hyper) {
+                            (Some(r), Some(h)) => Some(Box::new(rdp_graphics::redirect::ChainRedirector::new(
+                                vec![r, Box::new(h)],
+                            ))),
+                            (None, Some(h)) => Some(Box::new(h)),
+                            (r, None) => r,
                         };
                     let result = session::run_graphics_session(
                         &mut transport,
@@ -4421,6 +4900,10 @@ mod win {
                         if !worker_alive {
                             break;
                         }
+                        if crate::hyper_client::handoff_due() {
+                            tracing::info!("host switched to Hyper; leaving RDP");
+                            break;
+                        }
                         // Carry "a frame is ready to show" across iterations so a
                         // paced present deferred this tick still fires on a later one.
                         if dirty {
@@ -4468,7 +4951,11 @@ mod win {
                         if metrics_report_start.elapsed() >= Duration::from_secs(10) {
                             let report = metrics.report_and_reset();
                             if report.has_data() {
-                                tracing::info!(target: "perf", "{}", report.summary());
+                                tracing::info!(
+                                    target: "perf",
+                                    "{}",
+                                    report.summary(metrics_report_start.elapsed())
+                                );
                             }
                             metrics_report_start = std::time::Instant::now();
                         }
@@ -4511,6 +4998,12 @@ mod win {
             }
             let _ = worker.join();
 
+            if !window_closed {
+                if let Some(link) = crate::hyper_client::take_link() {
+                    let _ = crate::hyper_client::run(&window, &mut renderer, link)?;
+                    break 'session;
+                }
+            }
             if window_closed {
                 break 'session;
             }
@@ -4857,6 +5350,7 @@ mod win {
             // Touch is routed through the RDPEI dynamic channel, not the fast-path
             // input stream; it is filtered out before this function is called.
             RawInput::Touch { .. } => None,
+            RawInput::FocusLost => None,
         }
     }
 }

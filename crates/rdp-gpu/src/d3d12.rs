@@ -109,7 +109,8 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     float v = load_byte(uv_base + 1) / 255.0 - 0.5;
 
     float3 yuv = float3(y - 16.0 / 255.0, u, v);
-    float3 rgb = mul(yuv, yuv_to_rgb);
+    // Matrix times column vector: each row above is one output channel.
+    float3 rgb = mul(yuv_to_rgb, yuv);
     framebuffer[uint2(dx, dy)] = float4(saturate(rgb), 1.0);
 }
 "#;
@@ -1005,7 +1006,14 @@ impl D3D12Renderer {
         if cw == 0 || ch == 0 {
             return;
         }
-        if let Err(e) = self.ensure_upload(need) {
+        // Staged rows go at the pitch a texture copy needs (a multiple of 256).
+        let pitch = (cw * 4).next_multiple_of(256);
+        // Copies recorded earlier read the staging buffer when the list runs:
+        // finish them before it's overwritten (or replaced).
+        if self.list.is_some() {
+            let _ = self.submit_and_wait();
+        }
+        if let Err(e) = self.ensure_upload((pitch * ch) as usize) {
             tracing::warn!(error = %e, "D3D12 upload buffer allocation failed");
             return;
         }
@@ -1014,7 +1022,7 @@ impl D3D12Renderer {
         unsafe {
             for row in 0..ch {
                 let src = (row * w * 4) as usize;
-                let dst = (row * cw * 4) as usize;
+                let dst = (row * pitch) as usize;
                 std::ptr::copy_nonoverlapping(
                     rgba.as_ptr().add(src),
                     self.upload_addr.add(dst),
@@ -1040,7 +1048,7 @@ impl D3D12Renderer {
                             Width: cw,
                             Height: ch,
                             Depth: 1,
-                            RowPitch: cw * 4,
+                            RowPitch: pitch,
                         },
                     },
                 },
@@ -1068,6 +1076,9 @@ impl D3D12Renderer {
                 },
                 ),
             );
+            // (The locations hold a reference each, which ManuallyDrop keeps.)
+            let _ = core::mem::ManuallyDrop::into_inner(src_location.pResource);
+            let _ = core::mem::ManuallyDrop::into_inner(dst_location.pResource);
             Self::transition(
                 list,
                 &fb,
@@ -1112,6 +1123,16 @@ impl D3D12Renderer {
             tracing::warn!(error = %e, "D3D12 NV12 buffer allocation failed");
             return false;
         }
+        // Copies recorded earlier read the staging buffer when the list runs:
+        // finish them before it's overwritten (or replaced) — then make sure
+        // it holds the whole frame.
+        if self.list.is_some() {
+            let _ = self.submit_and_wait();
+        }
+        if let Err(e) = self.ensure_upload(need) {
+            tracing::warn!(error = %e, "D3D12 upload buffer allocation failed");
+            return false;
+        }
         let Some(fb) = self.framebuffer.clone() else { return false };
         let Some(nv12_buf) = self.nv12_input.clone() else { return false };
         let Some(upload) = self.upload_buffer.clone() else { return false };
@@ -1133,37 +1154,9 @@ impl D3D12Renderer {
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_DEST,
             );
-            let src_location = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: core::mem::ManuallyDrop::new(Some(upload)),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: windows::Win32::Graphics::Direct3D12::D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: DXGI_FORMAT_UNKNOWN,
-                            Width: need as u32,
-                            Height: 1,
-                            Depth: 1,
-                            RowPitch: need as u32,
-                        },
-                    },
-                },
-            };
-            let dst_location = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: core::mem::ManuallyDrop::new(Some(nv12_buf.clone())),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: 0,
-                },
-            };
-            list.CopyTextureRegion(
-                &dst_location,
-                0,
-                0,
-                0,
-                &src_location,
-                None,
-            );
+            // Buffer to buffer (a texture copy between buffers is invalid: the
+            // list wouldn't even close, and the frame was lost).
+            list.CopyBufferRegion(&nv12_buf, 0, &upload, 0, need as u64);
             Self::transition(
                 list,
                 &nv12_buf,

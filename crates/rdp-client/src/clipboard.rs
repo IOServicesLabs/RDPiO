@@ -66,9 +66,9 @@ unsafe fn open_clipboard_retrying(owner: Option<HWND>) -> bool {
 
 /// `CF_DIB` — a device-independent bitmap (`BITMAPINFO` + pixels): the format
 /// Windows apps put screenshots and copied images on the clipboard as.
-const CF_DIB: u32 = 8;
+pub(crate) const CF_DIB: u32 = 8;
 /// `CF_UNICODETEXT` clipboard format.
-const CF_UNICODETEXT: u32 = 13;
+pub(crate) const CF_UNICODETEXT: u32 = 13;
 /// `CF_HDROP` — a dropped-file list (for clipboard file copy).
 pub(crate) const CF_HDROP: u32 = 15;
 
@@ -621,7 +621,7 @@ pub(crate) fn render_hdrop(paths: &[PathBuf]) {
 
 /// Read a clipboard format's raw bytes. The size comes from `GlobalSize`, which
 /// is what makes a self-describing blob like `CF_DIB` copyable without parsing.
-unsafe fn get_clipboard_bytes(format: u32) -> Option<Vec<u8>> {
+pub(crate) unsafe fn get_clipboard_bytes(format: u32) -> Option<Vec<u8>> {
     if !open_clipboard_retrying(None) {
         return None;
     }
@@ -646,7 +646,7 @@ unsafe fn get_clipboard_bytes(format: u32) -> Option<Vec<u8>> {
 
 /// Publish `formats` — `(format id, raw bytes)` — on the clipboard, replacing
 /// its contents, in one open/empty/set session so every format survives.
-unsafe fn set_clipboard_formats(formats: &[(u32, Vec<u8>)]) {
+pub(crate) unsafe fn set_clipboard_formats(formats: &[(u32, Vec<u8>)]) {
     // Don't echo our own write back to the server as a "local change".
     crate::session::suppress_clipboard_echo();
     if !open_clipboard_retrying(None) {

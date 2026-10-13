@@ -1,0 +1,1331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rdpio</title>
+<style>
+:root {
+  /* IO Services: monochrome, one emerald accent, square corners, type first. */
+  --font: "Geomisans", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-display: "SanDiego", "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "GelatoTypewriter", "Cascadia Mono", "Consolas", monospace;
+  --radius: 4px;
+  --radius-lg: 6px;
+  --ease: cubic-bezier(.4, 0, .2, 1);
+
+  --bg: #fafafa;
+  --bg-solid: #fafafa;
+  --surface: #ffffff;
+  --surface-solid: #ffffff;
+  --surface-2: #f5f5f5;
+  --surface-hover: #f0f0f0;
+  --raised: #ffffff;
+  --stroke: #e5e5e5;
+  --stroke-strong: #d4d4d4;
+  --text: #141414;
+  --text-2: #5c5c5c;
+  --text-3: #808080;
+  --accent: #0b7a55;
+  --accent-hover: #096a4a;
+  --accent-text: #fafafa;
+  --accent-soft: rgba(11, 122, 85, .09);
+  --ok: #0b7a55;
+  --ok-soft: rgba(11, 122, 85, .09);
+  --warn: #a15c00;
+  --warn-soft: rgba(161, 92, 0, .1);
+  --bad: #c42020;
+  --bad-soft: rgba(196, 32, 32, .08);
+  --shadow: 0 1px 3px rgba(0, 0, 0, .06), 0 1px 2px -1px rgba(0, 0, 0, .06);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, .1), 0 4px 6px -4px rgba(0, 0, 0, .1);
+  --scrim: rgba(10, 10, 10, .4);
+  --input: #ffffff;
+  --input-focus: #ffffff;
+  --logo-fill: #ffffff;
+  color-scheme: light;
+}
+:root[data-theme="dark"] {
+  --bg: #0a0a0a;
+  --bg-solid: #0a0a0a;
+  --surface: #0f0f0f;
+  --surface-solid: #0f0f0f;
+  --surface-2: #141414;
+  --surface-hover: #1a1a1a;
+  --raised: #121212;
+  --stroke: #242424;
+  --stroke-strong: #2e2e2e;
+  --text: #fafafa;
+  --text-2: #a3a3a3;
+  --text-3: #808080;
+  --accent: #22c38e;
+  --accent-hover: #3bd19f;
+  --accent-text: #0a0a0a;
+  --accent-soft: rgba(34, 195, 142, .1);
+  --ok: #22c38e;
+  --ok-soft: rgba(34, 195, 142, .1);
+  --warn: #f5a524;
+  --warn-soft: rgba(245, 165, 36, .1);
+  --bad: #f26b6b;
+  --bad-soft: rgba(242, 107, 107, .1);
+  --shadow: 0 1px 3px rgba(0, 0, 0, .5);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, .6), 0 4px 6px -4px rgba(0, 0, 0, .6);
+  --scrim: rgba(0, 0, 0, .6);
+  --input: #0a0a0a;
+  --input-focus: #0a0a0a;
+  --logo-fill: #0a0a0a;
+  color-scheme: dark;
+}
+/*@brand-fonts*/
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  font: 14px/20px var(--font);
+  color: var(--text);
+  background: var(--bg);
+  display: flex;
+  overflow: hidden;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "kern" 1, "liga" 1;
+}
+input, select, textarea, button { font: inherit; color: inherit; }
+::selection { background: var(--accent); color: var(--accent-text); }
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-thumb { background: var(--stroke-strong); border: 4px solid transparent; background-clip: padding-box; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background-color: var(--text-3); }
+[hidden] { display: none !important; }
+svg { width: 16px; height: 16px; flex: none; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+
+/* ---------------------------------------------------------------- nav */
+nav {
+  width: 232px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  padding: 16px 8px 12px;
+  gap: 2px;
+}
+.brand { display: flex; flex-direction: column; gap: 10px; padding: 6px 12px 22px; margin-bottom: 8px; border-bottom: 1px solid var(--stroke); }
+.brand svg.logo { width: 54px; height: 16px; color: var(--text); }
+.brand b { display: block; font: 600 20px/1 var(--font-display); letter-spacing: -.02em; }
+.brand span { display: block; margin-top: 6px; color: var(--text-3); font: 11px/1 var(--font-mono); text-transform: uppercase; letter-spacing: .1em; }
+.logo-bar, .logo-o { fill: var(--logo-fill); stroke: currentColor; }
+.nav-item {
+  position: relative;
+  display: flex; align-items: center; gap: 12px;
+  height: 38px; padding: 0 12px;
+  border: 0; border-radius: var(--radius);
+  background: transparent; text-align: left;
+  color: var(--text); cursor: default;
+  transition: background .12s;
+}
+.nav-item { color: var(--text-2); }
+.nav-item:hover { background: var(--surface-hover); color: var(--text); }
+.nav-item[aria-current="page"] { background: var(--surface); color: var(--text); box-shadow: inset 0 0 0 1px var(--stroke); }
+.nav-item[aria-current="page"]::before {
+  content: ""; position: absolute; left: 0; top: 10px; bottom: 10px; width: 2px;
+  border-radius: 0; background: var(--accent);
+  animation: grow .2s var(--ease);
+}
+@keyframes grow { from { transform: scaleY(0); } }
+.nav-item svg { width: 18px; height: 18px; flex: none; }
+.nav-item .badge { margin-left: auto; }
+.nav-foot { margin-top: auto; padding: 8px 12px 0; color: var(--text-3); font: 11px/16px var(--font-mono); text-transform: uppercase; letter-spacing: .08em; }
+
+/* ---------------------------------------------------------------- main */
+main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-solid);
+  border-left: 1px solid var(--stroke);
+  margin-top: 0;
+  overflow: hidden;
+}
+:root[data-theme="dark"] main { background: #0d0d0d; }
+:root:not([data-theme="dark"]) main { background: #ffffff; }
+:root:not([data-theme="dark"]) main .card { background: #fafafa; }
+.page { display: none; flex: 1; overflow: auto; padding: 28px 36px 40px; animation: rise .22s var(--ease); }
+.page.active { display: block; }
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } }
+.page-head { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+h1 { font: 600 32px/40px var(--font-display); margin: 0; letter-spacing: -.02em; }
+h2 { font: 12px/16px var(--font-mono); text-transform: uppercase; letter-spacing: .1em; color: var(--text-2); margin: 32px 0 12px; display: flex; align-items: center; gap: 8px; }
+h2 .count { color: var(--text-3); font-weight: 400; }
+.spacer { flex: 1; }
+p.lead { color: var(--text-2); margin: -12px 0 20px; max-width: 70ch; }
+
+/* ---------------------------------------------------------------- controls */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: 32px; padding: 5px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--stroke-strong);
+  background: var(--surface-solid);
+  color: var(--text);
+  cursor: default;
+  white-space: nowrap;
+  transition: background .1s, transform .06s, opacity .1s;
+}
+:root[data-theme="dark"] .btn:not(.primary) { background: var(--surface-2); }
+:root[data-theme="dark"] .btn.ghost { background: transparent; }
+.btn:hover { background: var(--surface-hover); }
+.btn:active { transform: scale(.98); opacity: .85; }
+.btn:disabled { opacity: .45; pointer-events: none; }
+.btn.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+.btn.primary:hover { background: var(--accent-hover); }
+.btn.danger { color: var(--bad); }
+.btn.ghost { background: transparent; border-color: transparent; }
+.btn.ghost:hover { background: var(--surface-hover); }
+.btn.icon { width: 32px; padding: 0; }
+.btn svg { width: 16px; height: 16px; flex: none; }
+.btn.lg { min-height: 40px; padding: 8px 20px; font-weight: 600; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field > label, .label { font-size: 13px; color: var(--text-2); }
+.hint { font-size: 12px; color: var(--text-3); line-height: 16px; }
+.input, select.input {
+  height: 34px; padding: 0 11px;
+  border-radius: var(--radius);
+  border: 1px solid var(--stroke-strong);
+  background: var(--input);
+  outline: none;
+  width: 100%;
+  user-select: text;
+  transition: background .1s;
+}
+.input:hover { background: var(--surface-hover); }
+.input:focus { background: var(--input-focus); border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.input::placeholder { color: var(--text-3); }
+select.input { appearance: none; padding-right: 32px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%23888' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 11px center; }
+select.input option { background: var(--raised); color: var(--text); }
+.row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; }
+.row.two { grid-template-columns: 2fr 1fr; }
+.stack { display: flex; flex-direction: column; gap: 16px; }
+
+.search { position: relative; width: min(340px, 100%); }
+.search svg { position: absolute; left: 11px; top: 9px; width: 16px; height: 16px; color: var(--text-3); pointer-events: none; }
+.search .input { padding-left: 34px; }
+
+.seg { display: inline-flex; padding: 2px; gap: 2px; border-radius: var(--radius); background: var(--surface-2); border: 1px solid var(--stroke); }
+.seg button { border: 0; background: transparent; padding: 5px 14px; border-radius: 2px; cursor: default; color: var(--text-2); transition: background .12s, color .12s; }
+.seg button:hover { color: var(--text); }
+.seg button[aria-pressed="true"] { background: var(--text); color: var(--bg-solid); }
+
+.switch { display: flex; align-items: center; gap: 12px; padding: 12px 16px; justify-content: space-between; }
+.switch + .switch { border-top: 1px solid var(--stroke); }
+.switch .txt { display: flex; flex-direction: column; }
+.switch .txt span:not(.badge) { font-size: 12px; color: var(--text-3); line-height: 16px; }
+.switch .txt .badge { align-self: flex-start; margin: 4px 0 2px !important; }
+.toggle { position: relative; width: 40px; height: 20px; flex: none; }
+.toggle input { position: absolute; inset: 0; opacity: 0; margin: 0; z-index: 1; }
+.toggle i { position: absolute; inset: 0; border-radius: 10px; border: 1px solid var(--text-2); transition: background .15s, border-color .15s; }
+.toggle i::after { content: ""; position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; border-radius: 50%; background: var(--text-2); transition: transform .18s var(--ease), background .15s, width .1s; }
+.toggle input:checked + i { background: var(--accent); border-color: var(--accent); }
+.toggle input:checked + i::after { transform: translateX(20px); background: var(--accent-text); }
+.toggle input:active + i::after { width: 15px; }
+.toggle input:focus-visible + i { outline: 2px solid var(--text); outline-offset: 2px; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+}
+.group { overflow: hidden; }
+
+.badge svg { width: 12px; height: 12px; }
+.badge { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 7px; border-radius: 2px; font: 11px/1 var(--font-mono); text-transform: uppercase; letter-spacing: .06em; background: var(--surface-2); border: 1px solid var(--stroke); color: var(--text-2); white-space: nowrap; }
+.badge.accent { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.badge.ok { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+.badge.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.badge.bad { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: none; }
+.dot.live { box-shadow: 0 0 0 0 currentColor; animation: pulse 1.8s infinite; }
+@keyframes pulse { 70% { box-shadow: 0 0 0 6px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+
+/* ---------------------------------------------------------------- quick connect */
+.quick {
+  display: flex; align-items: center; gap: 10px; padding: 14px; flex-wrap: wrap;
+  background: var(--surface); border-left: 2px solid var(--accent);
+}
+.quick .input { flex: 1; min-width: 200px; height: 40px; font-size: 15px; }
+.quick .btn.lg { min-width: 120px; }
+
+/* ---------------------------------------------------------------- connection cards */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 12px; }
+.conn {
+  position: relative;
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 16px;
+  transition: background .12s, transform .15s var(--ease), box-shadow .15s;
+  animation: rise .25s var(--ease) both;
+}
+.conn:hover { background: var(--surface-hover); box-shadow: var(--shadow); }
+.conn-top { display: flex; gap: 12px; align-items: center; min-width: 0; }
+.avatar {
+  width: 40px; height: 40px; flex: none; border-radius: var(--radius);
+  display: grid; place-items: center;
+  font: 600 16px/1 var(--font-display); color: var(--bg-solid);
+  background: var(--text);
+}
+.conn-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conn-sub { color: var(--text-3); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conn-meta { display: flex; flex-wrap: wrap; gap: 6px; min-height: 20px; }
+.conn-actions { display: flex; gap: 6px; align-items: center; }
+.conn-actions .btn.primary { flex: 1; }
+.conn .live-tag { position: absolute; top: 14px; right: 14px; }
+
+.list { display: flex; flex-direction: column; }
+.item {
+  display: flex; align-items: center; gap: 14px; padding: 10px 14px;
+  transition: background .1s;
+}
+.item + .item { border-top: 1px solid var(--stroke); }
+.item:hover { background: var(--surface-hover); }
+.item .avatar { width: 32px; height: 32px; border-radius: var(--radius); font-size: 13px; }
+.item .grow { flex: 1; min-width: 0; }
+.item .when { color: var(--text-3); font-size: 12px; white-space: nowrap; }
+.item .acts { display: flex; gap: 4px; opacity: .0; transition: opacity .12s; }
+.item:hover .acts, .item:focus-within .acts { opacity: 1; }
+
+.empty { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 48px 20px; color: var(--text-2); gap: 10px; }
+.empty > svg { width: 120px; height: 90px; opacity: .9; }
+.empty b { color: var(--text); font-size: 16px; }
+
+/* ---------------------------------------------------------------- dialogs */
+.scrim {
+  position: fixed; inset: 0; background: var(--scrim);
+  display: none; align-items: center; justify-content: center; z-index: 20;
+  padding: 24px;
+}
+.scrim.open { display: flex; animation: fade .15s ease; }
+@keyframes fade { from { opacity: 0; } }
+.dialog {
+  width: min(640px, 100%);
+  max-height: 100%;
+  display: flex; flex-direction: column;
+  background: var(--raised);
+  border: 1px solid var(--stroke-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  animation: pop .22s var(--ease);
+}
+.dialog.sm { width: min(420px, 100%); }
+@keyframes pop { from { opacity: 0; transform: scale(.96) translateY(6px); } }
+.dialog header { padding: 22px 24px 0; }
+.dialog header h3 { margin: 0; font: 600 22px/28px var(--font-display); letter-spacing: -.01em; }
+.dialog header p { margin: 4px 0 0; color: var(--text-2); }
+.dialog .body { padding: 18px 24px 24px; overflow: auto; }
+.dialog footer { display: flex; gap: 8px; justify-content: flex-end; padding: 18px 24px; background: var(--surface-2); border-top: 1px solid var(--stroke); }
+:root[data-theme="dark"] .dialog footer { background: var(--surface-2); }
+.dialog footer .btn { min-width: 110px; }
+.tabs { display: flex; gap: 4px; padding: 14px 24px 0; border-bottom: 1px solid var(--stroke); }
+.tabs button { position: relative; border: 0; background: none; padding: 8px 12px 12px; color: var(--text-2); cursor: default; border-radius: 0; font: 12px/16px var(--font-mono); text-transform: uppercase; letter-spacing: .08em; }
+.tabs button:hover { color: var(--text); }
+.tabs button[aria-selected="true"] { color: var(--text); }
+.tabs button[aria-selected="true"]::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 2px; border-radius: 0; background: var(--accent); }
+.tabpane { display: none; }
+.tabpane.active { display: flex; animation: rise .18s var(--ease); }
+
+.choices { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.choice {
+  position: relative;
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 12px 12px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--stroke-strong);
+  background: var(--surface-2);
+  text-align: left; cursor: default;
+  transition: border-color .12s, background .12s;
+}
+.choice:hover { background: var(--surface-hover); }
+.choice b { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.choice span { font-size: 12px; color: var(--text-3); line-height: 16px; }
+.choice[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+.choice b { font-family: var(--font-display); }
+.choice svg { width: 18px; height: 18px; color: var(--accent); }
+.choices.two { grid-template-columns: repeat(2, 1fr); }
+
+.pw { position: relative; }
+.pw .input { padding-right: 40px; }
+.pw button { position: absolute; right: 4px; top: 3px; width: 28px; height: 28px; border: 0; border-radius: 4px; background: transparent; color: var(--text-3); display: grid; place-items: center; }
+.pw button:hover { background: var(--surface-hover); color: var(--text); }
+.pw button svg { width: 16px; height: 16px; }
+.inline-link { border: 0; background: none; padding: 0; color: var(--accent); cursor: default; font-size: 12px; }
+.inline-link:hover { text-decoration: underline; }
+.check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
+.check input { width: 18px; height: 18px; accent-color: var(--accent); margin: 0; }
+.error-text { color: var(--bad); font-size: 13px; min-height: 18px; }
+
+/* ---------------------------------------------------------------- menu */
+.menu {
+  position: fixed; z-index: 30; min-width: 180px; padding: 4px;
+  background: var(--raised); border: 1px solid var(--stroke-strong); border-radius: var(--radius);
+  box-shadow: var(--shadow-lg); display: none; animation: pop .14s var(--ease);
+}
+.menu.open { display: block; }
+.menu button { display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; border-radius: 4px; background: none; text-align: left; cursor: default; }
+.menu button:hover { background: var(--surface-hover); }
+.menu button.danger { color: var(--bad); }
+.menu svg { width: 16px; height: 16px; }
+.menu hr { border: 0; border-top: 1px solid var(--stroke); margin: 4px 0; }
+
+/* ---------------------------------------------------------------- toasts */
+.toasts { position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 40; max-width: min(420px, calc(100% - 40px)); }
+.toast {
+  display: flex; gap: 12px; align-items: flex-start;
+  padding: 14px 16px; border-radius: var(--radius);
+  background: var(--raised); border: 1px solid var(--stroke-strong); box-shadow: var(--shadow-lg);
+  animation: slide .25s var(--ease);
+}
+.toast.out { animation: slideout .2s ease forwards; }
+@keyframes slide { from { opacity: 0; transform: translateX(24px); } }
+@keyframes slideout { to { opacity: 0; transform: translateX(24px); } }
+.toast .ico { width: 20px; height: 20px; flex: none; border-radius: 2px; display: grid; place-items: center; color: #fff; font-size: 12px; font-weight: 700; margin-top: 1px; }
+.toast.ok .ico { background: var(--ok); color: var(--accent-text); }
+.toast.bad .ico { background: var(--bad); }
+.toast.info .ico { background: var(--accent); color: var(--accent-text); }
+.toast b { display: block; }
+.toast span { color: var(--text-2); font-size: 13px; user-select: text; word-break: break-word; }
+.toast .x { margin-left: auto; border: 0; background: none; color: var(--text-3); width: 24px; height: 24px; border-radius: 4px; flex: none; }
+.toast .x:hover { background: var(--surface-hover); }
+
+/* ---------------------------------------------------------------- this PC */
+.hero { display: flex; gap: 20px; align-items: center; padding: 22px 24px; flex-wrap: wrap; }
+.hero .big-ico { width: 56px; height: 56px; border-radius: var(--radius); display: grid; place-items: center; flex: none; }
+.hero .big-ico svg { width: 28px; height: 28px; }
+.hero .big-ico.ok { background: var(--ok-soft); color: var(--ok); }
+.hero .big-ico.warn { background: var(--warn-soft); color: var(--warn); }
+.hero .big-ico.off { background: var(--surface-2); color: var(--text-3); }
+.hero h3 { margin: 0; font: 600 22px/28px var(--font-display); letter-spacing: -.01em; }
+.hero p { margin: 2px 0 0; color: var(--text-2); }
+.hero .acts { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+.kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.kv .card { padding: 14px 16px; }
+.kv .k { font: 11px/16px var(--font-mono); text-transform: uppercase; letter-spacing: .08em; color: var(--text-3); }
+.kv .v { font-weight: 600; margin-top: 2px; word-break: break-word; }
+.addr { font-family: "Cascadia Mono", "Consolas", monospace; font-size: 13px; user-select: text; }
+.steps { counter-reset: s; display: flex; flex-direction: column; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.steps li { counter-increment: s; display: flex; gap: 12px; align-items: flex-start; color: var(--text-2); }
+.steps li::before { content: counter(s, decimal-leading-zero); width: 28px; height: 24px; border-radius: 2px; background: var(--text); color: var(--bg-solid); display: grid; place-items: center; font: 11px/1 var(--font-mono); flex: none; }
+.steps code, kbd { font-family: "Cascadia Mono", "Consolas", monospace; font-size: 12px; padding: 1px 6px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--stroke); color: var(--text); user-select: text; }
+.keys { display: grid; grid-template-columns: auto 1fr; gap: 10px 16px; align-items: center; padding: 16px; }
+.update-bar { display: flex; align-items: center; gap: 14px; padding: 10px 36px; border-bottom: 1px solid var(--stroke); background: var(--surface); flex-wrap: wrap; }
+.switch .txt span.upd-title { font-size: 14px; color: var(--text); line-height: 20px; }
+.update-bar .tag { font: 11px/1 var(--font-mono); text-transform: uppercase; letter-spacing: .1em; color: var(--accent); }
+.update-bar .msg { flex: 1; min-width: 200px; }
+.update-bar .bar { width: 160px; height: 4px; background: var(--surface-2); border: 1px solid var(--stroke); }
+.update-bar .bar i { display: block; height: 100%; background: var(--accent); transition: width .2s; }
+.keys span { color: var(--text-2); }
+
+.skeleton { background: linear-gradient(90deg, var(--surface-2), var(--surface-hover), var(--surface-2)); background-size: 200% 100%; animation: shimmer 1.2s infinite; border-radius: 6px; }
+@keyframes shimmer { to { background-position: -200% 0; } }
+.spin { width: 16px; height: 16px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: rot .7s linear infinite; }
+@keyframes rot { to { transform: rotate(360deg); } }
+
+@media (max-width: 860px) {
+  nav { width: 64px; }
+  .brand b, .brand span, .nav-item .lbl, .nav-foot, .nav-item .badge { display: none; }
+  .page { padding: 20px; }
+  .choices { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-logo" viewBox="0 0 108 32"><rect class="logo-bar" x="1" y="8.75" width="69" height="15.5" rx=".6" stroke-width="1.5"/><circle class="logo-o" cx="91" cy="16.5" r="15.25" stroke-width="1.5"/></symbol>
+  <symbol id="i-conn" viewBox="0 0 20 20"><rect x="2.5" y="3.5" width="15" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7 16.5h6M10 13.5v3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+  <symbol id="i-host" viewBox="0 0 20 20"><rect x="4" y="2.5" width="12" height="15" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7 6h6M7 9h6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="10" cy="13.5" r="1.2" fill="currentColor"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 20 20"><path d="M10 6.8a3.2 3.2 0 1 0 0 6.4 3.2 3.2 0 0 0 0-6.4Z" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8.6 2.5h2.8l.4 2.1 1.5.9 2-.8 1.4 2.4-1.6 1.4v1.8l1.6 1.4-1.4 2.4-2-.8-1.5.9-.4 2.1H8.6l-.4-2.1-1.5-.9-2 .8-1.4-2.4 1.6-1.4V8.5L3.3 7.1l1.4-2.4 2 .8 1.5-.9Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
+  <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="m10.5 10.5 3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+  <symbol id="i-play" viewBox="0 0 16 16"><path d="M5 3.5v9l7.5-4.5Z" fill="currentColor"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 16 16"><path d="M10.5 2.5 13.5 5.5 6 13H3v-3Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></symbol>
+  <symbol id="i-more" viewBox="0 0 16 16"><circle cx="3.5" cy="8" r="1.2" fill="currentColor"/><circle cx="8" cy="8" r="1.2" fill="currentColor"/><circle cx="12.5" cy="8" r="1.2" fill="currentColor"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 16 16"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
+  <symbol id="i-save" viewBox="0 0 16 16"><path d="M4 2.5h6.5L13.5 5.5v7a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1Z M5.5 2.5v3h4v-3M5 13.5v-4h6v4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></symbol>
+  <symbol id="i-x" viewBox="0 0 16 16"><path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 16 16"><path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8Z" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
+  <symbol id="i-bolt" viewBox="0 0 16 16"><path d="M9 1.5 3.5 9H8l-1 5.5L12.5 7H8Z" fill="currentColor"/></symbol>
+  <symbol id="i-rdp" viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5.5 14h5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></symbol>
+  <symbol id="i-direct" viewBox="0 0 16 16"><path d="M2 8h9M8 4.5 11.5 8 8 11.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M14 3v10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
+  <symbol id="i-game" viewBox="0 0 16 16"><path d="M4.5 4.5h7a3 3 0 0 1 3 3v1.2a2.3 2.3 0 0 1-4 1.5L10 9.5H6l-.5.7a2.3 2.3 0 0 1-4-1.5V7.5a3 3 0 0 1 3-3Z" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M5 6.5v2M4 7.5h2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></symbol>
+  <symbol id="i-text" viewBox="0 0 16 16"><path d="M3 3.5h10M8 3.5v9M5.5 12.5h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="m3.5 8.5 3 3 6-7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2.8 4.5 5.6v6c0 4.6 3.2 8.2 7.5 9.6 4.3-1.4 7.5-5 7.5-9.6v-6Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="m8.8 12 2.3 2.3 4.2-4.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3.5 2.8 19.5h18.4Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 10v4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="17" r="1.1" fill="currentColor"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3.5v8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M7.2 6.3a7.5 7.5 0 1 0 9.6 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 16 16"><path d="M1.5 4a1 1 0 0 1 1-1h3.3l1.4 1.5h6.3a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></symbol>
+  <symbol id="i-key" viewBox="0 0 16 16"><circle cx="5" cy="10" r="2.8" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="m7 8 6-6M11 4l1.5 1.5M9.5 5.5 11 7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+</svg>
+
+<nav aria-label="rdpio">
+  <div class="brand"><svg class="logo" aria-hidden="true"><use href="#i-logo"/></svg><div><b>rdpio</b><span id="brand-sub">by IO Services</span></div></div>
+  <button class="nav-item" data-page="connections" aria-current="page"><svg><use href="#i-conn"/></svg><span class="lbl">Connections</span><span class="badge accent" id="nav-live" hidden></span></button>
+  <button class="nav-item" data-page="host"><svg><use href="#i-host"/></svg><span class="lbl">This PC</span><span class="badge" id="nav-host" hidden></span></button>
+  <button class="nav-item" data-page="settings"><svg><use href="#i-gear"/></svg><span class="lbl">Settings</span></button>
+  <div class="nav-foot" id="version"></div>
+</nav>
+
+<main>
+  <div class="update-bar" id="update-bar" hidden></div>
+  <!-- ======================================================== connections -->
+  <section class="page active" id="page-connections">
+    <div class="page-head">
+      <h1>Connections</h1>
+      <div class="spacer"></div>
+      <label class="search"><svg><use href="#i-search"/></svg><span class="sr">Search</span><input class="input" id="search" placeholder="Search connections" autocomplete="off" spellcheck="false"></label>
+      <button class="btn primary" id="new-btn"><svg><use href="#i-plus"/></svg>New connection</button>
+    </div>
+
+    <form class="card quick" id="quick" autocomplete="off">
+      <input class="input" id="quick-host" placeholder="PC name or address — e.g. gaming-pc, 100.101.5.9" spellcheck="false">
+      <div class="seg" id="quick-mode" role="group" aria-label="How">
+        <button type="button" data-v="rdp" title="Plain Remote Desktop">RDP</button>
+        <button type="button" data-v="hyper" title="Sign in over RDP, then switch to the Hyper stream">Hyper</button>
+        <button type="button" data-v="direct" title="Hyper with the Hyper password (no RDP)">Direct</button>
+      </div>
+      <button class="btn primary lg" type="submit"><svg><use href="#i-play"/></svg>Connect</button>
+    </form>
+
+    <div id="saved-wrap">
+      <h2>Saved <span class="count" id="saved-count"></span></h2>
+      <div class="grid" id="saved"></div>
+    </div>
+    <div id="recent-wrap">
+      <h2>Recent <span class="count" id="recent-count"></span></h2>
+      <div class="card list" id="recent"></div>
+    </div>
+    <div class="empty" id="empty" hidden>
+      <svg viewBox="0 0 120 90" fill="none"><rect x="14" y="10" width="92" height="58" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/><path d="M48 80h24M60 68v12" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"/><path d="m52 30 14 9-14 9" stroke="var(--accent)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <b>No connections yet</b>
+      <span>Type a PC's name or address above to connect, or save one with its own settings.</span>
+      <button class="btn primary" id="empty-new"><svg><use href="#i-plus"/></svg>New connection</button>
+    </div>
+    <div class="empty" id="no-match" hidden><b>Nothing matches</b><span>Press Enter in the search box to connect to it.</span></div>
+  </section>
+
+  <!-- ======================================================== this PC -->
+  <section class="page" id="page-host">
+    <div class="page-head"><h1>This PC</h1><div class="spacer"></div><button class="btn ghost" id="host-refresh"><svg><use href="#i-refresh"/></svg>Refresh</button></div>
+    <p class="lead">Let your other devices stream this PC with Hyper: low-latency, GPU-encoded, at their own screen's resolution.</p>
+    <div class="card hero" id="host-hero">
+      <div class="big-ico off"><svg><use href="#i-power"/></svg></div>
+      <div><h3 class="skeleton" style="width:220px;height:24px"></h3><p class="skeleton" style="width:300px;height:16px;margin-top:8px"></p></div>
+    </div>
+    <h2>Details</h2>
+    <div class="kv" id="host-kv"></div>
+    <h2>Exact-resolution display</h2>
+    <div class="card group" id="host-display"></div>
+    <h2>While streaming</h2>
+    <div class="card group" id="host-stream"></div>
+    <h2>Updates</h2>
+    <div class="card group" id="host-updates"></div>
+    <h2>Reach this PC at</h2>
+    <div class="card list" id="host-addrs"></div>
+    <h2>Connect from another device</h2>
+    <div class="card" style="padding:18px 20px">
+      <ol class="steps">
+        <li><span>Install rdpio on the other device (this PC has <span id="host-ver"></span>). From then on it keeps up with this PC: an older rdpio is updated by it when it connects.</span></li>
+        <li><span>Add a connection to <b id="host-name-hint">this PC</b> with <b>Hyper Direct</b>, using the Hyper password set here.</span></li>
+        <li><span>Away from home, use this PC's Tailscale address. In the session, <kbd>Ctrl+Shift+Q</kbd> disconnects and locks this PC.</span></li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ======================================================== settings -->
+  <section class="page" id="page-settings">
+    <div class="page-head"><h1>Settings</h1></div>
+    <h2>Appearance</h2>
+    <div class="card group">
+      <div class="switch"><div class="txt">Theme<span>Follow Windows, or always light or dark.</span></div>
+        <div class="seg" id="theme-seg"><button data-v="system">System</button><button data-v="light">Light</button><button data-v="dark">Dark</button></div></div>
+    </div>
+    <h2>Launching</h2>
+    <div class="card group">
+      <label class="switch"><div class="txt">Keep this window open after connecting<span>Off: rdpio hides while the session runs and closes with it (it comes back if the connection fails).</span></div>
+        <span class="toggle"><input type="checkbox" id="keep-open"><i></i></span></label>
+    </div>
+    <h2>New connections start with</h2>
+    <div class="card" style="padding:16px">
+      <div class="stack">
+        <div class="field"><span class="label">Connection</span><div class="choices" id="def-transport"></div></div>
+        <div class="field"><span class="label">Tuned for</span><div class="choices two" id="def-profile"></div></div>
+        <label class="check"><input type="checkbox" id="def-fullscreen">Full screen</label>
+      </div>
+    </div>
+    <h2>In a session</h2>
+    <div class="card keys">
+      <kbd>Ctrl+Shift+Q</kbd><span>Disconnect (a Hyper host locks itself)</span>
+      <kbd>Ctrl+Shift+M</kbd><span>Lock the mouse in for games — Win, Alt+Tab and Ctrl+Esc then go to the remote PC. Again to release</span>
+      <kbd>Ctrl+Shift+K</kbd><span>Hyper: Win, Alt+Tab, Alt+F4 to the host (the default) or to this PC</span>
+      <kbd>Ctrl+Shift+O</kbd><span>Hyper: office mode on or off (crisp text) </span>
+      <kbd>Ctrl+Shift+S</kbd><span>Hyper: stats — frame rate, latency, bitrate, loss</span>
+      <kbd>Ctrl+Alt+End</kbd><span>Ctrl+Alt+Del on the remote PC</span>
+    </div>
+    <h2>Updates</h2>
+    <div class="card group">
+      <div class="switch"><div class="txt"><span id="upd-version" class="upd-title">rdpio</span><span id="upd-status">Up to date.</span></div><button class="btn" id="upd-check"><svg><use href="#i-refresh"/></svg>Check now</button></div>
+      <label class="switch"><div class="txt">Check for updates automatically<span>When this window opens, rdpio looks for a newer release on GitHub and offers it. Nothing installs without you.</span></div>
+        <span class="toggle"><input type="checkbox" id="upd-auto"><i></i></span></label>
+      <label class="switch"><div class="txt">Update from the PCs I connect to<span>A Hyper PC with a newer rdpio hands it to this one while you're connected. It's checked against rdpio's release signature, and it installs when the session ends (or at once, when this rdpio is too old to stream from it).</span></div>
+        <span class="toggle"><input type="checkbox" id="upd-hosts"><i></i></span></label>
+      <div class="switch"><div class="txt">Channel<span>Releases, or nightly builds: every change, as soon as it's built.</span></div>
+        <div class="seg" id="upd-channel"><button data-v="stable">Releases</button><button data-v="nightly">Nightly</button></div></div>
+    </div>
+    <h2>Troubleshooting</h2>
+    <div class="card group">
+      <div class="switch"><div class="txt">Session logs<span>One per PC you connect to, from the last session.</span></div><button class="btn" id="open-client-logs"><svg><use href="#i-folder"/></svg>Open</button></div>
+      <div class="switch"><div class="txt">About<span id="about"></span></div></div>
+    </div>
+  </section>
+</main>
+
+<!-- ======================================================== edit dialog -->
+<div class="scrim" id="edit-scrim">
+  <form class="dialog" id="edit" autocomplete="off" novalidate>
+    <header><h3 id="edit-title">New connection</h3><p id="edit-sub">Where to connect, and how.</p></header>
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" data-tab="general" aria-selected="true">General</button>
+      <button type="button" role="tab" data-tab="stream" aria-selected="false">Stream</button>
+      <button type="button" role="tab" data-tab="display" aria-selected="false">Display &amp; devices</button>
+    </div>
+    <div class="body">
+      <div class="tabpane stack active" data-pane="general">
+        <div class="row two">
+          <div class="field"><label for="f-host">PC name or address</label><input class="input" id="f-host" placeholder="gaming-pc, 192.168.1.20, 100.101.5.9" spellcheck="false"></div>
+          <div class="field"><label for="f-port">RDP port</label><input class="input" id="f-port" inputmode="numeric" placeholder="3389"></div>
+        </div>
+        <div class="field"><label for="f-name">Display name</label><input class="input" id="f-name" placeholder="Same as the PC name"></div>
+        <div class="row">
+          <div class="field"><label for="f-user">User name</label><input class="input" id="f-user" placeholder="Optional" spellcheck="false"></div>
+          <div class="field"><label for="f-domain">Domain</label><input class="input" id="f-domain" placeholder="Optional" spellcheck="false"></div>
+        </div>
+        <div class="field" id="f-pw-field"><label for="f-pw">Windows password</label>
+          <div class="pw"><input class="input" id="f-pw" type="password" placeholder="Saved on this PC for you only"><button type="button" class="reveal" tabindex="-1" title="Show"><svg><use href="#i-eye"/></svg></button></div>
+          <span class="hint" id="f-pw-hint"></span>
+        </div>
+      </div>
+
+      <div class="tabpane stack" data-pane="stream">
+        <div class="field"><span class="label">Connection</span><div class="choices" id="f-transport"></div></div>
+        <div class="field" id="f-hpw-field"><label for="f-hpw">Hyper password</label>
+          <div class="pw"><input class="input" id="f-hpw" type="password" placeholder="The one set on the other PC"><button type="button" class="reveal" tabindex="-1" title="Show"><svg><use href="#i-eye"/></svg></button></div>
+          <span class="hint" id="f-hpw-hint"></span>
+        </div>
+        <div class="field" id="f-profile-field"><span class="label">Tuned for</span><div class="choices two" id="f-profile"></div></div>
+        <label class="check" id="f-fast-field"><input type="checkbox" id="f-fast">Sharpest office text at once — ~8 ms more latency on every frame (otherwise still text sharpens within half a second)</label>
+        <div class="row" id="f-hyper-row">
+          <div class="field"><label for="f-codec">Video codec</label>
+            <select class="input" id="f-codec"><option value="auto">Automatic</option><option value="hevc">HEVC (H.265)</option><option value="h264">H.264</option></select></div>
+          <div class="field"><label for="f-fps">Frame rate</label>
+            <select class="input" id="f-fps"><option value="0">Match this screen</option><option>30</option><option>60</option><option>90</option><option>120</option><option>144</option><option>165</option><option>240</option></select></div>
+          <div class="field"><label for="f-hport">Hyper port</label><input class="input" id="f-hport" inputmode="numeric" placeholder="Default"></div>
+        </div>
+        <div class="field" id="f-gpu-field"><label for="f-gpu">Graphics chip (laptops with two)</label>
+          <select class="input" id="f-gpu">
+            <option value="auto">Automatic — the power-saving one on battery, the fastest plugged in</option>
+            <option value="performance">Always the fastest</option>
+            <option value="display">Always the power-saving one (longest battery)</option>
+          </select>
+          <span class="hint">On battery the faster chip can switch off completely. Plugging in or out switches mid-stream.</span></div>
+      </div>
+
+      <div class="tabpane stack" data-pane="display">
+        <div class="card group">
+          <label class="switch"><div class="txt">Full screen<span>Borderless on this screen. Ctrl+Shift+Q leaves.</span></div><span class="toggle"><input type="checkbox" id="f-fullscreen"><i></i></span></label>
+          <label class="switch" id="f-multimon-row"><div class="txt">Use all my monitors<span>RDP: the remote desktop spans every screen.</span></div><span class="toggle"><input type="checkbox" id="f-multimon"><i></i></span></label>
+          <label class="switch"><div class="txt">Lowest latency<span>Show each frame the moment it's ready (may tear).</span></div><span class="toggle"><input type="checkbox" id="f-lowlat"><i></i></span></label>
+          <label class="switch" id="f-vsync-row"><div class="txt">Smooth presentation<span>Hyper: wait for this screen's refresh (no tearing, a little more latency).</span></div><span class="toggle"><input type="checkbox" id="f-vsync"><i></i></span></label>
+          <label class="switch" id="f-keys-row"><div class="txt">Windows keys go to the remote PC<span>Hyper: Win, Alt+Tab, Alt+F4 and Ctrl+Esc act there. Ctrl+Shift+K switches in a session; Ctrl+Alt+Del always stays here.</span></div><span class="toggle"><input type="checkbox" id="f-keys"><i></i></span></label>
+        </div>
+        <div class="card group" id="f-devices">
+          <label class="switch"><div class="txt">Printer<span>Your default printer in the session.</span></div><span class="toggle"><input type="checkbox" id="f-printer"><i></i></span></label>
+          <label class="switch"><div class="txt">Drives<span>Your drives in the session's File Explorer.</span></div><span class="toggle"><input type="checkbox" id="f-drives"><i></i></span></label>
+          <label class="switch"><div class="txt">Trust any certificate<span>For a PC whose certificate Windows doesn't trust (its own, self-signed).</span></div><span class="toggle"><input type="checkbox" id="f-insecure"><i></i></span></label>
+        </div>
+      </div>
+      <div class="error-text" id="edit-error" role="alert"></div>
+    </div>
+    <footer>
+      <button type="button" class="btn danger" id="edit-delete" style="margin-right:auto">Delete</button>
+      <button type="button" class="btn" id="edit-cancel">Cancel</button>
+      <button type="button" class="btn" id="edit-save-connect">Save &amp; connect</button>
+      <button type="submit" class="btn primary">Save</button>
+    </footer>
+  </form>
+</div>
+
+<!-- ======================================================== password prompt -->
+<div class="scrim" id="pw-scrim">
+  <form class="dialog sm" id="pw-form" autocomplete="off">
+    <header><h3 id="pw-title">Password</h3><p id="pw-sub"></p></header>
+    <div class="body stack">
+      <div class="pw"><input class="input" id="pw-input" type="password"><button type="button" class="reveal" tabindex="-1" title="Show"><svg><use href="#i-eye"/></svg></button></div>
+      <label class="check" id="pw-remember-row"><input type="checkbox" id="pw-remember" checked>Remember it on this PC (for you only)</label>
+    </div>
+    <footer><button type="button" class="btn" id="pw-cancel">Cancel</button><button type="submit" class="btn primary">Connect</button></footer>
+  </form>
+</div>
+
+<!-- ======================================================== Hyper password (host) -->
+<div class="scrim" id="hpw-scrim">
+  <form class="dialog sm" id="hpw-form" autocomplete="off">
+    <header><h3 id="hpw-title">Hyper password</h3><p>Other devices sign in to this PC's Hyper stream with it. Any length works — but anyone who can reach this PC and knows it can control it.</p></header>
+    <div class="body stack">
+      <div class="field"><label for="hpw-1">New password</label><div class="pw"><input class="input" id="hpw-1" type="password"><button type="button" class="reveal" tabindex="-1" title="Show"><svg><use href="#i-eye"/></svg></button></div></div>
+      <div class="field"><label for="hpw-2">Again</label><input class="input" id="hpw-2" type="password"></div>
+      <div class="error-text" id="hpw-error" role="alert"></div>
+      <span class="hint">Windows will ask for permission: setting up the host needs an administrator.</span>
+    </div>
+    <footer><button type="button" class="btn" id="hpw-cancel">Cancel</button><button type="submit" class="btn primary" id="hpw-ok">Set password</button></footer>
+  </form>
+</div>
+
+<div class="menu" id="menu" role="menu"></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const bridge = window.chrome && window.chrome.webview;
+
+// ------------------------------------------------------------ the bridge
+let nextId = 1;
+const pending = new Map();
+function call(cmd, args = {}) {
+  return new Promise((resolve, reject) => {
+    if (!bridge) { reject(new Error("not running inside rdpio")); return; }
+    const id = nextId++;
+    pending.set(id, { resolve, reject });
+    bridge.postMessage({ id, cmd, ...args });
+  });
+}
+if (bridge) bridge.addEventListener("message", ev => {
+  const m = ev.data;
+  if (m && m.id !== undefined && m.id !== null && pending.has(m.id)) {
+    const p = pending.get(m.id); pending.delete(m.id);
+    m.ok ? p.resolve(m.data) : p.reject(new Error(m.error || "failed"));
+    return;
+  }
+  if (m && m.event) onEvent(m);
+});
+
+// ------------------------------------------------------------ helpers
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const icon = (name, cls = "") => `<svg class="${cls}"><use href="#i-${name}"/></svg>`;
+function hue(s) { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h % 360; }
+function avatar(name) {
+  const words = String(name || "?").replace(/[^\p{L}\p{N} .-]/gu, "").split(/[\s.-]+/).filter(Boolean);
+  const init = ((words[0] || "?")[0] + (words.length > 1 ? words[1][0] : (words[0] || "")[1] || "")).toUpperCase();
+  const h = hue(name);
+  return `<div class="avatar">${esc(init)}</div>`;
+}
+function ago(unix) {
+  if (!unix) return "";
+  const s = Math.max(0, Date.now() / 1000 - unix);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  if (s < 86400 * 7) { const d = Math.floor(s / 86400); return d === 1 ? "yesterday" : `${d} days ago`; }
+  return new Date(unix * 1000).toLocaleDateString();
+}
+const TRANSPORTS = {
+  rdp: { name: "Remote Desktop", short: "RDP", icon: "rdp", desc: "Windows' own protocol. Works with any PC that has Remote Desktop on." },
+  hyper: { name: "RDP + Hyper", short: "Hyper", icon: "bolt", desc: "Sign in with Remote Desktop, then switch to the GPU stream when the PC runs Hyper." },
+  direct: { name: "Hyper Direct", short: "Direct", icon: "direct", desc: "Straight to the GPU stream with the Hyper password. Fastest; needs Hyper on the PC." },
+};
+const PROFILES = {
+  game: { name: "Games & motion", icon: "game", desc: "Lowest latency. Fast-moving pictures first." },
+  office: { name: "Work & text", icon: "text", desc: "Crisp text at your screen's resolution; video still smooth." },
+};
+function chips(o) {
+  const out = [];
+  const t = TRANSPORTS[o.transport] || TRANSPORTS.hyper;
+  out.push(`<span class="badge ${o.transport === "rdp" ? "" : "accent"}">${icon(t.icon)}${t.short}</span>`);
+  if (o.transport !== "rdp" || o.profile === "office") out.push(`<span class="badge">${o.profile === "office" ? "Office" : "Game"}</span>`);
+  if (o.fps) out.push(`<span class="badge">${o.fps} fps</span>`);
+  if (o.codec && o.codec !== "auto") out.push(`<span class="badge">${o.codec.toUpperCase()}</span>`);
+  if (!o.fullscreen) out.push(`<span class="badge">Window</span>`);
+  return out.join("");
+}
+function toast(kind, title, text, ms = 6000) {
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
+  el.innerHTML = `<div class="ico">${kind === "ok" ? "✓" : kind === "bad" ? "!" : "i"}</div><div><b>${esc(title)}</b>${text ? `<span>${esc(text)}</span>` : ""}</div><button class="x" title="Close">${icon("x")}</button>`;
+  const close = () => { el.classList.add("out"); setTimeout(() => el.remove(), 200); };
+  $(".x", el).onclick = close;
+  $("#toasts").append(el);
+  if (ms) setTimeout(close, ms);
+  return el;
+}
+function fail(e) { toast("bad", "Something went wrong", e && e.message ? e.message : String(e)); }
+
+// ------------------------------------------------------------ theme
+let state = null;
+let systemDark = matchMedia("(prefers-color-scheme: dark)").matches;
+function applyTheme() {
+  const pref = state ? state.settings.theme : "system";
+  const dark = pref === "dark" || (pref === "system" && systemDark);
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  document.documentElement.dataset.mica = state && state.mica ? "1" : "0";
+  call("theme_applied", { dark }).catch(() => {});
+}
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", e => { systemDark = e.matches; applyTheme(); });
+
+// ------------------------------------------------------------ navigation
+function show(page) {
+  $$(".nav-item").forEach(b => b.setAttribute("aria-current", b.dataset.page === page ? "page" : "false"));
+  $$(".page").forEach(p => p.classList.toggle("active", p.id === `page-${page}`));
+  if (page === "host") refreshHost();
+}
+$$(".nav-item").forEach(b => b.onclick = () => show(b.dataset.page));
+
+// ------------------------------------------------------------ connections page
+function render() {
+  if (!state) return;
+  const q = $("#search").value.trim().toLowerCase();
+  const match = c => !q || [c.name, c.host, c.user, c.domain].some(v => v && String(v).toLowerCase().includes(q));
+  const saved = state.connections.filter(match).sort((a, b) => a.name.localeCompare(b.name));
+  const savedIds = new Set(state.connections.map(c => c.id));
+  const recent = state.recent.filter(r => !(r.connection_id && savedIds.has(r.connection_id) && !q)).filter(match);
+
+  $("#saved").innerHTML = saved.map((c, i) => `
+    <article class="card conn" data-id="${esc(c.id)}" style="animation-delay:${Math.min(i, 12) * 25}ms">
+      ${c.running ? `<span class="badge ok live-tag"><span class="dot live"></span>Connected</span>` : ""}
+      <div class="conn-top">${avatar(c.name)}<div style="min-width:0"><div class="conn-name" title="${esc(c.name)}">${esc(c.name)}</div>
+        <div class="conn-sub">${esc(c.user ? `${c.user} @ ` : "")}${esc(c.host)}${c.port !== 3389 ? `:${c.port}` : ""}</div></div></div>
+      <div class="conn-meta">${chips(c.options)}</div>
+      <div class="conn-actions">
+        <button class="btn primary" data-act="connect">${icon("play")}${c.running ? "Show" : "Connect"}</button>
+        <button class="btn icon" data-act="edit" title="Edit">${icon("edit")}</button>
+        <button class="btn icon" data-act="more" title="More">${icon("more")}</button>
+      </div>
+    </article>`).join("");
+  $("#saved-count").textContent = state.connections.length ? String(state.connections.length) : "";
+  $("#saved-wrap").hidden = saved.length === 0;
+
+  $("#recent").innerHTML = recent.map((r, i) => `
+    <div class="item" data-i="${state.recent.indexOf(r)}" tabindex="-1">
+      ${avatar(r.name)}
+      <div class="grow"><div class="conn-name">${esc(r.name)}${r.running ? ` <span class="badge ok" style="margin-left:6px"><span class="dot live"></span>Connected</span>` : ""}</div>
+        <div class="conn-sub">${esc(r.user ? `${r.user} @ ` : "")}${esc(r.host)}${r.port !== 3389 ? `:${r.port}` : ""} · ${TRANSPORTS[r.options.transport]?.short || ""}</div></div>
+      <span class="when">${esc(ago(r.when))}</span>
+      <div class="acts">
+        ${r.connection_id ? "" : `<button class="btn ghost icon" data-act="save" title="Save">${icon("save")}</button>`}
+        <button class="btn ghost icon" data-act="forget" title="Remove from Recent">${icon("x")}</button>
+      </div>
+      <button class="btn" data-act="connect">${icon("play")}${r.running ? "Show" : "Connect"}</button>
+    </div>`).join("");
+  $("#recent-count").textContent = "";
+  $("#recent-wrap").hidden = recent.length === 0;
+  const nothing = state.connections.length === 0 && state.recent.length === 0;
+  $("#empty").hidden = !nothing;
+  $("#no-match").hidden = nothing || saved.length + recent.length > 0;
+
+  const live = state.connections.filter(c => c.running).length + state.recent.filter(r => r.running && !r.connection_id).length;
+  $("#nav-live").hidden = live === 0;
+  $("#nav-live").textContent = live ? `${live} live` : "";
+}
+
+$("#search").addEventListener("input", render);
+$("#search").addEventListener("keydown", e => {
+  if (e.key === "Enter") {
+    const first = $("#saved .conn") || $("#recent .item");
+    if (first) first.querySelector('[data-act="connect"]').click();
+    else if ($("#search").value.trim()) { $("#quick-host").value = $("#search").value.trim(); $("#quick").requestSubmit(); }
+  }
+  if (e.key === "Escape") { $("#search").value = ""; render(); }
+});
+
+$("#saved").addEventListener("click", e => {
+  const btn = e.target.closest("[data-act]"); const card = e.target.closest(".conn");
+  if (!card) return;
+  const c = state.connections.find(x => x.id === card.dataset.id);
+  if (!c) return;
+  if (!btn) return;
+  if (btn.dataset.act === "connect") connect({ id: c.id }, c);
+  if (btn.dataset.act === "edit") openEdit(c);
+  if (btn.dataset.act === "more") openMenu(btn, [
+    { label: "Connect", icon: "play", run: () => connect({ id: c.id }, c) },
+    { label: "Edit", icon: "edit", run: () => openEdit(c) },
+    { label: "Duplicate", icon: "copy", run: () => openEdit({ ...c, id: null, name: `${c.name} (copy)`, has_password: false, has_hyper_password: false }) },
+    "-",
+    { label: "Delete", icon: "trash", danger: true, run: () => del(c) },
+  ]);
+});
+$("#saved").addEventListener("dblclick", e => {
+  const card = e.target.closest(".conn");
+  if (card && !e.target.closest("button")) { const c = state.connections.find(x => x.id === card.dataset.id); if (c) connect({ id: c.id }, c); }
+});
+$("#recent").addEventListener("click", e => {
+  const row = e.target.closest(".item"); if (!row) return;
+  const r = state.recent[+row.dataset.i]; if (!r) return;
+  const btn = e.target.closest("[data-act]"); if (!btn) return;
+  if (btn.dataset.act === "connect") connectRecent(r);
+  if (btn.dataset.act === "forget") call("forget_recent", { host: r.host, port: r.port, user: r.user }).then(setState).catch(fail);
+  if (btn.dataset.act === "save") openEdit({ id: null, name: r.name, host: r.host, port: r.port, user: r.user, domain: r.domain, options: r.options });
+});
+$("#recent").addEventListener("dblclick", e => {
+  const row = e.target.closest(".item"); if (!row || e.target.closest("button")) return;
+  const r = state.recent[+row.dataset.i]; if (r) connectRecent(r);
+});
+function connectRecent(r) {
+  if (r.connection_id) { const c = state.connections.find(x => x.id === r.connection_id); if (c) return connect({ id: c.id }, c); }
+  connect({ target: { host: r.host, port: r.port, user: r.user, domain: r.domain, name: r.name, options: r.options } }, r);
+}
+
+// quick connect
+let quickMode = "hyper";
+function setQuickMode(v) { quickMode = v; $$("#quick-mode button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.v === v))); }
+$$("#quick-mode button").forEach(b => b.onclick = () => setQuickMode(b.dataset.v));
+$("#quick").addEventListener("submit", e => {
+  e.preventDefault();
+  const host = $("#quick-host").value.trim();
+  if (!host) { $("#quick-host").focus(); return; }
+  const options = { ...(state ? state.settings.defaults : {}), transport: quickMode };
+  connect({ target: { host, options } }, { name: host, host, options });
+});
+
+// ------------------------------------------------------------ connecting
+const connecting = new Set();
+async function connect(req, what, extra = {}) {
+  const key = req.id || (req.target && req.target.host);
+  if (connecting.has(key)) return;
+  connecting.add(key);
+  const t = toast("info", `Connecting to ${what.name || what.host}…`, "", 2500);
+  try {
+    const r = await call("connect", { ...req, ...extra });
+    if (r && r.need) {
+      t.remove();
+      const pw = await askPassword(r.need, what, !!req.id);
+      if (pw === null) return;
+      const more = r.need === "password" ? { password: pw.value } : { hyper_password: pw.value };
+      connecting.delete(key);
+      return connect(req, what, { ...extra, ...more, remember: pw.remember });
+    }
+  } catch (e) { t.remove(); fail(e); }
+  finally { connecting.delete(key); }
+}
+
+let pwResolve = null;
+function askPassword(need, what, canRemember) {
+  const hyper = need === "hyper_password";
+  $("#pw-title").textContent = hyper ? "Hyper password" : "Password";
+  $("#pw-sub").textContent = hyper
+    ? `For the Hyper stream on ${what.name || what.host} (set on that PC under This PC).`
+    : `Windows password for ${what.user || "your account"} on ${what.name || what.host}.`;
+  $("#pw-input").value = "";
+  $("#pw-remember-row").hidden = !canRemember;
+  openScrim("#pw-scrim");
+  setTimeout(() => $("#pw-input").focus(), 30);
+  return new Promise(res => { pwResolve = res; });
+}
+$("#pw-form").addEventListener("submit", e => {
+  e.preventDefault();
+  closeScrim("#pw-scrim");
+  if (pwResolve) pwResolve({ value: $("#pw-input").value, remember: $("#pw-remember").checked && !$("#pw-remember-row").hidden });
+  pwResolve = null;
+});
+$("#pw-cancel").onclick = () => { closeScrim("#pw-scrim"); if (pwResolve) pwResolve(null); pwResolve = null; };
+
+// ------------------------------------------------------------ edit dialog
+let editing = null;
+let fTransport = "hyper", fProfile = "game";
+function choiceButtons(el, table, current, onPick) {
+  el.innerHTML = Object.entries(table).map(([k, v]) => `<button type="button" class="choice" data-v="${k}" aria-pressed="${k === current}"><b>${icon(v.icon)}${esc(v.name)}</b><span>${esc(v.desc)}</span></button>`).join("");
+  $$("button", el).forEach(b => b.onclick = () => { $$("button", el).forEach(x => x.setAttribute("aria-pressed", String(x === b))); onPick(b.dataset.v); });
+}
+function syncEditVisibility() {
+  const hyperish = fTransport !== "rdp";
+  $("#f-hpw-field").hidden = fTransport !== "direct";
+  $("#f-hyper-row").hidden = !hyperish;
+  $("#f-fast-field").hidden = !(hyperish && fProfile === "office");
+  $("#f-vsync-row").hidden = !hyperish;
+  $("#f-keys-row").hidden = !hyperish;
+  $("#f-gpu-field").hidden = fTransport !== "direct";
+  $("#f-multimon-row").hidden = fTransport !== "rdp";
+  $("#f-devices").hidden = fTransport === "direct";
+  $("#f-pw-field").hidden = fTransport === "direct";
+}
+function openEdit(c) {
+  editing = { ...(c || {}) };
+  const o = { ...(state ? state.settings.defaults : {}), ...((c && c.options) || {}) };
+  $("#edit-title").textContent = c && c.id ? `Edit ${c.name}` : "New connection";
+  $("#edit-sub").textContent = c && c.id ? `${c.host}${c.port && c.port !== 3389 ? ":" + c.port : ""}` : "Where to connect, and how.";
+  $("#f-host").value = (c && c.host) || "";
+  $("#f-port").value = c && c.port && c.port !== 3389 ? c.port : "";
+  $("#f-name").value = c && c.name && c.name !== c.host ? c.name : "";
+  $("#f-user").value = (c && c.user) || "";
+  $("#f-domain").value = (c && c.domain) || "";
+  $("#f-pw").value = ""; $("#f-hpw").value = "";
+  $("#f-pw").placeholder = c && c.has_password ? "Saved — leave blank to keep it" : "Optional — asked when you connect if left blank";
+  $("#f-pw-hint").innerHTML = c && c.has_password ? `<button type="button" class="inline-link" id="forget-pw">Forget the saved password</button>` : "Kept encrypted for your Windows account only.";
+  $("#f-hpw").placeholder = c && c.has_hyper_password ? "Saved — leave blank to keep it" : "The Hyper password set on that PC";
+  $("#f-hpw-hint").innerHTML = c && c.has_hyper_password ? `<button type="button" class="inline-link" id="forget-hpw">Forget the saved Hyper password</button>` : "";
+  fTransport = o.transport || "hyper"; fProfile = o.profile || "game";
+  choiceButtons($("#f-transport"), TRANSPORTS, fTransport, v => { fTransport = v; syncEditVisibility(); });
+  choiceButtons($("#f-profile"), PROFILES, fProfile, v => { fProfile = v; syncEditVisibility(); });
+  $("#f-fast").checked = !!o.best_text;
+  $("#f-codec").value = o.codec || "auto";
+  $("#f-fps").value = String(o.fps || 0);
+  $("#f-hport").value = o.hyper_port ? o.hyper_port : "";
+  $("#f-fullscreen").checked = o.fullscreen !== false;
+  $("#f-multimon").checked = !!o.multimon;
+  $("#f-lowlat").checked = !!o.low_latency;
+  $("#f-vsync").checked = !!o.vsync;
+  $("#f-gpu").value = ["performance", "display"].includes(o.gpu) ? o.gpu : "auto";
+  $("#f-keys").checked = !o.local_keys;
+  $("#f-printer").checked = !!o.printer;
+  $("#f-drives").checked = !!o.drives;
+  $("#f-insecure").checked = !!o.insecure;
+  $("#edit-delete").hidden = !(c && c.id);
+  $("#edit-error").textContent = "";
+  editing.clearPw = false; editing.clearHpw = false;
+  selectTab("general");
+  syncEditVisibility();
+  openScrim("#edit-scrim");
+  setTimeout(() => (c && c.host ? $("#f-name") : $("#f-host")).focus(), 30);
+}
+$("#edit").addEventListener("click", e => {
+  if (e.target.id === "forget-pw") { editing.clearPw = true; e.target.replaceWith(Object.assign(document.createElement("span"), { textContent: "The saved password will be forgotten when you save." })); }
+  if (e.target.id === "forget-hpw") { editing.clearHpw = true; e.target.replaceWith(Object.assign(document.createElement("span"), { textContent: "The saved Hyper password will be forgotten when you save." })); }
+});
+function selectTab(name) {
+  $$(".tabs button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.tab === name)));
+  $$(".tabpane").forEach(p => p.classList.toggle("active", p.dataset.pane === name));
+}
+$$(".tabs button").forEach(b => b.onclick = () => selectTab(b.dataset.tab));
+function collect() {
+  const num = (v, d) => { const n = parseInt(String(v).trim(), 10); return Number.isFinite(n) ? n : d; };
+  return {
+    id: editing && editing.id ? editing.id : null,
+    name: $("#f-name").value.trim(),
+    host: $("#f-host").value.trim(),
+    port: num($("#f-port").value, 3389),
+    user: $("#f-user").value.trim(),
+    domain: $("#f-domain").value.trim(),
+    password: $("#f-pw").value,
+    clear_password: !!(editing && editing.clearPw) && !$("#f-pw").value,
+    hyper_password: $("#f-hpw").value,
+    clear_hyper_password: !!(editing && editing.clearHpw) && !$("#f-hpw").value,
+    options: {
+      transport: fTransport, profile: fProfile,
+      best_text: $("#f-fast").checked,
+      codec: $("#f-codec").value,
+      fps: num($("#f-fps").value, 0),
+      fullscreen: $("#f-fullscreen").checked,
+      multimon: $("#f-multimon").checked,
+      low_latency: $("#f-lowlat").checked,
+      vsync: $("#f-vsync").checked,
+      hyper_port: num($("#f-hport").value, 0),
+      gpu: $("#f-gpu").value,
+      local_keys: !$("#f-keys").checked,
+      printer: $("#f-printer").checked,
+      drives: $("#f-drives").checked,
+      insecure: $("#f-insecure").checked,
+    },
+  };
+}
+async function saveEdit(andConnect) {
+  const conn = collect();
+  if (!conn.host) { selectTab("general"); $("#edit-error").textContent = "Enter the PC's name or address."; $("#f-host").focus(); return; }
+  if (!(conn.port >= 1 && conn.port <= 65535)) { selectTab("general"); $("#edit-error").textContent = "The port must be 1–65535."; $("#f-port").focus(); return; }
+  try {
+    const r = await call("save", { conn });
+    setState(r.state);
+    closeScrim("#edit-scrim");
+    toast("ok", conn.id ? "Saved" : "Connection added", conn.name || conn.host, 2500);
+    if (andConnect) { const c = state.connections.find(x => x.id === r.id); if (c) connect({ id: c.id }, c); }
+  } catch (e) { $("#edit-error").textContent = e.message; }
+}
+$("#edit").addEventListener("submit", e => { e.preventDefault(); saveEdit(false); });
+$("#edit-save-connect").onclick = () => saveEdit(true);
+$("#edit-cancel").onclick = () => closeScrim("#edit-scrim");
+$("#edit-delete").onclick = () => { const c = editing; closeScrim("#edit-scrim"); if (c && c.id) del(c); };
+$("#new-btn").onclick = () => openEdit(null);
+$("#empty-new").onclick = () => openEdit(null);
+
+let undoTimer = null;
+async function del(c) {
+  try {
+    setState(await call("delete", { id: c.id }));
+    toast("info", `Deleted ${c.name}`, "", 3500);
+  } catch (e) { fail(e); }
+}
+
+// ------------------------------------------------------------ menu / dialogs
+function openMenu(anchor, items) {
+  const m = $("#menu");
+  m.innerHTML = items.map((it, i) => it === "-" ? "<hr>" : `<button data-i="${i}" class="${it.danger ? "danger" : ""}">${icon(it.icon)}${esc(it.label)}</button>`).join("");
+  $$("button", m).forEach(b => b.onclick = () => { closeMenu(); items[+b.dataset.i].run(); });
+  m.classList.add("open");
+  const r = anchor.getBoundingClientRect();
+  const mw = m.offsetWidth, mh = m.offsetHeight;
+  m.style.left = `${Math.min(r.right - mw, innerWidth - mw - 8)}px`;
+  m.style.top = `${r.bottom + mh + 6 > innerHeight ? r.top - mh - 4 : r.bottom + 4}px`;
+  setTimeout(() => $("button", m) && $("button", m).focus(), 0);
+}
+function closeMenu() { $("#menu").classList.remove("open"); }
+document.addEventListener("mousedown", e => { if (!e.target.closest("#menu")) closeMenu(); });
+function openScrim(sel) { $(sel).classList.add("open"); }
+function closeScrim(sel) { $(sel).classList.remove("open"); }
+$$(".scrim").forEach(s => s.addEventListener("mousedown", e => { if (e.target === s) { s.dataset.down = "1"; } }));
+$$(".scrim").forEach(s => s.addEventListener("mouseup", e => {
+  if (e.target === s && s.dataset.down === "1") { if (s.id === "pw-scrim") $("#pw-cancel").click(); else closeScrim(`#${s.id}`); }
+  s.dataset.down = "";
+}));
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") {
+    if ($("#menu").classList.contains("open")) return closeMenu();
+    const open = $$(".scrim.open").pop();
+    if (open) { open.id === "pw-scrim" ? $("#pw-cancel").click() : closeScrim(`#${open.id}`); return; }
+  }
+  if (e.ctrlKey && e.key.toLowerCase() === "n" && !$(".scrim.open")) { e.preventDefault(); openEdit(null); }
+  if (e.ctrlKey && e.key.toLowerCase() === "f" && !$(".scrim.open")) { e.preventDefault(); show("connections"); $("#search").focus(); }
+});
+document.addEventListener("click", e => {
+  const b = e.target.closest(".reveal"); if (!b) return;
+  const input = b.parentElement.querySelector("input");
+  input.type = input.type === "password" ? "text" : "password";
+  input.focus();
+});
+document.addEventListener("contextmenu", e => { if (!e.target.closest("input, textarea")) e.preventDefault(); });
+
+// ------------------------------------------------------------ this PC
+let hostStatus = null;
+let hostBusy = null;
+function refreshHost() { call("host_status").catch(fail); }
+$("#host-refresh").onclick = refreshHost;
+function renderHost() {
+  const s = hostStatus;
+  const hero = $("#host-hero");
+  if (!s) return;
+  let cls, ico, title, sub, acts = "";
+  const busy = hostBusy ? `<button class="btn" disabled><span class="spin"></span>Waiting for Windows…</button>` : "";
+  if (s.service === "missing") {
+    cls = "off"; ico = "power"; title = "Hyper isn't set up on this PC";
+    sub = "Set it up to stream this PC to your other devices — Windows asks for permission once.";
+    acts = busy || `<button class="btn primary lg" data-host="install">Set up Hyper</button>`;
+  } else if (s.outdated) {
+    cls = "warn"; ico = "warn"; title = "Hyper needs an update";
+    sub = `The Hyper service here runs ${s.service_version ? "rdpio " + s.service_version : "another rdpio build"}; this window is ${state.version}. Update it so devices get the newest.`;
+    acts = busy || `<button class="btn primary" data-host="update">Update</button><button class="btn" data-host="uninstall">Remove</button>`;
+  } else if (s.service === "running") {
+    cls = s.password_set ? "ok" : "warn"; ico = s.password_set ? "shield" : "warn";
+    title = s.password_set ? "Ready for your devices" : "Running — set a Hyper password";
+    sub = s.password_set ? `Hyper is running and listening on UDP ${s.port}.` : "Devices sign in to Hyper with a password set here.";
+    acts = busy || `<button class="btn ${s.password_set ? "" : "primary"}" data-host="password">${icon("key")}${s.password_set ? "Change password" : "Set password"}</button><button class="btn" data-host="uninstall">Remove</button>`;
+  } else {
+    cls = "warn"; ico = "warn"; title = s.service === "starting" ? "Hyper is starting…" : "Hyper is installed but not running";
+    sub = s.service === "starting" ? "Give it a moment." : "Reinstalling starts it again (and keeps your password).";
+    acts = busy || `<button class="btn primary" data-host="update">Start again</button><button class="btn" data-host="uninstall">Remove</button>`;
+  }
+  hero.innerHTML = `<div class="big-ico ${cls}"><svg><use href="#i-${ico}"/></svg></div><div><h3>${esc(title)}</h3><p>${esc(sub)}</p></div><div class="acts">${acts}</div>`;
+  $("#host-kv").innerHTML = [
+    ["This PC", s.computer || "—"],
+    ["Graphics", s.gpu || "—"],
+    ["Hyper service", { running: "Running", stopped: "Stopped", starting: "Starting", stopping: "Stopping", missing: "Not installed", unknown: "Unknown" }[s.service]],
+    ["Hyper password", s.password_set ? "Set" : "Not set"],
+    ["Hyper version", s.service_version || (s.service === "missing" ? "—" : "Local build")],
+    ["Port", `UDP ${s.port}`],
+  ].map(([k, v]) => `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join("");
+  const label = { tailscale: ["accent", "Tailscale — from anywhere"], lan: ["", "Home network"], zerotier: ["", "ZeroTier"], other: ["", "Network"] };
+  $("#host-addrs").innerHTML = s.addresses.length ? s.addresses.map(a => `
+    <div class="item"><div class="grow"><div class="addr">${esc(a.ip)}</div><div class="conn-sub">${esc(a.name)}</div></div>
+      <span class="badge ${label[a.kind][0]}">${esc(label[a.kind][1])}</span>
+      <button class="btn ghost icon" data-copy="${esc(a.ip)}" title="Copy">${icon("copy")}</button></div>`).join("")
+    : `<div class="item"><span class="conn-sub">No network connection.</span></div>`;
+  const disp = {
+    running: ["ok", "On", "Each device gets a display of its own made at its exact resolution and refresh rate — no scaling, no black bars. This PC's own screens rest while it streams."],
+    fallback: ["ok", "Using Virtual Display Driver", "The open-source Virtual Display Driver installed here makes each device a display at its exact resolution and refresh rate. rdpio turns it on only while a device streams. rdpio's own driver takes over once it's installed and signed."],
+    installed: ["warn", "Installed, not running", "Windows hasn't started it: a test build needs test signing on (bcdedit /set testsigning on) and a restart."],
+    missing: ["", "Not installed", s.display_available ? "Install it so devices get their own resolution instead of this PC's screen scaled to fit. Until rdpio's driver is signed, the open-source Virtual Display Driver (signed; winget install VirtualDrivers.Virtual-Display-Driver) works too." : "Install the open-source Virtual Display Driver (winget install VirtualDrivers.Virtual-Display-Driver) and rdpio uses it to give each device its exact resolution."],
+  }[s.display];
+  const dispBtn = hostBusy || s.display === "fallback" ? "" : s.display === "missing"
+    ? (s.display_available ? `<button class="btn primary" data-host="display_install">Install</button>` : "")
+    : `<button class="btn" data-host="display_uninstall">Remove</button>`;
+  $("#host-display").innerHTML = `<div class="switch"><div class="txt">rdpio Display <span class="badge ${disp[0]}" style="display:inline-flex;margin-left:8px">${esc(disp[1])}</span><span>${esc(disp[2])}</span></div>${dispBtn}</div>`;
+  const hs = s.settings || {};
+  const streamRows = [
+    ["virtual_display", "Give each device its own display", "With the display driver above: a display made at the device's resolution and refresh rate. This PC's screens rest meanwhile."],
+    ["match_resolution", "Match each device's screen", "Without a display of its own, this PC's monitor switches to the device's resolution (or the closest) while it streams. Off: the monitor stays as it is and the picture is scaled to fit."],
+    ["fast_refresh", "Fastest refresh rate while streaming", "The monitor runs at its fastest rate that suits the stream (240 Hz for 120 fps), so each frame is ready sooner."],
+    ["keep_monitors", "Keep my other monitors on", "Off: this PC's other monitors go dark while it streams, so nothing opens where the device can't see it."],
+  ];
+  $("#host-stream").innerHTML = streamRows.map(([k, t, d]) => `<label class="switch"><div class="txt">${esc(t)}<span>${esc(d)}</span></div><span class="toggle"><input type="checkbox" data-hs="${k}" ${hs[k] ? "checked" : ""} ${hostBusy ? "disabled" : ""}><i></i></span></label>`).join("");
+  const updRows = [
+    ["auto_update", "Keep Hyper up to date", "The Hyper service installs new rdpio releases from GitHub by itself, between streams, and passes them on to the devices that connect."],
+    ["nightly", "Nightly builds", "Every change as soon as it's built, instead of releases."],
+  ];
+  $("#host-updates").innerHTML = s.service === "missing" ? `<div class="switch"><div class="txt">Set up Hyper first<span>Then it keeps itself up to date.</span></div></div>` : updRows.map(([k, t, d]) => `<label class="switch"><div class="txt">${esc(t)}<span>${esc(d)}</span></div><span class="toggle"><input type="checkbox" data-hs="${k}" ${hs[k] ? "checked" : ""} ${hostBusy || (k === "nightly" && !hs.auto_update) ? "disabled" : ""}><i></i></span></label>`).join("");
+  $("#host-name-hint").textContent = s.computer || "this PC";
+  const n = $("#nav-host");
+  // A dot on "This PC" while Hyper is installed here but not ready.
+  n.hidden = s.service === "missing" || (s.service === "running" && s.password_set && !s.outdated);
+  n.className = "badge warn"; n.textContent = "!";
+}
+$("#host-addrs").addEventListener("click", e => {
+  const b = e.target.closest("[data-copy]"); if (!b) return;
+  navigator.clipboard.writeText(b.dataset.copy).then(() => toast("ok", "Copied", b.dataset.copy, 2000)).catch(fail);
+});
+for (const id of ["#host-stream", "#host-updates"]) $(id).addEventListener("change", e => {
+  const k = e.target.dataset.hs; if (!k) return;
+  hostBusy = "settings"; renderHost();
+  call("host_action", { action: "settings", settings: { [k]: e.target.checked } }).catch(err => { hostBusy = null; renderHost(); fail(err); });
+});
+$("#host-display").addEventListener("click", e => {
+  const b = e.target.closest("[data-host]"); if (b) runHost(b.dataset.host);
+});
+$("#host-hero").addEventListener("click", e => {
+  const b = e.target.closest("[data-host]"); if (!b) return;
+  const action = b.dataset.host;
+  if (action === "password" || (action === "install" && !(hostStatus && hostStatus.password_set))) return openHostPassword(action);
+  runHost(action);
+});
+function runHost(action, password) {
+  hostBusy = action; renderHost();
+  call("host_action", password === undefined ? { action } : { action, password }).catch(e => { hostBusy = null; renderHost(); fail(e); });
+}
+let hostPwAction = "password";
+function openHostPassword(action) {
+  hostPwAction = action;
+  $("#hpw-title").textContent = action === "install" ? "Choose a Hyper password" : "Change the Hyper password";
+  $("#hpw-ok").textContent = action === "install" ? "Set up Hyper" : "Set password";
+  $("#hpw-1").value = ""; $("#hpw-2").value = ""; $("#hpw-error").textContent = "";
+  openScrim("#hpw-scrim");
+  setTimeout(() => $("#hpw-1").focus(), 30);
+}
+$("#hpw-form").addEventListener("submit", e => {
+  e.preventDefault();
+  if ($("#hpw-1").value !== $("#hpw-2").value) { $("#hpw-error").textContent = "The two passwords don't match."; return; }
+  closeScrim("#hpw-scrim");
+  runHost(hostPwAction, $("#hpw-1").value);
+});
+$("#hpw-cancel").onclick = () => closeScrim("#hpw-scrim");
+
+// ------------------------------------------------------------ settings page
+function renderSettings() {
+  const s = state.settings;
+  $$("#theme-seg button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.v === s.theme)));
+  $("#keep-open").checked = !!s.keep_open;
+  choiceButtons($("#def-transport"), TRANSPORTS, s.defaults.transport, v => saveDefaults({ transport: v }));
+  choiceButtons($("#def-profile"), PROFILES, s.defaults.profile, v => saveDefaults({ profile: v }));
+  $("#def-fullscreen").checked = s.defaults.fullscreen !== false;
+  $("#about").textContent = `rdpio ${state.version} · build ${state.build} · IO Services`;
+  $("#version").textContent = `Version ${state.version}`;
+  $("#host-ver").textContent = state.version;
+  const u = s.updates || { check: true, from_hosts: true, channel: "stable" };
+  $("#upd-auto").checked = !!u.check;
+  $("#upd-hosts").checked = !!u.from_hosts;
+  $$("#upd-channel button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.v === u.channel)));
+  setQuickMode(quickModeSet ? quickMode : s.defaults.transport);
+  renderUpdate(state.update);
+}
+
+// ------------------------------------------------------------ updates
+let updateInfo = null;
+function renderUpdate(u) {
+  if (!u) return;
+  updateInfo = u;
+  const bar = $("#update-bar");
+  const v = u.version ? `rdpio ${esc(u.version)}` : "rdpio";
+  let html = "";
+  switch (u.state) {
+    case "available":
+      html = `<span class="tag">Update</span><span class="msg">${v} is available. You have ${esc(state.version)}.</span>${u.page ? `<button class="btn ghost" data-upd="notes">What's new</button>` : ""}<button class="btn primary" data-upd="install">Update now</button>`;
+      break;
+    case "downloading":
+      html = `<span class="tag">Update</span><span class="msg">Downloading ${v}…</span><span class="bar"><i style="width:${Math.round((u.progress || 0) * 100)}%"></i></span>`;
+      break;
+    case "ready":
+      html = `<span class="tag">Update</span><span class="msg">${v} is downloaded (from a PC you connected to). It installs with a restart of rdpio.</span><button class="btn primary" data-upd="install">Restart to update</button>`;
+      break;
+    case "restart":
+      html = `<span class="tag">Update</span><span class="msg">${v} is installed. Restart this window to use it.</span><button class="btn primary" data-upd="install">Restart</button>`;
+      break;
+    case "installing":
+      html = `<span class="tag">Update</span><span class="msg">Installing… rdpio reopens in a moment.</span><span class="spin"></span>`;
+      break;
+  }
+  bar.innerHTML = html;
+  bar.hidden = !html;
+  const status = {
+    idle: "", checking: "Checking…", current: "Up to date.", available: `${v} is available.`,
+    downloading: `Downloading ${v}: ${Math.round((u.progress || 0) * 100)}%`, ready: `${v} is ready to install.`,
+    restart: `${v} is installed: restart to use it.`, installing: "Installing…", error: u.error || "The check didn't work.",
+  }[u.state] ?? "";
+  $("#upd-version").textContent = `rdpio ${state.version || ""}`;
+  $("#upd-status").textContent = status || `Build ${state.build}`;
+  $("#upd-check").disabled = ["checking", "downloading", "installing"].includes(u.state);
+}
+$("#update-bar").addEventListener("click", e => {
+  const b = e.target.closest("[data-upd]"); if (!b) return;
+  if (b.dataset.upd === "notes" && updateInfo && updateInfo.page) call("open", { what: updateInfo.page }).catch(fail);
+  if (b.dataset.upd === "install") call("update_install").then(renderUpdate).catch(fail);
+});
+let manualCheck = false;
+$("#upd-check").onclick = () => { manualCheck = true; call("update_check").then(renderUpdate).catch(fail); };
+$("#upd-auto").onchange = e => call("update_prefs", { check: e.target.checked }).then(setState).catch(fail);
+$("#upd-hosts").onchange = e => call("update_prefs", { from_hosts: e.target.checked }).then(setState).catch(fail);
+$$("#upd-channel button").forEach(b => b.onclick = () => call("update_prefs", { channel: b.dataset.v }).then(setState).catch(fail));
+let quickModeSet = false;
+$$("#quick-mode button").forEach(b => b.addEventListener("click", () => { quickModeSet = true; }));
+$$("#theme-seg button").forEach(b => b.onclick = () => call("settings", { theme: b.dataset.v }).then(setState).catch(fail));
+$("#keep-open").onchange = e => call("settings", { keep_open: e.target.checked }).then(setState).catch(fail);
+$("#def-fullscreen").onchange = e => saveDefaults({ fullscreen: e.target.checked });
+function saveDefaults(patch) { call("settings", { defaults: { ...state.settings.defaults, ...patch } }).then(setState).catch(fail); }
+$("#open-client-logs").onclick = () => call("open", { what: "client_logs" }).catch(fail);
+
+// ------------------------------------------------------------ state + events
+function setState(s) {
+  if (!s) return;
+  state = s;
+  applyTheme();
+  render();
+  renderSettings();
+}
+function onEvent(m) {
+  switch (m.event) {
+    case "state": setState(m.state); break;
+    case "system_theme": systemDark = !!m.dark; applyTheme(); break;
+    case "host_status": hostStatus = m.status; renderHost(); break;
+    case "update":
+      renderUpdate(m.update);
+      if (m.update.state === "error") toast("bad", "Update", m.update.error, 10000);
+      if (m.update.state === "current" && manualCheck) toast("ok", "rdpio is up to date", `${state.version}`, 3000);
+      manualCheck = false;
+      break;
+    case "host_action_done":
+      hostBusy = null;
+      if (m.ok) toast("ok", { install: "Hyper is set up", update: "Hyper updated", uninstall: "Hyper removed", password: "Hyper password changed", display_install: "rdpio Display installed", display_uninstall: "rdpio Display removed", settings: "Saved" }[m.action] || "Done");
+      else toast("bad", "That didn't work", m.message, 12000);
+      renderHost();
+      break;
+    case "session_ended":
+      if (m.failed) {
+        const why = m.reason ? m.reason.replace(/^rdpio:\s*/, "") : `The session stopped (code ${m.code}).`;
+        toast("bad", m.seconds < 12 ? `Couldn't connect to ${m.name}` : `Disconnected from ${m.name}`, why, 15000);
+      }
+      break;
+  }
+}
+
+call("state").then(s => { setState(s); $("#quick-host").focus(); }).catch(fail);
+setInterval(render, 60000); // ("5 min ago" stays current)
+</script>
+</body>
+</html>

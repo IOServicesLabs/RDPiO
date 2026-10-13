@@ -4,7 +4,7 @@ RDPiO is only the **client** (decode + present). The **encoder** is the host's
 built-in Windows RDP server, so the levers that decide whether you can hit 60–120fps
 — and whether motion is smooth — live in the host's OS config, not in RDPiO. This
 guide lists them in priority order. Apply one at a time and measure: RDPiO logs the
-achieved frame rate as `decode fps` when run with `RUST_LOG=info`.
+achieved frame rate as `host_fps` in its periodic `metrics:` log line.
 
 > Context: the reference host is a rack server with a server-class CPU and **no
 > iGPU** (only a basic BMC/management display adapter), so the RDP server
@@ -42,19 +42,34 @@ bottleneck.
 ## 1. Lift the RDP frame-rate cap — REQUIRED for >30fps  [all hosts]
 
 By default the RDP server paces the remote session at ~30fps. No client change can
-exceed that until the cap is lifted on the host. The community lever is the
-`DWMFRAMEINTERVAL` value (frame interval in ms):
+exceed that until the cap is lifted on the host. `tune-rdpio-host.ps1` does it (and,
+on a host with a GPU, turns on hardware encoding):
 
-```cmd
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations" ^
-  /v DWMFRAMEINTERVAL /t REG_DWORD /d 15 /f
+```powershell
+.	une-rdpio-host.ps1 -Gaming -Fps 60           # report what would change (no admin)
+.	une-rdpio-host.ps1 -Apply -Gaming -Fps 60    # elevated: apply, saving old values
+.	une-rdpio-host.ps1 -Revert                   # elevated: put the old values back
 ```
 
-- `15` ms ≈ 60fps target; try `8` for ~120fps.
-- Log off and back on (or reboot) — the value is read at session start.
-- **Verify:** reconnect with `RUST_LOG=info` and watch the `decode fps` line climb
-  past 30 during motion. If it stays pinned at ~30, the value didn't take effect on
-  your Windows build; it varies by version, so trust the measured fps, not the docs.
+Two host values set the ceiling:
+
+- `DWMFRAMEINTERVAL` under `HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations`
+  — the minimum time between captured frames, in ms. `15` is Microsoft's documented
+  value for 60fps.
+- `DisplayRefreshRate` (same key) — the refresh rate of the session's virtual display.
+  The session's desktop composes at this rate, so it caps the frame rate too.
+
+**Above 60fps is an experiment.** Microsoft documents 60 as the maximum; `-Fps 120`
+sets `DWMFRAMEINTERVAL=8` and `DisplayRefreshRate=120` to find out whether a given
+Windows build goes further.
+
+- Sign out of Windows (or reboot) afterwards — the values are read at session start,
+  and reconnecting to a still-signed-in session keeps the old ones.
+- **Verify:** the client logs a `metrics:` line every 10 s. `host_fps` is how many
+  frames the host actually sent; `shown_fps` is how many the client displayed (capped
+  by the local screen's refresh rate unless `--low-latency` allows tearing). Move
+  something continuously (a game, or testufo.com in a browser) — if `host_fps` stays
+  pinned at ~30 or ~60, that is the host's cap, whatever the registry says.
 
 ## 2. Steady the CPU clocks — the biggest *jitter* lever  [SW host]
 

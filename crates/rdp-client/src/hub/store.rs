@@ -43,7 +43,7 @@ const MRU_CAP: usize = 50;
 
 /// `%LOCALAPPDATA%\rdpio` — the same location as the W365 caches. The directory
 /// is created if missing (idempotent, mirroring `password_cache.rs`).
-fn data_dir() -> Result<PathBuf, HubError> {
+pub(crate) fn data_dir() -> Result<PathBuf, HubError> {
     let local = std::env::var("LOCALAPPDATA")
         .ok()
         .filter(|s| !s.is_empty())
@@ -280,6 +280,18 @@ impl ConnectionStore {
         Ok(true)
     }
 
+    /// Replace a record's saved password outright (an `upsert` keeps it when
+    /// the new one is blank). Returns `false` when there's no such record.
+    pub fn replace_password(&mut self, id: &uuid::Uuid, password: ProtectedPassword) -> Result<bool, HubError> {
+        let Some(rec) = self.records.iter_mut().find(|r| &r.id == id) else {
+            return Ok(false);
+        };
+        rec.saved_password = password;
+        rec.updated_at = now_unix();
+        self.save()?;
+        Ok(true)
+    }
+
     fn save(&self) -> Result<(), HubError> {
         write_json_atomic(&self.path, &self.records)
     }
@@ -401,6 +413,20 @@ impl MruStore {
             .sort_by(|a, b| b.last_connected_at.cmp(&a.last_connected_at));
         self.cap(MRU_CAP);
         self.save()
+    }
+
+    /// Forget every entry for `host:port` as `username` (any domain), and
+    /// persist. Host and user compare without case, as Windows does.
+    pub fn remove(&mut self, host: &str, port: u16, username: Option<&str>) -> Result<bool, HubError> {
+        let before = self.records.len();
+        let same = |a: Option<&str>, b: Option<&str>| a.unwrap_or("").trim().eq_ignore_ascii_case(b.unwrap_or("").trim());
+        self.records
+            .retain(|r| !(r.host.trim().eq_ignore_ascii_case(host.trim()) && r.port == port && same(r.username.as_deref(), username)));
+        if self.records.len() == before {
+            return Ok(false);
+        }
+        self.save()?;
+        Ok(true)
     }
 
     /// Keep at most `max` entries, dropping the oldest (the tail, which is the
@@ -834,6 +860,31 @@ mod tests {
         assert_eq!(list.len(), 3);
         assert_eq!(list[0].host, "host-a");
         assert_eq!(list[0].port, 3390);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn mru_entries_can_be_forgotten() {
+        let path = temp_file("mru-remove");
+        let mut store = MruStore::load_from(path.clone()).unwrap();
+        store.record("pc.lan", 3389, Some("bob".into()), None, "PC", None).unwrap();
+        store.record("pc.lan", 3389, Some("amy".into()), None, "PC", None).unwrap();
+        assert!(store.remove("PC.lan", 3389, Some("Bob")).unwrap());
+        assert!(!store.remove("pc.lan", 3390, Some("amy")).unwrap());
+        let reloaded = MruStore::load_from(path.clone()).unwrap();
+        assert_eq!(reloaded.list_most_recent_first().len(), 1);
+        assert_eq!(reloaded.list_most_recent_first()[0].username.as_deref(), Some("amy"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_saved_password_can_be_replaced_with_none() {
+        let path = temp_file("conn-replace");
+        let mut store = ConnectionStore::load_from(path.clone()).unwrap();
+        let rec = store.upsert(input("PC", "pc.lan", 3389, Some("secret"))).unwrap();
+        assert!(store.replace_password(&rec.id, ProtectedPassword::protect("").unwrap()).unwrap());
+        let reloaded = ConnectionStore::load_from(path.clone()).unwrap();
+        assert_eq!(reloaded.get(&rec.id).unwrap().saved_password.unprotect().unwrap(), "");
         cleanup(&path);
     }
 

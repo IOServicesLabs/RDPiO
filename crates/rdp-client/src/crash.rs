@@ -10,6 +10,8 @@
 
 #![cfg(windows)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::Diagnostics::Debug::{
@@ -57,7 +59,26 @@ unsafe extern "system" fn on_unhandled(info: *const EXCEPTION_POINTERS) -> i32 {
             "FATAL: unhandled native exception — rdpio is crashing (see module/offset for the culprit)"
         );
     }
+    last_words();
     0 // EXCEPTION_CONTINUE_SEARCH: let the OS finish the crash now that we've logged
+}
+
+/// What must still happen if the process dies (a Hyper stream locks the
+/// console it left unlocked): a plain `fn()`, run once, from the crash
+/// filter or the panic hook — keep it to a system call or two.
+static LAST_WORDS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_last_words(f: Option<fn()>) {
+    LAST_WORDS.store(f.map_or(0, |f| f as usize), Ordering::SeqCst);
+}
+
+fn last_words() {
+    let f = LAST_WORDS.swap(0, Ordering::SeqCst);
+    if f != 0 {
+        // SAFETY: only ever stored from a `fn()` in `set_last_words`.
+        let f: fn() = unsafe { std::mem::transmute(f) };
+        f();
+    }
 }
 
 /// Install the process-wide unhandled-exception logger. Call once, right after
@@ -66,4 +87,13 @@ pub fn install() {
     unsafe {
         SetUnhandledExceptionFilter(Some(on_unhandled));
     }
+    // A panic is a crash too where it ends the process (release builds
+    // abort); where it only ends a thread, the stream carries on.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        if cfg!(panic = "abort") {
+            last_words();
+        }
+    }));
 }

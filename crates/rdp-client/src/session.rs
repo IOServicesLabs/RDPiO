@@ -251,6 +251,15 @@ fn note_server_input_flags(share_pdu: &[u8]) {
     }
 }
 
+/// Allow relative mouse capture regardless of server caps — the Hyper stream
+/// carries relative motion itself.
+pub(crate) fn force_rel_mouse() {
+    SERVER_INPUT_FLAGS.fetch_or(
+        0x8000_0000 | rdp_pdu::capabilities::INPUT_FLAG_MOUSE_RELATIVE as u32,
+        Ordering::SeqCst,
+    );
+}
+
 /// Whether the server supports TS_RELPOINTER_EVENT relative mouse input
 /// (INPUT_FLAG_MOUSE_RELATIVE in its Demand Active input caps).
 pub(crate) fn rel_mouse_supported() -> bool {
@@ -2314,6 +2323,9 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                     for command in &out.commands {
                         if let GfxCommand::EndFrame { frame_id } = command {
                             total_frames += 1;
+                            if let Some(m) = metrics.as_ref() {
+                                m.record_frame_received();
+                            }
                             if let Some(ack) = udp_graphics.frame_ack(*frame_id, total_frames, depth)
                             {
                                 let _ = tunnel.send(&ack);
@@ -2632,6 +2644,9 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         for command in &out.commands {
             if let GfxCommand::EndFrame { frame_id } = command {
                 total_frames += 1;
+                if let Some(m) = metrics.as_ref() {
+                    m.record_frame_received();
+                }
                 // `ack_gap_us` is the server-visible frame clock: time since the
                 // previous frame-ack. If it tracks the network inter-frame
                 // interval (~16-33ms) the server is streaming at full rate; if it

@@ -42,6 +42,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 /// [`init_wake_event`] runs. See [`Window::wait_for_work`].
 static WAKE_EVENT: AtomicIsize = AtomicIsize::new(0);
 
+/// Windows made from now on show without taking the focus (the selftest's
+/// motion source, while someone works at the PC).
+pub static SHOW_INACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Create the frame-ready event. Idempotent; called once at startup before the
 /// session worker starts.
 pub fn init_wake_event() {
@@ -87,6 +91,76 @@ static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 /// TS_RELPOINTER_EVENT — motion is sent as raw relative deltas with the local
 /// cursor hidden and recentred, so FPS aiming never pins at a window edge.
 static CAPTURE: AtomicBool = AtomicBool::new(false);
+/// The Hyper stats overlay, toggled with Ctrl+Shift+S.
+static STATS: AtomicBool = AtomicBool::new(false);
+/// In a Hyper session (see [`SystemKeysFollowCapture`]): the reserved system
+/// keys (Win, Alt+Tab, Alt/Ctrl+Esc) go to the host unless Ctrl+Shift+K gave
+/// them to this PC, or the mouse is locked in.
+static SYSTEM_KEYS_NEED_CAPTURE: AtomicBool = AtomicBool::new(false);
+/// Hyper: Ctrl+Shift+K gave the reserved system keys to this PC.
+static SYSTEM_KEYS_LOCAL: AtomicBool = AtomicBool::new(false);
+/// The window property marking a window that is topmost while its app is
+/// active (see `WM_ACTIVATEAPP`): the borderless ones.
+const TOPMOST_PROP: PCWSTR = w!("rdpio.topmost");
+
+/// While alive (a Hyper session), the reserved system keys reach the host
+/// while the stream's window is in front, unless Ctrl+Shift+K gives them back
+/// to this PC (or the mouse is locked in, which takes them regardless).
+/// Ctrl+Alt+Del and Ctrl+Shift+Q always stay here, so a fullscreen stream has
+/// a way out.
+pub struct SystemKeysFollowCapture(bool);
+
+impl SystemKeysFollowCapture {
+    pub fn on() -> Self {
+        Self(SYSTEM_KEYS_NEED_CAPTURE.swap(true, Ordering::SeqCst))
+    }
+}
+
+impl Drop for SystemKeysFollowCapture {
+    fn drop(&mut self) {
+        SYSTEM_KEYS_NEED_CAPTURE.store(self.0, Ordering::SeqCst);
+    }
+}
+
+/// A Win key-down went to the remote side: its key-up goes there too.
+static WIN_REMOTE: AtomicBool = AtomicBool::new(false);
+/// The virtual key of a hotkey consumed on its key-down, whose key-up is
+/// consumed too (0 = none).
+static SWALLOW_UP: AtomicIsize = AtomicIsize::new(0);
+
+/// Whether the reserved system keys go to the remote side right now.
+fn system_keys_remote() -> bool {
+    !SYSTEM_KEYS_NEED_CAPTURE.load(Ordering::SeqCst) || CAPTURE.load(Ordering::SeqCst) || !SYSTEM_KEYS_LOCAL.load(Ordering::SeqCst)
+}
+
+/// Hyper: start with the reserved system keys on this PC (`--hyper-local-keys`;
+/// Ctrl+Shift+K switches).
+pub fn set_system_keys_local(local: bool) {
+    SYSTEM_KEYS_LOCAL.store(local, Ordering::SeqCst);
+}
+
+/// Hyper: whether Win, Alt+Tab and the like go to the host right now.
+pub fn system_keys_to_host() -> bool {
+    system_keys_remote()
+}
+
+/// Whether the stats overlay is on (Ctrl+Shift+S).
+pub fn stats_overlay() -> bool {
+    STATS.load(Ordering::Relaxed)
+}
+
+/// Hyper office mode (crisp text), toggled with Ctrl+Shift+O.
+static OFFICE: AtomicBool = AtomicBool::new(false);
+
+/// Whether Hyper office mode is on (Ctrl+Shift+O).
+pub fn office_mode() -> bool {
+    OFFICE.load(Ordering::Relaxed)
+}
+
+/// Start in office mode (`--hyper-office`) or not.
+pub fn set_office_mode(on: bool) {
+    OFFICE.store(on, Ordering::Relaxed);
+}
 /// Raw-input mouse registration is process-wide and done once.
 static RAW_REGISTERED: AtomicBool = AtomicBool::new(false);
 
@@ -189,6 +263,9 @@ pub enum RawInput {
     /// local keyboard, e.g. when the window regains focus. `toggle_flags` is a
     /// `TS_SYNC_*` mask.
     SyncLockKeys { toggle_flags: u32 },
+    /// The window lost keyboard focus: anything held must be released (keys
+    /// pressed now go to another window, so their key-ups never arrive here).
+    FocusLost,
     /// A multi-touch contact in window client pixels and its contact id. The
     /// caller maps client coordinates to virtual-desktop coordinates and sends
     /// the frame over RDPEI.
@@ -269,31 +346,51 @@ pub fn install_keyboard_hook() {
 /// True when the foreground window is one of ours (matches our window class), so
 /// the hook only captures system keys while the user is actually in the session.
 unsafe fn foreground_is_ours() -> bool {
-    let fg = GetForegroundWindow();
-    if fg.0.is_null() {
+    is_ours(GetForegroundWindow())
+}
+
+/// Whether `hwnd` is one of this process's windows (our window class; another
+/// rdpio's windows have it too).
+unsafe fn is_ours(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32));
+    if pid != std::process::id() {
         return false;
     }
     let mut buf = [0u16; 32];
-    let n = GetClassNameW(fg, &mut buf);
+    let n = GetClassNameW(hwnd, &mut buf);
     n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == "rdpioWindowClass"
 }
 
 /// Low-level keyboard hook procedure: forward the reserved system combos to the
 /// session and swallow them locally; everything else flows through untouched.
 unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && foreground_is_ours() {
+    if code == HC_ACTION as i32 {
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         const VK_TAB: u32 = 0x09;
         const VK_ESCAPE: u32 = 0x1B;
         const VK_LWIN: u32 = 0x5B;
         const VK_RWIN: u32 = 0x5C;
+        let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+        let win = matches!(kb.vkCode, VK_LWIN | VK_RWIN);
         let alt = kb.flags.0 & LLKHF_ALTDOWN.0 != 0;
         let ctrl = (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
-        let capture = matches!(kb.vkCode, VK_LWIN | VK_RWIN)
-            || (kb.vkCode == VK_TAB && alt)
-            || (kb.vkCode == VK_ESCAPE && (alt || ctrl));
-        if capture {
-            let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+        let reserved = win || (kb.vkCode == VK_TAB && alt) || (kb.vkCode == VK_ESCAPE && (alt || ctrl));
+        // A Win key-up goes wherever its key-down went, whatever changed in
+        // between (the lock toggled, the focus moved): else one side keeps it
+        // held down.
+        let remote = if win && !down {
+            WIN_REMOTE.swap(false, Ordering::SeqCst)
+        } else {
+            reserved && system_keys_remote() && foreground_is_ours()
+        };
+        if reserved && remote {
+            if win && down {
+                WIN_REMOTE.store(true, Ordering::SeqCst);
+            }
             push_input(RawInput::Key {
                 scancode: kb.scanCode as u16,
                 extended: kb.flags.0 & LLKHF_EXTENDED.0 != 0,
@@ -418,8 +515,12 @@ impl Window {
                 Some(hinstance),
                 None,
             )?;
+            if ex_style.0 & WS_EX_TOPMOST.0 != 0 {
+                let _ = SetPropW(hwnd, TOPMOST_PROP, Some(HANDLE(1 as *mut c_void)));
+            }
 
-            let _ = ShowWindow(hwnd, SW_SHOW);
+            // (The selftest's window shows without taking the focus.)
+            let _ = ShowWindow(hwnd, if SHOW_INACTIVE.load(Ordering::Relaxed) { SW_SHOWNOACTIVATE } else { SW_SHOW });
             // Get WM_CLIPBOARDUPDATE when the local clipboard changes, so we can
             // re-advertise it to the remote session (clipboard redirection).
             let _ = AddClipboardFormatListener(hwnd);
@@ -454,24 +555,35 @@ impl Window {
     /// arrive and leaves the CPU alone in between. The timeout is only a safety
     /// net for time-based work (frame pacing, the telemetry tick).
     pub fn wait_for_work(&self, timeout_ms: u32) {
+        self.wait_for_work_or(timeout_ms, None);
+    }
+
+    /// [`wait_for_work`](Self::wait_for_work), or until `also` (a raw handle)
+    /// is signalled: whether that's what ended the wait (the wait took its
+    /// signal).
+    pub fn wait_for_work_or(&self, timeout_ms: u32, also: Option<isize>) -> bool {
         let handle = WAKE_EVENT.load(Ordering::Acquire);
         unsafe {
             if handle == 0 {
                 // No event yet (shouldn't happen) — fall back to a short sleep
                 // rather than spinning.
                 std::thread::sleep(std::time::Duration::from_millis(timeout_ms.min(8) as u64));
-                return;
+                return false;
             }
-            let handles = [HANDLE(handle as *mut c_void)];
+            let mut handles = vec![HANDLE(handle as *mut c_void)];
+            if let Some(h) = also {
+                handles.push(HANDLE(h as *mut c_void));
+            }
             // MWMO_INPUTAVAILABLE also returns for messages already queued, so a
             // message that arrived between the pump and this wait can't be
             // missed and stall us for the whole timeout.
-            MsgWaitForMultipleObjectsEx(
+            let r = MsgWaitForMultipleObjectsEx(
                 Some(&handles),
                 timeout_ms,
                 QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE,
             );
+            also.is_some() && r.0 == 1
         }
     }
 
@@ -773,6 +885,7 @@ unsafe fn ensure_raw_mouse(hwnd: HWND) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_DESTROY => {
+            let _ = RemovePropW(hwnd, TOPMOST_PROP);
             let _ = ClipCursor(None);
             PostQuitMessage(0);
             LRESULT(0)
@@ -798,26 +911,54 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
             }
             let down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
-            // Local escape hatch: Ctrl+Shift+Q closes the client. Borderless
-            // spanning/fullscreen windows have no frame or system menu (so Alt+F4
-            // does nothing) and every other key is forwarded to the server, which
-            // otherwise leaves no way to quit. Consumed locally — not forwarded.
-            const VK_Q: usize = 0x51;
-            if down
-                && wparam.0 == VK_Q
-                && (GetKeyState(VK_CONTROL.0 as i32) as i16) < 0
-                && (GetKeyState(VK_SHIFT.0 as i32) as i16) < 0
-            {
-                PostQuitMessage(0);
+            // The key-up of a hotkey consumed below is consumed too: the
+            // remote side never saw its key-down.
+            if !down && wparam.0 as isize == SWALLOW_UP.load(Ordering::Relaxed) {
+                SWALLOW_UP.store(0, Ordering::Relaxed);
                 return LRESULT(0);
             }
-            // Ctrl+Shift+M toggles mouse-capture (game) mode. Consumed locally.
+            // Local hotkeys, consumed here: Ctrl+Shift+Q closes the client
+            // (borderless windows have no frame or system menu, and every other
+            // key is forwarded, which otherwise leaves no way to quit);
+            // Ctrl+Shift+M toggles the mouse lock (game mode); Ctrl+Shift+S the
+            // Hyper stats, Ctrl+Shift+O its office mode and Ctrl+Shift+K where
+            // the system keys go — only in a Hyper session (elsewhere they're
+            // the remote app's own).
+            const VK_Q: usize = 0x51;
+            const VK_S: usize = 0x53;
             const VK_M: usize = 0x4D;
-            if down
-                && wparam.0 == VK_M
-                && (GetKeyState(VK_CONTROL.0 as i32) as i16) < 0
-                && (GetKeyState(VK_SHIFT.0 as i32) as i16) < 0
-            {
+            const VK_O: usize = 0x4F;
+            const VK_K: usize = 0x4B;
+            let hotkey = matches!(wparam.0, VK_Q | VK_M)
+                || (matches!(wparam.0, VK_S | VK_O | VK_K) && SYSTEM_KEYS_NEED_CAPTURE.load(Ordering::SeqCst));
+            if down && hotkey && (GetKeyState(VK_CONTROL.0 as i32) as i16) < 0 && (GetKeyState(VK_SHIFT.0 as i32) as i16) < 0 {
+                SWALLOW_UP.store(wparam.0 as isize, Ordering::Relaxed);
+                // A fresh press acts, auto-repeat doesn't (holding Ctrl+Shift+M
+                // would flip the lock back and forth).
+                if (lparam.0 & (1 << 30)) != 0 {
+                    return LRESULT(0);
+                }
+                if wparam.0 == VK_Q {
+                    PostQuitMessage(0);
+                    return LRESULT(0);
+                }
+                if wparam.0 == VK_S {
+                    let on = !STATS.load(Ordering::Relaxed);
+                    STATS.store(on, Ordering::Relaxed);
+                    signal_frame();
+                    return LRESULT(0);
+                }
+                if wparam.0 == VK_O {
+                    OFFICE.fetch_xor(true, Ordering::Relaxed);
+                    signal_frame();
+                    return LRESULT(0);
+                }
+                if wparam.0 == VK_K {
+                    let local = !SYSTEM_KEYS_LOCAL.fetch_xor(true, Ordering::SeqCst);
+                    tracing::info!(to = if local { "this PC" } else { "the host" }, "Win, Alt+Tab and Ctrl+Esc (Ctrl+Shift+K)");
+                    signal_frame();
+                    return LRESULT(0);
+                }
                 let on = !CAPTURE.load(Ordering::SeqCst);
                 CAPTURE.store(on, Ordering::SeqCst);
                 if on {
@@ -838,11 +979,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 );
                 return LRESULT(0);
             }
+            // In a Hyper session the Win keys that reach this window are this
+            // PC's (the remote side's go through the keyboard hook): forwarding
+            // them too would open both Start menus.
+            const VK_LWIN_KEY: usize = 0x5B;
+            const VK_RWIN_KEY: usize = 0x5C;
+            if matches!(wparam.0, VK_LWIN_KEY | VK_RWIN_KEY) && SYSTEM_KEYS_NEED_CAPTURE.load(Ordering::SeqCst) {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
             push_input(RawInput::Key {
                 scancode: ((lparam.0 >> 16) & 0xff) as u16,
                 extended: (lparam.0 & (1 << 24)) != 0,
                 down,
             });
+            // A Hyper session with the system keys at the host: Alt+F4 and
+            // Alt+Space are the host app's, not this window's (closing it
+            // would end the stream).
+            const VK_F4_KEY: usize = 0x73;
+            const VK_SPACE_KEY: usize = 0x20;
+            if matches!(msg, WM_SYSKEYDOWN | WM_SYSKEYUP)
+                && matches!(wparam.0, VK_F4_KEY | VK_SPACE_KEY)
+                && SYSTEM_KEYS_NEED_CAPTURE.load(Ordering::SeqCst)
+                && system_keys_remote()
+            {
+                return LRESULT(0);
+            }
             // System keys still reach DefWindowProc so Alt+F4 etc. work locally;
             // ordinary keys are consumed (forwarded to the remote session).
             if matches!(msg, WM_SYSKEYDOWN | WM_SYSKEYUP) {
@@ -1011,11 +1172,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // MSDN: an application that processes WM_TOUCH returns zero.
             LRESULT(0)
         }
+        WM_ACTIVATEAPP => {
+            // A borderless window is topmost, to cover the taskbar — which
+            // would also keep it over whatever the user switches to (another
+            // app, Task Manager, Start). While another app is active it sits
+            // just under that app's window — at the bottom when there's none
+            // to name — and it's topmost again once ours is active. (Every one
+            // of our windows gets this, so per-monitor windows move together.)
+            if !GetPropW(hwnd, TOPMOST_PROP).is_invalid() {
+                let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+                if wparam.0 != 0 {
+                    let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+                } else {
+                    // (By now the other app's window is the foreground one.)
+                    let next = GetForegroundWindow();
+                    if next.0.is_null() {
+                        let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, flags);
+                    } else if !is_ours(next) {
+                        let _ = SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags);
+                        if (GetWindowLongPtrW(next, GWL_EXSTYLE) as u32) & WS_EX_TOPMOST.0 == 0 {
+                            let _ = SetWindowPos(hwnd, Some(next), 0, 0, 0, 0, flags);
+                        }
+                    }
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_KILLFOCUS => {
             // Never hold the cursor hostage while another window has focus.
             if CAPTURE.load(Ordering::SeqCst) {
                 let _ = ClipCursor(None);
             }
+            push_input(RawInput::FocusLost);
             LRESULT(0)
         }
         WM_MOVE => {
@@ -1094,7 +1282,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if (lparam.0 & 0xffff) as u32 == HTCLIENT {
                 // Relative capture: the local cursor is a parked artifact —
                 // hide it (the remote cursor is what the game shows, if any).
-                if CAPTURE.load(Ordering::SeqCst) && crate::session::rel_mouse_supported() {
+                // (Only while it's ours to hide: over a window in the background
+                // the user needs to see the pointer.)
+                if CAPTURE.load(Ordering::SeqCst) && crate::session::rel_mouse_supported() && GetForegroundWindow() == hwnd {
                     let _ = SetCursor(Some(HCURSOR::default()));
                     return LRESULT(1);
                 }

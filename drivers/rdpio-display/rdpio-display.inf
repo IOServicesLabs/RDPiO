@@ -1,0 +1,68 @@
+;
+; rdpio-display.inf - rdpio Display, the Hyper virtual display (IddCx).
+;
+
+[Version]
+PnpLockDown=1
+Signature="$Windows NT$"
+ClassGUID={4D36E968-E325-11CE-BFC1-08002BE10318}
+Class=Display
+ClassVer=2.0
+Provider=%ManufacturerName%
+CatalogFile=rdpio-display.cat
+DriverVer=
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$.10.0...22000
+
+[Standard.NT$ARCH$.10.0...22000]
+%DeviceName%=RdpioDisplay_Install, Root\RdpioDisplay
+
+[SourceDisksFiles]
+rdpio-display.dll=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[RdpioDisplay_Install.NT]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT
+CopyFiles=UMDriverCopy
+
+[RdpioDisplay_Install.NT.hw]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.HW
+AddReg=RdpioDisplay_HardwareDeviceSettings
+
+[RdpioDisplay_HardwareDeviceSettings]
+HKR,,"UpperFilters",%REG_MULTI_SZ%,"IndirectKmd"
+HKR,"WUDF","DeviceGroupId",%REG_SZ%,"rdpioDisplayGroup"
+; Only SYSTEM (the Hyper agent) and Administrators may open the device.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[RdpioDisplay_Install.NT.Services]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.Services
+
+[RdpioDisplay_Install.NT.Wdf]
+UmdfService=rdpioDisplay,rdpioDisplay_Install
+UmdfServiceOrder=rdpioDisplay
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+
+[rdpioDisplay_Install]
+UmdfLibraryVersion=$UMDFVERSION$
+ServiceBinary=%12%\UMDF\rdpio-display.dll
+UmdfExtensions=IddCx0102
+
+[DestinationDirs]
+UMDriverCopy=12,UMDF
+
+[UMDriverCopy]
+rdpio-display.dll
+
+[Strings]
+ManufacturerName="rdpio"
+DiskName="rdpio Display Installation Disk"
+DeviceName="rdpio Display"
+REG_MULTI_SZ=0x00010000
+REG_SZ=0x00000000

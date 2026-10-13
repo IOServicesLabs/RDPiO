@@ -70,52 +70,74 @@ pub fn nv12_to_rgba(
     height: usize,
     stride: usize,
 ) -> Option<Vec<u8>> {
-    if stride < width || y_plane.len() < stride * height {
-        return None;
-    }
-    if uv_plane.len() < stride * (height / 2) {
-        return None;
-    }
+    let mut out = Vec::new();
+    nv12_to_rgba_into(y_plane, uv_plane, width, height, stride, &mut out, 1).then_some(out)
+}
 
-    let mut out = vec![0u8; width * height * 4];
-    for y in 0..height {
-        let y_row = y * stride;
-        let uv_row = (y / 2) * stride;
+/// [`nv12_to_rgba`] into `out` (sized to `width * height * 4`, reusing its
+/// allocation), with the rows shared out over up to `threads` threads: for a
+/// whole video frame every refresh, on a PC whose GPU can't convert it.
+/// `false` (and `out` untouched) if the planes are too small.
+pub fn nv12_to_rgba_into(
+    y_plane: &[u8],
+    uv_plane: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    out: &mut Vec<u8>,
+    threads: usize,
+) -> bool {
+    // Each row reads `width` luma bytes and its chroma row's `width` rounded
+    // up to whole U,V pairs.
+    let uv_rows = height.div_ceil(2);
+    let uv_need = if uv_rows == 0 { 0 } else { (uv_rows - 1) * stride + width.div_ceil(2) * 2 };
+    if stride < width || y_plane.len() < stride * height || uv_plane.len() < uv_need {
+        return false;
+    }
+    let row_bytes = width * 4;
+    out.resize(row_bytes * height, 0);
+    if row_bytes == 0 || height == 0 {
+        return true;
+    }
+    let rows = height.div_ceil(threads.clamp(1, height));
+    std::thread::scope(|s| {
+        let mut chunks = out.chunks_mut(rows * row_bytes).enumerate();
+        // The first share runs here: one thread fewer to start.
+        let first = chunks.next();
+        for (i, chunk) in chunks {
+            s.spawn(move || nv12_rows_to_rgba(y_plane, uv_plane, width, stride, i * rows, chunk));
+        }
+        if let Some((_, chunk)) = first {
+            nv12_rows_to_rgba(y_plane, uv_plane, width, stride, 0, chunk);
+        }
+    });
+    true
+}
+
+/// Rows `first..` of an NV12 frame (as many as `out` holds) to RGBA. The
+/// caller has checked the planes are big enough.
+fn nv12_rows_to_rgba(y_plane: &[u8], uv_plane: &[u8], width: usize, stride: usize, first: usize, out: &mut [u8]) {
+    for (r, dst) in out.chunks_exact_mut(width * 4).enumerate() {
+        let y = first + r;
+        let yr = &y_plane[y * stride..][..width];
+        let uvr = &uv_plane[(y / 2) * stride..][..width.div_ceil(2) * 2];
         let mut x = 0usize;
         // SIMD 4-pixel chunks. x stays even, so each chunk spans two UV pairs.
         while x + 4 <= width {
-            let yy = i32x4::new([
-                y_plane[y_row + x] as i32,
-                y_plane[y_row + x + 1] as i32,
-                y_plane[y_row + x + 2] as i32,
-                y_plane[y_row + x + 3] as i32,
-            ]);
-            let uv_x = x & !1;
-            let u0 = uv_plane[uv_row + uv_x] as i32;
-            let v0 = uv_plane[uv_row + uv_x + 1] as i32;
-            let u1 = uv_plane[uv_row + uv_x + 2] as i32;
-            let v1 = uv_plane[uv_row + uv_x + 3] as i32;
+            let yy = i32x4::new([yr[x] as i32, yr[x + 1] as i32, yr[x + 2] as i32, yr[x + 3] as i32]);
+            let (u0, v0, u1, v1) = (uvr[x] as i32, uvr[x + 1] as i32, uvr[x + 2] as i32, uvr[x + 3] as i32);
             let u = i32x4::new([u0, u0, u1, u1]);
             let v = i32x4::new([v0, v0, v1, v1]);
-            let di = (y * width + x) * 4;
-            out[di..di + 16].copy_from_slice(&yuv_to_rgba_4x(yy, u, v));
+            dst[x * 4..x * 4 + 16].copy_from_slice(&yuv_to_rgba_4x(yy, u, v));
             x += 4;
         }
         // Scalar tail (also handles widths < 4).
         for x in x..width {
-            let yy = y_plane[y_row + x] as i32;
             let uv_x = x & !1;
-            let u = uv_plane[uv_row + uv_x] as i32;
-            let v = uv_plane[uv_row + uv_x + 1] as i32;
-            let (r, g, b) = yuv_to_rgb(yy, u, v);
-            let di = (y * width + x) * 4;
-            out[di] = r;
-            out[di + 1] = g;
-            out[di + 2] = b;
-            out[di + 3] = 0xFF;
+            let (r, g, b) = yuv_to_rgb(yr[x] as i32, uvr[uv_x] as i32, uvr[uv_x + 1] as i32);
+            dst[x * 4..x * 4 + 4].copy_from_slice(&[r, g, b, 0xFF]);
         }
     }
-    Some(out)
 }
 
 /// Repack a strided NV12 buffer (as a hardware/MFT decoder emits it) into a
@@ -391,6 +413,37 @@ mod tests {
     #[test]
     fn rejects_short_planes() {
         assert!(nv12_to_rgba(&[0u8; 3], &[0u8; 8], 4, 4, 4).is_none());
+        // An odd height still needs its last chroma row.
+        assert!(nv12_to_rgba(&[0u8; 12], &[0u8; 4], 4, 3, 4).is_none());
+        assert!(nv12_to_rgba(&[0u8; 12], &[0u8; 8], 4, 3, 4).is_some());
+    }
+
+    /// Splitting the rows over threads changes nothing, for any split: odd
+    /// widths and heights, shares that don't divide evenly, more threads
+    /// than rows. The buffer is reused across sizes.
+    #[test]
+    fn threaded_conversion_matches_the_plain_one() {
+        let mut out = Vec::new();
+        for &(w, h, stride) in &[(642usize, 362usize, 648usize), (7, 5, 8), (1, 1, 2), (64, 2, 64)] {
+            let mut seed = 0x9E37_79B9u32;
+            let mut noise = |n: usize| {
+                (0..n)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        (seed >> 24) as u8
+                    })
+                    .collect::<Vec<u8>>()
+            };
+            let y = noise(stride * h);
+            let uv = noise(stride * h.div_ceil(2));
+            let plain = nv12_to_rgba(&y, &uv, w, h, stride).unwrap();
+            for threads in [1, 2, 3, 7, 16, 1000] {
+                assert!(nv12_to_rgba_into(&y, &uv, w, h, stride, &mut out, threads));
+                assert!(out == plain, "{w}x{h} stride {stride}, {threads} threads");
+            }
+        }
     }
 
     #[test]

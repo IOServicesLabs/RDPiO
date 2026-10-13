@@ -1,0 +1,16 @@
+[package]
+name = "rdp-hyper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hyper Accelerator: rdpio's low-latency game-streaming protocol (UDP, FEC, AEAD)"
+
+[dependencies]
+ring = "0.17"
+# Password-authenticated key exchange for direct mode (no RDP sign-in).
+spake2 = "0.4"
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+thiserror.workspace = true

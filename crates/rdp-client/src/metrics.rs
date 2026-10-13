@@ -20,6 +20,10 @@ pub struct Metrics {
     rtt_us: Mutex<Vec<u64>>,
 
     // Counters.
+    /// Frames the server finished sending (EndFrame), counted on the network
+    /// thread: the host's real frame rate, independent of the local display's
+    /// refresh rate (which caps `frames_presented` under vsync).
+    frames_received: AtomicU64,
     frames_decoded: AtomicU64,
     frames_presented: AtomicU64,
     blits_submitted: AtomicU64,
@@ -35,6 +39,10 @@ impl Metrics {
     pub fn record_decode_us(&self, us: u64) {
         self.decode_us.lock().unwrap().push(us);
         self.frames_decoded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_frame_received(&self) {
+        self.frames_received.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_present_us(&self, us: u64) {
@@ -89,6 +97,7 @@ impl Metrics {
             present_p999: percentile(&present, 0.999),
             frame_interval_p50: percentile(&frame_interval, 0.50),
             frame_interval_p99: percentile(&frame_interval, 0.99),
+            frames_received: self.frames_received.swap(0, Ordering::Relaxed),
             frames_decoded: self.frames_decoded.swap(0, Ordering::Relaxed),
             frames_presented: self.frames_presented.swap(0, Ordering::Relaxed),
             blits_submitted: self.blits_submitted.swap(0, Ordering::Relaxed),
@@ -114,6 +123,7 @@ pub struct MetricsReport {
     pub present_p999: u64,
     pub frame_interval_p50: u64,
     pub frame_interval_p99: u64,
+    pub frames_received: u64,
     pub frames_decoded: u64,
     pub frames_presented: u64,
     pub blits_submitted: u64,
@@ -131,6 +141,7 @@ impl MetricsReport {
     /// True if any frames were observed in this window.
     pub fn has_data(&self) -> bool {
         self.frames_decoded > 0
+            || self.frames_received > 0
             || self.frames_presented > 0
             || self.allocations > 0
             || self.network_rx_bytes > 0
@@ -138,14 +149,17 @@ impl MetricsReport {
     }
 
     /// Format the report as a concise one-line summary.
-    pub fn summary(&self) -> String {
+    pub fn summary(&self, window: std::time::Duration) -> String {
+        let secs = window.as_secs_f64().max(0.001);
+        let host_fps = self.frames_received as f64 / secs;
+        let shown_fps = self.frames_presented as f64 / secs;
         let fps = if self.frame_interval_p50 > 0 {
             1_000_000.0 / self.frame_interval_p50 as f64
         } else {
             0.0
         };
         format!(
-            "metrics: fps={fps:.1} dec={}/{}/{}us present={}/{}/{}us interval={}/{}us blits={} allocs={}/{}MB gpu={}/{}us rtt={}/{}us net={}/{}MB",
+            "metrics: host_fps={host_fps:.1} shown_fps={shown_fps:.1} fps={fps:.1} dec={}/{}/{}us present={}/{}/{}us interval={}/{}us blits={} allocs={}/{}MB gpu={}/{}us rtt={}/{}us net={}/{}MB",
             self.decode_p50,
             self.decode_p99,
             self.decode_p999,

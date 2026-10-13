@@ -47,6 +47,8 @@ webpki-roots = "0.26"
 # The Teams-native engine runs on libwebrtc (what Microsoft's own add-in uses);
 # `features = ["engine"]` would select the older webrtc-rs engine instead.
 rdp-webrtc = { path = "../rdp-webrtc", features = ["libwebrtc"] }
+# Hyper Accelerator protocol (`--hyper` / `--hyper-host`).
+rdp-hyper.workspace = true
 # Teams-native call audio: Opus decode (remote → speakers) and encode (mic →
 # call), via the official libopus (built from source; see .cargo/config.toml).
 opus = "0.3"
@@ -101,6 +103,32 @@ windows = { workspace = true, features = [
     # FileTimeToLocalFileTime/FileTimeToSystemTime for the UTC->local conversion.
     "Win32_Globalization",
     "Win32_System_Time",
+    # Hyper host agent: lock the PC after streaming; QPC timestamps.
+    "Win32_System_Shutdown",
+    # Hyper direct mode: the service and its SYSTEM console agent.
+    "Win32_System_Services",
+    "Win32_Devices_Display",
+    "Win32_Security",
+    # WASAPI device names (PKEY_Device_FriendlyName → string).
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Performance",
+    # Hyper streams: Wi-Fi media streaming mode + QoS marking (net_tune.rs).
+    "Win32_NetworkManagement_WiFi",
+    "Win32_NetworkManagement_QoS",
+    # Hyper streams keep the display and system awake (net_tune::KeepAwake).
+    "Win32_System_Power",
+    # The launcher: Mica and a themed title bar, the elevated copy's pipe,
+    # the Windows theme, this PC's GPU name.
+    "Win32_Graphics_Dwm",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    # The virtual display: finding, installing and talking to its driver.
+    "Win32_Devices_DeviceAndDriverInstallation",
 ] }
 
 [build-dependencies]

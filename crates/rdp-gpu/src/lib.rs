@@ -20,8 +20,17 @@ mod backend;
 #[cfg(windows)]
 pub use backend::{Backend, Renderer};
 
+/// Which GPU renderers decode and present on: the fastest, or the one the
+/// display is attached to (on battery).
+#[cfg(windows)]
+pub mod gpu {
+    pub use crate::d3d11::{chosen_adapter_luid, device_adapter_luid, prefer_display_adapter, prefers_display_adapter};
+}
+
 #[cfg(windows)]
 pub mod h264;
+#[cfg(windows)]
+pub mod hyper;
 
 #[cfg(not(windows))]
 mod stub;
@@ -58,4 +67,45 @@ pub enum Upscaler {
     /// The video processor's plain bilinear scale. Soft but completely artifact-
     /// free; also the automatic fallback when the shader upscalers can't be built.
     Bilinear,
+}
+
+/// Where a `src`-sized picture goes in a `dst`-sized window when its aspect
+/// ratio is kept: the largest such rectangle, centred, as `(x, y, w, h)`.
+/// Within 2 px of the whole window it is the whole window (no hairline bars
+/// from rounding).
+pub fn fit_rect(src: (u32, u32), dst: (u32, u32)) -> (u32, u32, u32, u32) {
+    let ((sw, sh), (dw, dh)) = (src, dst);
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return (0, 0, dw, dh);
+    }
+    let scale = (dw as f64 / sw as f64).min(dh as f64 / sh as f64);
+    let w = ((sw as f64 * scale).round() as u32).clamp(1, dw);
+    let h = ((sh as f64 * scale).round() as u32).clamp(1, dh);
+    if dw - w <= 2 && dh - h <= 2 {
+        return (0, 0, dw, dh);
+    }
+    ((dw - w) / 2, (dh - h) / 2, w, h)
+}
+
+#[cfg(test)]
+mod fit_rect_tests {
+    use super::fit_rect;
+
+    #[test]
+    fn a_picture_keeps_its_shape_in_any_window() {
+        // Same shape: the whole window, scaled or not.
+        assert_eq!(fit_rect((2560, 1440), (1920, 1080)), (0, 0, 1920, 1080));
+        assert_eq!(fit_rect((1920, 1080), (1920, 1080)), (0, 0, 1920, 1080));
+        // 16:9 on a 3:2 laptop: full width, bars above and below — 1:1 when
+        // the host already scaled it to that width.
+        assert_eq!(fit_rect((2256, 1268), (2256, 1504)), (0, 118, 2256, 1268));
+        assert_eq!(fit_rect((1920, 1080), (2256, 1504)), (0, 117, 2256, 1269));
+        // A portrait picture on a landscape screen: bars left and right.
+        assert_eq!(fit_rect((1080, 1920), (1920, 1080)), (656, 0, 608, 1080));
+        // Rounding doesn't leave a hairline.
+        assert_eq!(fit_rect((1366, 768), (1920, 1080)), (0, 0, 1920, 1080));
+        // Degenerate sizes: the whole window.
+        assert_eq!(fit_rect((0, 0), (800, 600)), (0, 0, 800, 600));
+        assert_eq!(fit_rect((800, 600), (0, 0)), (0, 0, 0, 0));
+    }
 }

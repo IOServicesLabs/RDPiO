@@ -37,7 +37,11 @@ pub fn read_password(prompt: &str) -> io::Result<String> {
         }
         eprintln!(); // echo the newline the user's (hidden) Enter didn't show
     }
-    read?;
+    // End of input (stdin redirected or closed) isn't an answer: an empty one
+    // must have been typed.
+    if read? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no input: run this from an interactive console"));
+    }
 
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
@@ -47,6 +51,8 @@ pub fn read_password(prompt: &str) -> io::Result<String> {
     eprint!("{prompt}");
     io::stderr().flush()?;
     let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
+    if io::stdin().lock().read_line(&mut line)? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no input: run this from an interactive console"));
+    }
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
