@@ -261,13 +261,14 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert_eq!(read_payload, (0..BYTES).map(|i| (i % 251) as u8).collect::<Vec<_>>());
-        // Loopback should move 8 MiB in well under a second; the real value on a
-        // modern desktop is usually tens of GB/s, but be lenient on CI/sandbox.
+        // Loopback moves 8 MiB in well under a second (GB/s on a desktop), but a
+        // shared CI runner on a debug build has measured 49 MB/s: the floor only
+        // catches a collapse (a stall per operation), not a slow machine.
         let seconds = elapsed.as_secs_f64();
         let mb = ((BYTES * 2) as f64) / (1024.0 * 1024.0);
         let mbps = mb / seconds.max(0.001);
         assert!(
-            mbps > 50.0,
+            mbps > 5.0,
             "IOCP loopback throughput too low: {:.1} MB/s over {:.3}s",
             mbps,
             seconds
