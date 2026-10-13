@@ -1155,7 +1155,7 @@ struct Args {
     hyper_keep_monitors: bool,
     /// Client: force a codec (`--hyper-codec h264|hevc`); default HEVC when this
     /// machine decodes it, else H.264.
-    hyper_codec: Option<rdp_gpu::h264::Codec>,
+    hyper_codec: Option<HyperCodec>,
     /// Client: present Hyper frames on vblank (`--hyper-vsync`) instead of
     /// immediately.
     hyper_vsync: bool,
@@ -1409,7 +1409,12 @@ impl Args {
                     let _ = it.next();
                 }
                 "--hyper-codec" => {
-                    args.hyper_codec = it.next().and_then(|v| rdp_gpu::h264::Codec::from_name(&v.to_ascii_lowercase()));
+                    #[cfg(windows)]
+                    {
+                        args.hyper_codec = it.next().and_then(|v| rdp_gpu::h264::Codec::from_name(&v.to_ascii_lowercase()));
+                    }
+                    #[cfg(not(windows))]
+                    let _ = it.next();
                 }
                 "--hyper-set-password" | "--hyper-service-install" | "--hyper-service-uninstall" | "--hyper-service"
                 | "--hyper-display-install" | "--hyper-display-uninstall"
@@ -1872,6 +1877,11 @@ mod udp;
 // client, `--hyper-host` agent on the host).
 #[cfg(windows)]
 mod hyper_client;
+/// `--hyper-codec`'s value (Hyper is Windows-only: nothing elsewhere).
+#[cfg(windows)]
+type HyperCodec = rdp_gpu::h264::Codec;
+#[cfg(not(windows))]
+type HyperCodec = ();
 #[cfg(windows)]
 mod updater;
 #[cfg(windows)]
@@ -1880,7 +1890,9 @@ mod hyper_audio;
 mod hyper_direct;
 #[cfg(windows)]
 mod hyper_link;
+#[cfg(windows)]
 mod net_tune;
+#[cfg(windows)]
 mod udp_batch;
 #[cfg(windows)]
 mod hyper_clipboard;

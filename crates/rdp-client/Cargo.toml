@@ -30,6 +30,9 @@ tungstenite.workspace = true
 url.workspace = true
 http.workspace = true
 mimalloc.workspace = true
+# Hyper Accelerator protocol (`--hyper` / `--hyper-host`): pure Rust, so on
+# every platform (its Windows ends are cfg'd).
+rdp-hyper.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 # Linux/Unix TLS for the RDP Enhanced Security path (SChannel's counterpart).
@@ -47,8 +50,6 @@ webpki-roots = "0.26"
 # The Teams-native engine runs on libwebrtc (what Microsoft's own add-in uses);
 # `features = ["engine"]` would select the older webrtc-rs engine instead.
 rdp-webrtc = { path = "../rdp-webrtc", features = ["libwebrtc"] }
-# Hyper Accelerator protocol (`--hyper` / `--hyper-host`).
-rdp-hyper.workspace = true
 # Teams-native call audio: Opus decode (remote → speakers) and encode (mic →
 # call), via the official libopus (built from source; see .cargo/config.toml).
 opus = "0.3"
