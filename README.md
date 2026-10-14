@@ -10,15 +10,47 @@ printer), and can ride a low-latency UDP side-band transport.
 
 ---
 
+## Quick install
+
+**Windows**: one line in PowerShell. No admin needed.
+
+```powershell
+irm https://raw.githubusercontent.com/IOServicesLabs/RDPiO/main/install.ps1 | iex
+```
+
+It installs the latest release to `%LOCALAPPDATA%\Programs\rdpio`, adds a
+Start menu shortcut and puts `rdpio` on your PATH, then opens the launcher.
+From then on rdpio keeps itself up to date (signed releases; see
+[Updates](docs/hyper.md#updates-and-versions)). For nightly builds, run
+`$env:RDPIO_CHANNEL='nightly'` first. [install.ps1](install.ps1) shows the
+other options.
+
+**Or just the exe**, with `curl` (built into Windows 10 and 11, from Command
+Prompt or PowerShell):
+
+```bat
+curl.exe -LO https://github.com/IOServicesLabs/RDPiO/releases/latest/download/rdpio.exe
+curl.exe -LO https://github.com/IOServicesLabs/RDPiO/releases/latest/download/rdpio.exe.update
+rdpio.exe
+```
+
+Keep `rdpio.exe.update` beside the exe. It's the release's signed manifest,
+and a Hyper host needs it to pass updates on to the devices that connect.
+
+**To stream this PC to your other devices** (Hyper): in the launcher, open
+**This PC** and choose **Set up Hyper**. Then add a **Hyper Direct**
+connection on the laptop. The full walkthrough is in
+[docs/hyper.md](docs/hyper.md).
+
 ## Quick start
 
 Copy-paste one of these. Swap `192.168.1.50` / `alice` / the password for your
 own — the only required argument is `--host`.
 
-**Windows** — download the latest build and connect:
+**Windows**: download the latest release and connect:
 
 ```powershell
-irm https://github.com/IOServicesLabs/RDPiO/releases/download/nightly/rdpio-windows-x86_64.zip -OutFile rdpio.zip
+irm https://github.com/IOServicesLabs/RDPiO/releases/latest/download/rdpio-windows-x86_64.zip -OutFile rdpio.zip
 Expand-Archive rdpio.zip -DestinationPath . -Force
 .\rdpio-windows-x86_64\rdpio.exe --host 192.168.1.50 --user alice --password 'hunter2' --insecure
 ```
@@ -26,7 +58,7 @@ Expand-Archive rdpio.zip -DestinationPath . -Force
 **Linux** — same, but headless (it runs the protocol and logs frames; no window yet):
 
 ```bash
-curl -L https://github.com/IOServicesLabs/RDPiO/releases/download/nightly/rdpio-linux-x86_64.tar.gz | tar xz
+curl -L https://github.com/IOServicesLabs/RDPiO/releases/latest/download/rdpio-linux-x86_64.tar.gz | tar xz
 RUST_LOG=info ./rdpio-linux-x86_64/rdpio --host 192.168.1.50 --user alice --password 'hunter2'
 ```
 
