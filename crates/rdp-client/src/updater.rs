@@ -144,12 +144,25 @@ fn remove_package(exe: &Path) {
     let _ = std::fs::remove_file(sidecar(exe));
 }
 
+/// A process of ours started detached from any console: no window of its
+/// own, and none of ours to inherit. The launcher has let its console go
+/// (`FreeConsole`), and handing a child those dead standard handles fails
+/// the start ("the handle is invalid").
+pub fn detached(exe: &Path) -> std::process::Command {
+    use std::os::windows::process::CommandExt as _;
+    use std::process::Stdio;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 /// Install a staged package over this rdpio, then run `then` (arguments for
 /// the new exe; `None`: nothing). Call, then exit: the new exe waits for this
 /// process to end.
 pub fn install(staged_exe: &Path, then: Option<Vec<OsString>>) -> std::io::Result<()> {
     let target = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(staged_exe);
+    let mut cmd = detached(staged_exe);
     cmd.arg("--finish-update").arg("--target").arg(&target).arg("--wait").arg(std::process::id().to_string());
     if let Some(args) = then {
         cmd.arg("--then").args(args);
@@ -205,7 +218,7 @@ pub fn finish_update(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         Err(e) => return Err(format!("couldn't put the update in place at {}: {e}", target.display()).into()),
     }
     if let (false, Some(args)) = (elevated, then) {
-        std::process::Command::new(&target).args(args).spawn()?;
+        detached(&target).args(args).spawn()?;
     }
     Ok(())
 }
@@ -433,6 +446,31 @@ mod tests {
     #[test]
     fn the_manifest_sits_beside_the_exe() {
         assert_eq!(sidecar(Path::new(r"C:\x\rdpio.exe")), PathBuf::from(r"C:\x\rdpio.exe.update"));
+    }
+
+    /// The launcher lets its console go; its standard handles are then dead,
+    /// and a child that inherits them doesn't start. (Swaps this process's
+    /// handles for a moment: run alone.)
+    /// `cargo test -p rdp-client --bin rdpio dead_console -- --ignored --test-threads 1`
+    #[test]
+    #[ignore]
+    fn starts_from_a_process_whose_console_is_gone() {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+        let cmd = crate::hyper_direct::system_tool("cmd.exe");
+        let kinds = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+        let saved: Vec<HANDLE> = kinds.iter().map(|k| unsafe { GetStdHandle(*k) }.unwrap_or_default()).collect();
+        for k in kinds {
+            unsafe { SetStdHandle(k, HANDLE(0x1ee4 as *mut _)) }.unwrap();
+        }
+        let inherited = std::process::Command::new(&cmd).args(["/c", "exit"]).status();
+        let detached = detached(&cmd).args(["/c", "exit"]).status();
+        for (k, h) in kinds.iter().zip(saved) {
+            unsafe { SetStdHandle(*k, h) }.unwrap();
+        }
+        println!("inheriting dead handles: {inherited:?}");
+        println!("detached: {detached:?}");
+        assert!(matches!(detached, Ok(s) if s.success()));
     }
 
     #[test]

@@ -1201,7 +1201,7 @@ fn install_update(hwnd: HWND) {
         if crate::updater::replaced_by_newer().is_some() {
             // Already in place: just start it.
             if let Ok(exe) = std::env::current_exe() {
-                if std::process::Command::new(exe).spawn().is_ok() {
+                if crate::updater::detached(&exe).spawn().is_ok() {
                     unsafe {
                         let _ = PostMessageW(Some(HWND(owner as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0));
                     }
