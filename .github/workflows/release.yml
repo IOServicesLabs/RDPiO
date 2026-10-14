@@ -86,6 +86,53 @@ jobs:
             echo "::error::tag ${GITHUB_REF#refs/tags/} but Cargo.toml says $version"; exit 1
           fi
 
+      # Authenticode: Windows shows the verified publisher (no SmartScreen
+      # "unknown publisher" warning, a verified UAC prompt). Azure Artifact
+      # Signing, set up with the repository variables ARTIFACT_SIGNING_ENDPOINT,
+      # ARTIFACT_SIGNING_ACCOUNT and ARTIFACT_SIGNING_PROFILE and the secrets
+      # AZURE_TENANT_ID, AZURE_CLIENT_ID and AZURE_CLIENT_SECRET. Until then
+      # (and on pull requests) the exe goes out unsigned. Before the update
+      # manifest below: that hashes the exe as published.
+      - name: Check for Authenticode signing
+        id: authenticode
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          HAS_SECRET: ${{ secrets.AZURE_CLIENT_SECRET != '' }}
+          HAS_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT != '' }}
+        run: |
+          if [[ "$HAS_SECRET" == "true" && "$HAS_ACCOUNT" == "true" && "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+              echo "::warning::Authenticode signing isn't set up (see docs/signing.md): rdpio.exe goes out unsigned"
+            fi
+          fi
+
+      - name: Authenticode-sign rdpio.exe
+        if: steps.authenticode.outputs.enabled == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          files: ${{ github.workspace }}\target\${{ matrix.target }}\release\${{ matrix.bin }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Check the Authenticode signature
+        if: steps.authenticode.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          if ($sig.Status -ne 'Valid') { Write-Output "::error::rdpio.exe signature: $($sig.Status) $($sig.StatusMessage)"; exit 1 }
+          Write-Output "Signed by: $($sig.SignerCertificate.Subject)"
+
       # The update manifest (rdpio.exe.update): version, build, hash and
       # protocols, signed with the release key. rdpio installs an update —
       # from GitHub or handed over by a host — only with a valid one.
