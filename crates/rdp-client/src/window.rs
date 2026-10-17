@@ -78,6 +78,13 @@ pub fn signal_frame() {
 static PENDING_RESIZE: AtomicU32 = AtomicU32::new(0);
 /// Set when a `WM_QUIT` is observed.
 static QUIT: AtomicBool = AtomicBool::new(false);
+/// Set when the machine resumes from sleep (`WM_POWERBROADCAST`).
+static RESUMED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the machine resumed from sleep since the last call (clears the flag).
+pub fn take_resumed() -> bool {
+    RESUMED.swap(false, Ordering::SeqCst)
+}
 /// Input events captured in the window procedure, drained by the UI loop.
 static INPUT_QUEUE: Mutex<Vec<RawInput>> = Mutex::new(Vec::new());
 /// The current server cursor (HCURSOR as isize; 0 = none → default arrow). The
@@ -1197,6 +1204,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_POWERBROADCAST => {
+            // Back from sleep/hibernate: the connection almost certainly died
+            // while the machine was out, but nothing tells the socket so — the
+            // server's FIN/RST was lost and we send nothing on an idle session —
+            // so the window would sit on a frozen desktop. Flag it; the UI loop
+            // drops the connection and reconnects.
+            const PBT_APMRESUMESUSPEND: usize = 0x7;
+            const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
+            if matches!(wparam.0, PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC) {
+                RESUMED.store(true, Ordering::SeqCst);
+                signal_frame();
+            }
+            LRESULT(1)
         }
         WM_KILLFOCUS => {
             // Never hold the cursor hostage while another window has focus.

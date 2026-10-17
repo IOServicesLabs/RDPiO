@@ -4254,7 +4254,9 @@ mod win {
         let mut cookie: Option<rdp_pdu::logon::ReconnectCookie> = None;
         let mut pending = Some(first);
         let mut attempts = 0u32;
-        const MAX_RECONNECT: u32 = 5;
+        // ~2.5 minutes of backoff in all: after a resume from sleep, Wi-Fi can
+        // take well over the old 5 tries' ~15 s to rejoin and get an address.
+        const MAX_RECONNECT: u32 = 10;
         let mut client = (width, height); // current window client size, for scaling
         let mut desktop = (desktop_w, desktop_h); // current remote desktop size (resizable)
         let mut last_pos = (0u16, 0u16); // last pointer position (desktop pixels)
@@ -4380,7 +4382,15 @@ mod win {
                         }
                         window.set_title("Disconnected — RDPiO");
                         tracing::info!(error = %e, "auto-reconnect exhausted; window stays open");
-                        idle_until_close(&window, &mut renderer, conn_bar.as_ref())?;
+                        // Out of retries isn't final: a resume or the network
+                        // coming back starts a fresh round. A rejected password
+                        // stays rejected, so that one only waits for the close.
+                        let wake = (!rejected).then_some(&net_change_rx);
+                        if idle_until_close(&window, &mut renderer, conn_bar.as_ref(), wake)? {
+                            attempts = 0;
+                            window.set_title("Reconnecting… — RDPiO");
+                            continue 'session;
+                        }
                         break 'session;
                     }
                 },
@@ -4394,6 +4404,10 @@ mod win {
                 protocol,
             } = conn;
             tracing::info!(?protocol, info = ?session.info(), "RDP session ACTIVE");
+            // Start this connection with no stale wake-ups: network changes and
+            // resumes from before it was up say nothing about it.
+            net_listener::drain(&net_change_rx);
+            let _ = crate::window::take_resumed();
             // Step-9: a connection is established — record it in the hub's MRU
             // history (host, port, user, domain, display name, and the saved
             // record link when the hub launched it from Saved). No password is
@@ -4703,6 +4717,15 @@ mod win {
                     Frame::Continue { resize } => {
                         if let Some(bar) = conn_bar.as_ref() {
                             bar.tick();
+                        }
+                        // Back from sleep: the socket is very likely dead without
+                        // knowing it (no FIN/RST reached us, and an idle session
+                        // sends nothing that would find out), leaving a frozen
+                        // desktop. Drop it and reconnect from the cookie now.
+                        if worker_alive && crate::window::take_resumed() {
+                            tracing::info!("resumed from sleep; reconnecting");
+                            window.set_title("Reconnecting… — RDPiO");
+                            break;
                         }
                         let mut dirty = false;
                         // Per-monitor windows are fixed-size borderless surfaces;
@@ -5029,7 +5052,7 @@ mod win {
                 tracing::info!(reconnect, network_drop = dropped, "session worker finished");
                 if !reconnect {
                     window.set_title("Disconnected — RDPiO");
-                    idle_until_close(&window, &mut renderer, conn_bar.as_ref())?;
+                    idle_until_close(&window, &mut renderer, conn_bar.as_ref(), None)?;
                     break 'session;
                 }
                 window.set_title("Reconnecting… — RDPiO");
@@ -5050,15 +5073,40 @@ mod win {
     /// unchanged frame at ~60 fps only kept the CPU/GPU awake (battery) for a
     /// dead session. A present is still needed after a resize, which rebuilds
     /// the backbuffer.
+    ///
+    /// With `wake` (the network-change listener), a resume from sleep or a
+    /// network change returns `true`: worth another round of reconnects.
+    /// Returns `false` when the window closes.
     fn idle_until_close(
         window: &Window,
         renderer: &mut Renderer,
         conn_bar: Option<&crate::connbar::ConnBar>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        wake: Option<&mpsc::Receiver<()>>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        // Only what happens from here on counts, not the changes and resumes
+        // the failed retries already ran into.
+        if let Some(rx) = wake {
+            net_listener::drain(rx);
+        }
+        let _ = crate::window::take_resumed();
         loop {
             match window.pump() {
-                Frame::Quit => return Ok(()),
+                Frame::Quit => return Ok(false),
                 Frame::Continue { resize } => {
+                    if let Some(rx) = wake {
+                        if crate::window::take_resumed() {
+                            tracing::info!("resumed from sleep while disconnected; reconnecting");
+                            return Ok(true);
+                        }
+                        // The 2 s settle swallows the rest of the burst, so
+                        // the first attempt meets a network that's ready.
+                        if rx.try_recv().is_ok() {
+                            tracing::info!("network changed while disconnected; reconnecting");
+                            net_listener::wait_with_network_wake(Duration::from_secs(2), rx);
+                            net_listener::drain(rx);
+                            return Ok(true);
+                        }
+                    }
                     // Borderless modes close from the connection bar; keep its
                     // hover reveal working on the dead session too.
                     if let Some(bar) = conn_bar {

@@ -59,10 +59,26 @@ unsafe extern "system" fn ip_interface_change_callback(
     }
 }
 
+/// Drop queued change events. Called once a connection is up, so changes from
+/// an earlier stretch (a whole session, a sleep) can't cut later waits short.
+pub fn drain(rx: &Receiver<()>) {
+    while rx.try_recv().is_ok() {}
+}
+
 /// Wait for either `duration` to elapse or a network-change event.
+///
+/// Interfaces change in bursts (a resume or Wi-Fi join fires a dozen
+/// notifications while DHCP and DNS are still settling), so a wake waits a
+/// short settle time and swallows the rest of the burst: one burst buys one
+/// early retry, not one per notification.
 pub fn wait_with_network_wake(delay: std::time::Duration, rx: &Receiver<()>) -> bool {
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
     match rx.recv_timeout(delay) {
-        Ok(()) => true,
+        Ok(()) => {
+            std::thread::sleep(SETTLE.min(delay));
+            drain(rx);
+            true
+        }
         Err(mpsc::RecvTimeoutError::Timeout) => false,
         Err(mpsc::RecvTimeoutError::Disconnected) => false,
     }
