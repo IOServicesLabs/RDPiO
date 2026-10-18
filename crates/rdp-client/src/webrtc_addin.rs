@@ -437,6 +437,8 @@ impl IWTSVirtualChannel_Impl for VirtualChannel_Impl {
             cap.record(CAP_DIR_OUTBOUND, self.channel_id, &bytes);
         }
         self.outbound.lock().unwrap().push_back((self.channel_id, bytes));
+        // (The session worker sleeps until there's something to send.)
+        crate::net_wait::worker_wake::signal();
         Ok(())
     }
 

@@ -60,7 +60,7 @@ pub use rpc::{RpcMessage, RpcMessageKind};
 pub use session::{RedirectorModel, SessionError};
 
 #[cfg(any(feature = "engine", feature = "libwebrtc"))]
-pub use bridge::{HostMedia, NativeRedirector, CHANNEL_NAME};
+pub use bridge::{set_outbound_waker, HostMedia, NativeRedirector, CHANNEL_NAME};
 #[cfg(any(feature = "engine", feature = "libwebrtc"))]
 pub use dispatch::Redirector;
 #[cfg(any(feature = "engine", feature = "libwebrtc"))]

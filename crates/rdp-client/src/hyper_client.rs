@@ -148,6 +148,8 @@ impl DvcRedirector for HyperRedirector {
                         Ok((socket, send, recv)) => {
                             *LINK.lock().unwrap() = Some(Link { socket, send, recv, size: (width, height), fps, codec, update: false, update_only: false, host_app: String::new() });
                             outbound.lock().unwrap().push(Handshake::ClientReady.to_bytes());
+                            // (The session worker sleeps until there's something to send.)
+                            crate::net_wait::worker_wake::signal();
                         }
                         Err(e) => tracing::warn!(%host, error = %e, "Hyper UDP path failed; staying on RDP"),
                     }
@@ -278,6 +280,10 @@ struct Shared {
     /// to the host with the feedback.
     ltr_decoded: AtomicU32,
     /// The host's newer rdpio, downloading beside the stream.
+    /// Cameras this PC can send the host (`u32::MAX` until counted).
+    cameras: AtomicU32,
+    /// A notice from the host to show over the stream (`Control::Notice`).
+    notice: Mutex<Option<String>>,
     update: Mutex<Option<rdp_hyper::update::Fetch>>,
     /// Its version, once downloaded (for a notice on screen).
     update_note: Mutex<Option<String>>,
@@ -412,9 +418,19 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         heard: AtomicBool::new(false),
         queued: AtomicU32::new(0),
         ltr_decoded: AtomicU32::new(u32::MAX),
+        cameras: AtomicU32::new(u32::MAX),
+        notice: Mutex::new(None),
         update: Mutex::new(link.update.then(|| rdp_hyper::update::Fetch::new(crate::updater::version(), crate::updater::build()))),
         update_note: Mutex::new(None),
     });
+    {
+        // (Counting cameras asks Media Foundation: off this thread.)
+        let s = shared.clone();
+        let _ = std::thread::Builder::new().name("hyper-cameras".into()).spawn(move || {
+            crate::wasapi::com_init();
+            s.cameras.store(crate::hyper_camera::camera_count() as u32, Ordering::Relaxed);
+        });
+    }
     if link.update {
         tracing::info!(host_app = %link.host_app, "the host has a newer rdpio: downloading it beside the stream");
         let s = shared.clone();
@@ -516,6 +532,9 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     // through the framebuffer: an overlay drawn over the framebuffer now
     // would show an older picture, so a fresh one is asked for.
     let mut framebuffer_stale = false;
+    // Until the first picture: how long it's been (said on screen, not a
+    // black window), and whether the wait was logged.
+    let (started, mut ever_shown, mut said_waiting) = (Instant::now(), false, false);
     shared.send(Kind::Control, &Control::KeyframeRequest.to_bytes());
 
     // The loop lives in a closure so any error (a GPU reset, a decoder
@@ -613,7 +632,17 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             }
         }
         input.ack(shared.input_ack.load(Ordering::Relaxed));
-        if input.has_pending() && (had_input || last_input_send.elapsed() > Duration::from_millis(15)) {
+        // New input goes at once — but pointer motion at most once a
+        // millisecond, merged meanwhile: a 4-8 kHz gaming mouse otherwise
+        // costs a Wi-Fi packet per report. Unacknowledged input is resent
+        // every 15 ms.
+        let unsent = input.unsent();
+        let due = match unsent {
+            Some(false) => true,
+            Some(true) => last_input_send.elapsed() >= INPUT_MOTION_EVERY,
+            None => false,
+        };
+        if input.has_pending() && (due || last_input_send.elapsed() > Duration::from_millis(15)) {
             // Oldest first; a burst bigger than a packet takes two at a time
             // (the rest follows as the host acknowledges).
             for p in input.packets(2) {
@@ -640,6 +669,11 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                 (refresh_hz, refresh_epoch, refresh_read) = (hz, epoch, Instant::now());
             }
             shared.send(Kind::Control, &Control::Refresh { hz: refresh_hz.min(u16::MAX as u32) as u16 }.to_bytes());
+            // (And whether there's a camera to offer the host's apps.)
+            let cameras = shared.cameras.load(Ordering::Relaxed);
+            if cameras != u32::MAX {
+                shared.send(Kind::Control, &Control::Cameras { count: cameras.min(u8::MAX as u32) as u8 }.to_bytes());
+            }
             refresh_sent = Instant::now();
         }
         // Plugged in or unplugged: decoding and presenting move to the GPU
@@ -767,6 +801,10 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             hint = crate::hyper_overlay::render(&[format!("rdpio {v} downloaded from the host: it installs when you close this window")]);
             hint_until = Instant::now() + Duration::from_secs(6);
         }
+        if let Some(text) = shared.notice.lock().unwrap().take() {
+            hint = crate::hyper_overlay::render(&[text]);
+            hint_until = Instant::now() + Duration::from_secs(10);
+        }
         let office = crate::window::office_mode();
         if office != office_sent || mode_sent.elapsed() > Duration::from_secs(1) {
             if office != office_sent {
@@ -806,6 +844,20 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         // hotkeys — shown before the first picture too, so even a stream that
         // shows nothing says how to leave it. One that goes away needs a
         // fresh picture under it.
+        // Signed in, but no picture seconds in (the hotkeys' hint gone): say
+        // so on screen, and in the log once.
+        if !ever_shown && !minimized && started.elapsed() > Duration::from_secs(3) && Instant::now() >= hint_until {
+            let secs = started.elapsed().as_secs();
+            hint = crate::hyper_overlay::render(&[
+                format!("Signed in to the host - waiting for its picture ({secs} s)..."),
+                "The rdpio window's Activity page shows what's happening.   Ctrl+Shift+Q quits".to_string(),
+            ]);
+            hint_until = Instant::now() + Duration::from_millis(1100);
+            overlay_dirty = true;
+            if secs >= 10 && !std::mem::replace(&mut said_waiting, true) {
+                tracing::warn!(secs, heard = shared.heard.load(Ordering::Relaxed), awaiting_key, "no picture from the host yet");
+            }
+        }
         let stats_on = crate::window::stats_overlay();
         let hint_on = hint.is_some() && Instant::now() < hint_until;
         if stats_on != stats_were_on || hint_on != hint_was_on {
@@ -909,6 +961,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             }
         }
 
+        ever_shown |= shown > 0;
         if report.elapsed() > Duration::from_secs(1) {
             let secs = report.elapsed().as_secs_f64();
             lat_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -983,7 +1036,10 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         // only bounds time-based work: input resends, keyframe requests, an
         // overlay's end, the once-a-second report. Hidden or still, that's
         // a few wakes a second, not twenty.
-        let timeout = if input.has_pending() {
+        let timeout = if input.unsent().is_some() {
+            // (Motion merged for the next millisecond.)
+            1
+        } else if input.has_pending() {
             5
         } else if minimized {
             1_000
@@ -1030,6 +1086,9 @@ static IN_PLACE_FAILED: AtomicBool = AtomicBool::new(false);
 /// No picture and no input this long: the 1 ms timer goes (it keeps the
 /// laptop's CPU from its deeper sleep on a still screen).
 const FINE_TIMER_IDLE: Duration = Duration::from_secs(2);
+
+/// Pointer motion goes at most this often (see the input send in `run`).
+const INPUT_MOTION_EVERY: Duration = Duration::from_millis(1);
 
 /// Shown frames a second at which the picture counts as moving (video, a
 /// game) and keeps the screen on; office trickling stays under it.
@@ -1183,6 +1242,7 @@ fn receive_loop(
     let (mut delay_min, mut delay_sum, mut delay_n) = (i64::MAX, 0i64, 0i64);
     let mut game_audio: Option<crate::hyper_audio::AudioSink> = None;
     let mut mic: Option<crate::hyper_audio::AudioSender> = None;
+    let mut camera: Option<crate::hyper_camera::CameraSender> = None;
     while !shared.stop.load(Ordering::Relaxed) {
         let datagrams = receiver.recv(&socket);
         for d in datagrams.into_iter().flatten() {
@@ -1248,6 +1308,34 @@ fn receive_loop(
                             tracing::info!("the host's console moved to another session; reconnecting now");
                             shared.lost.store(true, Ordering::Relaxed);
                             shared.stop.store(true, Ordering::Relaxed);
+                            crate::window::signal_frame();
+                        }
+                        // A host app is using the camera: send ours, only meanwhile.
+                        Some(Control::Camera { on }) => {
+                            if camera.as_ref().is_some_and(|c| c.is_finished()) {
+                                camera = None;
+                            }
+                            if on && camera.is_none() {
+                                let s = shared.clone();
+                                camera = Some(crate::hyper_camera::CameraSender::start(
+                                    Arc::new(move |body: &[u8]| s.send(Kind::Camera, body)),
+                                    now_us,
+                                ));
+                            } else if !on {
+                                if let Some(c) = camera.take() {
+                                    // (Stopping joins the capture: not on this thread.)
+                                    std::thread::spawn(move || drop(c));
+                                }
+                            }
+                        }
+                        Some(Control::CameraKeyframe) => {
+                            if let Some(c) = &camera {
+                                c.keyframe();
+                            }
+                        }
+                        Some(Control::Notice { text }) => {
+                            tracing::info!(%text, "notice from the host");
+                            *shared.notice.lock().unwrap() = Some(text);
                             crate::window::signal_frame();
                         }
                         // A host app is listening to the mic: capture ours (like
@@ -2420,8 +2508,78 @@ mod tests {
         }
     }
 
+    /// A session the launcher opens in a Workspace tab draws into a child of
+    /// the launcher's window (`RDPIO_EMBED_PARENT`), over the page's own
+    /// window: its swapchain works there, the parent shows its picture where
+    /// it is, and a tab that isn't in front counts as unseen.
+    /// `cargo test -p rdp-client --bin rdpio inside_another -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn a_window_inside_another_shows_pictures() {
+        use windows::core::w;
+        use windows::Win32::Foundation::{HWND, RECT};
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        crate::window::set_process_dpi_aware();
+        let codec = Codec::H264;
+        let (w, h) = (1280u32, 720u32);
+        unsafe {
+            let units = bars_stream(codec, w, h);
+            let parent = CreateWindowExW(Default::default(), w!("STATIC"), w!("rdpio embed test"), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE, 80, 80, 1000, 700, None, None, None, None).unwrap();
+            // (The page's window, under the tab's session: GDI-drawn here.)
+            let page = CreateWindowExW(Default::default(), w!("STATIC"), w!("the page"), WS_CHILD | WS_VISIBLE, 0, 0, 1000, 700, Some(parent), None, None, None).unwrap();
+            std::env::set_var("RDPIO_EMBED_PARENT", (parent.0 as isize).to_string());
+            let window = crate::window::Window::new("rdpio embedded", 640, 360).unwrap();
+            std::env::remove_var("RDPIO_EMBED_PARENT");
+            let child = HWND(window.hwnd_raw() as *mut _);
+            assert_eq!(GetParent(child).ok(), Some(parent), "not inside the parent");
+            assert!(window.output_hidden(), "hidden until the launcher places it");
+            // Where the tab is (as the launcher does it).
+            let (x, y, cw, ch) = (40, 60, 640u32, 360u32);
+            SetWindowPos(child, Some(HWND_TOP), x, y, cw as i32, ch as i32, SWP_SHOWWINDOW | SWP_NOACTIVATE).unwrap();
+            let _ = window.pump();
+            assert!(!window.output_hidden(), "placed, it's seen");
+            let mut renderer = Renderer::new(window.hwnd_raw(), cw, ch, rdp_gpu::Backend::D3D11).unwrap();
+            renderer.set_keep_aspect(true);
+            renderer.ensure_framebuffer(w, h).unwrap();
+            let mut decoder = Decoder::new(&renderer, w, h, codec).unwrap();
+            let mut rgba = Vec::new();
+            for u in &units {
+                if let Some(p) = decoder.decode(&u.data).unwrap() {
+                    paint(&mut renderer, p, (w, h), &mut rgba);
+                    renderer.present_frame().unwrap();
+                }
+                let _ = window.pump();
+            }
+            // The page repaints (as it does all the time): the session stays on top.
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(page), None, true);
+            for _ in 0..4 {
+                renderer.present_frame().unwrap();
+                let _ = window.pump();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let mut rc = RECT::default();
+            GetClientRect(parent, &mut rc).unwrap();
+            let (pw, ph) = (rc.right as u32, rc.bottom as u32);
+            let shot = hwnd_pixels(parent.0 as isize, pw, ph);
+            let mut tab = Vec::with_capacity((cw * ch * 4) as usize);
+            for row in 0..ch {
+                let at = (((y as u32 + row) * pw + x as u32) * 4) as usize;
+                tab.extend_from_slice(&shot[at..at + (cw * 4) as usize]);
+            }
+            check_bars(codec, "window in a tab", &tab, cw, &[2, ch / 2, ch - 4]);
+            // Another tab in front: this one is hidden, and unseen.
+            let _ = ShowWindow(child, SW_HIDE);
+            assert!(window.output_hidden(), "a hidden tab's session still counts as seen");
+            let _ = DestroyWindow(parent);
+        }
+    }
+
     /// The window's client area as the compositor shows it (RGBA).
     fn window_pixels(window: &crate::window::Window, w: u32, h: u32) -> Vec<u8> {
+        hwnd_pixels(window.hwnd_raw(), w, h)
+    }
+
+    fn hwnd_pixels(hwnd: isize, w: u32, h: u32) -> Vec<u8> {
         use windows::Win32::Graphics::Gdi::*;
         #[link(name = "user32")]
         extern "system" {
@@ -2446,7 +2604,7 @@ mod tests {
             let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
             let bmp = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
             let old = SelectObject(dc, bmp.into());
-            let ok = PrintWindow(window.hwnd_raw() as *mut _, dc.0, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
+            let ok = PrintWindow(hwnd as *mut _, dc.0, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
             assert!(ok != 0, "PrintWindow failed");
             let _ = GdiFlush();
             let src = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);

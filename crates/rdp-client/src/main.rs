@@ -31,6 +31,7 @@
 
 mod arm_broker;
 mod congestion;
+mod log_ring;
 mod feed;
 mod prompt;
 mod gateway;
@@ -273,6 +274,17 @@ fn main() {
             }
             return;
         }
+    }
+    #[cfg(windows)]
+    if std::env::args().any(|a| a == "--hyper-camera-test") {
+        match hyper_camera::selftest() {
+            Ok(()) => println!("Hyper camera test passed"),
+            Err(e) => {
+                eprintln!("Hyper camera test failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
     }
     #[cfg(windows)]
     if std::env::args().any(|a| a == "--hyper-audio-test") {
@@ -1420,7 +1432,7 @@ impl Args {
                 | "--hyper-display-install" | "--hyper-display-uninstall"
                 | "--hyper-console-agent" => {}
                 "--hyper-host" => args.hyper_host = true,
-                "--hyper-audio-test" => {}
+                "--hyper-audio-test" | "--hyper-camera-test" => {}
                 "--hyper-selftest" => {
                     let _ = it.next();
                 }
@@ -1767,9 +1779,11 @@ fn init_tracing(log_file: Option<&str>) {
             Err(e) => eprintln!("rdpio: could not open log file '{path}': {e}; using stdout"),
         }
     }
+    // (Through the launcher's log ring too, once it turns that on.)
     tracing_subscriber::fmt()
         .with_env_filter(mk_filter())
         .with_target(true)
+        .with_writer(|| log_ring::Tee)
         .init();
 }
 
@@ -1896,6 +1910,9 @@ mod net_tune;
 mod udp_batch;
 #[cfg(windows)]
 mod hyper_clipboard;
+
+#[cfg(windows)]
+mod hyper_camera;
 #[cfg(windows)]
 mod hyper_overlay;
 #[cfg(windows)]
@@ -5250,18 +5267,24 @@ mod win {
         let (x0, y0, w, h) = (o.x as i64, o.y as i64, o.w as i64, o.h as i64);
         let (cx0, cy0) = (x0.max(0), y0.max(0));
         let (cx1, cy1) = ((x0 + w).min(desktop.0 as i64), (y0 + h).min(desktop.1 as i64));
-        if cx1 <= cx0 || cy1 <= cy0 || o.rgba.len() < (w * h * 4) as usize {
+        if cx1 <= cx0 || cy1 <= cy0 {
             return false;
         }
+        // Fitted, converted and drawn on the GPU where it can be.
+        let crate::teams_video::Picture::Nv12 { nv12, width, height, cover, mirror } = &o.picture;
+        if renderer.draw_nv12_fit((o.x, o.y, o.w, o.h), nv12, (*width, *height), *cover, *mirror) {
+            return true;
+        }
+        let rgba_full = o.picture.to_rgba(o.w, o.h);
         let (cw, ch) = ((cx1 - cx0) as usize, (cy1 - cy0) as usize);
         let rgba = if (cw as i64, ch as i64) == (w, h) {
-            o.rgba
+            rgba_full
         } else {
             let (sx, sy) = ((cx0 - x0) as usize, (cy0 - y0) as usize);
             let mut v = Vec::with_capacity(cw * ch * 4);
             for row in sy..sy + ch {
                 let start = (row * o.w as usize + sx) * 4;
-                v.extend_from_slice(&o.rgba[start..start + cw * 4]);
+                v.extend_from_slice(&rgba_full[start..start + cw * 4]);
             }
             v
         };

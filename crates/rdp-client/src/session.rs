@@ -2158,9 +2158,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     let mut graphics = GraphicsChannel::with_caps(gfx_caps.clone());
     // Optional DVC redirector (e.g. the Teams WebRTC add-in host) that bridges
     // channels — like `com.microsoft.rdc.dvc.webrtc.1` — the mux would decline.
-    // It produces data asynchronously on its own threads, so while one is wired
-    // in the event wait below must keep a short tick to flush its queue.
-    let redirector_active = redirector.is_some();
+    // It produces data asynchronously on its own threads and wakes this worker
+    // when it has queued some (no polling tick needed).
     if let Some(redirector) = redirector {
         graphics.set_redirector(redirector);
     }
@@ -2488,12 +2487,11 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
             Some(p) => p,
             None => {
                 if let Some(w) = wait.as_ref() {
-                    let idle = if mic_started || cam_capture.is_some() {
-                        // Audio/camera capture: poll at the device cadence.
-                        std::time::Duration::from_millis(10)
-                    } else if udp.is_some() || redirector_active {
-                        // Tunnel pump (retransmit RTO floor is 15 ms) and the
-                        // redirector's async output queue.
+                    // (Mic buffers and camera frames wake the worker as they
+                    // fill: no capture polling.)
+                    let idle = if udp.is_some() {
+                        // Tunnel pump (retransmit RTO floor is 15 ms). (A
+                        // redirector's async output wakes the worker itself.)
                         std::time::Duration::from_millis(15)
                     } else if let Some((_, since)) = pending_resize.as_ref() {
                         RESIZE_SETTLE

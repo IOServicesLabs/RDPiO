@@ -516,6 +516,19 @@ impl H264Encoder {
         }
     }
 
+    /// Make the next frame a keyframe (a receiver lost frames and can't
+    /// decode on). Best effort: an encoder without the setting carries on.
+    pub fn request_keyframe(&self) {
+        unsafe {
+            if let Ok(codec) = self.transform.cast::<windows::Win32::Media::MediaFoundation::ICodecAPI>() {
+                let mut v = windows::Win32::System::Variant::VARIANT::default();
+                (*v.Anonymous.Anonymous).vt = windows::Win32::System::Variant::VT_UI4;
+                (*v.Anonymous.Anonymous).Anonymous.ulVal = 1;
+                let _ = codec.SetValue(&windows::Win32::Media::MediaFoundation::CODECAPI_AVEncVideoForceKeyFrame, &v);
+            }
+        }
+    }
+
     /// Encode one NV12 frame, returning any H.264 bytes produced (may be empty
     /// when the encoder buffers input before emitting an access unit).
     pub fn encode(&mut self, nv12: &[u8]) -> WinResult<Vec<u8>> {

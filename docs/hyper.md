@@ -74,7 +74,18 @@ Optional host flags (append to the install command):
 For game audio to go to the client instead of the host's speakers, and for the
 client's microphone to reach host apps, the host needs virtual audio devices:
 **Steam** installs "Steam Streaming Speakers/Microphone" (used automatically);
-VB-Audio CABLE works for the mic too.
+VB-Audio CABLE works for the mic too. While streaming, the host's default
+microphone is the virtual one, so apps set to **"Default"** hear the laptop's
+mic. An app set to a particular microphone (Discord, say, on the PC's own
+"FrontMic") can't: the laptop then shows a notice naming the app and the
+microphone it uses.
+
+The **laptop's camera** shows up on the host as **"rdpio Camera"** (Windows 11
+hosts). Pick it in the app (Discord, Teams, a browser); the laptop's camera, and
+its light, turn on only while an app on the host uses it. `rdpio
+--hyper-camera-test`, run as administrator on the host, checks the host side
+without a laptop. `RDPIO_HYPER_CAMERA=0` on the laptop keeps its camera to
+itself.
 
 ## Connecting (the laptop)
 
@@ -230,7 +241,8 @@ vblank — on a G-Sync/FreeSync display that also means no tearing).
 ## What carries over
 
 Picture (H.264/HEVC), game audio (Opus), microphone (only while a host app
-listens, like RDP), keyboard and mouse (incl. relative mouse), the host's
+listens, like RDP), camera (only while a host app uses it), keyboard and mouse
+(incl. relative mouse), the host's
 cursor shape, clipboard text, images and files (both ways, up to 4 GB),
 resolution changes, and monitor consolidation. If the network drops, the
 client reconnects by itself and the host keeps the session unlocked for 20 s;

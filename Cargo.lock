@@ -2054,6 +2054,7 @@ name = "rdp-client"
 version = "0.2.3"
 dependencies = [
  "base64 0.22.1",
+ "cc",
  "embed-resource",
  "http",
  "mimalloc",

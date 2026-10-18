@@ -267,6 +267,8 @@ pub struct DesktopCapture {
     driver_seen: bool,
     /// The capture device's adapter (as [`adapter_luid`](Self::adapter_luid)).
     luid: i64,
+    /// A driver frame seen by [`peek`](Self::peek), not converted yet.
+    peeked: Option<driver_frames::NextFrame>,
 }
 
 impl DesktopCapture {
@@ -376,6 +378,7 @@ impl DesktopCapture {
                 driver_since: Instant::now(),
                 driver_seen: false,
                 luid,
+                peeked: None,
             })
         }
     }
@@ -407,6 +410,44 @@ impl DesktopCapture {
     /// Whether frames come from the rdpio Display driver.
     pub fn from_driver(&self) -> bool {
         self.driver.is_some()
+    }
+
+    /// Whether a frame can be looked at before it's converted ([`peek`](Self::peek)
+    /// then [`take`](Self::take)): the driver's frames, whose newest stays put
+    /// until a newer one comes. Desktop Duplication hands its frame back at
+    /// once, so [`acquire`](Self::acquire) converts it there and then.
+    pub fn defers(&self) -> bool {
+        self.driver.is_some() && !self.stale
+    }
+
+    /// Driver frames: wait up to `timeout_ms` for a newer frame and say when
+    /// it was presented (µs), without converting it — a frame the stream's
+    /// rate skips (a 240 Hz monitor streaming 60 fps) costs nothing. `Ok(None)`:
+    /// nothing new (or the driver's frames stopped: [`defers`](Self::defers)
+    /// then says so, and [`acquire`](Self::acquire) duplicates the output).
+    pub fn peek(&mut self, timeout_ms: u32) -> WinResult<Option<u64>> {
+        unsafe {
+            let Some(next) = self.driver_peek(timeout_ms)? else { return Ok(None) };
+            let present_us = (next.state.present_qpc as f64 / self.qpc_per_us) as u64;
+            self.peeked = Some(next);
+            Ok(Some(present_us))
+        }
+    }
+
+    /// The newest driver frame, converted: the one [`peek`](Self::peek) saw,
+    /// or a newer one that came since. `Ok(None)` if there's none.
+    pub fn take(&mut self) -> WinResult<Option<CapturedFrame>> {
+        unsafe {
+            let next = match self.driver_peek(0)? {
+                Some(newer) => Some(newer),
+                None => self.peeked.take(),
+            };
+            self.peeked = None;
+            match next {
+                Some(next) => self.driver_convert(next),
+                None => Ok(None),
+            }
+        }
     }
 
     /// Wait up to `timeout_ms` for the next desktop frame. `Ok(None)` on
@@ -498,6 +539,19 @@ impl DesktopCapture {
 
     /// [`acquire`](Self::acquire) from the driver's shared textures.
     unsafe fn acquire_from_driver(&mut self, timeout_ms: u32) -> WinResult<Option<CapturedFrame>> {
+        let next = match self.driver_peek(timeout_ms)? {
+            Some(next) => Some(next),
+            None => self.peeked.take(),
+        };
+        match next {
+            Some(next) => self.driver_convert(next),
+            None => Ok(None),
+        }
+    }
+
+    /// The driver's next frame (waiting up to `timeout_ms`), checked to be
+    /// usable here, not converted.
+    unsafe fn driver_peek(&mut self, timeout_ms: u32) -> WinResult<Option<driver_frames::NextFrame>> {
         let mut next = self.driver_next();
         if matches!(next, Ok(None)) {
             if let Some(d) = &self.driver {
@@ -538,6 +592,12 @@ impl DesktopCapture {
                 vp.views.clear();
             }
         }
+        Ok(Some(next))
+    }
+
+    /// Convert driver frame `next` into the ring.
+    unsafe fn driver_convert(&mut self, next: driver_frames::NextFrame) -> WinResult<Option<CapturedFrame>> {
+        let s = next.state;
         // The driver writes other slots meanwhile; this one is ours until
         // the GPU has read it.
         if !driver_frames::lock(&next.mutex, 100) {
@@ -3329,6 +3389,17 @@ mod hardware {
             assert_eq!(f.accumulated, 1);
             assert_eq!(first_pixel(&cap.device, &cap.context, &f.nv12), [9, 99, 199, 255]);
             assert!(cap.acquire(20).unwrap().is_none(), "nothing new");
+            // Deferred: a frame seen isn't converted, and what's taken later is
+            // the newest (one that came after the look, too).
+            assert!(cap.defers());
+            fake.publish(&context, 1, [1, 1, 1, 255], surface);
+            context.Flush();
+            assert!(cap.peek(500).unwrap().is_some(), "seen");
+            fake.publish(&context, 2, [7, 77, 177, 255], surface);
+            context.Flush();
+            let f = cap.take().unwrap().expect("the newest frame");
+            assert_eq!(first_pixel(&cap.device, &cap.context, &f.nv12), [7, 77, 177, 255]);
+            assert!(cap.take().unwrap().is_none(), "nothing left to take");
             drop(cap);
 
             let mut cap = DesktopCapture::new(&m.device_name, None, 2).unwrap();

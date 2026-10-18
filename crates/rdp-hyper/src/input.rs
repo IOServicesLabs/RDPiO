@@ -138,6 +138,16 @@ impl InputSender {
         !self.pending.is_empty()
     }
 
+    /// Events queued since the last packet: `None` if none, else whether they
+    /// are all pointer motion (which may wait a moment to be merged; a key or
+    /// a button shouldn't).
+    pub fn unsent(&self) -> Option<bool> {
+        let sent = self.sent;
+        let mut fresh = self.pending.iter().filter(|(seq, _)| seq.wrapping_sub(sent) as i32 > 0).peekable();
+        fresh.peek()?;
+        Some(fresh.all(|(_, e)| matches!(e, InputEvent::MouseRel { .. } | InputEvent::MouseAbs { .. })))
+    }
+
     /// Packet bodies for the unacknowledged events, oldest first, at most
     /// `max_packets` of them (anything beyond waits for acks to free room).
     /// Empty if nothing is pending.
@@ -237,6 +247,20 @@ mod tests {
         }
         let mut rx = InputReceiver::new();
         assert_eq!(rx.receive(&tx.packet().unwrap()), all);
+    }
+
+    #[test]
+    fn motion_may_wait_to_be_merged_but_keys_may_not() {
+        let mut tx = InputSender::new();
+        assert_eq!(tx.unsent(), None);
+        tx.push(InputEvent::MouseRel { dx: 1, dy: 2 });
+        tx.push(InputEvent::MouseRel { dx: 3, dy: 4 });
+        assert_eq!(tx.unsent(), Some(true));
+        tx.push(A);
+        assert_eq!(tx.unsent(), Some(false));
+        let _ = tx.packets(2);
+        assert_eq!(tx.unsent(), None, "everything is in a packet now");
+        assert!(tx.has_pending(), "but not acknowledged");
     }
 
     #[test]

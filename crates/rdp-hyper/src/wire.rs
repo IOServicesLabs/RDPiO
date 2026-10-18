@@ -55,6 +55,10 @@ pub enum Kind {
     /// Moving an update between builds ([`crate::update::UpdateMsg`]); read by
     /// any protocol version.
     Update = 7,
+    /// One shard of the client's camera (H.264, framed as [`Kind::Video`]
+    /// is). Sent only once the host asks (`Control::Camera`), so a host that
+    /// doesn't know it never gets one.
+    Camera = 8,
 }
 
 impl Kind {
@@ -66,6 +70,7 @@ impl Kind {
             4 => Self::Control,
             6 => Self::Reliable,
             7 => Self::Update,
+            8 => Self::Camera,
             _ => return None,
         })
     }

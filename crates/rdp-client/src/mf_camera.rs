@@ -29,7 +29,7 @@ use windows::Win32::Media::MediaFoundation::{
 use rdp_channels::names::CAMERA_DEVICE_PREFIX;
 
 /// Read the friendly name from a capture-device activation object.
-unsafe fn device_name(activate: &IMFActivate) -> String {
+pub(crate) unsafe fn device_name(activate: &IMFActivate) -> String {
     let mut ptr = PWSTR::null();
     let mut len = 0u32;
     if activate
@@ -46,7 +46,7 @@ unsafe fn device_name(activate: &IMFActivate) -> String {
 }
 
 /// Initialize Media Foundation (idempotent) and build the vidcap-source filter.
-unsafe fn vidcap_attributes() -> windows::core::Result<windows::Win32::Media::MediaFoundation::IMFAttributes>
+pub(crate) unsafe fn vidcap_attributes() -> windows::core::Result<windows::Win32::Media::MediaFoundation::IMFAttributes>
 {
     MFStartup(MF_VERSION, MFSTARTUP_LITE)?;
     let mut attrs = None;
@@ -68,6 +68,8 @@ pub struct MfCamera {
     /// is sent and the stream stays decodable — frames are skipped before the
     /// encoder, never after. `None` = free-running (latest frame wins).
     demand: Option<Arc<AtomicU32>>,
+    /// The next encoded frame should be a keyframe (see [`MfCamera::request_keyframe`]).
+    keyframe: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -126,10 +128,13 @@ impl MfCamera {
     fn spawn(device_index: u32, media: MediaType, demand: Option<Arc<AtomicU32>>) -> Self {
         let frames = Arc::new(Mutex::new(VecDeque::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (frames_w, stop_w, demand_w) = (frames.clone(), stop.clone(), demand.clone());
+        let keyframe = Arc::new(AtomicBool::new(false));
+        let (frames_w, stop_w, demand_w, keyframe_w) = (frames.clone(), stop.clone(), demand.clone(), keyframe.clone());
         let worker = std::thread::spawn(move || unsafe {
+            // (Media Foundation's capture objects want COM on this thread.)
+            crate::wasapi::com_init();
             if let Err(e) =
-                capture_loop(device_index, media, &frames_w, &stop_w, demand_w.as_deref())
+                capture_loop(device_index, media, &frames_w, &stop_w, demand_w.as_deref(), &keyframe_w)
             {
                 tracing::warn!(error = %e, "camera capture loop ended");
             }
@@ -138,8 +143,19 @@ impl MfCamera {
             frames,
             stop,
             demand,
+            keyframe,
             worker: Some(worker),
         }
+    }
+
+    /// H.264: make the next frame encoded a keyframe (the receiver lost some).
+    pub fn request_keyframe(&self) {
+        self.keyframe.store(true, Ordering::SeqCst);
+    }
+
+    /// The capture thread has stopped (the camera failed or went away).
+    pub fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(|w| w.is_finished())
     }
 
     /// On-demand mode: ask the capture thread for `n` more frames.
@@ -183,6 +199,7 @@ unsafe fn capture_loop(
     frames: &Arc<Mutex<VecDeque<Vec<u8>>>>,
     stop: &Arc<AtomicBool>,
     demand: Option<&AtomicU32>,
+    keyframe: &AtomicBool,
 ) -> windows::core::Result<()> {
     let attrs = vidcap_attributes()?;
     let mut devices: *mut Option<IMFActivate> = std::ptr::null_mut();
@@ -262,7 +279,12 @@ unsafe fn capture_loop(
             let raw = std::slice::from_raw_parts(data, cur_len as usize);
             // Encode to H.264 when negotiated, else forward the raw NV12.
             let frame = match encoder.as_mut() {
-                Some(enc) => match enc.encode(raw) {
+                Some(enc) => match {
+                    if keyframe.swap(false, Ordering::SeqCst) {
+                        enc.request_keyframe();
+                    }
+                    enc.encode(raw)
+                } {
                     Ok(h264) if !h264.is_empty() => Some(h264),
                     Ok(_) => None, // encoder buffered this frame; nothing to send yet
                     Err(e) => {
@@ -287,6 +309,8 @@ unsafe fn capture_loop(
                     }
                     q.push_back(frame);
                 }
+                // The session worker sends it now (it sleeps until woken).
+                crate::net_wait::worker_wake::signal();
             }
         }
         let _ = buffer.Unlock();

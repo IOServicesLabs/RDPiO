@@ -21,6 +21,15 @@
 //! reason it printed, and with "close after connecting" the launcher hides
 //! while the session runs and comes back if it fails.
 //!
+//! Everything the launcher and its sessions log is on the page too (the
+//! Activity page, a Workspace tab's log): the launcher's own lines through
+//! [`crate::log_ring`], each session's by tailing its log file.
+//!
+//! The Workspace opens sessions inside this window, one per tab: the session
+//! process creates its window as a child of this one (`RDPIO_EMBED_PARENT`),
+//! says so ([`crate::window::WM_RDPIO_EMBEDDED`]), and this side puts it
+//! where the page's tab is, hiding the ones whose tab isn't in front.
+//!
 //! Without the WebView2 runtime, [`run`] fails and `main` opens the hub.
 
 mod host;
@@ -28,22 +37,22 @@ pub mod profile;
 
 pub use host::LauncherPipe;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicIsize, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2Controller, ICoreWebView2Controller2,
-    ICoreWebView2Environment, ICoreWebView2Settings3, COREWEBVIEW2_COLOR,
+    ICoreWebView2Environment, ICoreWebView2Settings3, ICoreWebView2_3, COREWEBVIEW2_COLOR, COREWEBVIEW2_PROCESS_FAILED_KIND,
 };
 use webview2_com::{
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler, NavigationStartingEventHandler,
-    NewWindowRequestedEventHandler, WebMessageReceivedEventHandler,
+    NewWindowRequestedEventHandler, ProcessFailedEventHandler, TrySuspendCompletedHandler, WebMessageReceivedEventHandler,
 };
 use windows::core::{w, Interface, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -110,10 +119,27 @@ impl From<webview2_com::Error> for LauncherError {
 /// A session process the launcher started.
 struct Session {
     key: String,
+    name: String,
     started: Instant,
     /// Recorded in the history yet (direct sessions: the launcher does it).
     recorded: bool,
     record: Option<RecordMru>,
+    /// Its log file (tailed onto the page).
+    log: Option<PathBuf>,
+    /// Opened in a Workspace tab (a child of this window)…
+    embedded: bool,
+    /// …and its window, once it said so (`WM_RDPIO_EMBEDDED`).
+    child: Option<isize>,
+}
+
+/// Where the Workspace's tab in front is (this window's client pixels), and
+/// whose it is.
+#[derive(Default)]
+struct Embed {
+    active: Option<String>,
+    rect: (i32, i32, i32, i32),
+    /// Off while the page covers it (a dialog, another page).
+    visible: bool,
 }
 
 struct RecordMru {
@@ -134,9 +160,20 @@ struct State {
     prefs: profile::Store,
     keep_open: bool,
     mica: bool,
+    dark: bool,
     sessions: HashMap<u32, Session>,
     /// Hidden while a session runs ("close after connecting").
     hidden: bool,
+    minimized: bool,
+    /// The newest log line the page has.
+    log_sent: Cell<u64>,
+    embed: Embed,
+}
+
+impl State {
+    fn page_shown(&self) -> bool {
+        !self.hidden && !self.minimized
+    }
 }
 
 thread_local! {
@@ -146,6 +183,31 @@ thread_local! {
 /// Events from worker threads, waiting for the UI thread.
 static EVENTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
+/// New log lines wait for the page (one `_logs` event at a time).
+static LOGS_DUE: AtomicBool = AtomicBool::new(false);
+/// The page is in sight: sessions' logs are read often (else now and then).
+static PAGE_SHOWN: AtomicBool = AtomicBool::new(true);
+
+/// A log line was kept (any thread): the page gets it soon.
+fn notify_logs() {
+    if !LOGS_DUE.swap(true, Ordering::AcqRel) {
+        post_event(json!({ "event": "_logs" }));
+    }
+}
+
+/// The lines the page doesn't have yet, if it's in sight (else they wait:
+/// nothing wakes the launcher for a page no one sees).
+fn flush_logs(st: &State) {
+    if !st.page_shown() {
+        return;
+    }
+    LOGS_DUE.store(false, Ordering::Release);
+    let lines = crate::log_ring::since(st.log_sent.get(), 1000);
+    if let Some(last) = lines.last() {
+        st.log_sent.set(last.seq);
+        send(st, &json!({ "event": "log", "lines": lines }));
+    }
+}
 
 /// Hand an event to the page from any thread.
 fn post_event(event: Value) {
@@ -164,6 +226,8 @@ pub fn run() -> Result<(), LauncherError> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
+    crate::log_ring::enable(notify_logs);
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "launcher open");
     hide_own_console();
     let connections = ConnectionStore::load()?;
     let mru = MruStore::load()?;
@@ -196,8 +260,12 @@ pub fn run() -> Result<(), LauncherError> {
             prefs,
             keep_open,
             mica,
+            dark,
             sessions: HashMap::new(),
             hidden: false,
+            minimized: false,
+            log_sent: Cell::new(0),
+            embed: Embed::default(),
         })
     });
     HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
@@ -298,11 +366,12 @@ fn create_window(dark: bool) -> Result<HWND, LauncherError> {
         let h = scale(740).min(work.bottom - work.top);
         let x = work.left + (work.right - work.left - w) / 2;
         let y = work.top + (work.bottom - work.top - h) / 2;
+        // (Clipping its children: sessions in Workspace tabs live in it.)
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("rdpio"),
-            WS_OVERLAPPEDWINDOW,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             x,
             y,
             w,
@@ -482,12 +551,89 @@ fn init_webview(hwnd: HWND, mica: bool, dark: bool) -> Result<(ICoreWebView2Cont
             })),
             &mut token,
         )?;
+        // A process of the page's died — a resume from hibernation can take
+        // the GPU's or the renderer's with it, leaving a black window that
+        // answers nothing: the page comes back (see `on_event`).
+        webview.add_ProcessFailed(
+            &ProcessFailedEventHandler::create(Box::new(|_, args| {
+                let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                if let Some(args) = args {
+                    let _ = args.ProcessFailedKind(&mut kind);
+                }
+                post_event(json!({ "event": "_webview_failed", "kind": kind.0 }));
+                Ok(())
+            })),
+            &mut token,
+        )?;
         controller.SetIsVisible(true)?;
-        // (RDPIO_LAUNCHER_HTML: a page to try instead of the built-in one.)
-        let page = std::env::var_os("RDPIO_LAUNCHER_HTML").and_then(|p| std::fs::read_to_string(p).ok());
-        webview.NavigateToString(&HSTRING::from(with_brand_fonts(page.as_deref().unwrap_or(PAGE))))?;
+        webview.NavigateToString(&HSTRING::from(page_html()))?;
     }
     Ok((controller, webview))
+}
+
+/// The page, with the brand fonts in.
+fn page_html() -> String {
+    // (RDPIO_LAUNCHER_HTML: a page to try instead of the built-in one.)
+    let page = std::env::var_os("RDPIO_LAUNCHER_HTML").and_then(|p| std::fs::read_to_string(p).ok());
+    with_brand_fonts(page.as_deref().unwrap_or(PAGE))
+}
+
+/// The page's renderer died or hangs: load the page again (its state is all
+/// on this side; it asks for it, and for the log, when it starts).
+fn reload_page(st: &State) {
+    unsafe {
+        let _ = st.webview.NavigateToString(&HSTRING::from(page_html()));
+    }
+}
+
+/// WebView2's browser process is gone: a new one in the same window. (At most
+/// a few times a minute: one that dies at once each time isn't retried forever.)
+fn rebuild_webview() {
+    static TRIES: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+    {
+        let mut t = TRIES.lock().unwrap();
+        t.retain(|i| i.elapsed() < Duration::from_secs(60));
+        if t.len() >= 3 {
+            tracing::error!("the window's web view keeps failing; not restarting it again");
+            return;
+        }
+        t.push(Instant::now());
+    }
+    let Some((hwnd, mica, dark)) = with_state(|st| {
+        unsafe {
+            let _ = st.controller.Close();
+        }
+        (st.hwnd, st.mica, st.dark)
+    }) else {
+        return;
+    };
+    match init_webview(hwnd, mica, dark) {
+        Ok((controller, webview)) => {
+            with_state(|st| {
+                st.controller = controller;
+                st.webview = webview;
+                st.log_sent.set(0);
+            });
+            resize_webview(hwnd);
+            with_state(|st| set_page_visible(st, st.page_shown()));
+            tracing::info!("the window's web view restarted");
+        }
+        Err(e) => tracing::error!(error = %e, "could not restart the window's web view"),
+    }
+}
+
+/// After a resume: WebView2 may still show what it drew before the machine
+/// slept (or nothing): hidden and shown again, it draws afresh.
+fn redraw_page(st: &State) {
+    if !st.page_shown() {
+        return;
+    }
+    unsafe {
+        let _ = st.controller.SetIsVisible(false);
+        let _ = st.controller.SetIsVisible(true);
+        let _ = st.controller.NotifyParentWindowPositionChanged();
+    }
+    send(st, &json!({ "event": "resumed" }));
 }
 
 /// Open a web link in the default browser (only http(s)).
@@ -514,6 +660,74 @@ fn resize_webview(hwnd: HWND) {
     });
 }
 
+/// The page shown (`true`) or out of sight — the window hidden while a
+/// session runs, or minimized. Out of sight, WebView2 is told so and
+/// suspended: it stops drawing (the "Connected" dots pulse for as long as a
+/// session runs) and its processes go idle, instead of animating behind the
+/// session for hours. Shown again, it resumes where it was.
+fn set_page_visible(st: &State, visible: bool) {
+    PAGE_SHOWN.store(visible, Ordering::Relaxed);
+    unsafe {
+        let _ = st.controller.SetIsVisible(visible);
+        if let Ok(w3) = st.webview.cast::<ICoreWebView2_3>() {
+            if visible {
+                let _ = w3.Resume();
+            } else {
+                let _ = w3.TrySuspend(&TrySuspendCompletedHandler::create(Box::new(|_, _| Ok(()))));
+            }
+        }
+    }
+    if visible {
+        flush_logs(st);
+    }
+}
+
+/// The Workspace's sessions where the page says: the one whose tab is in
+/// front over the tab, the rest hidden (and so paused: see
+/// `Window::output_hidden`). Asynchronous: a session that's busy (or hung)
+/// never holds up this window.
+fn apply_embed(st: &State) {
+    let e = &st.embed;
+    for s in st.sessions.values() {
+        let Some(child) = s.child else { continue };
+        let child = HWND(child as *mut _);
+        unsafe {
+            if e.visible && e.active.as_deref() == Some(s.key.as_str()) && e.rect.2 > 0 && e.rect.3 > 0 {
+                let (x, y, w, h) = e.rect;
+                let _ = SetWindowPos(child, Some(HWND_TOP), x, y, w, h, SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+            } else {
+                let _ = ShowWindowAsync(child, SW_HIDE);
+            }
+        }
+    }
+}
+
+/// Close a session: its window is asked to (the session says goodbye to the
+/// host); one that doesn't go within a few seconds — hung, say, after a
+/// resume — is ended, and one with no window yet (still connecting) at once.
+fn close_session(pid: u32, child: Option<isize>) {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+    let windows = match child {
+        Some(c) => vec![HWND(c as *mut _)],
+        None => windows_of(pid),
+    };
+    let grace = if windows.is_empty() { 0 } else { 6000 };
+    for w in windows {
+        unsafe {
+            let _ = PostMessageW(Some(w), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+    std::thread::spawn(move || unsafe {
+        let Ok(h) = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) else { return };
+        if WaitForSingleObject(h, grace) == WAIT_TIMEOUT {
+            tracing::warn!(pid, "the session didn't close; ending it");
+            let _ = TerminateProcess(h, 1);
+        }
+        let _ = CloseHandle(h);
+    });
+}
+
 fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     STATE.with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.as_mut().map(f)))
 }
@@ -523,7 +737,51 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         match msg {
             WM_SIZE => {
                 resize_webview(hwnd);
+                // Minimized: out of sight (see `set_page_visible`).
+                let minimized = wparam.0 == SIZE_MINIMIZED as usize;
+                with_state(|st| {
+                    st.minimized = minimized;
+                    if !st.hidden {
+                        set_page_visible(st, !minimized);
+                    }
+                });
                 LRESULT(0)
+            }
+            WM_POWERBROADCAST => {
+                // Back from sleep or hibernation.
+                if matches!(wparam.0, 0x7 | 0x12) {
+                    post_event(json!({ "event": "_resumed" }));
+                }
+                LRESULT(1)
+            }
+            crate::window::WM_RDPIO_EMBEDDED => {
+                // A session for a Workspace tab made its window (in this one).
+                let (child, pid) = (wparam.0 as isize, lparam.0 as u32);
+                let mut owner = 0u32;
+                GetWindowThreadProcessId(HWND(child as *mut _), Some(&mut owner));
+                let known = owner == pid
+                    && with_state(|st| {
+                        let Some(s) = st.sessions.get_mut(&pid).filter(|s| s.embedded) else { return false };
+                        s.child = Some(child);
+                        let key = s.key.clone();
+                        apply_embed(st);
+                        send(st, &json!({ "event": "embedded", "key": key }));
+                        true
+                    })
+                    .unwrap_or(false);
+                if !known && owner != 0 {
+                    // (Not one of ours, or no longer in a tab: a window of its own.)
+                    let _ = PostMessageW(Some(HWND(child as *mut _)), crate::window::WM_RDPIO_POPOUT, WPARAM(0), LPARAM(0));
+                }
+                LRESULT(0)
+            }
+            WM_ACTIVATE => {
+                // In front or not: the page pauses its endless animations
+                // (a live session's pulsing dot) while another window has the
+                // user's attention.
+                let active = (wparam.0 & 0xFFFF) != 0;
+                with_state(|st| send(st, &json!({ "event": "active", "on": active })));
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_MOVE | WM_MOVING => {
                 with_state(|st| {
@@ -562,6 +820,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_CLOSE => {
+                // Sessions in Workspace tabs carry on, each in a window of its own.
+                let children: Vec<isize> = with_state(|st| st.sessions.values().filter_map(|s| s.child).collect()).unwrap_or_default();
+                for c in children {
+                    let _ = SendMessageTimeoutW(HWND(c as *mut _), crate::window::WM_RDPIO_POPOUT, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 3000, None);
+                }
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }
@@ -691,10 +954,65 @@ fn handle(st: &mut State, cmd: &str, req: &Value) -> Result<Value, String> {
                     }
                 }
                 Some("host_logs") => shell_open(&crate::hyper_direct::data_dir().to_string_lossy()),
+                Some("session_log") => {
+                    // (The running session's file, else the last one for that PC.)
+                    let key = s(req, "key").unwrap_or_default();
+                    let log = st.sessions.values().find(|s| s.key == key).and_then(|s| s.log.clone()).or_else(|| {
+                        let host = s(req, "host")?;
+                        local_dir("logs").map(|d| d.join(format!("{}.log", safe_file_name(&host))))
+                    });
+                    match log.filter(|p| p.exists()) {
+                        Some(p) => shell_open(&p.to_string_lossy()),
+                        None => return Err("No log for that session yet.".into()),
+                    }
+                }
                 Some(url) if url.starts_with("https://") => shell_open(url),
                 _ => return Err("nothing to open".into()),
             }
             Ok(Value::Null)
+        }
+        "logs" => {
+            // (The page starting: everything kept; after that, what's new.)
+            let since = req.get("since").and_then(Value::as_u64).unwrap_or(0);
+            let lines = crate::log_ring::since(since, 4000);
+            if let Some(last) = lines.last() {
+                st.log_sent.set(st.log_sent.get().max(last.seq));
+            }
+            Ok(json!({ "lines": lines }))
+        }
+        "logs_clear" => {
+            crate::log_ring::clear();
+            Ok(Value::Null)
+        }
+        "disconnect" => {
+            let key = s(req, "key").ok_or("no session")?;
+            let (pid, child) = st.sessions.iter().find(|(_, s)| s.key == key).map(|(p, s)| (*p, s.child)).ok_or("That session isn't running.")?;
+            tracing::info!(pid, "disconnecting a session");
+            close_session(pid, child);
+            Ok(Value::Null)
+        }
+        "embed_layout" => {
+            // (CSS pixels from the page; the window's are `dpr` times as many.)
+            let dpr = req.get("dpr").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.5, 8.0);
+            let px = |k: &str| (req.get(k).and_then(Value::as_f64).unwrap_or(0.0) * dpr).round() as i32;
+            st.embed = Embed {
+                active: s(req, "key"),
+                rect: (px("x"), px("y"), px("w"), px("h")),
+                visible: req.get("visible").and_then(Value::as_bool).unwrap_or(true),
+            };
+            apply_embed(st);
+            Ok(Value::Null)
+        }
+        "embed_popout" => {
+            let key = s(req, "key").ok_or("no session")?;
+            let sess = st.sessions.values_mut().find(|s| s.key == key).ok_or("That session isn't running.")?;
+            sess.embedded = false;
+            if let Some(c) = sess.child.take() {
+                unsafe {
+                    let _ = PostMessageW(Some(HWND(c as *mut _)), crate::window::WM_RDPIO_POPOUT, WPARAM(0), LPARAM(0));
+                }
+            }
+            Ok(state_json(st))
         }
         "forget_recent" => {
             let host = s(req, "host").ok_or("no host")?;
@@ -713,6 +1031,20 @@ fn parse_id(req: &Value) -> Result<uuid::Uuid, String> {
 
 fn state_json(st: &State) -> Value {
     let running: Vec<&str> = st.sessions.values().map(|s| s.key.as_str()).collect();
+    let sessions: Vec<Value> = st
+        .sessions
+        .iter()
+        .map(|(pid, s)| {
+            json!({
+                "key": s.key,
+                "name": s.name,
+                "pid": pid,
+                "embedded": s.embedded,
+                "shown": s.child.is_some(),
+                "seconds": s.started.elapsed().as_secs(),
+            })
+        })
+        .collect();
     let connections: Vec<Value> = st
         .connections
         .list()
@@ -729,6 +1061,7 @@ fn state_json(st: &State) -> Value {
                 "has_password": r.saved_password.unprotect().is_ok_and(|p| !p.is_empty()),
                 "has_hyper_password": e.hyper_password.is_some(),
                 "options": e.options,
+                "folder": e.folder,
                 "updated": r.updated_at,
                 "running": running.contains(&r.id.to_string().as_str()),
             })
@@ -763,6 +1096,7 @@ fn state_json(st: &State) -> Value {
     json!({
         "connections": connections,
         "recent": recent,
+        "sessions": sessions,
         "settings": {
             "theme": st.prefs.file.theme,
             "keep_open": st.keep_open,
@@ -812,6 +1146,10 @@ fn save(st: &mut State, req: &Value) -> Result<Value, String> {
     }
     let mut entry = st.prefs.entry(&record.id);
     entry.options = options;
+    if let Some(f) = c.get("folder").and_then(Value::as_str) {
+        // ("Work / Servers" → "Work/Servers".)
+        entry.folder = f.split('/').map(str::trim).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("/");
+    }
     if c.get("clear_hyper_password").and_then(Value::as_bool).unwrap_or(false) {
         entry.hyper_password = None;
     }
@@ -828,7 +1166,13 @@ fn save(st: &mut State, req: &Value) -> Result<Value, String> {
 /// one-time `password` / `hyper_password` (and `remember` to save them on a
 /// saved connection). Replies `{need: "password" | "hyper_password"}` when a
 /// session would have to ask for one (it has no console to ask on).
+/// `embed: {w, h}` (this window's pixels) opens it in a Workspace tab of
+/// that size: windowed, inside this window.
 fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
+    let embed = req.get("embed").filter(|e| e.is_object()).map(|e| {
+        let px = |k: &str| e.get(k).and_then(Value::as_f64).unwrap_or(0.0).round().clamp(200.0, 8192.0) as u32;
+        (px("w"), px("h"))
+    });
     let given_pw = req.get("password").and_then(Value::as_str).map(String::from);
     let given_hyper = req.get("hyper_password").and_then(Value::as_str).map(String::from);
     let remember = req.get("remember").and_then(Value::as_bool).unwrap_or(false);
@@ -889,10 +1233,22 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
         st.prefs.file.recent.insert(profile::recent_key(&host, port, user.as_deref()), options.clone());
     }
     let _ = st.prefs.save();
-    if let Some((pid, _)) = st.sessions.iter().find(|(_, s)| s.key == key) {
-        // Already open: bring it forward instead of a second session.
+    if let Some((pid, s)) = st.sessions.iter().find(|(_, s)| s.key == key) {
+        // Already open: its tab, or its window brought forward, instead of a
+        // second session.
+        if s.embedded {
+            return Ok(json!({ "already": true, "key": key, "embedded": true }));
+        }
         bring_forward(*pid);
-        return Ok(json!({ "already": true }));
+        return Ok(json!({ "already": true, "key": key }));
+    }
+    // In a tab: a window of the tab's size, never full screen.
+    let mut options = options;
+    let mut args_size = None;
+    if let Some((w, h)) = embed {
+        options.fullscreen = false;
+        options.multimon = false;
+        args_size = Some(format!("{w}x{h}"));
     }
     let mut args: Vec<String> = vec!["--host".into(), host.clone(), "--port".into(), port.to_string()];
     if let Some(u) = &user {
@@ -906,12 +1262,28 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
         args.extend(["--launcher-id".into(), id.to_string()]);
     }
     args.extend(options.to_args());
-    let log = local_dir("logs").map(|d| d.join(format!("{}.log", safe_file_name(&host))));
+    if let Some(size) = args_size {
+        args.extend(["--size".into(), size]);
+    }
+    // One log per PC (two sessions to one PC at once: one each).
+    let log = local_dir("logs").map(|d| {
+        let base = safe_file_name(&host);
+        (1..)
+            .map(|n| d.join(if n == 1 { format!("{base}.log") } else { format!("{base}-{n}.log") }))
+            .find(|p| !st.sessions.values().any(|s| s.log.as_ref() == Some(p)))
+            .unwrap()
+    });
     if let Some(log) = &log {
+        // The last one is kept as `.prev` here, before the session starts:
+        // the page then reads only this session's lines from the file.
+        if std::fs::metadata(log).is_ok_and(|m| m.len() > 0) {
+            let _ = std::fs::rename(log, format!("{}.prev", log.display()));
+        }
         args.extend(["--log-file".into(), log.to_string_lossy().into_owned()]);
     }
-    let pid = spawn_session(&args, password.as_deref(), hyper_password.as_deref(), key.clone(), name.clone())?;
-    tracing::info!(pid, host = %host, transport = ?options.transport, "launcher started a session");
+    let parent = embed.map(|_| st.hwnd.0 as isize);
+    let pid = spawn_session(&args, password.as_deref(), hyper_password.as_deref(), key.clone(), name.clone(), log.clone(), parent)?;
+    tracing::info!(pid, host = %host, transport = ?options.transport, in_tab = embed.is_some(), "launcher started a session");
     let record = (options.transport == Transport::Direct).then(|| RecordMru {
         host: host.clone(),
         port,
@@ -920,12 +1292,17 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
         name: name.clone(),
         id,
     });
-    st.sessions.insert(pid, Session { key: key.clone(), started: Instant::now(), recorded: false, record });
-    if !st.keep_open {
+    st.sessions.insert(
+        pid,
+        Session { key: key.clone(), name: name.clone(), started: Instant::now(), recorded: false, record, log, embedded: embed.is_some(), child: None },
+    );
+    // (A session in a tab is in this window: it stays.)
+    if !st.keep_open && embed.is_none() {
         unsafe {
             let _ = ShowWindow(st.hwnd, SW_HIDE);
         }
         st.hidden = true;
+        set_page_visible(st, false);
     }
     send(st, &json!({ "event": "state", "state": state_json(st) }));
     Ok(json!({ "started": true, "key": key }))
@@ -955,8 +1332,17 @@ fn safe_file_name(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).take(64).collect()
 }
 
-/// Start a session process and a thread that watches it.
-fn spawn_session(args: &[String], password: Option<&str>, hyper_password: Option<&str>, key: String, name: String) -> Result<u32, String> {
+/// Start a session process and threads that watch it (and read its log).
+/// `parent`: open its window inside that one (a Workspace tab).
+fn spawn_session(
+    args: &[String],
+    password: Option<&str>,
+    hyper_password: Option<&str>,
+    key: String,
+    name: String,
+    log: Option<PathBuf>,
+    parent: Option<isize>,
+) -> Result<u32, String> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -970,9 +1356,18 @@ fn spawn_session(args: &[String], password: Option<&str>, hyper_password: Option
     if let Some(p) = hyper_password {
         cmd.env(crate::HYPER_PASSWORD_ENV, p);
     }
+    match parent {
+        Some(p) => cmd.env("RDPIO_EMBED_PARENT", p.to_string()),
+        None => cmd.env_remove("RDPIO_EMBED_PARENT"),
+    };
     let mut child = cmd.spawn().map_err(|e| format!("could not start the session: {e}"))?;
     let pid = child.id();
     let mut stderr = child.stderr.take();
+    let ended = Arc::new(AtomicBool::new(false));
+    let tail = log.and_then(|path| {
+        let (src, name, ended) = (key.clone(), name.clone(), ended.clone());
+        std::thread::Builder::new().name("launcher-log".into()).spawn(move || tail_log(&path, &src, &name, &ended)).ok()
+    });
     std::thread::spawn(move || {
         let started = Instant::now();
         // A session still up after this connected (a direct sign-in gives up
@@ -982,15 +1377,28 @@ fn spawn_session(args: &[String], password: Option<&str>, hyper_password: Option
             std::thread::sleep(Duration::from_secs(10));
             post_event(json!({ "event": "_up", "pid": pid, "key": up_key }));
         });
+        // (What it prints there is its last word: an error. On the page too.)
         let mut err = String::new();
-        if let Some(e) = stderr.as_mut() {
-            let _ = e.read_to_string(&mut err);
+        if let Some(e) = stderr.take() {
+            for line in std::io::BufReader::new(e).lines().map_while(Result::ok) {
+                crate::log_ring::push_plain(&key, &name, "ERROR", &line);
+                err.push_str(&line);
+                err.push('\n');
+            }
         }
         let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+        ended.store(true, Ordering::Release);
+        if let Some(t) = tail {
+            let _ = t.join();
+        }
         drop(up);
         let ran = started.elapsed();
-        // The last line printed is the reason (`rdpio: …` / the error).
-        let reason = err.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("").to_string();
+        // The last line printed is the reason (`rdpio: …` / the error); else
+        // the last error it logged.
+        let mut reason = err.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("").to_string();
+        if reason.is_empty() && code != 0 {
+            reason = crate::log_ring::last_error(&key).unwrap_or_default();
+        }
         post_event(json!({
             "event": "_ended",
             "pid": pid,
@@ -1004,11 +1412,46 @@ fn spawn_session(args: &[String], password: Option<&str>, hyper_password: Option
     Ok(pid)
 }
 
-/// The session window of process `pid` to the front.
-fn bring_forward(pid: u32) {
+/// Read a session's log file as it grows, into the page's log. Often while
+/// the page is in sight, now and then while it isn't; once more when the
+/// session has ended.
+fn tail_log(path: &std::path::Path, src: &str, name: &str, ended: &AtomicBool) {
+    use std::io::{Seek, SeekFrom};
+    crate::net_tune::eco_thread();
+    let (mut pos, mut partial) = (0u64, Vec::<u8>::new());
+    loop {
+        let last = ended.load(Ordering::Acquire);
+        if let Ok(mut f) = std::fs::File::open(path) {
+            let len = f.metadata().map_or(0, |m| m.len());
+            if len < pos {
+                // (A new file: from its start.)
+                (pos, partial) = (0, Vec::new());
+            }
+            if len > pos && f.seek(SeekFrom::Start(pos)).is_ok() {
+                let mut buf = Vec::new();
+                if (&mut f).take(len - pos).read_to_end(&mut buf).is_ok() {
+                    pos += buf.len() as u64;
+                    partial.extend_from_slice(&buf);
+                    while let Some(i) = partial.iter().position(|&b| b == b'\n') {
+                        let line: Vec<u8> = partial.drain(..=i).collect();
+                        crate::log_ring::push(src, name, &String::from_utf8_lossy(&line));
+                    }
+                }
+            }
+        }
+        if last {
+            crate::log_ring::push(src, name, &String::from_utf8_lossy(&partial));
+            return;
+        }
+        std::thread::sleep(if PAGE_SHOWN.load(Ordering::Relaxed) { Duration::from_millis(250) } else { Duration::from_secs(2) });
+    }
+}
+
+/// Process `pid`'s visible top-level windows.
+fn windows_of(pid: u32) -> Vec<HWND> {
     struct Find {
         pid: u32,
-        found: HWND,
+        found: Vec<HWND>,
     }
     extern "system" fn each(hwnd: HWND, l: LPARAM) -> windows::core::BOOL {
         let f = unsafe { &mut *(l.0 as *mut Find) };
@@ -1016,20 +1459,26 @@ fn bring_forward(pid: u32) {
         unsafe {
             GetWindowThreadProcessId(hwnd, Some(&mut p));
             if p == f.pid && IsWindowVisible(hwnd).as_bool() {
-                f.found = hwnd;
-                return false.into();
+                f.found.push(hwnd);
             }
         }
         true.into()
     }
-    let mut f = Find { pid, found: HWND::default() };
+    let mut f = Find { pid, found: Vec::new() };
     unsafe {
         let _ = EnumWindows(Some(each), LPARAM(&mut f as *mut Find as isize));
-        if !f.found.0.is_null() {
-            if IsIconic(f.found).as_bool() {
-                let _ = ShowWindow(f.found, SW_RESTORE);
+    }
+    f.found
+}
+
+/// The session window of process `pid` to the front.
+fn bring_forward(pid: u32) {
+    if let Some(&w) = windows_of(pid).first() {
+        unsafe {
+            if IsIconic(w).as_bool() {
+                let _ = ShowWindow(w, SW_RESTORE);
             }
-            let _ = SetForegroundWindow(f.found);
+            let _ = SetForegroundWindow(w);
         }
     }
 }
@@ -1037,7 +1486,30 @@ fn bring_forward(pid: u32) {
 /// Events from the worker threads, on the UI thread.
 fn on_event(e: Value) {
     let kind = e.get("event").and_then(Value::as_str).unwrap_or("").to_string();
+    if kind == "_webview_failed" {
+        // (COREWEBVIEW2_PROCESS_FAILED_KIND: 0 the browser, 1 the page's
+        // renderer, 2 it hangs, 3 a frame's renderer, 6 the GPU process.)
+        let k = e.get("kind").and_then(Value::as_i64).unwrap_or(-1);
+        tracing::warn!(kind = k, "a process of the window's web view failed");
+        match k {
+            0 => rebuild_webview(),
+            1 | 2 => {
+                with_state(|st| reload_page(st));
+            }
+            // (WebView2 starts a new GPU process itself: draw with it.)
+            6 => {
+                with_state(|st| redraw_page(st));
+            }
+            _ => {}
+        }
+        return;
+    }
     with_state(|st| match kind.as_str() {
+        "_logs" => flush_logs(st),
+        "_resumed" => {
+            tracing::info!(sessions = st.sessions.len(), "this PC resumed from sleep; redrawing the window");
+            redraw_page(st);
+        }
         "_up" => {
             let pid = e.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
             // (After it ended, the `_ended` already took it out: not recorded.)
@@ -1064,13 +1536,17 @@ fn on_event(e: Value) {
             if let Ok(m) = MruStore::load() {
                 st.mru = m;
             }
+            let (session, reason) = (e.get("name").and_then(Value::as_str).unwrap_or(""), e.get("reason").and_then(Value::as_str).unwrap_or(""));
+            let seconds = e.get("seconds").and_then(Value::as_u64).unwrap_or(0);
+            tracing::info!(session, code, seconds, reason, "session ended");
             if st.hidden && st.sessions.is_empty() {
                 if failed {
+                    st.hidden = false;
+                    set_page_visible(st, true);
                     unsafe {
                         let _ = ShowWindow(st.hwnd, SW_SHOW);
                         let _ = SetForegroundWindow(st.hwnd);
                     }
-                    st.hidden = false;
                 } else {
                     // "Close after connecting": the session's done, so are we.
                     unsafe {

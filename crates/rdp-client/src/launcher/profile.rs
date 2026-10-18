@@ -172,6 +172,9 @@ pub struct Entry {
     pub options: Options,
     /// DPAPI-protected (this Windows user only).
     pub hyper_password: Option<ProtectedPassword>,
+    /// The Workspace folder it's filed under ("" = none; "/" nests:
+    /// "Work/Servers").
+    pub folder: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,7 +254,7 @@ impl Store {
     }
 
     pub fn entry(&self, id: &uuid::Uuid) -> Entry {
-        self.file.entries.get(id).cloned().unwrap_or_else(|| Entry { options: self.file.defaults.clone(), hyper_password: None })
+        self.file.entries.get(id).cloned().unwrap_or_else(|| Entry { options: self.file.defaults.clone(), ..Entry::default() })
     }
 }
 

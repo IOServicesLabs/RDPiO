@@ -130,7 +130,24 @@ pub enum Control {
     /// cost the laptop a decode each. Repeated every few seconds; a host that
     /// doesn't know it ignores it.
     Refresh { hz: u16 },
+    /// Client → host: how many cameras the client has (0: none, or it won't
+    /// share one). With any, the host offers apps a virtual camera for the
+    /// stream's length. Repeated every few seconds.
+    Cameras { count: u8 },
+    /// Host → client: an app on the host is (or stopped) using the virtual
+    /// camera — send the camera ([`crate::wire::Kind::Camera`]) or stop.
+    /// Repeated while on.
+    Camera { on: bool },
+    /// Host → client: the camera stream broke (lost frames): a keyframe.
+    CameraKeyframe,
+    /// Host → client: something the user should know, shown over the stream
+    /// for a few seconds (an app on the host records from a microphone the
+    /// stream can't reach).
+    Notice { text: String },
 }
+
+/// Longest [`Control::Notice`] text (bytes): it fits one packet.
+pub const NOTICE_MAX: usize = 600;
 
 impl Control {
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -188,6 +205,23 @@ impl Control {
                 o.push(12);
                 o.extend_from_slice(&hz.to_le_bytes());
             }
+            Self::Cameras { count } => {
+                o.push(13);
+                o.push(*count);
+            }
+            Self::Camera { on } => {
+                o.push(14);
+                o.push(*on as u8);
+            }
+            Self::CameraKeyframe => o.push(15),
+            Self::Notice { text } => {
+                o.push(16);
+                let mut end = text.len().min(NOTICE_MAX);
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                o.extend_from_slice(&text.as_bytes()[..end]);
+            }
         }
         o
     }
@@ -226,6 +260,10 @@ impl Control {
             10 => Self::Reconnect,
             11 => Self::Recover,
             12 => Self::Refresh { hz: u16_at(1)? },
+            13 => Self::Cameras { count: *b.get(1)? },
+            14 => Self::Camera { on: *b.get(1)? != 0 },
+            15 => Self::CameraKeyframe,
+            16 => Self::Notice { text: String::from_utf8_lossy(&b[1..b.len().min(1 + NOTICE_MAX)]).into_owned() },
             _ => return None,
         })
     }
@@ -283,6 +321,11 @@ mod tests {
             Control::Mode { office: false, fast_text: false },
             Control::Reconnect,
             Control::Refresh { hz: 144 },
+            Control::Cameras { count: 2 },
+            Control::Camera { on: true },
+            Control::Camera { on: false },
+            Control::CameraKeyframe,
+            Control::Notice { text: "Discord records from FrontMic".into() },
         ];
         for c in all {
             assert_eq!(Control::parse(&c.to_bytes()), Some(c.clone()), "{c:?}");

@@ -92,6 +92,16 @@ impl Renderer {
         }
     }
 
+    /// A CPU video picture fitted into a framebuffer rectangle on the GPU
+    /// (see `D3D11Renderer::draw_nv12_fit`). `false`: not done (Direct3D 12,
+    /// or no shader): convert on the CPU.
+    pub fn draw_nv12_fit(&mut self, rect: (i32, i32, u32, u32), nv12: &[u8], size: (u32, u32), cover: bool, mirror: bool) -> bool {
+        match self {
+            Self::D3D11(r) => r.draw_nv12_fit(rect, nv12, size, cover, mirror),
+            Self::D3D12(_) => false,
+        }
+    }
+
     /// See `D3D11Renderer::video_layer_status`.
     pub fn video_layer_status(&self) -> Option<(bool, u32, u32, u32)> {
         match self {

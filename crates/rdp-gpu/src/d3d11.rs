@@ -332,6 +332,9 @@ pub struct D3D11Renderer {
     /// first. A FLIP backbuffer coming back around is missing exactly the
     /// union of these plus the current frame's dirty set.
     recent_dirty: std::collections::VecDeque<Option<Vec<(u32, u32, u32, u32)>>>,
+    /// The texture [`draw_nv12_fit`](Self::draw_nv12_fit) uploads a picture
+    /// into (kept while the picture's size holds).
+    fit_upload: Option<(ID3D11Texture2D, (u32, u32))>,
     /// Video pictures may go to a [`VideoLayer`] (Hyper asks for it).
     video_layer_wanted: bool,
     video_layer: Option<VideoLayer>,
@@ -789,6 +792,7 @@ impl D3D11Renderer {
                 video_layer_wanted: false,
                 video_layer: None,
                 video_layer_failed: false,
+                fit_upload: None,
             };
             renderer.create_rtv()?;
             // Enable multithread protection so the session worker can use the
@@ -2094,7 +2098,8 @@ impl D3D11Renderer {
             if rect != (0, 0, sc_w, sc_h) {
                 self.context.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]);
             }
-            if shader.draw(&rtv, tex, slice, (w, h), rect).is_err() {
+            let dst = (rect.0 as i32, rect.1 as i32, rect.2, rect.3);
+            if shader.draw(&rtv, tex, slice, (0.0, 0.0, w as f32, h as f32), dst, false, false).is_err() {
                 return Ok(false);
             }
         }
@@ -2105,6 +2110,90 @@ impl D3D11Renderer {
         // present copies it whole.
         self.rotate_dirty(true);
         res.map(|()| true)
+    }
+
+    /// A video picture from the CPU (`nv12`: tightly packed, `sw`×`sh`, BT.601
+    /// as webcams and Teams video come) fitted into framebuffer rectangle
+    /// `(x, y, w, h)` as CSS `object-fit` does — `cover` crops, else it's
+    /// letterboxed in black — and mirrored for a self-view. On the GPU: one
+    /// NV12 upload and one draw, where it was a per-pixel CPU scale and colour
+    /// conversion and an RGBA upload four times the size. The rectangle may
+    /// reach past the framebuffer's edges. `false`: not done here (no shader):
+    /// the caller converts on the CPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_nv12_fit(
+        &mut self,
+        (x, y, w, h): (i32, i32, u32, u32),
+        nv12: &[u8],
+        (sw, sh): (u32, u32),
+        cover: bool,
+        mirror: bool,
+    ) -> bool {
+        if w == 0 || h == 0 || sw == 0 || sh == 0 || sw % 2 != 0 || sh % 2 != 0 || nv12.len() < (sw * sh * 3 / 2) as usize {
+            return false;
+        }
+        let (Some(fb), false) = (self.framebuffer.clone(), self.nv12_shader_failed) else {
+            return false;
+        };
+        if self.nv12_shader.is_none() {
+            match Nv12Shader::new(&self.device, &self.context) {
+                Ok(s) => self.nv12_shader = Some(s),
+                Err(_) => return false,
+            }
+        }
+        unsafe {
+            if self.fit_upload.as_ref().is_none_or(|(_, s)| *s != (sw, sh)) {
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: sw,
+                    Height: sh,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_NV12,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags: 0,
+                };
+                let mut t: Option<ID3D11Texture2D> = None;
+                if self.device.CreateTexture2D(&desc, None, Some(&mut t)).is_err() {
+                    return false;
+                }
+                self.fit_upload = t.map(|t| (t, (sw, sh)));
+            }
+            let Some((tex, _)) = self.fit_upload.clone() else { return false };
+            // (Row pitch = the Y plane's width; the UV rows follow at it.)
+            self.context.UpdateSubresource(&tex, 0, None, nv12.as_ptr() as *const core::ffi::c_void, sw, sw * sh);
+            let shader = self.nv12_shader.as_mut().expect("nv12 shader");
+            let Ok(rtv) = shader.framebuffer_rtv(&fb) else { return false };
+            let (fx, fy) = (w as f64 / sw as f64, h as f64 / sh as f64);
+            let scale = if cover { fx.max(fy) } else { fx.min(fy) };
+            let (dw, dh) = ((sw as f64 * scale).round().max(1.0), (sh as f64 * scale).round().max(1.0));
+            let (src, dst) = if cover {
+                // The middle of the picture, as much of it as fills the box.
+                let (cw, ch) = ((w as f64 / scale).min(sw as f64), (h as f64 / scale).min(sh as f64));
+                let src = (((sw as f64 - cw) / 2.0) as f32, ((sh as f64 - ch) / 2.0) as f32, cw as f32, ch as f32);
+                (src, (x, y, w, h))
+            } else {
+                // Black around it, then the picture in the middle.
+                if let Ok(c1) = self.context.cast::<windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext1>() {
+                    let area = RECT { left: x, top: y, right: x + w as i32, bottom: y + h as i32 };
+                    c1.ClearView(&rtv, &[0.0, 0.0, 0.0, 1.0], Some(&[area]));
+                }
+                let (ox, oy) = (((w as f64 - dw) / 2.0) as i32, ((h as f64 - dh) / 2.0) as i32);
+                ((0.0, 0.0, sw as f32, sh as f32), (x + ox, y + oy, dw as u32, dh as u32))
+            };
+            if shader.draw(&rtv, &tex, 0, src, dst, mirror, true).is_err() {
+                return false;
+            }
+        }
+        // (The part on the framebuffer.)
+        let (x0, y0) = (x.max(0) as u32, y.max(0) as u32);
+        let (x1, y1) = (((x as i64 + w as i64).max(0) as u32).min(self.fb_width), ((y as i64 + h as i64).max(0) as u32).min(self.fb_height));
+        if x1 > x0 && y1 > y0 {
+            self.note_dirty(x0, y0, x1 - x0, y1 - y0);
+        }
+        true
     }
 
     /// [`blit_texture`](Self::blit_texture) of one slice of a texture array
@@ -3410,6 +3499,8 @@ SamplerState samp : register(s0);
 cbuffer Nv12Params : register(b0) {
     float2 src_off;    // region origin, normalised to the NV12 texture
     float2 src_scale;  // region size, normalised to the NV12 texture
+    float bt601;       // 1: BT.601 (webcams), 0: BT.709 (the session's video)
+    float3 pad;
 };
 
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -3428,6 +3519,13 @@ float4 to_rgb(float y, float2 c) {
     float  yy = 1.1640625 * (y - 0.0627451);   // 298/256, 16/255
     float  u  = c.x - 0.5019608;               // 128/255
     float  v  = c.y - 0.5019608;
+    if (bt601 > 0.5) {
+        return float4(
+            saturate(yy + 1.5976563 * v),                   // 409/256
+            saturate(yy - 0.3906250 * u - 0.8125000 * v),   // 100/256, 208/256
+            saturate(yy + 2.0156250 * u),                   // 516/256
+            1.0);
+    }
     return float4(
         saturate(yy + 1.7929688 * v),                       // 459/256
         saturate(yy - 0.2148438 * u - 0.5312500 * v),       // 55/256, 136/256
@@ -3453,11 +3551,13 @@ float4 ps_nv12_slice(VSOut i) : SV_Target {
 }
 "#;
 
-/// Constant buffer for [`NV12_HLSL`] — 16 bytes, the constant-buffer minimum.
+/// Constant buffer for [`NV12_HLSL`] (a multiple of 16 bytes).
 #[repr(C)]
 struct Nv12Params {
     src_off: [f32; 2],
     src_scale: [f32; 2],
+    bt601: f32,
+    _pad: [f32; 3],
 }
 
 /// GPU NV12 → RGBA conversion done with a pixel shader rather than the D3D11
@@ -3571,6 +3671,16 @@ impl Nv12Shader {
         }
     }
 
+    /// The render target view on the framebuffer (cached; see `rtv`).
+    unsafe fn framebuffer_rtv(&mut self, framebuffer: &ID3D11Texture2D) -> WinResult<ID3D11RenderTargetView> {
+        if self.rtv.is_none() {
+            let mut rtv: Option<ID3D11RenderTargetView> = None;
+            self.device.CreateRenderTargetView(framebuffer, None, Some(&mut rtv))?;
+            self.rtv = rtv;
+        }
+        Ok(self.rtv.clone().expect("framebuffer render target view"))
+    }
+
     /// A single-plane view onto an NV12 texture: `R8_UNORM` selects the luma
     /// plane, `R8G8_UNORM` the (half-resolution) interleaved chroma plane.
     /// `slice`: of a texture array, the one slice viewed.
@@ -3610,16 +3720,20 @@ impl Nv12Shader {
         Ok(srv.expect("nv12 plane view"))
     }
 
-    /// Convert the `src` (`w`, `h`) picture at `tex`'s origin into `rtv`'s
-    /// `(x, y, w, h)` rectangle, scaled by the bilinear sampler where the two
-    /// sizes differ.
+    /// Convert the `src` rectangle of `tex` (pixels: x, y, w, h) into `rtv`'s
+    /// `dst` rectangle (which may reach past its edges: clipped), scaled by
+    /// the bilinear sampler where the two sizes differ; `mirror` flips it
+    /// left to right, `bt601` takes BT.601 colours (webcams) for BT.709.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn draw(
         &mut self,
         rtv: &ID3D11RenderTargetView,
         tex: &ID3D11Texture2D,
         slice: u32,
-        (sw, sh): (u32, u32),
-        (x, y, w, h): (u32, u32, u32, u32),
+        (sx, sy, sw, sh): (f32, f32, f32, f32),
+        (x, y, w, h): (i32, i32, u32, u32),
+        mirror: bool,
+        bt601: bool,
     ) -> WinResult<()> {
         let mut td: D3D11_TEXTURE2D_DESC = core::mem::zeroed();
         tex.GetDesc(&mut td);
@@ -3640,7 +3754,13 @@ impl Nv12Shader {
         ctx.PSSetShaderResources(if array.is_some() { 2 } else { 0 }, Some(&[Some(luma), Some(chroma)]));
         ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
         ctx.PSSetConstantBuffers(0, Some(&[Some(self.params.clone())]));
-        let p = Nv12Params { src_off: [0.0, 0.0], src_scale: [sw as f32 / tw, sh as f32 / th] };
+        let (off_x, scale_x) = if mirror { ((sx + sw) / tw, -sw / tw) } else { (sx / tw, sw / tw) };
+        let p = Nv12Params {
+            src_off: [off_x, sy / th],
+            src_scale: [scale_x, sh / th],
+            bt601: if bt601 { 1.0 } else { 0.0 },
+            _pad: [0.0; 3],
+        };
         ctx.UpdateSubresource(&self.params, 0, None, &p as *const _ as *const core::ffi::c_void, 0, 0);
         ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
             TopLeftX: x as f32,
@@ -3727,6 +3847,8 @@ impl Nv12Shader {
                 let p = Nv12Params {
                     src_off: [rx as f32 / tw, ry as f32 / th],
                     src_scale: [cw as f32 / tw, ch as f32 / th],
+                    bt601: 0.0,
+                    _pad: [0.0; 3],
                 };
                 ctx.UpdateSubresource(
                     &self.params,

@@ -66,7 +66,7 @@ unsafe fn take_pwstr(p: PWSTR) -> String {
     s
 }
 
-unsafe fn friendly_name(device: &IMMDevice) -> String {
+pub(crate) unsafe fn friendly_name(device: &IMMDevice) -> String {
     use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
     use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
     let Ok(store) = device.OpenPropertyStore(STGM_READ) else { return String::new() };
@@ -388,6 +388,9 @@ pub struct Capture {
     /// Opened as the default device: where to ask for the default, and the
     /// id it had then.
     default: Option<(IMMDeviceEnumerator, EDataFlow, String)>,
+    /// Signalled by the audio engine each time it has captured a period
+    /// (event-driven mode); `None` where the device refused it (polled).
+    ready: Option<windows::Win32::Foundation::HANDLE>,
 }
 
 impl Capture {
@@ -408,11 +411,28 @@ impl Capture {
                 Some(_) => None,
                 None => Some((e.clone(), flow.edataflow(), take_pwstr(dev.GetId()?))),
             };
-            let client: IAudioClient = dev.Activate(CLSCTX_ALL, None)?;
+            let mut client: IAudioClient = dev.Activate(CLSCTX_ALL, None)?;
             let (fmt_ptr, format) = mix_format(&client)?;
             let flags = if loopback { AUDCLNT_STREAMFLAGS_LOOPBACK } else { 0 };
-            // 20 ms engine buffer; we poll every few ms.
-            let r = client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, fmt_ptr, None);
+            // 20 ms engine buffer, read as the engine signals each period
+            // (no polling every few ms); polled where a device won't signal.
+            let mut r = client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags | AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 200_000, 0, fmt_ptr, None);
+            let mut ready = None;
+            if r.is_ok() {
+                match windows::Win32::System::Threading::CreateEventW(None, false, false, None) {
+                    Ok(ev) if client.SetEventHandle(ev).is_ok() => ready = Some(ev),
+                    Ok(ev) => {
+                        let _ = windows::Win32::Foundation::CloseHandle(ev);
+                        r = Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
+                    }
+                    Err(e) => r = Err(e),
+                }
+            }
+            if r.is_err() {
+                // (A client initializes once: a fresh one, polled.)
+                client = dev.Activate(CLSCTX_ALL, None)?;
+                r = client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, fmt_ptr, None);
+            }
             CoTaskMemFree(Some(fmt_ptr as *const core::ffi::c_void));
             r?;
             let capture: IAudioCaptureClient = client.GetService()?;
@@ -428,7 +448,25 @@ impl Capture {
                 last: vec![0.0; channels],
                 converted: Vec::new(),
                 default,
+                ready,
             })
+        }
+    }
+
+    /// Whether the engine signals captured data (else it's polled).
+    #[cfg(test)]
+    pub fn event_driven(&self) -> bool {
+        self.ready.is_some()
+    }
+
+    /// Until the engine has something to read (event-driven: at most
+    /// 100 ms, so the owner still checks in), or `poll` where it doesn't signal.
+    pub fn wait(&self, poll: std::time::Duration) {
+        match self.ready {
+            Some(h) => unsafe {
+                let _ = windows::Win32::System::Threading::WaitForSingleObject(h, 100);
+            },
+            None => std::thread::sleep(poll),
         }
     }
 
@@ -504,6 +542,9 @@ impl Drop for Capture {
     fn drop(&mut self) {
         unsafe {
             let _ = self.client.Stop();
+            if let Some(h) = self.ready.take() {
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+            }
         }
     }
 }
@@ -1242,6 +1283,50 @@ mod tests {
     /// On real devices: a player and a loopback capture that follow the
     /// default output don't take an unchanged default for a new one. The
     /// player stays silent (nothing is pushed).
+    /// While audio plays, event-driven loopback gets its data as each period
+    /// is captured (an inaudible tone into an output nobody uses: S/PDIF).
+    #[test]
+    #[ignore = "needs a Realtek Digital Output"]
+    fn event_driven_loopback_hears_what_plays() {
+        com_init();
+        let out = find(Flow::Render, "Realtek Digital Output").expect("Realtek Digital Output");
+        let player = Player::new(Some(out.id.clone()), 2).expect("player");
+        let mut cap = Capture::new(Some(&out.id), Flow::Render, true, 2).expect("loopback");
+        assert!(cap.event_driven());
+        let (start, mut got, mut phase) = (std::time::Instant::now(), Vec::new(), 0f32);
+        let mut waits = 0;
+        while start.elapsed() < Duration::from_secs(1) {
+            let tone: Vec<f32> = (0..960).flat_map(|_| {
+                phase = (phase + 440.0 / RATE as f32) % 1.0;
+                let s = (phase * std::f32::consts::TAU).sin() * 0.001;
+                [s, s]
+            }).collect();
+            player.push(&tone);
+            cap.wait(Duration::from_millis(5));
+            waits += 1;
+            cap.read(&mut got).unwrap();
+        }
+        eprintln!("{waits} waits in 1 s, {} samples captured", got.len());
+        assert!(got.len() > RATE as usize, "loopback heard too little: {}", got.len());
+        assert!(waits > 50, "the engine's events didn't come ({waits} waits in a second)");
+    }
+
+    /// Loopback capture of the default output reads as the engine signals,
+    /// not on a polling timer. (Leaves every device setting alone.)
+    #[test]
+    #[ignore = "needs an audio output"]
+    fn loopback_capture_is_event_driven() {
+        com_init();
+        let mut cap = Capture::new(None, Flow::Render, true, 2).expect("loopback capture");
+        assert!(cap.event_driven(), "the engine refused event-driven capture");
+        let (start, mut got) = (std::time::Instant::now(), Vec::new());
+        for _ in 0..20 {
+            cap.wait(Duration::from_millis(5));
+            cap.read(&mut got).unwrap();
+        }
+        eprintln!("20 waits in {:?}, {} samples", start.elapsed(), got.len());
+    }
+
     #[test]
     #[ignore = "needs a default output device"]
     fn following_the_default_output_is_stable() {

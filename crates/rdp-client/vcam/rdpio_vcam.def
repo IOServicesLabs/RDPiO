@@ -1,0 +1,4 @@
+LIBRARY rdpio_vcam
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

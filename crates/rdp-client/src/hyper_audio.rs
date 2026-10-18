@@ -104,8 +104,9 @@ fn send_loop(
     // Silent frames in a row: past the tail, nothing is sent (the receiver
     // takes the pause for silence and lets its output close).
     let mut silent_run = 0u32;
-    // The host polls tighter (it has headroom and game audio latency shows);
-    // the client's mic wakes less often to keep the laptop's CPU idle.
+    // Read as the engine signals each captured period; where a device won't
+    // signal, polled — the host tighter (game audio latency shows), the
+    // client's mic less often (the laptop's CPU idles meanwhile).
     let poll = Duration::from_millis(if matches!(source, Source::Loopback) { 2 } else { 5 });
     // Devices come and go (unplugged, an HDMI endpoint reset by a display mode
     // change, a new default): the capture is reopened, at most once a second
@@ -142,7 +143,7 @@ fn send_loop(
             }
             continue;
         };
-        std::thread::sleep(poll);
+        cap.wait(poll);
         let mut lost = false;
         if let Err(e) = cap.read(&mut pcm) {
             tracing::info!(error = %e, "Hyper audio capture device lost; reopening");
@@ -482,6 +483,208 @@ impl HostRouting {
     }
 }
 
+/// Something about a watched endpoint's recording sessions may have changed
+/// (see [`ListenerWatch`]); also set to end a [`ListenerWatch::wait`] early.
+#[derive(Default)]
+pub struct Changed {
+    flag: std::sync::Mutex<bool>,
+    cond: std::sync::Condvar,
+}
+
+impl Changed {
+    pub fn notify(&self) {
+        *self.flag.lock().unwrap() = true;
+        self.cond.notify_all();
+    }
+
+    /// Until notified, or `timeout`.
+    fn wait(&self, timeout: Duration) {
+        let g = self.flag.lock().unwrap();
+        let (mut g, _) = self.cond.wait_timeout_while(g, timeout, |set| !*set).unwrap();
+        *g = false;
+    }
+}
+
+#[windows::core::implement(windows::Win32::Media::Audio::IAudioSessionNotification)]
+struct SessionCreated(Arc<Changed>);
+
+impl windows::Win32::Media::Audio::IAudioSessionNotification_Impl for SessionCreated_Impl {
+    fn OnSessionCreated(&self, _: windows::core::Ref<windows::Win32::Media::Audio::IAudioSessionControl>) -> windows::core::Result<()> {
+        self.0.notify();
+        Ok(())
+    }
+}
+
+#[windows::core::implement(windows::Win32::Media::Audio::IAudioSessionEvents)]
+struct SessionEvents(Arc<Changed>);
+
+impl windows::Win32::Media::Audio::IAudioSessionEvents_Impl for SessionEvents_Impl {
+    fn OnDisplayNameChanged(&self, _: &windows::core::PCWSTR, _: *const windows::core::GUID) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnIconPathChanged(&self, _: &windows::core::PCWSTR, _: *const windows::core::GUID) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnSimpleVolumeChanged(&self, _: f32, _: windows::core::BOOL, _: *const windows::core::GUID) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnChannelVolumeChanged(&self, _: u32, _: *const f32, _: u32, _: *const windows::core::GUID) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnGroupingParamChanged(&self, _: *const windows::core::GUID, _: *const windows::core::GUID) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnStateChanged(&self, _: windows::Win32::Media::Audio::AudioSessionState) -> windows::core::Result<()> {
+        self.0.notify();
+        Ok(())
+    }
+    fn OnSessionDisconnected(&self, _: windows::Win32::Media::Audio::AudioSessionDisconnectReason) -> windows::core::Result<()> {
+        self.0.notify();
+        Ok(())
+    }
+}
+
+/// Which apps record from a capture endpoint, told by Windows' audio-session
+/// notifications (a session made, started, stopped, gone) instead of asking
+/// three times a second for the length of a stream.
+pub struct ListenerWatch {
+    mgr: windows::Win32::Media::Audio::IAudioSessionManager2,
+    created: windows::Win32::Media::Audio::IAudioSessionNotification,
+    /// Sessions whose state changes we hear about (by session instance id).
+    watched: std::collections::HashMap<String, (windows::Win32::Media::Audio::IAudioSessionControl, windows::Win32::Media::Audio::IAudioSessionEvents)>,
+    changed: Arc<Changed>,
+}
+
+impl ListenerWatch {
+    /// Watch capture endpoint `id`; `changed` is notified on every change
+    /// (and may be notified by the owner to end a wait). `None` where the
+    /// notifications can't be had (the caller polls instead).
+    pub fn new(id: &str, changed: Arc<Changed>) -> Option<Self> {
+        use windows::Win32::Media::Audio::*;
+        use windows::Win32::System::Com::*;
+        wasapi::com_init();
+        unsafe {
+            let e: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+            let wide: Vec<u16> = id.encode_utf16().chain(Some(0)).collect();
+            let dev = e.GetDevice(windows::core::PCWSTR(wide.as_ptr())).ok()?;
+            let mgr: IAudioSessionManager2 = dev.Activate(CLSCTX_ALL, None).ok()?;
+            let created: IAudioSessionNotification = SessionCreated(changed.clone()).into();
+            mgr.RegisterSessionNotification(&created).ok()?;
+            Some(Self { mgr, created, watched: Default::default(), changed })
+        }
+    }
+
+    /// Whether any app is recording from the endpoint now. (Also starts
+    /// watching sessions made since the last look: Windows only reports
+    /// sessions created after an enumeration.)
+    pub fn listening(&mut self) -> bool {
+        use windows::core::Interface;
+        use windows::Win32::Media::Audio::*;
+        let mut any = false;
+        unsafe {
+            let Ok(list) = self.mgr.GetSessionEnumerator() else { return false };
+            for i in 0..list.GetCount().unwrap_or(0) {
+                let Ok(s) = list.GetSession(i) else { continue };
+                if s.GetState().is_ok_and(|st| st == AudioSessionStateActive) {
+                    any = true;
+                }
+                let key = s
+                    .cast::<IAudioSessionControl2>()
+                    .ok()
+                    .and_then(|s2| s2.GetSessionInstanceIdentifier().ok())
+                    .map(|p| {
+                        let id = p.to_string().unwrap_or_default();
+                        windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const core::ffi::c_void));
+                        id
+                    });
+                if let Some(key) = key.filter(|k| !self.watched.contains_key(k)) {
+                    let events: IAudioSessionEvents = SessionEvents(self.changed.clone()).into();
+                    if s.RegisterAudioSessionNotification(&events).is_ok() {
+                        self.watched.insert(key, (s, events));
+                    }
+                }
+            }
+        }
+        any
+    }
+
+    /// Until something changed, the owner notified, or `timeout`.
+    pub fn wait(&self, timeout: Duration) {
+        self.changed.wait(timeout);
+    }
+}
+
+impl Drop for ListenerWatch {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.mgr.UnregisterSessionNotification(&self.created);
+            for (s, events) in self.watched.values() {
+                let _ = s.UnregisterAudioSessionNotification(events);
+            }
+        }
+    }
+}
+
+/// Apps recording from a microphone other than `except` (the stream's), as
+/// `(app, microphone)`: their sound can't be the client's, so the user should
+/// pick the stream's (or "Default") in them.
+pub fn other_mic_users(except: &str) -> Vec<(String, String)> {
+    use windows::core::Interface;
+    use windows::Win32::Media::Audio::*;
+    use windows::Win32::System::Com::*;
+    let own = std::process::id();
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(e): windows::core::Result<IMMDeviceEnumerator> = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) else {
+            return out;
+        };
+        let Ok(devices) = e.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) else { return out };
+        for i in 0..devices.GetCount().unwrap_or(0) {
+            let Ok(dev) = devices.Item(i) else { continue };
+            let id = dev.GetId().ok().map(|p| {
+                let s = p.to_string().unwrap_or_default();
+                CoTaskMemFree(Some(p.0 as *const core::ffi::c_void));
+                s
+            });
+            if id.as_deref() == Some(except) {
+                continue;
+            }
+            let Ok(mgr): windows::core::Result<IAudioSessionManager2> = dev.Activate(CLSCTX_ALL, None) else { continue };
+            let Ok(list) = mgr.GetSessionEnumerator() else { continue };
+            for j in 0..list.GetCount().unwrap_or(0) {
+                let Ok(s) = list.GetSession(j) else { continue };
+                if !s.GetState().is_ok_and(|st| st == AudioSessionStateActive) {
+                    continue;
+                }
+                let Some(pid) = s.cast::<IAudioSessionControl2>().ok().and_then(|s2| s2.GetProcessId().ok()) else { continue };
+                if pid == own || pid == 0 {
+                    continue;
+                }
+                if let Some(app) = process_name(pid) {
+                    out.push((app, wasapi::friendly_name(&dev)));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A process's executable name, without `.exe`.
+fn process_name(pid: u32) -> Option<String> {
+    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(h);
+        ok.then(|| {
+            let path = String::from_utf16_lossy(&buf[..len as usize]);
+            std::path::Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or(path)
+        })
+    }
+}
+
 /// Whether any app is currently recording from capture endpoint `id`.
 pub fn endpoint_has_listeners(id: &str) -> bool {
     use windows::Win32::Media::Audio::*;
@@ -654,6 +857,33 @@ mod tests {
     /// alone: a tone played into the virtual mic is captured, Opus encoded,
     /// sent, decoded and played into the virtual speakers, whose loopback
     /// hears it. `cargo test -p rdp-client hyper_audio -- --ignored --nocapture`
+    /// Which apps record from which microphones now (read only). `cargo test -p rdp-client --bin rdpio other_mics -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn other_mics_in_use() {
+        wasapi::com_init();
+        eprintln!("recording now: {:?}", other_mic_users(""));
+    }
+
+    /// An app starting to record from the virtual mic is heard of at once,
+    /// from Windows, not found by polling. `cargo test -p rdp-client --bin rdpio recording_app -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs Steam Streaming Microphone"]
+    fn a_recording_app_is_heard_of_without_polling() {
+        wasapi::com_init();
+        let mic = wasapi::find(Flow::Capture, "Steam Streaming Microphone").expect("Steam Streaming Microphone");
+        let mut watch = ListenerWatch::new(&mic.id, Arc::new(Changed::default())).expect("session notifications");
+        let before = watch.listening();
+        let started = Instant::now();
+        let capture = wasapi::Capture::new(Some(&mic.id), Flow::Capture, false, 1).unwrap();
+        watch.wait(Duration::from_secs(3));
+        let heard = started.elapsed();
+        eprintln!("listening before: {before}; heard of a recording app after {heard:?}");
+        assert!(heard < Duration::from_secs(3), "no notification");
+        assert!(watch.listening());
+        drop(capture);
+    }
+
     #[test]
     #[ignore = "needs Steam Streaming Speakers and Microphone"]
     fn a_tone_makes_it_through_the_whole_path() {

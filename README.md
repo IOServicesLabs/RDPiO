@@ -42,6 +42,14 @@ and a Hyper host needs it to pass updates on to the devices that connect.
 connection on the laptop. The full walkthrough is in
 [docs/hyper.md](docs/hyper.md).
 
+**Running many machines**: the launcher's **Workspace** keeps saved
+connections in folders (right-click, or drag them onto a folder) and opens
+sessions side by side in tabs inside the launcher window: Ctrl+Tab between
+them, **Pop out** to give one a window of its own, Ctrl+W to disconnect. A tab
+that isn't in front pauses its picture. **Activity** shows what the launcher
+and every session are logging, live: when a connection doesn't come up, the
+reason is there (and under the tab, with **Log**).
+
 ## Quick start
 
 Copy-paste one of these. Swap `192.168.1.50` / `alice` / the password for your

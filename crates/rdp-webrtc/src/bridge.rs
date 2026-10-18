@@ -222,6 +222,16 @@ impl Drop for NativeRedirector {
 /// Frame each JSON value (NUL-terminated), record it to the capture if enabled,
 /// and enqueue it for the mux, tagged with the channel it belongs to. Best-effort:
 /// a serialize failure is logged and dropped, never propagated into the live call.
+/// Called once outbound messages are queued (see [`set_outbound_waker`]).
+static OUTBOUND_WAKER: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Have `wake` called whenever the engine queues messages for the server, so
+/// the mux thread can sleep until there's something to send instead of
+/// polling the queue. Set once per process; later calls are ignored.
+pub fn set_outbound_waker(wake: fn()) {
+    let _ = OUTBOUND_WAKER.set(wake);
+}
+
 fn push_framed(outbound: &Outbound, capture: &Option<Capture>, channel_id: u32, msgs: &[Value]) {
     if msgs.is_empty() {
         return;
@@ -238,6 +248,10 @@ fn push_framed(outbound: &Outbound, capture: &Option<Capture>, channel_id: u32, 
             }
             Err(e) => tracing::warn!(error = %e, "webrtc-native: failed to serialize outbound message"),
         }
+    }
+    drop(q);
+    if let Some(wake) = OUTBOUND_WAKER.get() {
+        wake();
     }
 }
 

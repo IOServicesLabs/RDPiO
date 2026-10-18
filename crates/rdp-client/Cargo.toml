@@ -130,9 +130,14 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Dxgi_Common",
     # The virtual display: finding, installing and talking to its driver.
     "Win32_Devices_DeviceAndDriverInstallation",
+    # The virtual camera's shared frame (its security descriptor).
+    "Win32_Security_Authorization",
 ] }
 
 [build-dependencies]
 # Embeds res/rdpio.rc (icon resource id 1) into the rdpio.exe at link time.
 # NONE = icon only; no manifest, no version resource.
 embed-resource = "2"
+# Compiles the virtual camera's media source (vcam/, C++) into rdpio_vcam.dll,
+# which rdpio.exe carries (see build.rs).
+cc = "1"

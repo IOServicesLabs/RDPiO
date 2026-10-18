@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 // `MONITORINFOF_PRIMARY` lives under WindowsAndMessaging (glob-imported below).
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetFocus, GetKeyState, VK_CAPITAL, VK_CONTROL, VK_NUMLOCK, VK_SCROLL, VK_SHIFT,
+    GetAsyncKeyState, GetFocus, GetKeyState, SetFocus, VK_CAPITAL, VK_CONTROL, VK_NUMLOCK, VK_SCROLL, VK_SHIFT,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
@@ -427,6 +427,36 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
     CallNextHookEx(None, code, wparam, lparam)
 }
 
+/// A session window opened inside the launcher's Workspace tab tells the
+/// launcher so: `wparam` = the window, `lparam` = this process.
+pub const WM_RDPIO_EMBEDDED: u32 = WM_APP + 0x32;
+/// The launcher asks a session window in a Workspace tab to become a window
+/// of its own again ("Pop out").
+pub const WM_RDPIO_POPOUT: u32 = WM_APP + 0x33;
+/// This process's window lives inside the launcher (see [`embed_parent`]).
+static EMBEDDED: AtomicBool = AtomicBool::new(false);
+
+/// The launcher window to open inside (a Workspace tab): `RDPIO_EMBED_PARENT`,
+/// set by the launcher that started this session.
+fn embed_parent() -> Option<HWND> {
+    let raw: isize = std::env::var("RDPIO_EMBED_PARENT").ok()?.trim().parse().ok()?;
+    let hwnd = HWND(raw as *mut c_void);
+    unsafe { IsWindow(Some(hwnd)).as_bool() }.then_some(hwnd)
+}
+
+/// Someone is at this window (a key, a click, the focus): whatever said no one
+/// can see it — a lock or screen-off notification that never got its "back"
+/// (resumes from hibernation have lost them) — is out of date. Without this a
+/// stale flag keeps the picture paused: a black window that never connects.
+fn someone_is_here() {
+    let locked = SESSION_LOCKED.swap(false, Ordering::Relaxed);
+    let off = DISPLAY_OFF.swap(false, Ordering::Relaxed);
+    if locked || off {
+        tracing::info!(locked, screen_off = off, "input in a window marked unseen: showing the picture again");
+        signal_frame();
+    }
+}
+
 pub struct Window {
     hwnd: HWND,
 }
@@ -525,6 +555,16 @@ impl Window {
 
             let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
 
+            // A windowed session the launcher opened in a Workspace tab: a
+            // child of the launcher's window, hidden until the launcher puts it
+            // where the tab is.
+            let parent = if style == WS_OVERLAPPEDWINDOW { embed_parent() } else { None };
+            let (style, x, y) = match parent {
+                Some(_) => (WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, 0, 0),
+                None => (style, x, y),
+            };
+            EMBEDDED.store(parent.is_some(), Ordering::Relaxed);
+
             // windows 0.58 returns `Result<HWND>` (Err on failure); `?` propagates it.
             let hwnd = CreateWindowExW(
                 ex_style,
@@ -535,7 +575,7 @@ impl Window {
                 y,
                 width,
                 height,
-                None,
+                parent,
                 None,
                 Some(hinstance),
                 None,
@@ -544,8 +584,13 @@ impl Window {
                 let _ = SetPropW(hwnd, TOPMOST_PROP, Some(HANDLE(1 as *mut c_void)));
             }
 
-            // (The selftest's window shows without taking the focus.)
-            let _ = ShowWindow(hwnd, if SHOW_INACTIVE.load(Ordering::Relaxed) { SW_SHOWNOACTIVATE } else { SW_SHOW });
+            if let Some(p) = parent {
+                tracing::info!("opening inside the launcher's Workspace");
+                let _ = PostMessageW(Some(p), WM_RDPIO_EMBEDDED, WPARAM(hwnd.0 as usize), LPARAM(std::process::id() as isize));
+            } else {
+                // (The selftest's window shows without taking the focus.)
+                let _ = ShowWindow(hwnd, if SHOW_INACTIVE.load(Ordering::Relaxed) { SW_SHOWNOACTIVATE } else { SW_SHOW });
+            }
             // Get WM_CLIPBOARDUPDATE when the local clipboard changes, so we can
             // re-advertise it to the remote session (clipboard redirection).
             let _ = AddClipboardFormatListener(hwnd);
@@ -582,12 +627,19 @@ impl Window {
             return true;
         }
         unsafe {
-            if IsIconic(self.hwnd).as_bool() {
+            // (In a Workspace tab: a tab not in front is hidden, and the
+            // launcher may be minimized or cloaked.)
+            if !IsWindowVisible(self.hwnd).as_bool() {
+                return true;
+            }
+            let root = GetAncestor(self.hwnd, GA_ROOT);
+            let root = if root.0.is_null() { self.hwnd } else { root };
+            if IsIconic(root).as_bool() {
                 return true;
             }
             let mut cloaked = 0u32;
             windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
-                self.hwnd,
+                root,
                 windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
                 &mut cloaked as *mut u32 as *mut c_void,
                 std::mem::size_of::<u32>() as u32,
@@ -973,6 +1025,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
             }
             let down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+            if down {
+                someone_is_here();
+            }
             // The key-up of a hotkey consumed below is consumed too: the
             // remote side never saw its key-down.
             if !down && wparam.0 as isize == SWALLOW_UP.load(Ordering::Relaxed) {
@@ -1270,6 +1325,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
             if matches!(wparam.0, PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC) {
                 RESUMED.store(true, Ordering::SeqCst);
+                // (The screen is on again; were it not, its notification says so.)
+                DISPLAY_OFF.store(false, Ordering::Relaxed);
+                tracing::info!("this PC resumed from sleep");
                 signal_frame();
             }
             // On battery or plugged in: a laptop's panel may change its rate.
@@ -1325,7 +1383,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_MOUSEACTIVATE if EMBEDDED.load(Ordering::Relaxed) => {
+            // In a Workspace tab a click doesn't focus a child window by itself.
+            let _ = SetFocus(Some(hwnd));
+            LRESULT(MA_ACTIVATE as isize)
+        }
+        WM_RDPIO_POPOUT => {
+            // Out of the Workspace tab: a window of its own, where the tab was.
+            if EMBEDDED.swap(false, Ordering::Relaxed) {
+                let mut r = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut r);
+                let _ = SetParent(hwnd, None);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0 as isize);
+                let _ = AdjustWindowRectEx(&mut r, WS_OVERLAPPEDWINDOW, false, WINDOW_EX_STYLE(0));
+                let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOZORDER);
+                let _ = SetForegroundWindow(hwnd);
+                tracing::info!("popped out of the launcher's Workspace");
+            }
+            LRESULT(0)
+        }
         WM_SETFOCUS => {
+            someone_is_here();
             // Focus regained: restore the capture confinement.
             if CAPTURE.load(Ordering::SeqCst) {
                 capture_clip(hwnd);

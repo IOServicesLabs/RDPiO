@@ -462,6 +462,40 @@ struct Shared {
     /// The refresh rate of the client's screen now (0: not said — an older
     /// client): the stream runs at most at that (see `Control::Refresh`).
     client_hz: AtomicU32,
+    /// The client's camera as a virtual camera here (see `hyper_camera`):
+    /// allowed in this stream (not the selftest), set up once, and running.
+    camera_allowed: bool,
+    camera_started: AtomicBool,
+    camera: Mutex<Option<crate::hyper_camera::HostCamera>>,
+}
+
+/// A captured frame: converted already (Desktop Duplication), or only seen —
+/// the driver's newest, converted when the stream takes it (see
+/// `DesktopCapture::peek`), so frames the stream's rate skips cost nothing.
+enum Captured {
+    Now(rdp_gpu::hyper::CapturedFrame),
+    Later { present_us: u64 },
+}
+
+impl Captured {
+    fn present_us(&self) -> u64 {
+        match self {
+            Self::Now(f) => f.present_us,
+            Self::Later { present_us } => *present_us,
+        }
+    }
+
+    /// The picture, converted now if it wasn't (`None`: the driver's frame
+    /// went missing meanwhile).
+    fn into_frame(self, cap: &mut rdp_gpu::hyper::DesktopCapture) -> Option<rdp_gpu::hyper::CapturedFrame> {
+        match self {
+            Self::Now(f) => Some(f),
+            Self::Later { .. } => cap.take().unwrap_or_else(|e| {
+                tracing::debug!(error = %e, "a driver frame couldn't be converted");
+                None
+            }),
+        }
+    }
 }
 
 /// Office mode, nobody at the controls this long, and the screen changing
@@ -674,6 +708,9 @@ fn stream_inner(
         ltr_acked: AtomicU32::new(u32::MAX),
         last_input_us: AtomicU64::new(0),
         client_hz: AtomicU32::new(0),
+        camera_allowed: route_audio,
+        camera_started: AtomicBool::new(false),
+        camera: Mutex::new(None),
     });
     // Frames leave from their own thread: pacing one overlaps capturing and
     // encoding the next, and the capture loop never waits on the network.
@@ -715,16 +752,36 @@ fn stream_inner(
         qpc_us,
         Arc::new(move |body: &[u8]| audio_shared.send(&audio_socket, Kind::Audio, body)),
     );
-    // Tell the client to capture its mic only while a host app listens.
+    // Tell the client to capture its mic only while a host app listens —
+    // heard from Windows as apps start and stop recording (polled only where
+    // that can't be had), and repeated every 2 s in case a packet is lost.
+    let mic_changed = Arc::new(crate::hyper_audio::Changed::default());
     let mic_watch = routing.mic_source.clone().map(|source| {
-        let (s, sock) = (shared.clone(), socket.try_clone());
+        let (s, sock, changed) = (shared.clone(), socket.try_clone(), mic_changed.clone());
         std::thread::spawn(move || {
             let Ok(sock) = sock else { return };
             crate::wasapi::com_init();
+            let mut watch = crate::hyper_audio::ListenerWatch::new(&source, changed);
             let mut on = false;
             let mut last_sent = Instant::now() - Duration::from_secs(10);
+            // Apps told about already (once a stream each).
+            let mut noticed = std::collections::HashSet::new();
             while !s.stop.load(Ordering::Relaxed) {
-                let now_on = crate::hyper_audio::endpoint_has_listeners(&source);
+                // An app recording from another microphone: the client's sound
+                // can't reach it there. Say so on the client's screen.
+                if last_sent.elapsed() >= Duration::from_secs(2) {
+                    for (app, mic) in crate::hyper_audio::other_mic_users(&source) {
+                        if noticed.insert(app.clone()) {
+                            tracing::info!(%app, %mic, "a host app records from another microphone than the stream's");
+                            let text = format!("{app} on the host records from \"{mic}\": set its microphone to \"Default\" to hear this PC's");
+                            s.send(&sock, Kind::Control, &Control::Notice { text }.to_bytes());
+                        }
+                    }
+                }
+                let now_on = match watch.as_mut() {
+                    Some(w) => w.listening(),
+                    None => crate::hyper_audio::endpoint_has_listeners(&source),
+                };
                 if now_on != on || last_sent.elapsed() > Duration::from_secs(2) {
                     if now_on != on {
                         tracing::info!(listening = now_on, "host app microphone use changed");
@@ -733,7 +790,10 @@ fn stream_inner(
                     s.send(&sock, Kind::Control, &Control::Mic { on }.to_bytes());
                     last_sent = Instant::now();
                 }
-                std::thread::sleep(Duration::from_millis(300));
+                match &watch {
+                    Some(w) => w.wait(Duration::from_secs(2).saturating_sub(last_sent.elapsed())),
+                    None => std::thread::sleep(Duration::from_millis(300)),
+                }
             }
         })
     });
@@ -758,7 +818,7 @@ fn stream_inner(
     let mut interval_us = 1_000_000 / fps.max(1) as u64;
     let mut credit = 1.0f64;
     let mut last_present_us: Option<u64> = None;
-    let mut skipped: Option<rdp_gpu::hyper::CapturedFrame> = None;
+    let mut skipped: Option<Captured> = None;
     // Office mode: once the screen goes still, the last picture goes in again
     // (up to a second's frames), each time sharper: the encoder spends the
     // frame budget refining it. Measured on a screen of new text with the
@@ -867,7 +927,7 @@ fn stream_inner(
         // While a skipped frame waits, wait for a newer one only until its turn.
         let until_us = |t: u64| t.saturating_sub(qpc_us()).div_ceil(1000).min(10) as u32;
         let wait_ms = match &skipped {
-            Some(f) => until_us(f.present_us + pace_us),
+            Some(f) => until_us(f.present_us() + pace_us),
             None if office && sharpen_left > 0 && last_tex.is_some() => until_us(last_encoded_us + pace_us),
             // A screen that changes wakes the wait at once; the timeout only
             // bounds the status and an answer to a keyframe request on a still
@@ -875,7 +935,11 @@ fn stream_inner(
             None if since_input_us > 1_000_000 => 30,
             None => 10,
         };
-        let captured = match cap.acquire(wait_ms) {
+        let captured = match if cap.defers() {
+            cap.peek(wait_ms).map(|p| p.map(|present_us| Captured::Later { present_us }))
+        } else {
+            cap.acquire(wait_ms).map(|c| c.map(Captured::Now))
+        } {
             Ok(c) => {
                 capture_errors = 0;
                 c
@@ -935,7 +999,7 @@ fn stream_inner(
         // whatever changes meanwhile waits in the duplication, and the
         // keyframe that ends a pause takes the newest picture.
         if shared.paused.load(Ordering::Relaxed) && !want_key {
-            if let Some(f) = captured {
+            if let Some(f) = captured.and_then(|c| c.into_frame(&mut cap)) {
                 last_tex = Some(f.nv12);
             }
             skipped = None;
@@ -955,14 +1019,15 @@ fn stream_inner(
         let mut refresh = false;
         let frame = match captured {
             Some(f) => {
-                if let Some(prev) = last_present_us.replace(f.present_us) {
-                    credit = (credit + f.present_us.saturating_sub(prev) as f64 / pace_us as f64).min(1.5);
+                let present_us = f.present_us();
+                if let Some(prev) = last_present_us.replace(present_us) {
+                    credit = (credit + present_us.saturating_sub(prev) as f64 / pace_us as f64).min(1.5);
                 }
                 if credit >= 0.9 || want_key {
                     credit = (credit - 1.0).max(0.0);
                     skipped = None;
                     sharpen_left = fps;
-                    Some((f.nv12, f.present_us))
+                    f.into_frame(&mut cap).map(|f| (f.nv12, f.present_us))
                 } else {
                     skipped = Some(f);
                     None
@@ -970,10 +1035,10 @@ fn stream_inner(
             }
             None => match skipped.take() {
                 // Nothing newer came: the screen went still on a skipped frame.
-                Some(f) if want_key || acquired_us >= f.present_us + pace_us => {
+                Some(f) if want_key || acquired_us >= f.present_us() + pace_us => {
                     credit = 0.0;
                     sharpen_left = fps;
-                    Some((f.nv12, f.present_us))
+                    f.into_frame(&mut cap).map(|f| (f.nv12, f.present_us))
                 }
                 Some(f) => {
                     skipped = Some(f);
@@ -1163,8 +1228,11 @@ fn stream_inner(
     let _ = pump.join();
     drop(clipboard);
     if let Some(t) = mic_watch {
+        mic_changed.notify(); // (out of its wait at once)
         let _ = t.join();
     }
+    // (The virtual camera goes with the stream.)
+    drop(shared.camera.lock().unwrap().take());
     drop(_game_audio);
     drop(routing);
     match &result {
@@ -1650,6 +1718,25 @@ fn receive_loop(
                 Some(Control::Refresh { hz }) => {
                     shared.client_hz.store(hz as u32, Ordering::Relaxed);
                 }
+                // The client has a camera: offer it to apps here, once.
+                Some(Control::Cameras { count }) => {
+                    if count > 0 && shared.camera_allowed && !shared.camera_started.swap(true, Ordering::Relaxed) {
+                        if let Ok(sock) = socket.try_clone() {
+                            let s = shared.clone();
+                            let _ = std::thread::Builder::new().name("hyper-camera-setup".into()).spawn(move || {
+                                let to_client = s.clone();
+                                let control: Arc<dyn Fn(&Control) + Send + Sync> =
+                                    Arc::new(move |c: &Control| to_client.send(&sock, Kind::Control, &c.to_bytes()));
+                                match crate::hyper_camera::HostCamera::start(control) {
+                                    // (Unless the stream ended meanwhile.)
+                                    Ok(c) if !s.stop.load(Ordering::Relaxed) => *s.camera.lock().unwrap() = Some(c),
+                                    Ok(_) => {}
+                                    Err(e) => tracing::info!(reason = %e, "no virtual camera for this stream"),
+                                }
+                            });
+                        }
+                    }
+                }
                 Some(Control::Feedback(fb)) => {
                     if let Some(id) = fb.ltr_frame {
                         shared.ltr_acked.store(id, Ordering::Relaxed);
@@ -1686,6 +1773,12 @@ fn receive_loop(
                     if let Some(c) = &clipboard {
                         c.apply(m);
                     }
+                }
+            }
+            // The client's camera, into the virtual camera.
+            Kind::Camera => {
+                if let Some(c) = shared.camera.lock().unwrap().as_ref() {
+                    c.push(&body);
                 }
             }
             // The client's microphone, into the virtual mic.

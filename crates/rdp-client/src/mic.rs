@@ -11,7 +11,7 @@ use crate::session::MicSource;
 use windows::core::PSTR;
 use windows::Win32::Media::Audio::{
     waveInAddBuffer, waveInClose, waveInGetNumDevs, waveInOpen, waveInPrepareHeader, waveInReset,
-    waveInStart, waveInUnprepareHeader, CALLBACK_NULL, HWAVEIN, WAVEFORMATEX, WAVEHDR,
+    waveInStart, waveInUnprepareHeader, CALLBACK_EVENT, CALLBACK_NULL, HWAVEIN, WAVEFORMATEX, WAVEHDR,
     WAVE_FORMAT_PCM, WAVE_MAPPER, WHDR_DONE,
 };
 
@@ -94,10 +94,15 @@ impl MicSource for Win32Mic {
             };
             let mut h = HWAVEIN::default();
             let device = self.device.unwrap_or(WAVE_MAPPER);
-            let mut opened = waveInOpen(Some(&mut h), device, &wfx, None, None, CALLBACK_NULL) == MM_OK;
+            // Each filled buffer signals the session worker's own wake event,
+            // so it harvests the mic when there's something to harvest (20
+            // times a second) instead of polling every 10 ms.
+            let wake = crate::net_wait::worker_wake::handle();
+            let (callback, kind) = if wake != 0 { (Some(wake as usize), CALLBACK_EVENT) } else { (None, CALLBACK_NULL) };
+            let mut opened = waveInOpen(Some(&mut h), device, &wfx, callback, None, kind) == MM_OK;
             if !opened && device != WAVE_MAPPER {
                 tracing::warn!(device, "waveInOpen on the chosen mic failed; using the default device");
-                opened = waveInOpen(Some(&mut h), WAVE_MAPPER, &wfx, None, None, CALLBACK_NULL) == MM_OK;
+                opened = waveInOpen(Some(&mut h), WAVE_MAPPER, &wfx, callback, None, kind) == MM_OK;
             }
             if !opened {
                 tracing::warn!("waveInOpen failed; microphone disabled");

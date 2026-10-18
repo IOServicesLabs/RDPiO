@@ -48,6 +48,9 @@ impl NativeWebRtcRedirector {
     /// keeps declining the WebRTC channel) only if the runtime thread can't be
     /// spawned.
     pub fn new(overlay: OverlayOut) -> Option<Self> {
+        // What the engine queues for the server wakes the session worker (it
+        // sleeps until then, not polling the queue).
+        rdp_webrtc::set_outbound_waker(crate::net_wait::worker_wake::signal);
         // Report this machine's real cameras/mics/speakers. Teams will not optimize
         // a call on an endpoint that claims to have none.
         let devices: Arc<dyn DeviceProvider> = Arc::new(WinDeviceProvider);
