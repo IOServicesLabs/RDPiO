@@ -2035,14 +2035,14 @@ dependencies = [
 
 [[package]]
 name = "rdp-asn1"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "rdp-channels"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rdp-pdu",
  "thiserror 1.0.69",
@@ -2051,7 +2051,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-client"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64 0.22.1",
  "cc",
@@ -2087,7 +2087,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rdp-channels",
  "rdp-pdu",
@@ -2097,11 +2097,11 @@ dependencies = [
 
 [[package]]
 name = "rdp-crypto"
-version = "0.2.3"
+version = "0.2.4"
 
 [[package]]
 name = "rdp-gpu"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cc",
  "rdp-graphics",
@@ -2113,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-graphics"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rayon-core",
  "rdp-channels",
@@ -2125,7 +2125,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-hyper"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64 0.22.1",
  "ring",
@@ -2137,7 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-nla"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rdp-asn1",
  "rdp-crypto",
@@ -2149,7 +2149,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-pdu"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bitflags 2.12.1",
  "byteorder",
@@ -2159,7 +2159,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-webrtc"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
