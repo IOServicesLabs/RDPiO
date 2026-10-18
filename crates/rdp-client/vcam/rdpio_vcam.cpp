@@ -34,6 +34,17 @@
 #include <cstring>
 #include <mutex>
 
+// C++/WinRT answers QueryInterface only for the interfaces a class lists, not
+// their bases: Frame Server asks the source for IMFMediaSource and the stream
+// for IMFMediaStream (both through IMFMediaEventGenerator), and without these
+// the virtual camera's Start fails with E_NOINTERFACE.
+template <> bool winrt::is_guid_of<IMFMediaSourceEx>(guid const& id) noexcept {
+    return winrt::is_guid_of<IMFMediaSourceEx, IMFMediaSource, IMFMediaEventGenerator>(id);
+}
+template <> bool winrt::is_guid_of<IMFMediaStream2>(guid const& id) noexcept {
+    return winrt::is_guid_of<IMFMediaStream2, IMFMediaStream, IMFMediaEventGenerator>(id);
+}
+
 // {9E8E8B5A-5C3B-4C7E-9B0F-5D2B7A1E6C31}
 static const GUID CLSID_RdpioCamera = {0x9e8e8b5a, 0x5c3b, 0x4c7e, {0x9b, 0x0f, 0x5d, 0x2b, 0x7a, 0x1e, 0x6c, 0x31}};
 // PINNAME_VIDEO_CAPTURE.

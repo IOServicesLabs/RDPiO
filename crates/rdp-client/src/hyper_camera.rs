@@ -606,4 +606,73 @@ mod tests {
         assert!(!DLL.is_empty(), "rdpio_vcam.dll wasn't built");
         assert_eq!(&DLL[..2], b"MZ");
     }
+
+    /// Frame Server asks the source and its stream for each of these (base
+    /// interfaces too): one that doesn't answer fails the virtual camera's
+    /// `Start` with E_NOINTERFACE. In this process, no administrator needed.
+    #[test]
+    fn the_media_source_answers_what_frame_server_asks() {
+        use std::ffi::c_void;
+        use windows::core::{IUnknown, GUID, HRESULT};
+        use windows::Win32::Media::MediaFoundation::*;
+        use windows::Win32::System::Com::IClassFactory;
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        crate::wasapi::com_init();
+        let path = std::env::temp_dir().join(format!("rdpio_vcam_test_{}.dll", std::process::id()));
+        std::fs::write(&path, DLL).unwrap();
+        // IKsControl (ks.h).
+        let ks = GUID::from_u128(0x28f54685_06fd_11d2_b27a_00a0c9223196);
+        unsafe {
+            let _ = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+            let lib = LoadLibraryW(&HSTRING::from(path.as_os_str())).unwrap();
+            type GetClassObject = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
+            let get: GetClassObject = std::mem::transmute(GetProcAddress(lib, windows::core::s!("DllGetClassObject")).unwrap());
+            let clsid = GUID::try_from(CLSID.trim_matches(['{', '}'])).unwrap();
+            let mut f = std::ptr::null_mut();
+            get(&clsid, &IClassFactory::IID, &mut f).ok().unwrap();
+            let factory = IClassFactory::from_raw(f);
+            let activate: IMFActivate = factory.CreateInstance(None).unwrap();
+            let missing = |unk: &IUnknown, list: &[(&str, GUID)]| -> Vec<String> {
+                list.iter()
+                    .filter(|(_, iid)| {
+                        let mut p = std::ptr::null_mut();
+                        let ok = unk.query(iid, &mut p).is_ok();
+                        if ok {
+                            drop(IUnknown::from_raw(p));
+                        }
+                        !ok
+                    })
+                    .map(|(n, _)| n.to_string())
+                    .collect()
+            };
+            let source: IUnknown = activate.ActivateObject().unwrap();
+            let gaps = missing(
+                &source,
+                &[
+                    ("IMFMediaEventGenerator", IMFMediaEventGenerator::IID),
+                    ("IMFMediaSource", IMFMediaSource::IID),
+                    ("IMFMediaSourceEx", IMFMediaSourceEx::IID),
+                    ("IMFGetService", IMFGetService::IID),
+                    ("IKsControl", ks),
+                    ("IMFSampleAllocatorControl", IMFSampleAllocatorControl::IID),
+                    ("IMFAttributes", IMFAttributes::IID),
+                ],
+            );
+            assert!(gaps.is_empty(), "the media source doesn't answer for {gaps:?}");
+            let ex: IMFMediaSourceEx = source.cast().unwrap();
+            let stream: IUnknown = ex.GetStreamAttributes(0).unwrap().cast().unwrap();
+            let gaps = missing(
+                &stream,
+                &[
+                    ("IMFMediaEventGenerator", IMFMediaEventGenerator::IID),
+                    ("IMFMediaStream", IMFMediaStream::IID),
+                    ("IMFMediaStream2", IMFMediaStream2::IID),
+                    ("IKsControl", ks),
+                    ("IMFAttributes", IMFAttributes::IID),
+                ],
+            );
+            assert!(gaps.is_empty(), "the stream doesn't answer for {gaps:?}");
+            let _ = ex.Shutdown();
+        }
+    }
 }
