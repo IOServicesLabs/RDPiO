@@ -116,6 +116,32 @@ always stays on the laptop, so there's always a way out.
   sound. The host sends no audio while it plays only silence (an app holding
   the device open), so they really do.
 
+Plugged in or not, it does no work no one sees:
+
+- **Hidden means paused.** Minimized, on another virtual desktop, the laptop's
+  screen off (timed out, lid closed) or the laptop locked: the host encodes
+  and sends nothing, and the client hands back what the stream held — Wi-Fi
+  may nap and scan again, the screen and the PC may sleep. Seen again, the
+  next picture comes at once.
+- **The screen may dim on a still picture.** While the picture moves (a video,
+  a game) the screen stays on, as for any video player. A still one with
+  nobody at the controls dims and sleeps on the laptop's own timeout; your
+  input in the window counts as using the PC.
+- **Frames the screen can show, no more.** A laptop that drops from 240 Hz to
+  60 on battery tells the host, which streams at 60 (never above what was
+  agreed at the start) — not 240 frames a second to decode and throw away.
+- **One pass to the screen.** A picture shown 1:1 with nothing over it goes
+  from the decoder straight into the window's backbuffer: no copy through a
+  framebuffer, no scaling pass. Where the display has an NV12 overlay plane
+  (most Intel laptops), it goes there instead and the display hardware
+  converts and composes it — the GPU's 3D engine and Windows' compositor stay
+  idle, as for a video player. The log says which (`video on a hardware
+  overlay plane`, or why not); `RDPIO_VIDEO_LAYER=0` turns the overlay off.
+- **No parity copies on a clean link.** After 10 s without a lost packet,
+  small frames go without forward error correction (it would double them);
+  the rare loss is repaired from a long-term reference, and the first loss
+  turns it back on.
+
 The host helps too, plugged in or not:
 
 - **Still-screen trickle (office mode).** Nobody has touched the keyboard,

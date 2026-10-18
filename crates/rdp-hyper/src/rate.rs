@@ -45,6 +45,11 @@ const BASELINE_MS: u64 = 5_000;
 const BULK_START: f64 = 8_000_000.0;
 const BULK_MIN: f64 = 1_000_000.0;
 const BULK_MAX: f64 = 100_000_000.0;
+/// A path that lost nothing for this long (ms) counts as clean (see
+/// [`RateController::parity_for`]).
+const CLEAN_AFTER_MS: u64 = 10_000;
+/// On a clean path, frames up to this size go without parity.
+pub const PARITY_FREE_BYTES: usize = 4096;
 
 pub struct RateController {
     limits: Limits,
@@ -69,6 +74,9 @@ pub struct RateController {
     overhead: f64,
     bulk: f64,
     bulk_busy: bool,
+    /// Since when no packet was lost (ms; `None` while losing).
+    clean_since_ms: Option<u64>,
+    clean: bool,
 }
 
 impl RateController {
@@ -88,6 +96,22 @@ impl RateController {
             overhead: 1.15,
             bulk: BULK_START,
             bulk_busy: false,
+            clean_since_ms: None,
+            clean: false,
+        }
+    }
+
+    /// The parity ratio for one frame. On a path that has lost nothing for a
+    /// while, a small non-key frame (office trickling, a caret, a small
+    /// change) goes without: its single parity shard would be a copy of it —
+    /// twice the packets, twice the radio time at both ends — and the rare
+    /// loss is repaired from a long-term reference instead. Keyframes and big
+    /// frames always carry it; the first loss brings it back for all.
+    pub fn parity_for(&self, bytes: usize, keyframe: bool) -> f32 {
+        if self.clean && !keyframe && bytes <= PARITY_FREE_BYTES {
+            0.0
+        } else {
+            self.fec
         }
     }
 
@@ -152,6 +176,12 @@ impl RateController {
         if fb.frames_lost > 0 {
             self.fec = self.fec.max(0.25);
         }
+        if raw > 0.0 || fb.frames_lost > 0 {
+            self.clean_since_ms = None;
+        } else if self.clean_since_ms.is_none() {
+            self.clean_since_ms = Some(now_ms);
+        }
+        self.clean = self.clean_since_ms.is_some_and(|t| now_ms.saturating_sub(t) >= CLEAN_AFTER_MS);
 
         let queue_us = if fb.frames > 0 {
             while self.minima.len() >= BASELINE_WINDOWS
@@ -231,6 +261,19 @@ mod tests {
             delay_avg_us: delay_avg,
             window_us: 50_000,
         }
+    }
+
+    #[test]
+    fn small_frames_skip_parity_only_on_a_clean_path() {
+        let mut r = RateController::new(Limits::default());
+        r.update(&fb(10_000, 5_000, 0, 0), 50, 0);
+        assert!(r.parity_for(1000, false) > 0.0, "not clean yet");
+        r.update(&fb(10_000, 5_000, 0, 0), 50, CLEAN_AFTER_MS);
+        assert_eq!(r.parity_for(1000, false), 0.0);
+        assert!(r.parity_for(1000, true) > 0.0, "keyframes keep parity");
+        assert!(r.parity_for(PARITY_FREE_BYTES + 1, false) > 0.0, "big frames keep parity");
+        r.update(&fb(10_000, 5_000, 0, 1), 50, CLEAN_AFTER_MS + 50);
+        assert!(r.parity_for(1000, false) > 0.0, "a loss brings parity back");
     }
 
     #[test]

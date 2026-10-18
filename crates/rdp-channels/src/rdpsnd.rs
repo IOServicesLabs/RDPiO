@@ -37,6 +37,10 @@ pub trait AudioSink {
     fn set_compressed_format(&mut self, _format: &AudioFormat) {}
     /// Optional: play a compressed audio frame. The default drops it.
     fn play_compressed(&mut self, _format: &AudioFormat, _payload: &[u8]) {}
+    /// Called now and then by the session loop, audio or not: a sink may let
+    /// its device go after a while of silence (and reopen it on the next
+    /// sound) so the audio hardware can sleep.
+    fn idle(&mut self) {}
 }
 
 /// An [`AudioSink`] that discards audio — the default until a real device is

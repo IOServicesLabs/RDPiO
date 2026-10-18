@@ -919,6 +919,26 @@ impl H264GpuDecoder {
         Ok(frames)
     }
 
+    /// A picture read in place, copied out after all (into a pooled texture,
+    /// as a decoder that copies does) so the decoder gets its surface back:
+    /// for a caller that has to keep pictures a while. A copied picture — or
+    /// one there's no texture to copy into — comes back as it is.
+    pub fn detach(&mut self, picture: DecodedTexture) -> DecodedTexture {
+        if picture.held.is_none() {
+            return picture;
+        }
+        unsafe {
+            let mut desc: D3D11_TEXTURE2D_DESC = core::mem::zeroed();
+            picture.texture.GetDesc(&mut desc);
+            let Ok(dest) = self.acquire_texture(desc.Width, desc.Height) else {
+                return picture;
+            };
+            let subresource = picture.slice * desc.MipLevels.max(1);
+            self.context.CopySubresourceRegion(&dest, 0, 0, 0, 0, &picture.texture, subresource, None);
+            DecodedTexture { texture: dest, slice: 0, held: None, ..picture }
+        }
+    }
+
     /// Copy the decoded D3D texture (a slice of the decoder's pool) into the next
     /// ring texture and return it.
     unsafe fn copy_out(&mut self, sample: &IMFSample) -> WinResult<Option<DecodedTexture>> {

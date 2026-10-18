@@ -87,15 +87,35 @@ impl Drop for WifiLowLatency {
 
 /// The system and display kept awake until dropped. Per thread: drop it on
 /// the thread that made it (it isn't `Send`).
-pub struct KeepAwake(std::marker::PhantomData<*const ()>);
+pub struct KeepAwake {
+    display: bool,
+    _thread: std::marker::PhantomData<*const ()>,
+}
 
 impl KeepAwake {
     pub fn new() -> Self {
-        use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
-        unsafe {
-            SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+        let mut k = Self { display: false, _thread: std::marker::PhantomData };
+        k.set(true);
+        k
+    }
+
+    /// Keep the display on too (`true`), or only the system: a picture that
+    /// stands still with nobody at the controls may let the screen dim and
+    /// sleep as it would for any app — input in our window counts as the
+    /// user's, so it never goes dark under someone working.
+    pub fn display(&mut self, on: bool) {
+        if on != self.display {
+            self.set(on);
         }
-        Self(std::marker::PhantomData)
+    }
+
+    fn set(&mut self, display: bool) {
+        use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
+        let flags = if display { ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED } else { ES_CONTINUOUS | ES_SYSTEM_REQUIRED };
+        unsafe {
+            SetThreadExecutionState(flags);
+        }
+        self.display = display;
     }
 }
 
@@ -131,6 +151,31 @@ impl Drop for ThreadBoost {
         unsafe {
             let _ = windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(self.0);
         }
+    }
+}
+
+/// Mark the calling thread as background work (Windows' EcoQoS): the
+/// scheduler runs it on efficient cores and low clocks, and it never holds
+/// the CPU at turbo for something no one waits on — clipboard copies, file
+/// transfers, update checks. The latency-critical threads (network, decode,
+/// present, input) are never marked.
+pub fn eco_thread() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadInformation, ThreadPowerThrottling, THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        THREAD_POWER_THROTTLING_EXECUTION_SPEED, THREAD_POWER_THROTTLING_STATE,
+    };
+    let state = THREAD_POWER_THROTTLING_STATE {
+        Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+    };
+    unsafe {
+        let _ = SetThreadInformation(
+            GetCurrentThread(),
+            ThreadPowerThrottling,
+            &state as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+        );
     }
 }
 

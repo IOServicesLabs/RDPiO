@@ -81,6 +81,7 @@ impl ClipboardSync {
         let thread = std::thread::Builder::new()
             .name("hyper-clipboard".into())
             .spawn(move || unsafe {
+                crate::net_tune::eco_thread();
                 let class = w!("rdpioHyperClipboard");
                 let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), lpszClassName: class, ..Default::default() };
                 RegisterClassW(&wc);
@@ -125,6 +126,7 @@ impl ClipboardSync {
             let applier = std::thread::Builder::new()
                 .name("hyper-clipboard-apply".into())
                 .spawn(move || {
+                    crate::net_tune::eco_thread();
                     let mut incoming: Option<Incoming> = None;
                     for m in apply_rx {
                         apply_now(&mut incoming, m);
@@ -494,6 +496,7 @@ fn is_device_name(name: &str) -> bool {
 fn send_files(link: Arc<ReliableLink>, seq: u32) {
     let transfer = TRANSFER.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = std::thread::Builder::new().name("hyper-files".into()).spawn(move || {
+        crate::net_tune::eco_thread();
         // Only files the user signed in here could read themselves.
         if let Some(user) = SessionUser::current() {
             user.act(|| send_files_now(&link, transfer, seq));

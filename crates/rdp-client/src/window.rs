@@ -85,6 +85,24 @@ static RESUMED: AtomicBool = AtomicBool::new(false);
 pub fn take_resumed() -> bool {
     RESUMED.swap(false, Ordering::SeqCst)
 }
+/// This PC's screen is off (the display timed out, the lid closed) — from
+/// `GUID_CONSOLE_DISPLAY_STATE`. Dimmed still counts as on.
+static DISPLAY_OFF: AtomicBool = AtomicBool::new(false);
+/// This PC's session is locked (`WM_WTSSESSION_CHANGE`).
+static SESSION_LOCKED: AtomicBool = AtomicBool::new(false);
+/// Moves on whenever a display mode may have changed: `WM_DISPLAYCHANGE`, the
+/// window crossing to another monitor (`WM_DPICHANGED`, a move), or the power
+/// source switching (laptops change refresh rate with it).
+static DISPLAY_EPOCH: AtomicU32 = AtomicU32::new(0);
+
+/// See [`DISPLAY_EPOCH`]: compare with the last value seen.
+pub fn display_epoch() -> u32 {
+    DISPLAY_EPOCH.load(Ordering::Relaxed)
+}
+
+/// `GUID_CONSOLE_DISPLAY_STATE` (the SystemServices feature isn't built in).
+const CONSOLE_DISPLAY_STATE: windows::core::GUID =
+    windows::core::GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
 /// Input events captured in the window procedure, drained by the UI loop.
 static INPUT_QUEUE: Mutex<Vec<RawInput>> = Mutex::new(Vec::new());
 /// The current server cursor (HCURSOR as isize; 0 = none → default arrow). The
@@ -533,6 +551,18 @@ impl Window {
             let _ = AddClipboardFormatListener(hwnd);
             // Register for WM_TOUCH so the client can forward multi-touch input.
             let _ = RegisterTouchWindow(hwnd, windows::Win32::UI::Input::Touch::REGISTER_TOUCH_WINDOW_FLAGS(0));
+            // Screen on/off and lock/unlock: while no one can see the picture,
+            // the session stops asking for one (see `output_hidden`). Both stay
+            // registered for the window's life (and die with it).
+            let _ = windows::Win32::System::Power::RegisterPowerSettingNotification(
+                HANDLE(hwnd.0),
+                &CONSOLE_DISPLAY_STATE,
+                DEVICE_NOTIFY_WINDOW_HANDLE,
+            );
+            let _ = windows::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(
+                hwnd,
+                windows::Win32::System::RemoteDesktop::NOTIFY_FOR_THIS_SESSION,
+            );
             Ok(Self { hwnd })
         }
     }
@@ -540,6 +570,31 @@ impl Window {
     /// The raw `HWND` value, for handing to the GPU backend.
     pub fn hwnd_raw(&self) -> isize {
         self.hwnd.0 as isize
+    }
+
+    /// No one can see this window's picture: it's minimized, on another
+    /// virtual desktop (cloaked), this PC's screen is off, or its session is
+    /// locked. A session then stops the host sending pictures at all (RDP's
+    /// Suppress Output, Hyper's pause) — nothing decoded, nothing presented,
+    /// the radio idle — and asks for a fresh one when it's seen again.
+    pub fn output_hidden(&self) -> bool {
+        if DISPLAY_OFF.load(Ordering::Relaxed) || SESSION_LOCKED.load(Ordering::Relaxed) {
+            return true;
+        }
+        unsafe {
+            if IsIconic(self.hwnd).as_bool() {
+                return true;
+            }
+            let mut cloaked = 0u32;
+            windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+                self.hwnd,
+                windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
+                &mut cloaked as *mut u32 as *mut c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+            .is_ok()
+                && cloaked != 0
+        }
     }
 
     /// Update the window title (e.g. to show a reconnecting status).
@@ -1217,7 +1272,41 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 RESUMED.store(true, Ordering::SeqCst);
                 signal_frame();
             }
+            // On battery or plugged in: a laptop's panel may change its rate.
+            const PBT_APMPOWERSTATUSCHANGE: usize = 0xA;
+            if wparam.0 == PBT_APMPOWERSTATUSCHANGE {
+                DISPLAY_EPOCH.fetch_add(1, Ordering::Relaxed);
+            }
+            // The screen went off or came back (see `Window::output_hidden`).
+            const PBT_POWERSETTINGCHANGE: usize = 0x8013;
+            if wparam.0 == PBT_POWERSETTINGCHANGE && lparam.0 != 0 {
+                let s = &*(lparam.0 as *const windows::Win32::System::Power::POWERBROADCAST_SETTING);
+                if s.PowerSetting == CONSOLE_DISPLAY_STATE && s.DataLength >= 1 {
+                    // (0 off, 1 on, 2 dimmed.)
+                    let off = s.Data[0] == 0;
+                    if DISPLAY_OFF.swap(off, Ordering::Relaxed) != off {
+                        tracing::info!(screen_off = off, "this PC's screen changed");
+                        signal_frame();
+                    }
+                }
+            }
             LRESULT(1)
+        }
+        WM_DISPLAYCHANGE => {
+            DISPLAY_EPOCH.fetch_add(1, Ordering::Relaxed);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_WTSSESSION_CHANGE => {
+            const WTS_SESSION_LOCK: usize = 0x7;
+            const WTS_SESSION_UNLOCK: usize = 0x8;
+            if matches!(wparam.0, WTS_SESSION_LOCK | WTS_SESSION_UNLOCK) {
+                let locked = wparam.0 == WTS_SESSION_LOCK;
+                if SESSION_LOCKED.swap(locked, Ordering::Relaxed) != locked {
+                    tracing::info!(locked, "this PC's session changed");
+                    signal_frame();
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_KILLFOCUS => {
             // Never hold the cursor hostage while another window has focus.
@@ -1228,6 +1317,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_MOVE => {
+            // (Perhaps onto another monitor, at another refresh rate.)
+            DISPLAY_EPOCH.fetch_add(1, Ordering::Relaxed);
             // A moved window invalidates the capture clip rectangle.
             if CAPTURE.load(Ordering::SeqCst) && GetFocus() == hwnd {
                 capture_clip(hwnd);

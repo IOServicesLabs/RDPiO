@@ -12,3 +12,4 @@ rdp-channels.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wide.workspace = true
+rayon-core.workspace = true

@@ -332,6 +332,241 @@ pub struct D3D11Renderer {
     /// first. A FLIP backbuffer coming back around is missing exactly the
     /// union of these plus the current frame's dirty set.
     recent_dirty: std::collections::VecDeque<Option<Vec<(u32, u32, u32, u32)>>>,
+    /// Video pictures may go to a [`VideoLayer`] (Hyper asks for it).
+    video_layer_wanted: bool,
+    video_layer: Option<VideoLayer>,
+    /// This window's video layer was given up on (no overlay plane after all,
+    /// or it failed): pictures take the one-pass draw instead.
+    video_layer_failed: bool,
+}
+
+/// Hyper's video layer: the stream's pictures as NV12 in a DirectComposition
+/// visual above the window's own swapchain, where the display hardware can
+/// scan them out from an overlay plane (MPO). The display engine then does
+/// the colour conversion and the composition; the GPU's 3D engine and
+/// Windows' compositor stay idle, and a picture costs one NV12 copy (1.5
+/// bytes a pixel) instead of an RGBA draw and composition (4 bytes a pixel,
+/// several times over) — how video players get their battery life.
+///
+/// Built only where the display says it takes NV12 on an overlay plane, and
+/// given up for the window's life if Windows composes it anyway (no win over
+/// the one-pass draw, which a full-screen window can flip straight to the
+/// screen).
+struct VideoLayer {
+    dcomp: windows::Win32::Graphics::DirectComposition::IDCompositionDevice,
+    target: windows::Win32::Graphics::DirectComposition::IDCompositionTarget,
+    visual: windows::Win32::Graphics::DirectComposition::IDCompositionVisual,
+    swap_chain: IDXGISwapChain1,
+    wait: Option<HANDLE>,
+    /// `wait`'s signal already taken (see `D3D11Renderer::frame_slot`).
+    slot: bool,
+    tearing: bool,
+    size: (u32, u32),
+    offset: (u32, u32),
+    /// In the window's visual tree (hidden while overlays are drawn).
+    shown: bool,
+    presents: u32,
+    /// Sampled presents Windows put on an overlay plane / composed.
+    on_overlay: u32,
+    composed: u32,
+}
+
+/// Presents between two looks at where Windows put the layer's frames.
+const VIDEO_LAYER_SAMPLE_EVERY: u32 = 30;
+/// Composed this many looks with none on an overlay: given up.
+const VIDEO_LAYER_COMPOSED_LIMIT: u32 = 8;
+
+impl VideoLayer {
+    unsafe fn new(
+        device: &ID3D11Device,
+        window: &IDXGISwapChain,
+        size: (u32, u32),
+        offset: (u32, u32),
+    ) -> WinResult<Self> {
+        use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice, IDCompositionDevice};
+        use windows::Win32::Graphics::Dxgi::{
+            IDXGIOutput3, IDXGISwapChain3, DXGI_OVERLAY_SUPPORT_FLAG_DIRECT,
+            DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709};
+        // Only where the display can scan NV12 out from an overlay plane
+        // (`RDPIO_VIDEO_LAYER=force`: anywhere, composed or not — for testing).
+        let output: IDXGIOutput3 = window.GetContainingOutput()?.cast()?;
+        let support = output.CheckOverlaySupport(DXGI_FORMAT_NV12, device)?;
+        if support & DXGI_OVERLAY_SUPPORT_FLAG_DIRECT.0 as u32 == 0 && !video_layer_forced() {
+            return Err(windows::core::Error::new(
+                windows::Win32::Foundation::E_NOTIMPL,
+                "this display has no NV12 overlay plane",
+            ));
+        }
+        let dxgi_device: IDXGIDevice = device.cast()?;
+        let factory: IDXGIFactory2 = dxgi_device.GetAdapter()?.GetParent()?;
+        let desc = |flags: u32| DXGI_SWAP_CHAIN_DESC1 {
+            Width: size.0,
+            Height: size.1,
+            Format: DXGI_FORMAT_NV12,
+            Stereo: false.into(),
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 3,
+            Scaling: DXGI_SCALING_STRETCH,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+            Flags: flags,
+        };
+        // (A YUV swapchain says so: YUV_VIDEO.)
+        let waitable = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32
+            | windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO.0 as u32;
+        let tearing_flag = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32;
+        let yuv = windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO.0 as u32;
+        // Best → safe: waitable + tearing, waitable, plain.
+        let (swap_chain, tearing) = match factory.CreateSwapChainForComposition(device, &desc(waitable | tearing_flag), None) {
+            Ok(s) => (s, true),
+            Err(_) => match factory.CreateSwapChainForComposition(device, &desc(waitable), None) {
+                Ok(s) => (s, false),
+                Err(_) => (factory.CreateSwapChainForComposition(device, &desc(yuv), None).map_err(|e| step(e, "NV12 swapchain"))?, false),
+            },
+        };
+        // BT.709 limited range: what the stream is encoded in.
+        if let Ok(sc3) = swap_chain.cast::<IDXGISwapChain3>() {
+            let space = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
+            if sc3
+                .CheckColorSpaceSupport(space)
+                .is_ok_and(|f| f & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 != 0)
+            {
+                let _ = sc3.SetColorSpace1(space);
+            }
+        }
+        let mut wait = None;
+        if let Ok(sc2) = swap_chain.cast::<IDXGISwapChain2>() {
+            let _ = sc2.SetMaximumFrameLatency(1);
+            let h = sc2.GetFrameLatencyWaitableObject();
+            if !h.is_invalid() {
+                wait = Some(h);
+            }
+        }
+        let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device).map_err(|e| step(e, "DirectComposition"))?;
+        let target = dcomp.CreateTargetForHwnd(window.GetDesc()?.OutputWindow, true).map_err(|e| step(e, "composition target"))?;
+        let visual = dcomp.CreateVisual()?;
+        visual.SetContent(&swap_chain).map_err(|e| step(e, "visual content"))?;
+        visual.SetOffsetX2(offset.0 as f32)?;
+        visual.SetOffsetY2(offset.1 as f32)?;
+        tracing::info!(width = size.0, height = size.1, tearing, "video layer made (NV12 for an overlay plane)");
+        Ok(Self {
+            dcomp,
+            target,
+            visual,
+            swap_chain,
+            wait,
+            slot: false,
+            tearing,
+            size,
+            offset,
+            shown: false,
+            presents: 0,
+            on_overlay: 0,
+            composed: 0,
+        })
+    }
+
+    /// In the window's visual tree, or out of it.
+    unsafe fn show(&mut self, on: bool) -> WinResult<()> {
+        if self.shown == on {
+            return Ok(());
+        }
+        if on {
+            self.target.SetRoot(&self.visual)?;
+        } else {
+            self.target.SetRoot(None::<&windows::Win32::Graphics::DirectComposition::IDCompositionVisual>)?;
+        }
+        self.dcomp.Commit()?;
+        self.shown = on;
+        Ok(())
+    }
+
+    unsafe fn move_to(&mut self, offset: (u32, u32)) -> WinResult<()> {
+        if offset != self.offset {
+            self.visual.SetOffsetX2(offset.0 as f32)?;
+            self.visual.SetOffsetY2(offset.1 as f32)?;
+            self.dcomp.Commit()?;
+            self.offset = offset;
+        }
+        Ok(())
+    }
+
+    fn ready(&mut self) -> bool {
+        if !self.slot {
+            if let Some(h) = self.wait {
+                self.slot = unsafe { WaitForSingleObjectEx(h, 0, false) } == windows::Win32::Foundation::WAIT_OBJECT_0;
+            } else {
+                self.slot = true;
+            }
+        }
+        self.slot
+    }
+
+    /// Copy picture `(w, h)` (`slice` of `tex`) in and present it. `Ok(false)`:
+    /// presented, but Windows keeps composing this layer — give it up.
+    unsafe fn present(
+        &mut self,
+        context: &ID3D11DeviceContext,
+        tex: &ID3D11Texture2D,
+        slice: u32,
+        (w, h): (u32, u32),
+        low_latency: bool,
+    ) -> WinResult<bool> {
+        let back: ID3D11Texture2D = self.swap_chain.GetBuffer(0)?;
+        let mut d: D3D11_TEXTURE2D_DESC = core::mem::zeroed();
+        tex.GetDesc(&mut d);
+        let src = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+        context.CopySubresourceRegion(&back, 0, 0, 0, 0, tex, slice * d.MipLevels.max(1), Some(&src));
+        if !std::mem::take(&mut self.slot) {
+            if let Some(h) = self.wait {
+                let _ = WaitForSingleObjectEx(h, 100, false);
+            }
+        }
+        let (sync, flags) = if low_latency && self.tearing { (0, DXGI_PRESENT_ALLOW_TEARING) } else { (1, DXGI_PRESENT(0)) };
+        self.swap_chain.Present(sync, flags).ok()?;
+        self.presents += 1;
+        if self.on_overlay == 0 && self.presents % VIDEO_LAYER_SAMPLE_EVERY == 0 {
+            use windows::Win32::Graphics::Dxgi::{
+                IDXGISwapChainMedia, DXGI_FRAME_PRESENTATION_MODE_COMPOSED, DXGI_FRAME_PRESENTATION_MODE_OVERLAY,
+                DXGI_FRAME_STATISTICS_MEDIA,
+            };
+            let mut stats = DXGI_FRAME_STATISTICS_MEDIA::default();
+            if let Ok(media) = self.swap_chain.cast::<IDXGISwapChainMedia>() {
+                if media.GetFrameStatisticsMedia(&mut stats).is_ok() {
+                    if stats.CompositionMode == DXGI_FRAME_PRESENTATION_MODE_OVERLAY {
+                        self.on_overlay += 1;
+                        tracing::info!(presents = self.presents, "video on a hardware overlay plane");
+                    } else if stats.CompositionMode == DXGI_FRAME_PRESENTATION_MODE_COMPOSED {
+                        self.composed += 1;
+                    }
+                }
+            }
+        }
+        Ok(self.on_overlay > 0 || self.composed < VIDEO_LAYER_COMPOSED_LIMIT || video_layer_forced())
+    }
+}
+
+/// `e`, saying which step of making the video layer it stopped.
+fn step(e: windows::core::Error, what: &str) -> windows::core::Error {
+    windows::core::Error::new(e.code(), format!("{what}: {}", e.message()))
+}
+
+/// `RDPIO_VIDEO_LAYER=force`: the video layer even where Windows composes it.
+fn video_layer_forced() -> bool {
+    std::env::var("RDPIO_VIDEO_LAYER").is_ok_and(|v| v.trim() == "force")
+}
+
+impl Drop for VideoLayer {
+    fn drop(&mut self) {
+        if let Some(h) = self.wait.take() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+            }
+        }
+    }
 }
 
 /// Past this many distinct rects per frame, tracking costs more than a full
@@ -551,6 +786,9 @@ impl D3D11Renderer {
                 present_timer: None,
                 frame_dirty: None,
                 recent_dirty: std::collections::VecDeque::new(),
+                video_layer_wanted: false,
+                video_layer: None,
+                video_layer_failed: false,
             };
             renderer.create_rtv()?;
             // Enable multithread protection so the session worker can use the
@@ -582,6 +820,7 @@ impl D3D11Renderer {
         let (w, h) = (self.sc_width, self.sc_height);
         let (fb, low_latency, upscaler, sharpen, keep_aspect) =
             ((self.fb_width, self.fb_height), self.low_latency, self.upscaler, self.sharpen, self.keep_aspect);
+        let video_layer_wanted = self.video_layer_wanted;
         let timing = self.gpu_timing_cb.take();
         // A window takes one flip-model swapchain at a time: this renderer
         // goes before its successor is made. Nothing between the two may
@@ -605,10 +844,70 @@ impl D3D11Renderer {
         self.sharpen = sharpen;
         self.keep_aspect = keep_aspect;
         self.gpu_timing_cb = timing;
+        self.video_layer_wanted = video_layer_wanted;
         if fb.0 > 0 && fb.1 > 0 {
             self.ensure_framebuffer(fb.0, fb.1)?;
         }
         Ok(true)
+    }
+
+    /// Let video pictures ([`present_nv12`](Self::present_nv12)) go to a
+    /// hardware overlay plane where the display has one (see [`VideoLayer`]).
+    /// Off: the layer goes (an RDP session never has one).
+    pub fn set_video_layer(&mut self, on: bool) {
+        self.video_layer_wanted = on;
+        if !on {
+            self.video_layer = None;
+        }
+    }
+
+    /// The video layer now: `(shown, presents, sampled on an overlay plane,
+    /// sampled composed)`, or `None` without one.
+    pub fn video_layer_status(&self) -> Option<(bool, u32, u32, u32)> {
+        self.video_layer.as_ref().map(|l| (l.shown, l.presents, l.on_overlay, l.composed))
+    }
+
+    /// Take the video layer out of sight before the window's own swapchain
+    /// presents (an overlay to draw, a scaled picture, a clear).
+    fn hide_video_layer(&mut self) {
+        if let Some(l) = self.video_layer.as_mut().filter(|l| l.shown) {
+            if unsafe { l.show(false) }.is_err() {
+                self.video_layer = None;
+                self.video_layer_failed = true;
+            }
+            self.frame_slot = false;
+        }
+    }
+
+    /// [`present_nv12`](Self::present_nv12) on the video layer, the picture
+    /// at `rect` (its size).
+    unsafe fn present_on_layer(&mut self, tex: &ID3D11Texture2D, slice: u32, rect: (u32, u32, u32, u32)) -> WinResult<()> {
+        let size = (rect.2, rect.3);
+        if self.video_layer.as_ref().is_some_and(|l| l.size != size) {
+            self.video_layer = None;
+        }
+        if self.video_layer.is_none() {
+            self.video_layer = Some(VideoLayer::new(&self.device, &self.swap_chain, size, (rect.0, rect.1))?);
+        }
+        let layer = self.video_layer.as_mut().expect("video layer");
+        layer.move_to((rect.0, rect.1))?;
+        if !layer.shown {
+            // Black around a letterboxed picture: the window's own swapchain
+            // shows there.
+            if let Some(rtv) = self.rtv.as_ref() {
+                self.context.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
+                let _ = self.swap_chain.Present(0, DXGI_PRESENT(0));
+            }
+            self.frame_dirty = None;
+            self.recent_dirty.clear();
+            layer.show(true)?;
+        }
+        if !layer.present(&self.context, tex, slice, size, self.low_latency)? {
+            tracing::info!("the video layer is composed, not on an overlay plane: drawing pictures in one pass instead");
+            self.video_layer = None;
+            self.video_layer_failed = true;
+        }
+        Ok(())
     }
 
     /// Enable (or disable) the no-vsync tearing present path — absolute-minimum
@@ -702,6 +1001,9 @@ impl D3D11Renderer {
     /// instead, on a display Windows composes, stalls it a refresh or two per
     /// frame.
     pub fn frame_ready(&mut self) -> bool {
+        if let Some(l) = self.video_layer.as_mut().filter(|l| l.shown) {
+            return l.ready();
+        }
         if self.frame_slot {
             return true;
         }
@@ -715,12 +1017,18 @@ impl D3D11Renderer {
     /// The swapchain's "room for a frame" signal, to wait on alongside other
     /// work. Taking it consumes it: say so with [`note_frame_ready`](Self::note_frame_ready).
     pub fn frame_ready_handle(&self) -> Option<HANDLE> {
-        self.frame_wait
+        match self.video_layer.as_ref().filter(|l| l.shown) {
+            Some(l) => l.wait,
+            None => self.frame_wait,
+        }
     }
 
     /// [`frame_ready_handle`](Self::frame_ready_handle) was waited on and fired.
     pub fn note_frame_ready(&mut self) {
-        self.frame_slot = true;
+        match self.video_layer.as_mut().filter(|l| l.shown) {
+            Some(l) => l.slot = true,
+            None => self.frame_slot = true,
+        }
     }
 
     /// The `(SyncInterval, Flags)` pair for `Present`: tear with no vsync in
@@ -780,6 +1088,7 @@ impl D3D11Renderer {
     /// Clear the backbuffer to an RGBA color and present. Used before the first
     /// server frame arrives (and as the idle background).
     pub fn present_clear(&mut self, rgba: [f32; 4]) -> WinResult<()> {
+        self.hide_video_layer();
         self.wait_for_frame();
         // The clear rewrites the whole backbuffer outside the dirty tracking.
         self.frame_dirty = None;
@@ -1331,6 +1640,7 @@ impl D3D11Renderer {
         if timing_present {
             let _ = self.ensure_present_timer().map(|t| t.begin());
         }
+        self.hide_video_layer();
 
         if self.framebuffer.is_none() {
             let res = self.present_clear([0.06, 0.09, 0.16, 1.0]);
@@ -1733,6 +2043,68 @@ impl D3D11Renderer {
         regions: &[(u32, u32, u32, u32)],
     ) -> bool {
         self.blit_texture_slice(dest_x, dest_y, w, h, tex, 0, regions)
+    }
+
+    /// A video picture (NV12, `w`×`h`; `slice` of a texture array) drawn
+    /// straight into the backbuffer and presented, in one pass: colour
+    /// conversion on the way in, no framebuffer write, no copy out of it, no
+    /// scaling pass. A full-screen stream otherwise costs three full-frame
+    /// passes per frame — on an integrated GPU, whose memory is the system's,
+    /// gigabytes a second at high frame rates.
+    ///
+    /// Only for a picture shown 1:1 with nothing over it: a scaled one (the
+    /// upscaler's kernels), sharpening or per-monitor windows take the usual
+    /// [`blit_texture_slice`](Self::blit_texture_slice) + [`present_frame`](Self::present_frame).
+    /// `Ok(false)`: not done here (nothing drawn, nothing presented). The
+    /// framebuffer isn't touched, so a later [`present_frame`](Self::present_frame)
+    /// shows the picture last blitted into it, not this one.
+    pub fn present_nv12(&mut self, tex: &ID3D11Texture2D, slice: u32, (w, h): (u32, u32)) -> WinResult<bool> {
+        if !self.extra_targets.is_empty() || self.sharpen > 0.0 || self.nv12_shader_failed || w == 0 || h == 0 {
+            return Ok(false);
+        }
+        let (sc_w, sc_h) = (self.sc_width, self.sc_height);
+        let rect = if self.keep_aspect { crate::fit_rect((w, h), (sc_w, sc_h)) } else { (0, 0, sc_w, sc_h) };
+        if (rect.2, rect.3) != (w, h) {
+            return Ok(false);
+        }
+        // On a hardware overlay plane where the display has one.
+        if self.video_layer_wanted && !self.video_layer_failed && w % 2 == 0 && h % 2 == 0 && rect.0 % 2 == 0 && rect.1 % 2 == 0 {
+            match unsafe { self.present_on_layer(tex, slice, rect) } {
+                Ok(()) => return Ok(true),
+                Err(e) => {
+                    tracing::info!(error = %e, "no video layer: drawing pictures in one pass");
+                    self.video_layer = None;
+                    self.video_layer_failed = true;
+                    self.frame_slot = false;
+                }
+            }
+        }
+        self.hide_video_layer();
+        let Some(rtv) = self.rtv.clone() else {
+            return Ok(false);
+        };
+        if self.nv12_shader.is_none() {
+            match Nv12Shader::new(&self.device, &self.context) {
+                Ok(s) => self.nv12_shader = Some(s),
+                Err(_) => return Ok(false), // (blit_texture_slice decides and logs)
+            }
+        }
+        let shader = self.nv12_shader.as_mut().expect("nv12 shader");
+        unsafe {
+            if rect != (0, 0, sc_w, sc_h) {
+                self.context.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]);
+            }
+            if shader.draw(&rtv, tex, slice, (w, h), rect).is_err() {
+                return Ok(false);
+            }
+        }
+        self.wait_for_frame();
+        let (sync, flags) = self.present_params();
+        let res = unsafe { self.present_with_rects(sync, flags, None) };
+        // The backbuffers no longer hold the framebuffer: the next ordinary
+        // present copies it whole.
+        self.rotate_dirty(true);
+        res.map(|()| true)
     }
 
     /// [`blit_texture`](Self::blit_texture) of one slice of a texture array
@@ -3236,6 +3608,54 @@ impl Nv12Shader {
         self.device
             .CreateShaderResourceView(tex, Some(&desc), Some(&mut srv))?;
         Ok(srv.expect("nv12 plane view"))
+    }
+
+    /// Convert the `src` (`w`, `h`) picture at `tex`'s origin into `rtv`'s
+    /// `(x, y, w, h)` rectangle, scaled by the bilinear sampler where the two
+    /// sizes differ.
+    unsafe fn draw(
+        &mut self,
+        rtv: &ID3D11RenderTargetView,
+        tex: &ID3D11Texture2D,
+        slice: u32,
+        (sw, sh): (u32, u32),
+        (x, y, w, h): (u32, u32, u32, u32),
+    ) -> WinResult<()> {
+        let mut td: D3D11_TEXTURE2D_DESC = core::mem::zeroed();
+        tex.GetDesc(&mut td);
+        let array = (td.ArraySize > 1).then_some(slice);
+        let ps = match array {
+            None => self.ps.clone(),
+            Some(_) => self.ps_slice.clone().ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_NOTIMPL))?,
+        };
+        // (Macroblock-padded surfaces: the picture is a sub-rect of them.)
+        let (tw, th) = (td.Width.max(1) as f32, td.Height.max(1) as f32);
+        let luma = self.plane_srv(tex, DXGI_FORMAT_R8_UNORM, array)?;
+        let chroma = self.plane_srv(tex, DXGI_FORMAT_R8G8_UNORM, array)?;
+        let ctx = &self.context;
+        ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+        ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx.VSSetShader(&self.vs, None);
+        ctx.PSSetShader(&ps, None);
+        ctx.PSSetShaderResources(if array.is_some() { 2 } else { 0 }, Some(&[Some(luma), Some(chroma)]));
+        ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+        ctx.PSSetConstantBuffers(0, Some(&[Some(self.params.clone())]));
+        let p = Nv12Params { src_off: [0.0, 0.0], src_scale: [sw as f32 / tw, sh as f32 / th] };
+        ctx.UpdateSubresource(&self.params, 0, None, &p as *const _ as *const core::ffi::c_void, 0, 0);
+        ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
+            TopLeftX: x as f32,
+            TopLeftY: y as f32,
+            Width: w as f32,
+            Height: h as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]));
+        ctx.Draw(3, 0);
+        let no_srv: [Option<ID3D11ShaderResourceView>; 4] = [None, None, None, None];
+        ctx.PSSetShaderResources(0, Some(&no_srv));
+        let no_rtv: [Option<ID3D11RenderTargetView>; 1] = [None];
+        ctx.OMSetRenderTargets(Some(&no_rtv), None);
+        Ok(())
     }
 
     /// Convert `tex`'s dirty `regions` into the framebuffer at `(dest_x,dest_y)`,

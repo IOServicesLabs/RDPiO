@@ -34,3 +34,5 @@ pub mod surface;
 pub mod pointer;
 
 pub mod pool;
+
+pub mod workers;

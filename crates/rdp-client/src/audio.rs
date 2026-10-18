@@ -231,10 +231,19 @@ impl AacDecoder {
     }
 }
 
+/// No sound for this long: the device is closed (an open one keeps the audio
+/// engine and the codec awake, and the laptop out of its deepest idle), and
+/// reopened — a few milliseconds — by the next sound.
+const IDLE_CLOSE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A `waveOut` audio output device exposed as an rdpsnd sink.
 pub struct Win32Audio {
     handle: Option<HWAVEOUT>,
     format: Option<(u16, u32, u16)>,
+    /// The format of a device closed for silence (see [`IDLE_CLOSE`]), to
+    /// reopen it in.
+    idle_format: Option<(u16, u32, u16)>,
+    last_play: std::time::Instant,
     /// In-flight buffers: the boxed `WAVEHDR` (stable address for `waveOut`) and
     /// the PCM bytes it points at, held until the device is done with them.
     pending: Vec<(Box<WAVEHDR>, Vec<u8>)>,
@@ -253,8 +262,32 @@ impl Win32Audio {
         Self {
             handle: None,
             format: None,
+            idle_format: None,
+            last_play: std::time::Instant::now(),
             pending: Vec::new(),
             aac_decoder: None,
+        }
+    }
+
+    /// Open the device for `(channels, samples_per_sec, bits_per_sample)`.
+    unsafe fn open(&mut self, (channels, samples_per_sec, bits_per_sample): (u16, u32, u16)) -> bool {
+        let block_align = channels * (bits_per_sample / 8);
+        let wfx = WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_PCM as u16,
+            nChannels: channels,
+            nSamplesPerSec: samples_per_sec,
+            nAvgBytesPerSec: samples_per_sec * block_align as u32,
+            nBlockAlign: block_align,
+            wBitsPerSample: bits_per_sample,
+            cbSize: 0,
+        };
+        let mut h = HWAVEOUT::default();
+        if waveOutOpen(Some(&mut h), WAVE_MAPPER, &wfx, None, None, CALLBACK_NULL) == MM_OK {
+            self.handle = Some(h);
+            self.format = Some((channels, samples_per_sec, bits_per_sample));
+            true
+        } else {
+            false
         }
     }
 
@@ -343,20 +376,9 @@ impl AudioSink for Win32Audio {
         }
         unsafe {
             self.close();
-            let block_align = channels * (bits_per_sample / 8);
-            let wfx = WAVEFORMATEX {
-                wFormatTag: WAVE_FORMAT_PCM as u16,
-                nChannels: channels,
-                nSamplesPerSec: samples_per_sec,
-                nAvgBytesPerSec: samples_per_sec * block_align as u32,
-                nBlockAlign: block_align,
-                wBitsPerSample: bits_per_sample,
-                cbSize: 0,
-            };
-            let mut h = HWAVEOUT::default();
-            if waveOutOpen(Some(&mut h), WAVE_MAPPER, &wfx, None, None, CALLBACK_NULL) == MM_OK {
-                self.handle = Some(h);
-                self.format = Some((channels, samples_per_sec, bits_per_sample));
+            self.idle_format = None;
+            self.last_play = std::time::Instant::now();
+            if self.open((channels, samples_per_sec, bits_per_sample)) {
                 tracing::info!(
                     channels,
                     samples_per_sec,
@@ -370,12 +392,21 @@ impl AudioSink for Win32Audio {
     }
 
     fn play(&mut self, pcm: &[u8]) {
-        let Some(h) = self.handle else {
-            return;
-        };
         if pcm.is_empty() {
             return;
         }
+        self.last_play = std::time::Instant::now();
+        // Closed for silence: open again in the same format.
+        if self.handle.is_none() {
+            if let Some(f) = self.idle_format.take() {
+                if unsafe { !self.open(f) } {
+                    tracing::warn!("waveOutOpen failed reopening after silence; audio muted");
+                }
+            }
+        }
+        let Some(h) = self.handle else {
+            return;
+        };
         unsafe {
             self.reclaim();
             // Keep audio from drifting behind video: if the device has built up
@@ -432,6 +463,22 @@ impl AudioSink for Win32Audio {
             };
             if let Some(pcm) = dec.decode(payload) {
                 self.play(&pcm);
+            }
+        }
+    }
+
+    fn idle(&mut self) {
+        if self.handle.is_none() || self.last_play.elapsed() < IDLE_CLOSE {
+            return;
+        }
+        unsafe {
+            self.reclaim();
+            // (Still playing out a backlog: next time.)
+            if self.pending.is_empty() {
+                let format = self.format;
+                self.close();
+                self.idle_format = format;
+                tracing::debug!("audio: device closed after silence");
             }
         }
     }

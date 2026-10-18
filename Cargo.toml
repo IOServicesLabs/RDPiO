@@ -41,6 +41,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 byteorder = "1.5"
 bitflags = "2.6"
 wide = "0.7"
+# The decoders' worker threads (see rdp-graphics `workers`): a pool kept for
+# the process, with scoped jobs that borrow the frame — no `unsafe` of ours.
+# 1.12 for the workspace's MSRV.
+rayon-core = "1.12"
 ureq = { version = "2.10", features = ["json"] }
 # Allocator. The default on Windows is HeapAlloc, whose per-heap lock is
 # contended across our network / decode / UI threads, and the tile codecs

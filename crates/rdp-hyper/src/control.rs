@@ -124,6 +124,12 @@ pub enum Control {
     /// Host → client: the host's console moved to another session (a
     /// sign-in, a user switch); sign in again now — the agent there serves it.
     Reconnect,
+    /// Client → host: the refresh rate of the screen the stream is shown on
+    /// now (a laptop drops 240 Hz to 60 on battery). The host streams at most
+    /// that (and never above what was agreed): frames the screen can't show
+    /// cost the laptop a decode each. Repeated every few seconds; a host that
+    /// doesn't know it ignores it.
+    Refresh { hz: u16 },
 }
 
 impl Control {
@@ -178,6 +184,10 @@ impl Control {
             }
             Self::Reconnect => o.push(10),
             Self::Recover => o.push(11),
+            Self::Refresh { hz } => {
+                o.push(12);
+                o.extend_from_slice(&hz.to_le_bytes());
+            }
         }
         o
     }
@@ -215,6 +225,7 @@ impl Control {
             9 => Self::Mode { office: *b.get(1)? != 0, fast_text: b.get(2).is_some_and(|&v| v != 0) },
             10 => Self::Reconnect,
             11 => Self::Recover,
+            12 => Self::Refresh { hz: u16_at(1)? },
             _ => return None,
         })
     }
@@ -271,6 +282,7 @@ mod tests {
             Control::Mode { office: true, fast_text: true },
             Control::Mode { office: false, fast_text: false },
             Control::Reconnect,
+            Control::Refresh { hz: 144 },
         ];
         for c in all {
             assert_eq!(Control::parse(&c.to_bytes()), Some(c.clone()), "{c:?}");

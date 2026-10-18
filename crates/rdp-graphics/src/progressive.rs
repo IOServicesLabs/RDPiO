@@ -1231,6 +1231,8 @@ struct WorkerScratch {
     planes: [Vec<i16>; 3],
     temp: Vec<i16>,
     pool: BufferPool,
+    /// This batch's stage times, summed into the decoder's after it.
+    perf: PerfTotals,
 }
 
 impl WorkerScratch {
@@ -1243,6 +1245,7 @@ impl WorkerScratch {
             ],
             temp: vec![0i16; COEFFS],
             pool: BufferPool::new(),
+            perf: PerfTotals::default(),
         }
     }
 }
@@ -1621,24 +1624,22 @@ impl ProgressiveDecoder {
         if batch.is_empty() {
             return;
         }
-        // Below this, thread spawn overhead outweighs the win.
+        // Below this, handing work out costs more than it wins.
         const PAR_MIN: usize = 24;
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(batch.len().div_ceil(8))
-            .min(16);
-        if batch.len() >= PAR_MIN && threads > 1 {
+        let threads = crate::workers::threads().min(batch.len().div_ceil(8)).min(16);
+        let pool = crate::workers::pool().filter(|_| batch.len() >= PAR_MIN && threads > 1);
+        if let Some(pool) = pool {
             let per = batch.len().div_ceil(threads);
-            // The calling thread decodes the first chunk itself (one fewer
-            // spawn+join), and each spawned worker gets a persistent scratch
-            // entry — planes/temp and a warmed RGBA pool reused across frames
-            // instead of reallocated per frame per worker. (A fully persistent
-            // thread pool would need lifetime-erased pointers — `Slot` borrows
-            // the wire buffer — and this crate deliberately denies unsafe
-            // code, so the threads themselves remain scoped.)
+            // The calling thread decodes the first chunk itself, and each
+            // other chunk goes to the process's decode pool (threads kept
+            // between frames, not started and joined per batch) with a
+            // persistent scratch entry — planes/temp and a warmed RGBA pool
+            // reused across frames instead of reallocated per frame per worker.
             while self.worker_scratch.len() + 1 < threads {
                 self.worker_scratch.push(WorkerScratch::new());
+            }
+            for s in &mut self.worker_scratch {
+                s.perf = PerfTotals::default();
             }
             let mut chunks = batch.chunks_mut(per);
             let own = chunks.next();
@@ -1647,38 +1648,29 @@ impl ProgressiveDecoder {
             let own_pool = &mut self.pool;
             let own_perf = &mut self.perf;
             let worker_scratch = &mut self.worker_scratch;
-            let perfs: Vec<PerfTotals> = std::thread::scope(|s| {
-                let handles: Vec<_> = chunks
-                    .zip(worker_scratch.iter_mut())
-                    .map(|(chunk, scratch)| {
-                        s.spawn(move || {
-                            let mut perf = PerfTotals::default();
-                            for slot in chunk {
-                                decode_slot(
-                                    slot,
-                                    extrapolate,
-                                    &mut scratch.planes,
-                                    &mut scratch.temp,
-                                    &mut scratch.pool,
-                                    &mut perf,
-                                );
-                            }
-                            perf
-                        })
-                    })
-                    .collect();
+            pool.in_place_scope(|s| {
+                for (chunk, scratch) in chunks.zip(worker_scratch.iter_mut()) {
+                    s.spawn(move |_| {
+                        for slot in chunk {
+                            decode_slot(
+                                slot,
+                                extrapolate,
+                                &mut scratch.planes,
+                                &mut scratch.temp,
+                                &mut scratch.pool,
+                                &mut scratch.perf,
+                            );
+                        }
+                    });
+                }
                 // Our own share decodes here while the workers run theirs.
                 if let Some(chunk) = own {
                     for slot in chunk {
                         decode_slot(slot, extrapolate, own_planes, own_temp, own_pool, own_perf);
                     }
                 }
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("progressive decode worker panicked"))
-                    .collect()
             });
-            for p in perfs {
+            for p in self.worker_scratch.iter().map(|s| s.perf) {
                 self.perf.rlgr += p.rlgr;
                 self.perf.dwt += p.dwt;
                 self.perf.upgrade += p.upgrade;
@@ -2103,5 +2095,65 @@ mod tests {
         assert_eq!(tiles.len(), 1);
         assert_eq!((tiles[0].x, tiles[0].y), (2 * 64, 3 * 64));
         assert_eq!(tiles[0].rgba.len(), TILE * TILE * 4);
+    }
+
+    /// A REGION block of SIMPLE tiles, each `(xIdx, yIdx, [y, cb, cr] data)`.
+    fn simple_region(tiles: &[(u16, u16, [Vec<u8>; 3])]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for (x, y, comps) in tiles {
+            let mut body = vec![0u8, 0, 0]; // quantIdx Y/Cb/Cr
+            body.extend_from_slice(&x.to_le_bytes());
+            body.extend_from_slice(&y.to_le_bytes());
+            body.push(0); // flags
+            for c in comps {
+                body.extend_from_slice(&(c.len() as u16).to_le_bytes());
+            }
+            body.extend_from_slice(&0u16.to_le_bytes()); // tailLen
+            for c in comps {
+                body.extend_from_slice(c);
+            }
+            data.extend_from_slice(&WBT_TILE_SIMPLE.to_le_bytes());
+            data.extend_from_slice(&((6 + body.len()) as u32).to_le_bytes());
+            data.extend_from_slice(&body);
+        }
+        let mut region = vec![64u8]; // tileSize
+        region.extend_from_slice(&0u16.to_le_bytes()); // numRects
+        region.extend_from_slice(&[1, 0, 0]); // numQuant, numProgQuant, flags
+        region.extend_from_slice(&(tiles.len() as u16).to_le_bytes());
+        region.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        region.extend_from_slice(&[0x11u8, 0x11, 0x11, 0x11, 0x11]);
+        region.extend_from_slice(&data);
+        let mut block = WBT_REGION.to_le_bytes().to_vec();
+        block.extend_from_slice(&((6 + region.len()) as u32).to_le_bytes());
+        block.extend_from_slice(&region);
+        block
+    }
+
+    /// A region big enough to be decoded on the worker pool comes out exactly
+    /// as each of its tiles does decoded alone (on the calling thread).
+    #[test]
+    fn tiles_decoded_on_the_pool_match_tiles_decoded_alone() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut bytes = |n: usize| {
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed as u8
+                })
+                .collect::<Vec<u8>>()
+        };
+        let tiles: Vec<(u16, u16, [Vec<u8>; 3])> =
+            (0..48u16).map(|i| (i % 8, i / 8, [bytes(96), bytes(48), bytes(48)])).collect();
+        let together = ProgressiveDecoder::new().decode(0, &simple_region(&tiles));
+        assert_eq!(together.len(), tiles.len());
+        for t in &tiles {
+            let alone = ProgressiveDecoder::new().decode(0, &simple_region(std::slice::from_ref(t)));
+            let mine = together.iter().find(|o| (o.x, o.y) == (t.0 as u32 * 64, t.1 as u32 * 64)).expect("tile decoded");
+            assert_eq!(mine.rgba, alone[0].rgba, "tile ({}, {})", t.0, t.1);
+        }
+        // (And they aren't all the same picture: the test can tell them apart.)
+        assert!(together.iter().any(|o| o.rgba != together[0].rgba));
     }
 }

@@ -100,17 +100,25 @@ pub fn nv12_to_rgba_into(
         return true;
     }
     let rows = height.div_ceil(threads.clamp(1, height));
-    std::thread::scope(|s| {
-        let mut chunks = out.chunks_mut(rows * row_bytes).enumerate();
-        // The first share runs here: one thread fewer to start.
-        let first = chunks.next();
-        for (i, chunk) in chunks {
-            s.spawn(move || nv12_rows_to_rgba(y_plane, uv_plane, width, stride, i * rows, chunk));
+    let mut chunks = out.chunks_mut(rows * row_bytes).enumerate();
+    // The first share runs here; the rest on the decode pool (threads kept
+    // between frames, not started per frame).
+    let first = chunks.next();
+    match crate::workers::pool().filter(|_| rows < height) {
+        Some(pool) => pool.in_place_scope(|s| {
+            for (i, chunk) in chunks {
+                s.spawn(move |_| nv12_rows_to_rgba(y_plane, uv_plane, width, stride, i * rows, chunk));
+            }
+            if let Some((_, chunk)) = first {
+                nv12_rows_to_rgba(y_plane, uv_plane, width, stride, 0, chunk);
+            }
+        }),
+        None => {
+            for (i, chunk) in first.into_iter().chain(chunks) {
+                nv12_rows_to_rgba(y_plane, uv_plane, width, stride, i * rows, chunk);
+            }
         }
-        if let Some((_, chunk)) = first {
-            nv12_rows_to_rgba(y_plane, uv_plane, width, stride, 0, chunk);
-        }
-    });
+    }
     true
 }
 

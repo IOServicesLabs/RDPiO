@@ -17,6 +17,7 @@ pub const PDUTYPE2_CONTROL: u8 = 20;
 pub const PDUTYPE2_POINTER: u8 = 27;
 pub const PDUTYPE2_SYNCHRONIZE: u8 = 31;
 pub const PDUTYPE2_REFRESH_RECT: u8 = 33;
+pub const PDUTYPE2_SUPPRESS_OUTPUT: u8 = 35;
 pub const PDUTYPE2_SAVE_SESSION_INFO: u8 = 38;
 pub const PDUTYPE2_FONTLIST: u8 = 39;
 pub const PDUTYPE2_FONTMAP: u8 = 40;
@@ -54,6 +55,21 @@ pub fn refresh_rect_pdu(share_id: u32, user_id: u16, areas: &[(u16, u16, u16, u1
         }
     }
     share_data(share_id, user_id, PDUTYPE2_REFRESH_RECT, &body)
+}
+
+/// A Suppress Output PDU (MS-RDPBCGR 2.2.11.3.1): `None` asks the server to
+/// stop sending display updates (no one can see them); `Some(rect)` resumes
+/// them for the desktop `(left, top, right, bottom)`, right/bottom inclusive.
+pub fn suppress_output_pdu(share_id: u32, user_id: u16, resume: Option<(u16, u16, u16, u16)>) -> Vec<u8> {
+    let mut body = Vec::with_capacity(12);
+    body.push(resume.is_some() as u8); // allowDisplayUpdates
+    body.extend_from_slice(&[0, 0, 0]); // pad3Octets
+    if let Some((l, t, r, b)) = resume {
+        for v in [l, t, r, b] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    share_data(share_id, user_id, PDUTYPE2_SUPPRESS_OUTPUT, &body)
 }
 
 /// Wrap `body` in a Share Data Header for `pdu_type2`.
@@ -123,6 +139,16 @@ mod tests {
         assert_eq!(u16::from_le_bytes([pdu[2], pdu[3]]), PDUTYPE_DATA);
         assert_eq!(pdu[14], expected_type2); // pduType2
         assert_eq!(data_pdu_type2(pdu), Some(expected_type2));
+    }
+
+    #[test]
+    fn suppress_output_pdu_stops_and_resumes() {
+        let stop = suppress_output_pdu(0x0001_03EA, 1007, None);
+        check_header(&stop, PDUTYPE2_SUPPRESS_OUTPUT);
+        assert_eq!(&stop[stop.len() - 4..], &[0, 0, 0, 0]);
+        let go = suppress_output_pdu(0x0001_03EA, 1007, Some((0, 0, 1919, 1079)));
+        check_header(&go, PDUTYPE2_SUPPRESS_OUTPUT);
+        assert_eq!(&go[go.len() - 12..], &[1, 0, 0, 0, 0, 0, 0, 0, 0x7F, 0x07, 0x37, 0x04]);
     }
 
     #[test]

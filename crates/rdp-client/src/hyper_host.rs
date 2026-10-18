@@ -459,6 +459,9 @@ struct Shared {
     ltr_acked: AtomicU32,
     /// When the client's input last came (`qpc_us`; 0: none yet).
     last_input_us: AtomicU64,
+    /// The refresh rate of the client's screen now (0: not said — an older
+    /// client): the stream runs at most at that (see `Control::Refresh`).
+    client_hz: AtomicU32,
 }
 
 /// Office mode, nobody at the controls this long, and the screen changing
@@ -637,7 +640,10 @@ fn stream_inner(
     wake_display();
     let max_bps = opts.max_mbps.max(2) * 1_000_000;
     let (mut office, mut fast_text) = (opts.office, opts.fast_text);
-    let full_fps = fps;
+    // What was agreed; the client's screen may later ask for less (a laptop
+    // that drops to 60 Hz on battery), never for more.
+    let agreed_fps = fps;
+    let mut full_fps = fps;
     let (mut fps, mut tuning) = mode(office, fast_text, full_fps);
     // Office mode: the desktop at the client's own resolution, where the
     // monitor has it (crisp text, nothing scaled). Before the capture opens.
@@ -667,6 +673,7 @@ fn stream_inner(
         recover: AtomicBool::new(false),
         ltr_acked: AtomicU32::new(u32::MAX),
         last_input_us: AtomicU64::new(0),
+        client_hz: AtomicU32::new(0),
     });
     // Frames leave from their own thread: pacing one overlaps capturing and
     // encoding the next, and the capture loop never waits on the network.
@@ -828,6 +835,28 @@ fn stream_inner(
             tracing::info!(office, fast_text, fps, "stream mode changed");
             continue;
         }
+        // The client's screen changed its refresh rate: the stream follows
+        // (within what was agreed), with an encoder budgeted for the new rate.
+        let hz = shared.client_hz.load(Ordering::Relaxed);
+        let follow = if hz > 0 { hz.clamp(30.min(agreed_fps), agreed_fps) } else { agreed_fps };
+        if follow != full_fps {
+            full_fps = follow;
+            let (new_fps, new_tuning) = mode(office, fast_text, full_fps);
+            if new_fps != fps {
+                (fps, tuning) = (new_fps, new_tuning);
+                interval_us = 1_000_000 / fps.max(1) as u64;
+                let bps = shared.rate.lock().unwrap().bitrate_bps();
+                cap.release();
+                enc.release();
+                (cap, enc) = reopen_pipeline(device_name, opts, fps, bps, codec, tuning)?;
+                captures = CaptureTimes::default();
+                (last_tex, skipped, last_present_us, credit) = (None, None, None, 1.0);
+                resized(&shared, &socket, cap.stream, fps);
+                shared.keyframe.store(true, Ordering::Relaxed);
+                tracing::info!(fps, client_hz = hz, "the client's screen changed its refresh rate; the stream follows");
+                continue;
+            }
+        }
         let want_key = shared.keyframe.swap(false, Ordering::Relaxed);
         let since_input_us = qpc_us().saturating_sub(shared.last_input_us.load(Ordering::Relaxed));
         let (pace_us, resumed) = trickle.pace(office, since_input_us, interval_us);
@@ -840,6 +869,10 @@ fn stream_inner(
         let wait_ms = match &skipped {
             Some(f) => until_us(f.present_us + pace_us),
             None if office && sharpen_left > 0 && last_tex.is_some() => until_us(last_encoded_us + pace_us),
+            // A screen that changes wakes the wait at once; the timeout only
+            // bounds the status and an answer to a keyframe request on a still
+            // one — after a second without input, less often.
+            None if since_input_us > 1_000_000 => 30,
             None => 10,
         };
         let captured = match cap.acquire(wait_ms) {
@@ -896,19 +929,27 @@ fn stream_inner(
             });
         }
         let acquired_us = qpc_us();
-        // The client is minimized: keep the capture flowing (pointer, size
-        // changes, the picture to show on return) but encode and send
-        // nothing — and look only ~30 times a second.
+        // No one can see the client's window: keep the capture going
+        // (pointer, size changes, the picture to show on return) but encode
+        // and send nothing — and look (and convert) only twice a second:
+        // whatever changes meanwhile waits in the duplication, and the
+        // keyframe that ends a pause takes the newest picture.
         if shared.paused.load(Ordering::Relaxed) && !want_key {
             if let Some(f) = captured {
                 last_tex = Some(f.nv12);
             }
             skipped = None;
-            if last_status.elapsed() > Duration::from_millis(250) {
+            if last_status.elapsed() > Duration::from_millis(1000) {
                 shared.send_status(&socket);
                 last_status = Instant::now();
             }
-            std::thread::sleep(Duration::from_millis(30));
+            // (In steps, so a keyframe request ends the pause at once.)
+            for _ in 0..10 {
+                if !shared.paused.load(Ordering::Relaxed) || shared.keyframe.load(Ordering::Relaxed) || shared.stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
             continue;
         }
         let mut refresh = false;
@@ -1054,6 +1095,7 @@ fn stream_inner(
             let encode_us = qpc_us().saturating_sub(capture_us) as u32;
             let (is_ltr, recovery) = ltr.sent(out.input, frame_id, out.keyframe);
             // The data shards now; the sender thread adds parity once they're out.
+            let fec = shared.rate.lock().unwrap().parity_for(out.data.len(), out.keyframe);
             let data = packetize_data(
                 &OutFrame { frame_id, data: &out.data, keyframe: out.keyframe, ltr: is_ltr, recovery, capture_us, encode_us },
                 fec,
@@ -1604,6 +1646,9 @@ fn receive_loop(
                 Some(Control::Mode { office, fast_text }) => {
                     shared.office.store(office, Ordering::Relaxed);
                     shared.fast_text.store(fast_text, Ordering::Relaxed);
+                }
+                Some(Control::Refresh { hz }) => {
+                    shared.client_hz.store(hz as u32, Ordering::Relaxed);
                 }
                 Some(Control::Feedback(fb)) => {
                     if let Some(id) = fb.ltr_frame {

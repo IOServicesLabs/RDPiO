@@ -1090,6 +1090,13 @@ impl ActiveSession {
         Ok(())
     }
 
+    /// Let the audio sink close its device after a silence (see
+    /// [`rdp_channels::rdpsnd::AudioSink::idle`]).
+    #[cfg(windows)]
+    pub fn audio_idle(&mut self) {
+        self.audio.sink.idle();
+    }
+
     /// Run one reassembled RDPSND PDU that arrived on the `AUDIO_PLAYBACK_DVC`
     /// dynamic channel through the same RDPSND state machine and OS sink as the
     /// static `rdpsnd` path, returning the responses to wrap as DVC data. Modern
@@ -1164,6 +1171,29 @@ impl ActiveSession {
                 self.info.io_channel_id,
                 &share,
             ),
+        }
+    }
+
+    /// Stop (`None`) or resume (`Some` desktop rect, inclusive) the server's
+    /// display updates (Suppress Output PDU, slow path).
+    #[cfg(windows)]
+    pub fn send_suppress_output<S: Write>(
+        &mut self,
+        stream: &mut S,
+        resume: Option<(u16, u16, u16, u16)>,
+    ) -> Result<(), ActivateError> {
+        let share = rdp_pdu::finalization::suppress_output_pdu(
+            self.info.share_id,
+            self.info.user_channel_id,
+            resume,
+        );
+        match self.outbound.as_ref() {
+            Some(c) => {
+                let mut c = lock_outbound(c);
+                let payload = c.wrap(0, &share);
+                send_payload(stream, self.info.user_channel_id, self.info.io_channel_id, &payload)
+            }
+            None => send_payload(stream, self.info.user_channel_id, self.info.io_channel_id, &share),
         }
     }
 
@@ -1370,6 +1400,30 @@ fn take_refresh_requests() -> Vec<(u16, u16, u16, u16)> {
     REFRESH_REQUESTS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
 }
 
+/// The UI's view of whether anyone can see the session (see
+/// `Window::output_hidden`), and the desktop size to resume, packed
+/// `hidden << 32 | width << 16 | height`. The graphics loop turns a change into
+/// a Suppress Output PDU: while hidden the server encodes and sends nothing.
+#[cfg(windows)]
+static OUTPUT_HIDDEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// UI thread: whether the session's picture can be seen, and the desktop size.
+/// Cheap to call every loop iteration; the worker is woken only on a change.
+#[cfg(windows)]
+pub(crate) fn set_output_hidden(hidden: bool, (w, h): (u32, u32)) {
+    let packed = (hidden as u64) << 32 | (w.min(0xFFFF) as u64) << 16 | h.min(0xFFFF) as u64;
+    if OUTPUT_HIDDEN.swap(packed, Ordering::Relaxed) >> 32 != packed >> 32 {
+        crate::net_wait::worker_wake::signal();
+    }
+}
+
+/// Whether the session should be suppressed now, and the desktop to resume.
+#[cfg(windows)]
+fn output_hidden() -> (bool, (u16, u16)) {
+    let p = OUTPUT_HIDDEN.load(Ordering::Relaxed);
+    (p >> 32 != 0, ((p >> 16) as u16, p as u16))
+}
+
 /// Sends client input (slow-path Input Event PDUs) to the server, RC4/MAC-
 /// wrapping them when the session is encrypted. The cipher is shared with the
 /// session worker (see [`SharedOutbound`]); the lock is held across the socket
@@ -1474,9 +1528,11 @@ pub trait FrameSink {
         }
     }
     /// Blit a GPU NV12 texture (zero-copy DXVA decode) at (`x`,`y`), painting
-    /// only the dirty `rects`. Default: drop it (a sink without a GPU can't use
-    /// a GPU texture); the windowed driver color-converts it on the GPU.
+    /// only the dirty `rects` (`slice` of a decoder's surface array, kept by
+    /// `held`, when read in place). Default: drop it (a sink without a GPU
+    /// can't use a GPU texture); the windowed driver color-converts it on the GPU.
     #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
     fn blit_texture(
         &mut self,
         _x: u16,
@@ -1484,6 +1540,8 @@ pub trait FrameSink {
         _w: u16,
         _h: u16,
         _texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        _slice: u32,
+        _held: Option<HeldSurface>,
         _rects: &[(u16, u16, u16, u16)],
     ) {
     }
@@ -1733,6 +1791,50 @@ pub fn run_session<S: Read + Write, F: FrameSink>(
     }
 }
 
+/// A decoder's own surface, read in place (no copy), on its way to the UI
+/// thread: the decoder won't reuse it until this is dropped. Counted, so the
+/// decoder copies pictures out instead once a few are queued (it has only so
+/// many surfaces).
+#[cfg(windows)]
+pub struct HeldSurface(#[allow(dead_code)] windows::Win32::Media::MediaFoundation::IMFSample);
+
+// SAFETY: Media Foundation samples are free-threaded; this one is only held
+// (never used) on the UI thread, then released there.
+#[cfg(windows)]
+unsafe impl Send for HeldSurface {}
+
+#[cfg(windows)]
+static HELD_SURFACES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A picture read in place couldn't be drawn here (the renderer can't sample
+/// a decoder's surfaces): decoders copy their pictures out from now on.
+#[cfg(windows)]
+pub static IN_PLACE_OFF: AtomicBool = AtomicBool::new(false);
+
+#[cfg(windows)]
+impl HeldSurface {
+    /// Pictures read in place may be queued at most this deep; past it they're
+    /// copied out.
+    pub const MAX_IN_FLIGHT: usize = 3;
+
+    pub fn new(sample: windows::Win32::Media::MediaFoundation::IMFSample) -> Self {
+        HELD_SURFACES.fetch_add(1, Ordering::Relaxed);
+        Self(sample)
+    }
+
+    /// How many are on their way now.
+    pub fn in_flight() -> usize {
+        HELD_SURFACES.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HeldSurface {
+    fn drop(&mut self) {
+        HELD_SURFACES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// A decoded rectangle ready to blit at (`x`,`y`). Either already-RGBA pixels
 /// (uncompressed surfaces, AVC444 full-chroma) or an NV12 frame (AVC420) that
 /// the sink converts on the GPU when it can, else on the CPU.
@@ -1759,13 +1861,16 @@ pub enum GfxBlit {
         rects: Vec<(u16, u16, u16, u16)>,
     },
     /// A GPU NV12 texture (zero-copy DXVA decode) to color-convert on the GPU.
-    /// `rects` as in [`GfxBlit::Nv12`].
+    /// `rects` as in [`GfxBlit::Nv12`]. Read in place: `texture` is the
+    /// decoder's surface array, `slice` the picture's, and `held` keeps it.
     Texture {
         x: u16,
         y: u16,
         w: u16,
         h: u16,
         texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        slice: u32,
+        held: Option<HeldSurface>,
         rects: Vec<(u16, u16, u16, u16)>,
     },
     /// Copy a `w`x`h` framebuffer rectangle from (`sx`,`sy`) to (`dx`,`dy`)
@@ -1953,8 +2058,8 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
                         GfxBlit::Nv12 { x, y, w, h, nv12, rects } => {
                             sink.blit_nv12(x, y, w, h, &nv12, &rects)
                         }
-                        GfxBlit::Texture { x, y, w, h, texture, rects } => {
-                            sink.blit_texture(x, y, w, h, &texture, &rects)
+                        GfxBlit::Texture { x, y, w, h, texture, slice, held, rects } => {
+                            sink.blit_texture(x, y, w, h, &texture, slice, held, &rects)
                         }
                         GfxBlit::CopyRect { sx, sy, w, h, dx, dy } => {
                             sink.copy_rect(sx, sy, w, h, dx, dy)
@@ -2122,6 +2227,9 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     // seconds of artifact churn. Only forward once the size has been stable.
     let mut pending_resize: Option<(Vec<gcc::MonitorDef>, std::time::Instant)> = None;
     const RESIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+    // Display updates suppressed on the server (see `set_output_hidden`); a
+    // new connection starts with them on.
+    let mut suppressed = false;
 
     loop {
         // The UI thread sets this when the window closes. The reverse-connect /
@@ -2143,7 +2251,22 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         if !refresh.is_empty() {
             session.send_refresh_rect(stream, &refresh)?;
         }
+        // No one can see the picture (minimized, screen off, locked): the
+        // server stops encoding and sending it. Seen again: updates resume and
+        // the whole desktop is repainted (the server would anyway; the refresh
+        // makes sure).
+        let (hidden, (dw, dh)) = output_hidden();
+        if hidden != suppressed && dw > 0 && dh > 0 {
+            let rect = (0, 0, dw - 1, dh - 1);
+            session.send_suppress_output(stream, (!hidden).then_some(rect))?;
+            if !hidden {
+                session.send_refresh_rect(stream, &[rect])?;
+            }
+            tracing::info!(suppressed = hidden, "display updates {}", if hidden { "paused: no one can see them" } else { "resumed" });
+            suppressed = hidden;
+        }
 
+        session.audio_idle();
         // Push any local clipboard change to the server (we wake ~60x/sec).
         if take_clipboard_changed() {
             session.announce_clipboard(stream)?;

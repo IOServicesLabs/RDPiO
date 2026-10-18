@@ -767,6 +767,7 @@ fn watch_for_updates() -> Arc<Mutex<Option<rdp_hyper::update::Package>>> {
     let slot = Arc::new(Mutex::new(None));
     let found = slot.clone();
     let _ = std::thread::Builder::new().name("rdpio-updates".into()).spawn(move || {
+        crate::net_tune::eco_thread();
         sleep_unless_stopping(FIRST_UPDATE_CHECK);
         while !STOP.load(Ordering::SeqCst) {
             let s = host_settings();

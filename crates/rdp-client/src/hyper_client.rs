@@ -370,6 +370,9 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     // Present the moment a frame is decoded; waiting for vblank costs up to a
     // refresh interval and blocks the loop that also sends input.
     renderer.set_low_latency(!VSYNC.load(Ordering::Relaxed));
+    // Pictures on a hardware overlay plane where this display has one (the
+    // display engine converts and composes them; `RDPIO_VIDEO_LAYER=0` off).
+    renderer.set_video_layer(std::env::var("RDPIO_VIDEO_LAYER").map_or(true, |v| v.trim() != "0"));
     // A stream of another shape than the window (a 16:9 desktop on a 3:2
     // laptop) keeps its shape: scaled to fit, black around it.
     renderer.set_keep_aspect(true);
@@ -415,15 +418,19 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     if link.update {
         tracing::info!(host_app = %link.host_app, "the host has a newer rdpio: downloading it beside the stream");
         let s = shared.clone();
-        std::thread::Builder::new().name("hyper-update".into()).spawn(move || fetch_beside_stream(s))?;
+        std::thread::Builder::new().name("hyper-update".into()).spawn(move || {
+            crate::net_tune::eco_thread();
+            fetch_beside_stream(s)
+        })?;
     }
     // Wi-Fi without power-save naps or channel scans, and the stream's
     // packets marked as audio/video — for as long as it plays.
-    let _wifi = crate::net_tune::WifiLowLatency::enable();
+    // (These three are let go while no one can see the stream: see `paused`.)
+    let mut wifi = crate::net_tune::WifiLowLatency::enable();
     let _qos = crate::net_tune::QosFlow::tag(&shared.socket, None);
     // This thread decodes and presents: scheduled like a game's own.
-    let _boost = crate::net_tune::ThreadBoost::games();
-    let _awake = crate::net_tune::KeepAwake::new();
+    let mut boost = crate::net_tune::ThreadBoost::games();
+    let mut awake = Some(crate::net_tune::KeepAwake::new());
     // The decoder's waits at 1 ms, not the 15.6 ms default (see FineTimer) —
     // while anything happens: a still screen lets the laptop's timer coarsen
     // (see FINE_TIMER_IDLE).
@@ -478,6 +485,11 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     let mut decode_us_avg = 5_000u64;
     // When the power source was last looked at (see GPU_FOLLOWS_POWER).
     let mut power_checked = Instant::now();
+    // The screen's refresh rate as last told to the host (see Control::Refresh),
+    // and when (at which display epoch) it was last read.
+    let (mut refresh_sent, mut refresh_hz) = (Instant::now() - Duration::from_secs(10), 0u32);
+    let (mut refresh_read, mut refresh_epoch) = (Instant::now() - Duration::from_secs(60), u32::MAX);
+    let mut last_title = String::new();
     let mut present_us_total = 0u64;
     let mut cpu_before = process_cpu_us();
     let mut report = Instant::now();
@@ -500,6 +512,10 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     // swapchain has room (see `frame_ready`), replaced by a newer one
     // meanwhile.
     let mut pending: Option<(Picture, u64)> = None;
+    // The last picture went straight to the screen (`present_nv12`), not
+    // through the framebuffer: an overlay drawn over the framebuffer now
+    // would show an older picture, so a fresh one is asked for.
+    let mut framebuffer_stale = false;
     shared.send(Kind::Control, &Control::KeyframeRequest.to_bytes());
 
     // The loop lives in a closure so any error (a GPU reset, a decoder
@@ -610,6 +626,22 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             fine_timer = None;
         }
 
+        // The screen's refresh rate, to the host: a laptop that drops to 60 Hz
+        // on battery gets 60 frames a second, not the 240 it can't show.
+        // (Read again only after a display, monitor or power change, and now
+        // and then: asking the driver costs milliseconds on this thread.)
+        if refresh_sent.elapsed() >= Duration::from_secs(3) {
+            let epoch = crate::window::display_epoch();
+            if epoch != refresh_epoch || refresh_read.elapsed() >= Duration::from_secs(15) {
+                let hz = window_refresh_hz(window);
+                if hz != refresh_hz && refresh_hz != 0 {
+                    tracing::info!(hz, "this screen's refresh rate changed; telling the host");
+                }
+                (refresh_hz, refresh_epoch, refresh_read) = (hz, epoch, Instant::now());
+            }
+            shared.send(Kind::Control, &Control::Refresh { hz: refresh_hz.min(u16::MAX as u32) as u16 }.to_bytes());
+            refresh_sent = Instant::now();
+        }
         // Plugged in or unplugged: decoding and presenting move to the GPU
         // that suits it, in place (a fresh picture follows; the stream goes on).
         if GPU_FOLLOWS_POWER.load(Ordering::Relaxed) && power_checked.elapsed() >= Duration::from_secs(3) {
@@ -726,12 +758,11 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             shared.send(Kind::Control, &ask.to_bytes());
             last_key_request = Instant::now();
         }
-        // Minimized: keep decoding (every frame is a reference for the next)
-        // but don't draw what no one can see.
-        let minimized = unsafe {
-            windows::Win32::UI::WindowsAndMessaging::IsIconic(windows::Win32::Foundation::HWND(window.hwnd_raw() as *mut _))
-                .as_bool()
-        };
+        // No one can see the stream (minimized, on another virtual desktop,
+        // this screen off, this PC locked): the host is told to encode
+        // nothing; what still comes is decoded (every frame is a reference for
+        // the next) but not drawn.
+        let minimized = window.output_hidden();
         if let Some(v) = shared.update_note.lock().unwrap().take() {
             hint = crate::hyper_overlay::render(&[format!("rdpio {v} downloaded from the host: it installs when you close this window")]);
             hint_until = Instant::now() + Duration::from_secs(6);
@@ -757,6 +788,17 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             if paused && !minimized {
                 awaiting_key = true;
                 last_key_request = Instant::now() - Duration::from_secs(1);
+                // Seen again: the stream's holds come back before its picture.
+                wifi = crate::net_tune::WifiLowLatency::enable();
+                boost = crate::net_tune::ThreadBoost::games();
+                awake = Some(crate::net_tune::KeepAwake::new());
+                tracing::info!("stream visible again");
+            } else if !paused && minimized {
+                // Nothing to show: Wi-Fi may nap and scan again, the screen
+                // and the PC may sleep, this thread is ordinary, the timer
+                // coarse.
+                (wifi, boost, awake, fine_timer) = (None, None, None, None);
+                tracing::info!("stream hidden: paused, Wi-Fi and power settings handed back");
             }
             (paused, pause_sent) = (minimized, Instant::now());
         }
@@ -793,7 +835,35 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         // for it.
         let ready = (pending.is_some() || overlay_dirty) && !minimized && renderer.frame_ready();
         let picture = if ready { pending.take() } else { None };
-        if ready {
+        // One pass where it can: a GPU picture shown 1:1 with no overlay goes
+        // straight into the backbuffer.
+        let direct = match &picture {
+            Some((Picture::Gpu(t), _)) if ready && !stats_on && !hint_on => {
+                let t_present = Instant::now();
+                let done = renderer.present_nv12(&t.texture, t.slice, (w, h))?;
+                if done {
+                    present_us_total += t_present.elapsed().as_micros() as u64;
+                }
+                done
+            }
+            _ => false,
+        };
+        if direct {
+            let capture_us = picture.map_or(0, |(_, c)| c);
+            framebuffer_stale = true;
+            repaint_due = None;
+            overlay_dirty = false;
+            shown += 1;
+            let offset = shared.clock.lock().unwrap().offset_us;
+            let host_now = now_us() as i64 + offset;
+            lat_ms.push((host_now - capture_us as i64) as f64 / 1000.0);
+        } else if ready {
+            if picture.is_some() {
+                framebuffer_stale = false;
+            } else if std::mem::take(&mut framebuffer_stale) {
+                // (An overlay over an older picture: a fresh one follows.)
+                shared.send(Kind::Control, &Control::KeyframeRequest.to_bytes());
+            }
             let captured = picture.and_then(|(p, capture_us)| {
                 let in_place = matches!(&p, Picture::Gpu(t) if t.held.is_some());
                 let painted = paint(renderer, p, (w, h), &mut rgba);
@@ -867,11 +937,21 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                 frames_lost = lost,
                 "hyper"
             );
-            window.set_title(&format!(
+            // The screen stays on while the picture moves (someone watching
+            // without touching anything); a still one may dim like any app's.
+            if let Some(a) = awake.as_mut() {
+                a.display(shown as f64 / secs >= MOVING_FPS);
+            }
+            // (Only when it reads differently: each change repaints the caption.)
+            let title = format!(
                 "RDPiO — Hyper {w}x{h} · {:.0} fps · {:.1} ms · {mbps:.0} Mbps",
                 shown as f64 / secs,
                 p(0.5)
-            ));
+            );
+            if title != last_title {
+                window.set_title(&title);
+                last_title = title;
+            }
             if crate::window::stats_overlay() {
                 let decode_kind = match decoder {
                     Decoder::Gpu(_) => "GPU",
@@ -899,7 +979,19 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             report = Instant::now();
         }
 
-        let timeout = if input.has_pending() { 5 } else { 50 };
+        // Woken at once by a frame, input or a window message; the timeout
+        // only bounds time-based work: input resends, keyframe requests, an
+        // overlay's end, the once-a-second report. Hidden or still, that's
+        // a few wakes a second, not twenty.
+        let timeout = if input.has_pending() {
+            5
+        } else if minimized {
+            1_000
+        } else if awaiting_key || repaint_due.is_some() || hint_on || stats_on {
+            50
+        } else {
+            250
+        };
         if pending.is_some() {
             if window.wait_for_work_or(timeout, renderer.frame_ready_handle()) {
                 renderer.note_frame_ready();
@@ -911,6 +1003,8 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     Ok(ended)
     };
     let result = play();
+    // (Back in an RDP session, the window has no video layer.)
+    renderer.set_video_layer(false);
 
     shared.stop.store(true, Ordering::Relaxed);
     // Goodbye only when the window was closed: after a network drop or a
@@ -937,6 +1031,10 @@ static IN_PLACE_FAILED: AtomicBool = AtomicBool::new(false);
 /// laptop's CPU from its deeper sleep on a still screen).
 const FINE_TIMER_IDLE: Duration = Duration::from_secs(2);
 
+/// Shown frames a second at which the picture counts as moving (video, a
+/// game) and keeps the screen on; office trickling stays under it.
+const MOVING_FPS: f64 = 15.0;
+
 /// No video this long: the receive loop wakes less often and the feedback
 /// thins out (nothing to report on a still screen).
 const RECEIVE_IDLE: Duration = Duration::from_secs(1);
@@ -949,7 +1047,7 @@ static GPU_FOLLOWS_POWER: AtomicBool = AtomicBool::new(false);
 /// battery (a hybrid laptop's discrete GPU can then power off, and no frame
 /// is copied across to the display's GPU); plugged in, the fastest one.
 /// `RDPIO_GPU=display` or `performance` decides instead.
-fn wants_display_gpu() -> bool {
+pub(crate) fn wants_display_gpu() -> bool {
     let choice = std::env::var("RDPIO_GPU").ok().unwrap_or_else(|| GPU_CHOICE.lock().unwrap().clone());
     match choice.trim() {
         "display" => true,
@@ -1071,7 +1169,7 @@ fn receive_loop(
     clipboard: Option<Arc<crate::hyper_clipboard::ClipboardSync>>,
     cursor: mpsc::Sender<crate::session::CursorUpdate>,
 ) {
-    let _ = socket.set_read_timeout(Some(Duration::from_millis(10)));
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(25)));
     crate::net_tune::raise_thread();
     let mut reassembler = Reassembler::new();
     // Several datagrams per call where the kernel coalesces them.
@@ -1233,9 +1331,11 @@ fn receive_loop(
             crate::window::signal_frame();
         }
         // A still screen sends no video: wake (and report) less often then.
+        // (While video flows its packets wake us; the timeout only paces the
+        // feedback, every 50 ms.)
         if idle != (last_video.elapsed() > RECEIVE_IDLE) {
             idle = !idle;
-            let _ = socket.set_read_timeout(Some(Duration::from_millis(if idle { 50 } else { 10 })));
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(if idle { 125 } else { 25 })));
         }
         if last_feedback.elapsed() >= Duration::from_millis(if idle { 250 } else { 50 }) {
             let s = reassembler.take_stats();
@@ -1254,7 +1354,7 @@ fn receive_loop(
             (delay_min, delay_sum, delay_n) = (i64::MAX, 0, 0);
             last_feedback = Instant::now();
         }
-        if last_ping.elapsed() >= Duration::from_millis(500) {
+        if last_ping.elapsed() >= Duration::from_millis(if idle { 1000 } else { 500 }) {
             ping_id += 1;
             shared.send(Kind::Control, &Control::Ping { id: ping_id, client_us: now_us() }.to_bytes());
             last_ping = Instant::now();
@@ -1351,9 +1451,28 @@ fn map_input(raw: RawInput, (vx, vy, vw, vh): (u32, u32, u32, u32)) -> Vec<Input
 
 /// The primary display's refresh rate (the default frame rate to ask for).
 pub fn local_refresh_hz() -> u32 {
+    refresh_hz_of(windows::core::PCWSTR::null())
+}
+
+/// The refresh rate of the screen `window` is on now.
+fn window_refresh_hz(window: &Window) -> u32 {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST};
+    unsafe {
+        let monitor = MonitorFromWindow(windows::Win32::Foundation::HWND(window.hwnd_raw() as *mut _), MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool() {
+            return refresh_hz_of(windows::core::PCWSTR(info.szDevice.as_ptr()));
+        }
+    }
+    local_refresh_hz()
+}
+
+/// The current refresh rate of display `device` (null: the primary).
+fn refresh_hz_of(device: windows::core::PCWSTR) -> u32 {
     use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
     let mut m = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
-    let ok = unsafe { EnumDisplaySettingsW(windows::core::PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut m).as_bool() };
+    let ok = unsafe { EnumDisplaySettingsW(device, ENUM_CURRENT_SETTINGS, &mut m).as_bool() };
     if ok && m.dmDisplayFrequency > 1 { m.dmDisplayFrequency } else { 60 }
 }
 
@@ -1860,15 +1979,104 @@ mod tests {
         assert!(!super::IN_PLACE_FAILED.load(std::sync::atomic::Ordering::Relaxed), "a picture read in place failed to draw");
     }
 
-    /// `gpu`: the GPU renderer and decoder (pictures read in place), else
-    /// the software renderer and the CPU decoder.
-    unsafe fn show_bars(codec: Codec, gpu: bool) {
+    /// A GPU client showing the stream 1:1 with nothing over it: each picture
+    /// goes straight into the backbuffer in one pass (`present_nv12`), and the
+    /// window shows the newest one's colours. `cargo test -p rdp-client --bin rdpio straight_to_the_screen -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn pictures_go_straight_to_the_screen() {
+        crate::window::set_process_dpi_aware();
+        for codec in [Codec::H264, Codec::Hevc] {
+            unsafe {
+                let (w, h) = (1280u32, 720u32);
+                let units = bars_stream(codec, w, h);
+                let window = crate::window::Window::new("rdpio one-pass test", 640, 360).unwrap();
+                let (cw, ch) = client_size(&window);
+                // A swapchain the stream's size (the window shows it scaled by
+                // the compositor), so the picture is 1:1 in the backbuffer.
+                let mut renderer = Renderer::new(window.hwnd_raw(), w, h, rdp_gpu::Backend::D3D11).unwrap();
+                renderer.set_keep_aspect(true);
+                renderer.ensure_framebuffer(w, h).unwrap();
+                let mut decoder = Decoder::new(&renderer, w, h, codec).unwrap();
+                let (mut direct, mut last) = (0, None);
+                for u in &units {
+                    if let Some(super::Picture::Gpu(t)) = decoder.decode(&u.data).unwrap() {
+                        let at = std::time::Instant::now();
+                        assert!(renderer.present_nv12(&t.texture, t.slice, (w, h)).unwrap(), "{}: not presented in one pass", codec.name());
+                        eprintln!("{}: one-pass present in {:.2} ms", codec.name(), at.elapsed().as_secs_f64() * 1e3);
+                        direct += 1;
+                        last = Some(t);
+                    }
+                    let _ = window.pump();
+                }
+                assert!(direct > 0, "{}: nothing decoded", codec.name());
+                std::thread::sleep(Duration::from_millis(100));
+                let _ = window.pump();
+                check_bars(codec, "one-pass window", &window_pixels(&window, cw, ch), cw, &[2, ch / 2, ch - 4]);
+                // A scaled picture isn't drawn in one pass (the upscaler's
+                // kernels are the usual path's).
+                renderer.resize(w / 2, h / 2).unwrap();
+                let t = last.unwrap();
+                assert!(!renderer.present_nv12(&t.texture, t.slice, (w, h)).unwrap(), "{}: a scaled picture went the one-pass way", codec.name());
+            }
+        }
+    }
+
+    /// The video layer (NV12 for a hardware overlay plane): where this PC's
+    /// display has one, pictures go there and the window shows them; where it
+    /// hasn't (or Windows composes the layer), they're drawn in one pass
+    /// instead — either way the window shows the newest picture. Prints what
+    /// Windows did with the layer. `cargo test -p rdp-client --bin rdpio video_layer -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn the_video_layer_shows_pictures_or_steps_aside() {
+        let _ = tracing_subscriber::fmt().with_env_filter("info").with_writer(std::io::stderr).try_init();
+        crate::window::set_process_dpi_aware();
+        let (w, h) = (1280u32, 720u32);
+        let units = unsafe { bars_stream(Codec::H264, w, h) };
+        let window = crate::window::Window::new("rdpio video layer test", 640, 360).unwrap();
+        let (cw, ch) = client_size(&window);
+        let mut renderer = Renderer::new(window.hwnd_raw(), w, h, rdp_gpu::Backend::D3D11).unwrap();
+        renderer.set_keep_aspect(true);
+        renderer.set_video_layer(true);
+        renderer.ensure_framebuffer(w, h).unwrap();
+        let mut decoder = Decoder::new(&renderer, w, h, Codec::H264).unwrap();
+        let mut last = None;
+        for u in &units {
+            if let Some(super::Picture::Gpu(t)) = decoder.decode(&u.data).unwrap() {
+                assert!(renderer.present_nv12(&t.texture, t.slice, (w, h)).unwrap());
+                last = Some(t);
+            }
+            let _ = window.pump();
+        }
+        // Keep presenting the newest picture a while: Windows says where it put
+        // the layer's frames only every so often.
+        let t = last.expect("decoded");
+        for _ in 0..240 {
+            assert!(renderer.present_nv12(&t.texture, t.slice, (w, h)).unwrap());
+            let _ = window.pump();
+        }
+        eprintln!("video layer (shown, presents, on overlay, composed): {:?}", renderer.video_layer_status());
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = window.pump();
+        check_bars(Codec::H264, "video layer window", &window_pixels(&window, cw, ch), cw, &[2, ch / 2, ch - 4]);
+        // An overlay to draw (the stats): the layer steps aside and the window's
+        // own swapchain shows the framebuffer.
+        drop(t);
+        if renderer.video_layer_status().is_some_and(|s| s.0) {
+            renderer.present_clear([1.0, 0.0, 0.0, 1.0]).unwrap();
+            assert!(renderer.video_layer_status().is_some_and(|s| !s.0), "the layer stayed in sight over a clear");
+        }
+    }
+
+    /// The test stream: three pictures of four bars, then three of them
+    /// mirrored — encoded on this PC's GPU.
+    unsafe fn bars_stream(codec: Codec, w: u32, h: u32) -> Vec<rdp_gpu::hyper::Encoded> {
         use windows::core::Interface;
         use windows::Win32::Foundation::HMODULE;
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
         use windows::Win32::Graphics::Direct3D11::*;
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
-        let (w, h) = (1280u32, 720u32);
         // The stream, encoded on this PC's GPU.
         let (mut device, mut context) = (None, None);
         D3D11CreateDevice(
@@ -1943,6 +2151,14 @@ mod tests {
             }
         }
         assert!(units.first().is_some_and(|u| u.keyframe), "{}: the stream starts with a keyframe", codec.name());
+        units
+    }
+
+    /// `gpu`: the GPU renderer and decoder (pictures read in place), else
+    /// the software renderer and the CPU decoder.
+    unsafe fn show_bars(codec: Codec, gpu: bool) {
+        let (w, h) = (1280u32, 720u32);
+        let units = bars_stream(codec, w, h);
 
         // The client: the software renderer, in a window smaller than the
         // stream (so the picture is scaled on the way to the screen, too).

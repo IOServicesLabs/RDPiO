@@ -1965,6 +1965,10 @@ mod win {
             w: u16,
             h: u16,
             texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+            /// Read in place: the picture's slice of the decoder's surfaces,
+            /// held until this is drawn (see `session::HeldSurface`).
+            slice: u32,
+            held: Option<session::HeldSurface>,
             rects: Vec<(u16, u16, u16, u16)>,
         },
         /// GPU framebuffer→framebuffer copy (EGFX SurfaceToSurface).
@@ -2052,6 +2056,8 @@ mod win {
             w: u16,
             h: u16,
             texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+            slice: u32,
+            held: Option<session::HeldSurface>,
             rects: &[(u16, u16, u16, u16)],
         ) {
             // The texture lives on the shared (multithread-protected) device, so
@@ -2062,6 +2068,8 @@ mod win {
                 w,
                 h,
                 texture: texture.clone(),
+                slice,
+                held,
                 rects: rects.to_vec(),
             });
         }
@@ -2894,7 +2902,15 @@ mod win {
             // Lazily create the per-surface DXVA decoder from the shared device.
             if !self.gpu_decoders.contains_key(&surface_id) {
                 let (dev, ctx) = self.device.clone()?;
-                match rdp_gpu::h264::H264GpuDecoder::new(w, h, &dev, &ctx) {
+                // Pictures read in place (the decoder's own surfaces, no copy:
+                // a frame's worth of memory traffic less, which an integrated
+                // GPU's shared memory feels) unless that failed to draw here.
+                let made = if session::IN_PLACE_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+                    rdp_gpu::h264::H264GpuDecoder::new(w, h, &dev, &ctx)
+                } else {
+                    rdp_gpu::h264::H264GpuDecoder::with_codec_in_place(w, h, &dev, &ctx, rdp_gpu::h264::Codec::H264)
+                };
+                match made {
                     Ok(d) => {
                         tracing::info!(surface_id, w, h, "DXVA GPU H.264 decoder created (zero-copy)");
                         self.gpu_decoders.insert(surface_id, d);
@@ -2931,6 +2947,17 @@ mod win {
                             .into_iter()
                             .filter(|f| f.width != 0 && f.height != 0)
                             .map(|f| {
+                                // Read in place, but the UI thread is behind (or
+                                // can't draw those): copied out, so the decoder
+                                // never runs short of surfaces.
+                                let f = if f.held.is_some()
+                                    && (session::HeldSurface::in_flight() >= session::HeldSurface::MAX_IN_FLIGHT
+                                        || session::IN_PLACE_OFF.load(std::sync::atomic::Ordering::Relaxed))
+                                {
+                                    decoder.detach(f)
+                                } else {
+                                    f
+                                };
                                 // An empty mask means "paint the whole frame" —
                                 // the safe failure when this picture's entry
                                 // was dropped from the queue.
@@ -2941,6 +2968,8 @@ mod win {
                                     w: f.width as u16,
                                     h: f.height as u16,
                                     texture: f.texture,
+                                    slice: f.slice,
+                                    held: f.held.map(session::HeldSurface::new),
                                     rects,
                                 }
                             })
@@ -4207,6 +4236,12 @@ mod win {
             );
         }
         let extra_hwnds: Vec<isize> = extra_windows.iter().map(|w| w.hwnd_raw()).collect();
+        // On battery, decode and present on the GPU the display hangs off (a
+        // hybrid laptop's integrated one): the discrete GPU can power off, and
+        // no frame crosses between the two. Plugged in, the fastest. The UI
+        // loop follows the power source after this (`RDPIO_GPU` /
+        // `--hyper-gpu` decide instead).
+        rdp_gpu::gpu::prefer_display_adapter(crate::hyper_client::wants_display_gpu());
         let mut renderer = build_renderer(
             window.hwnd_raw(),
             sc_w,
@@ -4708,6 +4743,20 @@ mod win {
             let mut pending_present = false;
             let mut metrics_report_start = std::time::Instant::now();
             let mut activity_deadline = std::time::Instant::now();
+            // The 1 ms system timer, held only while H.264 video arrives: the
+            // hardware decoder sleeps on a busy surface, and at the default
+            // 15.6 ms tick each such sleep stalled a frame by up to a tick
+            // (measured on the Hyper path: p90 decode 13.4 ms → 0.5 ms). Off
+            // again 2 s after the video stops, so an office desktop keeps the
+            // coarse tick and the CPU its deeper sleep.
+            let mut fine_timer: Option<crate::net_tune::FineTimer> = None;
+            let mut last_video = std::time::Instant::now();
+            // The power source, looked at every 3 s; a change that holds for
+            // two looks moves decoding and presenting to the GPU that suits it
+            // (the renderer is rebuilt and the session resumes from its cookie,
+            // as after a GPU reset — a second or two, on plugging in or out).
+            let mut power_checked = std::time::Instant::now();
+            let mut gpu_switch_seen = false;
             loop {
                 match window.pump() {
                     Frame::Quit => {
@@ -4727,6 +4776,11 @@ mod win {
                             window.set_title("Reconnecting… — RDPiO");
                             break;
                         }
+                        // Minimized, cloaked, screen off or locked: the server
+                        // is told to stop sending pictures (Suppress Output),
+                        // and nothing is presented until someone can see it.
+                        let hidden = window.output_hidden();
+                        crate::session::set_output_hidden(hidden, desktop);
                         let mut dirty = false;
                         // Per-monitor windows are fixed-size borderless surfaces;
                         // their (creation-time) WM_SIZE must not resize the primary
@@ -4857,6 +4911,8 @@ mod win {
                                             renderer.update_rect(x, y, w, h, &rgba);
                                         }
                                         FrameMsg::BlitNv12 { x, y, w, h, nv12, rects } => {
+                                            last_video = std::time::Instant::now();
+                                            fine_timer.get_or_insert_with(crate::net_tune::FineTimer::new);
                                             // GPU color-convert; fall back to CPU so
                                             // the frame is never dropped. Only the
                                             // dirty region rects are painted.
@@ -4876,13 +4932,27 @@ mod win {
                                                 }
                                             }
                                         }
-                                        FrameMsg::BlitTexture { x, y, w, h, texture, rects } => {
+                                        FrameMsg::BlitTexture { x, y, w, h, texture, slice, held, rects } => {
+                                            last_video = std::time::Instant::now();
+                                            fine_timer.get_or_insert_with(crate::net_tune::FineTimer::new);
                                             // Zero-copy GPU NV12 texture color-convert.
                                             let regions = region_tuples_u32(&rects);
-                                            if !renderer.blit_texture(
+                                            let drawn = renderer.blit_texture_slice(
                                                 x as u32, y as u32, w as u32, h as u32, &texture,
-                                                &regions,
-                                            ) {
+                                                slice, &regions,
+                                            );
+                                            // (The decoder may have its surface back now.)
+                                            let in_place = held.is_some();
+                                            drop(held);
+                                            if !drawn && in_place {
+                                                // The renderer can't sample a decoder's
+                                                // surfaces: pictures are copied out from
+                                                // now on, and the server repaints this one.
+                                                if !session::IN_PLACE_OFF.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                                    tracing::warn!("decoded pictures can't be drawn in place here; copying them instead");
+                                                }
+                                                crate::session::request_refresh(x as i32, y as i32, w as u32, h as u32);
+                                            } else if !drawn {
                                                 // The video processor refused the
                                                 // frame. Read it back and convert on
                                                 // the CPU rather than dropping it:
@@ -4935,6 +5005,34 @@ mod win {
                         if !worker_alive {
                             break;
                         }
+                        if fine_timer.is_some() && last_video.elapsed() > Duration::from_secs(2) {
+                            fine_timer = None;
+                        }
+                        if !per_monitor && power_checked.elapsed() >= Duration::from_secs(3) {
+                            power_checked = std::time::Instant::now();
+                            let display_gpu = crate::hyper_client::wants_display_gpu();
+                            if display_gpu == rdp_gpu::gpu::prefers_display_adapter() {
+                                gpu_switch_seen = false;
+                            } else if gpu_switch_seen {
+                                gpu_switch_seen = false;
+                                rdp_gpu::gpu::prefer_display_adapter(display_gpu);
+                                let on = renderer
+                                    .device_context_clone()
+                                    .and_then(|(d, _)| rdp_gpu::gpu::device_adapter_luid(&d));
+                                // (One GPU, or both choices the same one: nothing to move.)
+                                if on.is_some() && on != rdp_gpu::gpu::chosen_adapter_luid() {
+                                    tracing::info!(
+                                        display_gpu,
+                                        "power source changed: moving decoding and presenting to the other GPU"
+                                    );
+                                    window.set_title("Reconnecting… — RDPiO");
+                                    device_lost = true;
+                                    break;
+                                }
+                            } else {
+                                gpu_switch_seen = true;
+                            }
+                        }
                         if crate::hyper_client::handoff_due() {
                             tracing::info!("host switched to Hyper; leaving RDP");
                             break;
@@ -4947,7 +5045,13 @@ mod win {
                         }
                         let pace_ready =
                             pace_interval.map_or(true, |iv| last_present.elapsed() >= iv);
-                        if pending_present && pace_ready {
+                        // Presented once the swapchain has room — polled, never
+                        // waited for here (a wait held up input and the next
+                        // frame a refresh or two where Windows composes the
+                        // window); the wait below wakes for it.
+                        let present_now =
+                            pending_present && pace_ready && !hidden && renderer.frame_ready();
+                        if present_now {
                             let present_start = std::time::Instant::now();
                             if let Err(e) = renderer.present_frame() {
                                 // Don't take the session down with the GPU:
@@ -4995,7 +5099,10 @@ mod win {
                             metrics_report_start = std::time::Instant::now();
                         }
 
-                        if !(pending_present && pace_ready) {
+                        if !present_now {
+                            // A frame waiting only for the swapchain: its signal
+                            // wakes us (see below).
+                            let for_swapchain = pending_present && pace_ready && !hidden;
                             // Wait for actual work rather than polling: the worker's
                             // event fires the moment a frame is queued and window
                             // messages wake us for input, so neither waits out a
@@ -5004,6 +5111,10 @@ mod win {
                             // tick — so an idle session costs a couple of wakeups
                             // a second instead of a thousand.
                             let timeout_ms = match (pending_present, pace_interval) {
+                                // Hidden: nothing to show; the screen or the
+                                // window coming back is a message that wakes us.
+                                _ if hidden => 1_000,
+                                _ if for_swapchain => 100,
                                 (true, Some(iv)) => {
                                     let left = iv.saturating_sub(last_present.elapsed());
                                     (left.as_millis() as u32).clamp(1, 100)
@@ -5019,7 +5130,13 @@ mod win {
                                     }
                                 }
                             };
-                            window.wait_for_work(timeout_ms);
+                            if for_swapchain {
+                                if window.wait_for_work_or(timeout_ms, renderer.frame_ready_handle()) {
+                                    renderer.note_frame_ready();
+                                }
+                            } else {
+                                window.wait_for_work(timeout_ms);
+                            }
                         }
                     }
                 }

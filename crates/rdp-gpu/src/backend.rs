@@ -84,6 +84,37 @@ impl Renderer {
         }
     }
 
+    /// Let video pictures go to a hardware overlay plane where the display has
+    /// one (see `D3D11Renderer::set_video_layer`). Direct3D 12: never.
+    pub fn set_video_layer(&mut self, on: bool) {
+        if let Self::D3D11(r) = self {
+            r.set_video_layer(on);
+        }
+    }
+
+    /// See `D3D11Renderer::video_layer_status`.
+    pub fn video_layer_status(&self) -> Option<(bool, u32, u32, u32)> {
+        match self {
+            Self::D3D11(r) => r.video_layer_status(),
+            Self::D3D12(_) => None,
+        }
+    }
+
+    /// A video picture drawn straight into the backbuffer and presented, in
+    /// one pass (see [`D3D11Renderer::present_nv12`](crate::d3d11::D3D11Renderer::present_nv12)).
+    /// `Ok(false)`: not done (Direct3D 12 always).
+    pub fn present_nv12(
+        &mut self,
+        tex: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        slice: u32,
+        size: (u32, u32),
+    ) -> windows::core::Result<bool> {
+        match self {
+            Self::D3D11(r) => r.present_nv12(tex, slice, size),
+            Self::D3D12(_) => Ok(false),
+        }
+    }
+
     /// Made again on the GPU now chosen (see
     /// [`prefer_display_adapter`](crate::d3d11::prefer_display_adapter)),
     /// settings kept, picture gone. `false`: not done (Direct3D 12, or
