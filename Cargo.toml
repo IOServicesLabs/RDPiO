@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT OR Apache-2.0"
@@ -24,15 +24,15 @@ description = "GPU-accelerated RDP client in Rust"
 
 [workspace.dependencies]
 # Internal crates
-rdp-asn1 = { path = "crates/rdp-asn1", version = "0.2.2" }
-rdp-crypto = { path = "crates/rdp-crypto", version = "0.2.2" }
-rdp-pdu = { path = "crates/rdp-pdu", version = "0.2.2" }
-rdp-core = { path = "crates/rdp-core", version = "0.2.2" }
-rdp-nla = { path = "crates/rdp-nla", version = "0.2.2" }
-rdp-channels = { path = "crates/rdp-channels", version = "0.2.2" }
-rdp-graphics = { path = "crates/rdp-graphics", version = "0.2.2" }
-rdp-gpu = { path = "crates/rdp-gpu", version = "0.2.2" }
-rdp-hyper = { path = "crates/rdp-hyper", version = "0.2.2" }
+rdp-asn1 = { path = "crates/rdp-asn1", version = "0.2.3" }
+rdp-crypto = { path = "crates/rdp-crypto", version = "0.2.3" }
+rdp-pdu = { path = "crates/rdp-pdu", version = "0.2.3" }
+rdp-core = { path = "crates/rdp-core", version = "0.2.3" }
+rdp-nla = { path = "crates/rdp-nla", version = "0.2.3" }
+rdp-channels = { path = "crates/rdp-channels", version = "0.2.3" }
+rdp-graphics = { path = "crates/rdp-graphics", version = "0.2.3" }
+rdp-gpu = { path = "crates/rdp-gpu", version = "0.2.3" }
+rdp-hyper = { path = "crates/rdp-hyper", version = "0.2.3" }
 
 # Third-party, pure and cross-platform
 thiserror = "1.0"
