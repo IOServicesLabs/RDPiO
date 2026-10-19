@@ -147,8 +147,9 @@ fn send_loop(send: &Arc<dyn Fn(&[u8]) + Send + Sync>, clock: fn() -> u64, stop: 
             tracing::warn!("the camera stopped; not sending it");
             return;
         }
-        // (A frame comes every 33 ms.)
-        std::thread::sleep(Duration::from_millis(8));
+        // Until the next frame (one every 33 ms); a keyframe request waits
+        // for it anyway.
+        camera.wait_frame(Duration::from_millis(250));
     }
 }
 

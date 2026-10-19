@@ -389,6 +389,20 @@ impl UdpTunnel {
         }
     }
 
+    /// The tunnel's UDP socket, for the session worker's event wait (which
+    /// makes it non-blocking: reads surface `WouldBlock`, like the idle
+    /// timeout before).
+    pub fn raw_socket(&self) -> std::os::windows::io::RawSocket {
+        use std::os::windows::io::AsRawSocket;
+        self.tls.get_ref().socket.as_raw_socket()
+    }
+
+    /// Datagrams sent that the server hasn't acknowledged: retransmission
+    /// needs the worker to come round within the RTO.
+    pub fn awaiting_acks(&self) -> bool {
+        self.tls.get_ref().conn.unacked_len() > 0
+    }
+
     /// Send a higher-layer payload (e.g. a frame-ack) over the tunnel.
     pub fn send(&mut self, payload: &[u8]) -> io::Result<()> {
         self.tls.write_all(&rdp_channels::emt::data(payload))?;

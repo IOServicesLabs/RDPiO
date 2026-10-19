@@ -32,6 +32,8 @@ static LINES: Mutex<VecDeque<Line>> = Mutex::new(VecDeque::new());
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static ON: AtomicBool = AtomicBool::new(false);
 static NOTIFY: OnceLock<fn()> = OnceLock::new();
+/// The launcher's own lines, in a file as well (see [`keep_file`]).
+static FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
 /// Start keeping lines; `notify` runs (on the pushing thread) after each.
 pub fn enable(notify: fn()) {
@@ -41,6 +43,15 @@ pub fn enable(notify: fn()) {
 
 pub fn enabled() -> bool {
     ON.load(Ordering::Acquire)
+}
+
+/// [`Tee`]'s lines go to `path` too (the last run's kept as `.prev`): the
+/// ring is gone with the process, and with it what led up to a restart.
+pub fn keep_file(path: &std::path::Path) {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > 0) {
+        let _ = std::fs::rename(path, path.with_extension("log.prev"));
+    }
+    *FILE.lock().unwrap() = std::fs::File::create(path).ok();
 }
 
 /// One line as `tracing`'s formatter prints it
@@ -172,6 +183,9 @@ pub struct Tee;
 impl Write for Tee {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let _ = std::io::stdout().write_all(buf);
+        if let Some(f) = FILE.lock().unwrap().as_mut() {
+            let _ = f.write_all(buf);
+        }
         if enabled() {
             for line in String::from_utf8_lossy(buf).lines() {
                 push("launcher", "rdpio", line);

@@ -1,13 +1,22 @@
 //! Opus audio over lossy UDP (both directions: game sound to the client, the
 //! client's mic to the host).
 //!
-//! Each packet carries the newest 10 ms Opus frame plus the one before it, so
-//! a single lost packet costs nothing (its frame rides the next packet). Longer
-//! gaps are filled by the decoder's packet-loss concealment, briefly, then
-//! silence — never by waiting.
+//! Each packet carries the newest Opus frame (10 ms; 20 ms where the receiver
+//! says it takes them, [`crate::control::Control::AudioReport`]) plus — while
+//! the receiver loses any, or hasn't said — the one before it, so a single
+//! lost packet costs nothing (its frame rides the next packet). Longer gaps
+//! are filled by the decoder's packet-loss concealment, briefly, then silence
+//! — never by waiting.
 
 /// Samples per channel in one 10 ms frame at 48 kHz.
 pub const FRAME_SAMPLES: usize = 480;
+
+/// Samples per channel in the longest frame Opus codes (120 ms at 48 kHz): a
+/// receiver's decode buffer.
+pub const MAX_FRAME_SAMPLES: usize = 5760;
+
+/// The longest frame (ms) this build's receivers decode, as they report it.
+pub const LONGEST_FRAME_MS: u8 = 20;
 
 /// One audio packet body.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -130,6 +130,8 @@ struct Session {
     embedded: bool,
     /// …and its window, once it said so (`WM_RDPIO_EMBEDDED`).
     child: Option<isize>,
+    /// It had a window of its own once it was up (see `connect`).
+    seen_window: bool,
 }
 
 /// Where the Workspace's tab in front is (this window's client pixels), and
@@ -227,6 +229,10 @@ pub fn run() -> Result<(), LauncherError> {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
     crate::log_ring::enable(notify_logs);
+    // (In a file too, for what happened before a restart.)
+    if let Some(d) = local_dir("logs") {
+        crate::log_ring::keep_file(&d.join("launcher.log"));
+    }
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "launcher open");
     hide_own_console();
     let connections = ConnectionStore::load()?;
@@ -1233,14 +1239,22 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
         st.prefs.file.recent.insert(profile::recent_key(&host, port, user.as_deref()), options.clone());
     }
     let _ = st.prefs.save();
-    if let Some((pid, s)) = st.sessions.iter().find(|(_, s)| s.key == key) {
+    if let Some((&pid, s)) = st.sessions.iter().find(|(_, s)| s.key == key) {
         // Already open: its tab, or its window brought forward, instead of a
         // second session.
         if s.embedded {
             return Ok(json!({ "already": true, "key": key, "embedded": true }));
         }
-        bring_forward(*pid);
-        return Ok(json!({ "already": true, "key": key }));
+        // Unless the window it had is gone while the process isn't (stuck
+        // closing, or after a resume): bringing it forward would show
+        // nothing. It's ended, and a new one starts.
+        if !s.seen_window || !windows_of(pid).is_empty() {
+            bring_forward(pid);
+            return Ok(json!({ "already": true, "key": key }));
+        }
+        tracing::warn!(pid, "that session's window is gone but its process isn't; ending it and starting a new one");
+        st.sessions.remove(&pid);
+        close_session(pid, None);
     }
     // In a tab: a window of the tab's size, never full screen.
     let mut options = options;
@@ -1294,7 +1308,7 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
     });
     st.sessions.insert(
         pid,
-        Session { key: key.clone(), name: name.clone(), started: Instant::now(), recorded: false, record, log, embedded: embed.is_some(), child: None },
+        Session { key: key.clone(), name: name.clone(), started: Instant::now(), recorded: false, record, log, embedded: embed.is_some(), child: None, seen_window: false },
     );
     // (A session in a tab is in this window: it stays.)
     if !st.keep_open && embed.is_none() {
@@ -1514,6 +1528,9 @@ fn on_event(e: Value) {
             let pid = e.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
             // (After it ended, the `_ended` already took it out: not recorded.)
             if let Some(sess) = st.sessions.get_mut(&pid) {
+                // (A sign-in still going on after 10 s, a Cloud PC's say, has
+                // none yet: never taken for stuck.)
+                sess.seen_window |= !sess.embedded && !windows_of(pid).is_empty();
                 if !sess.recorded {
                     sess.recorded = true;
                     if let Some(r) = sess.record.take() {

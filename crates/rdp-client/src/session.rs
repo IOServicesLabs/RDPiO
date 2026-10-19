@@ -2139,7 +2139,7 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
     stop: &std::sync::atomic::AtomicBool,
     redirector: Option<Box<dyn rdp_graphics::redirect::DvcRedirector>>,
-    wait: Option<crate::net_wait::SocketWait>,
+    mut wait: Option<crate::net_wait::SocketWait>,
 ) -> Result<(), ActivateError> {
     use rdp_graphics::channel::GraphicsChannel;
     use rdp_pdu::gfx::GfxCommand;
@@ -2208,6 +2208,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     // is its own RDPGFX demuxer (the tunnel carries an independent DVC). All
     // best-effort: any failure leaves graphics flowing over TCP, untouched.
     let mut udp: Option<crate::udp::UdpTunnel> = None;
+    // The tunnel's socket isn't in the worker's event wait: poll it.
+    let mut udp_polled = true;
     let mut udp_graphics = GraphicsChannel::with_caps(gfx_caps);
     // Network back-pressure for the UDP graphics path: on a lossy link (host on
     // Wi-Fi) a fast client's decode backlog stays ~0, so the only thing that
@@ -2465,6 +2467,9 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         }
         if tunnel_dead {
             udp = None;
+            if let Some(w) = wait.as_mut() {
+                w.unwatch_also();
+            }
         }
 
         // Flush anything the hosted DVC redirector (Teams WebRTC add-in)
@@ -2489,9 +2494,10 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                 if let Some(w) = wait.as_ref() {
                     // (Mic buffers and camera frames wake the worker as they
                     // fill: no capture polling.)
-                    let idle = if udp.is_some() {
-                        // Tunnel pump (retransmit RTO floor is 15 ms). (A
-                        // redirector's async output wakes the worker itself.)
+                    let idle = if udp.as_ref().is_some_and(|t| udp_polled || t.awaiting_acks()) {
+                        // Tunnel retransmission (its RTO floor is 15 ms); its
+                        // datagrams wake the wait. (A redirector's async
+                        // output wakes the worker itself.)
                         std::time::Duration::from_millis(15)
                     } else if let Some((_, since)) = pending_resize.as_ref() {
                         RESIZE_SETTLE
@@ -2599,6 +2605,15 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                         ) {
                             Ok(tunnel) => {
                                 tracing::info!("UDP multitransport tunnel established");
+                                // Its datagrams wake the worker (no polling).
+                                udp_polled = match wait.as_mut().map(|w| w.watch_also(tunnel.raw_socket())) {
+                                    Some(Ok(())) => false,
+                                    Some(Err(e)) => {
+                                        tracing::warn!(error = %e, "UDP socket event registration failed; polling it");
+                                        true
+                                    }
+                                    None => true,
+                                };
                                 udp = Some(tunnel);
                             }
                             Err(e) => {

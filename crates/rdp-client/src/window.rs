@@ -14,7 +14,8 @@ use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, DeleteObject, EnumDisplayMonitors, GetMonitorInfoW,
-    BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HBRUSH, HDC, HGDIOBJ, HMONITOR, MONITORINFO,
+    MonitorFromWindow, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HBRUSH, HDC, HGDIOBJ, HMONITOR,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 // `MONITORINFOF_PRIMARY` lives under WindowsAndMessaging (glob-imported below).
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -152,6 +153,51 @@ static WIN_REMOTE: AtomicBool = AtomicBool::new(false);
 /// The virtual key of a hotkey consumed on its key-down, whose key-up is
 /// consumed too (0 = none).
 static SWALLOW_UP: AtomicIsize = AtomicIsize::new(0);
+/// Where the window was before Ctrl+Shift+F made it fullscreen (`None`: it
+/// started fullscreen).
+static WINDOWED_RECT: Mutex<Option<RECT>> = Mutex::new(None);
+
+/// Ctrl+Shift+F: borderless fullscreen on the window's monitor, or a normal
+/// window again — where it was, or three quarters of the monitor, centred.
+/// The picture follows through `WM_SIZE` (a Hyper host fits the stream to
+/// the window). Not in a Workspace tab, whose size is the tab's.
+unsafe fn toggle_fullscreen(hwnd: HWND) {
+    if EMBEDDED.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+        return;
+    }
+    let flags = SWP_FRAMECHANGED | SWP_SHOWWINDOW;
+    if (GetWindowLongPtrW(hwnd, GWL_STYLE) as u32) & WS_POPUP.0 != 0 {
+        let r = WINDOWED_RECT.lock().unwrap().take().unwrap_or_else(|| {
+            let work = info.rcWork;
+            let (w, h) = ((work.right - work.left) * 3 / 4, (work.bottom - work.top) * 3 / 4);
+            let (x, y) = (work.left + (work.right - work.left - w) / 2, work.top + (work.bottom - work.top - h) / 2);
+            RECT { left: x, top: y, right: x + w, bottom: y + h }
+        });
+        let _ = RemovePropW(hwnd, TOPMOST_PROP);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0 as isize);
+        let _ = SetWindowPos(hwnd, Some(HWND_NOTOPMOST), r.left, r.top, r.right - r.left, r.bottom - r.top, flags);
+        tracing::info!("windowed (Ctrl+Shift+F)");
+    } else {
+        // (A maximized window comes back as it was before it was maximized.)
+        if IsZoomed(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let mut r = RECT::default();
+        if !IsIconic(hwnd).as_bool() && GetWindowRect(hwnd, &mut r).is_ok() {
+            *WINDOWED_RECT.lock().unwrap() = Some(r);
+        }
+        let m = info.rcMonitor;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE).0 as isize);
+        // Topmost, as a borderless window is (see WM_ACTIVATEAPP).
+        let _ = SetPropW(hwnd, TOPMOST_PROP, Some(HANDLE(1 as *mut c_void)));
+        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), m.left, m.top, m.right - m.left, m.bottom - m.top, flags);
+        tracing::info!("fullscreen (Ctrl+Shift+F)");
+    }
+}
 
 /// Whether the reserved system keys go to the remote side right now.
 fn system_keys_remote() -> bool {
@@ -1038,16 +1084,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // (borderless windows have no frame or system menu, and every other
             // key is forwarded, which otherwise leaves no way to quit);
             // Ctrl+Shift+M toggles the mouse lock (game mode); Ctrl+Shift+S the
-            // Hyper stats, Ctrl+Shift+O its office mode and Ctrl+Shift+K where
-            // the system keys go — only in a Hyper session (elsewhere they're
-            // the remote app's own).
+            // Hyper stats, Ctrl+Shift+O its office mode, Ctrl+Shift+K where
+            // the system keys go and Ctrl+Shift+F fullscreen or a window — only
+            // in a Hyper session (elsewhere they're the remote app's own).
             const VK_Q: usize = 0x51;
             const VK_S: usize = 0x53;
             const VK_M: usize = 0x4D;
             const VK_O: usize = 0x4F;
             const VK_K: usize = 0x4B;
+            const VK_F: usize = 0x46;
             let hotkey = matches!(wparam.0, VK_Q | VK_M)
-                || (matches!(wparam.0, VK_S | VK_O | VK_K) && SYSTEM_KEYS_NEED_CAPTURE.load(Ordering::SeqCst));
+                || (matches!(wparam.0, VK_S | VK_O | VK_K | VK_F) && SYSTEM_KEYS_NEED_CAPTURE.load(Ordering::SeqCst));
             if down && hotkey && (GetKeyState(VK_CONTROL.0 as i32) as i16) < 0 && (GetKeyState(VK_SHIFT.0 as i32) as i16) < 0 {
                 SWALLOW_UP.store(wparam.0 as isize, Ordering::Relaxed);
                 // A fresh press acts, auto-repeat doesn't (holding Ctrl+Shift+M
@@ -1067,6 +1114,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 if wparam.0 == VK_O {
                     OFFICE.fetch_xor(true, Ordering::Relaxed);
+                    signal_frame();
+                    return LRESULT(0);
+                }
+                if wparam.0 == VK_F {
+                    toggle_fullscreen(hwnd);
                     signal_frame();
                     return LRESULT(0);
                 }
@@ -1491,5 +1543,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real window: Ctrl+Shift+F's toggle covers its monitor, then puts it
+    /// back where it was. `cargo test -p rdp-client --bin rdpio fullscreen -- --ignored`
+    #[test]
+    #[ignore = "opens a window"]
+    fn fullscreen_and_back() {
+        let window = Window::new("rdpio fullscreen test", 800, 500).unwrap();
+        let hwnd = window.hwnd;
+        let rect = || unsafe {
+            let mut r = RECT::default();
+            GetWindowRect(hwnd, &mut r).unwrap();
+            r
+        };
+        let before = rect();
+        unsafe { toggle_fullscreen(hwnd) };
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        unsafe { GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).ok().unwrap() };
+        let full = rect();
+        assert_eq!((full.left, full.top, full.right, full.bottom), (info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right, info.rcMonitor.bottom));
+        assert!(unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32 & WS_POPUP.0 != 0);
+        assert!(!unsafe { GetPropW(hwnd, TOPMOST_PROP) }.is_invalid());
+        unsafe { toggle_fullscreen(hwnd) };
+        let after = rect();
+        assert_eq!((after.left, after.top, after.right, after.bottom), (before.left, before.top, before.right, before.bottom));
+        assert!(unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32 & WS_CAPTION.0 == WS_CAPTION.0);
+        assert!(unsafe { GetPropW(hwnd, TOPMOST_PROP) }.is_invalid());
+        assert!(unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 == 0);
+        println!("window {before:?} -> monitor {full:?} -> {after:?}");
     }
 }

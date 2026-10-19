@@ -203,6 +203,21 @@ int rdp_nvenc_open(void *device, const RdpNvencConfig *cfg, RdpNvenc **out, char
         s->config.rcParams.multiPass = mp ? (NV_ENC_MULTI_PASS)atoi(mp) : NV_ENC_MULTI_PASS_DISABLED;
     }
     s->config.rcParams.enableLookahead = 0;
+    // No picture coded finer than QP 12: below it, a still or nearly still
+    // screen's spare bitrate went on detail no one sees. Measured (1080p
+    // text, 30 Mbps, a still screen for a second): luma after 1 s 49.9 ->
+    // 47.9 dB (H.264), 51.8 -> 49.9 (HEVC) — under a level of error — for
+    // 37% / 12% fewer bytes; a desktop with a speck of motion 3.8 -> 0.6 Mbps.
+    // RDPIO_NVENC_MINQP=n another floor (0: none).
+    const char *mq = getenv("RDPIO_NVENC_MINQP");
+    uint32_t min_qp = mq && *mq ? (uint32_t)atoi(mq) : 12;
+    if (min_qp > 0) {
+        uint32_t q = min_qp;
+        s->config.rcParams.enableMinQP = 1;
+        s->config.rcParams.minQP.qpInterP = q;
+        s->config.rcParams.minQP.qpInterB = q;
+        s->config.rcParams.minQP.qpIntra = q;
+    }
     if (getenv("RDPIO_NVENC_AQ")) {
         s->config.rcParams.enableAQ = 1;
         s->config.rcParams.aqStrength = (uint32_t)atoi(getenv("RDPIO_NVENC_AQ"));

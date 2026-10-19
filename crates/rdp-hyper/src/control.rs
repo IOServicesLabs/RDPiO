@@ -144,6 +144,20 @@ pub enum Control {
     /// for a few seconds (an app on the host records from a microphone the
     /// stream can't reach).
     Notice { text: String },
+    /// Either side, as the receiver of the other's audio (game sound, the
+    /// mic): the longest Opus frame it decodes (ms) and how many frames it
+    /// had to conceal since its last report. Every couple of seconds while
+    /// audio comes. A sender told nothing (an older receiver) keeps 10 ms
+    /// frames, each packet carrying the one before too; told, it may send
+    /// longer frames and leaves the copy out while nothing is lost.
+    AudioReport { frame_ms: u8, lost: u16 },
+    /// Client → host: the size (pixels) of the window the stream is shown in,
+    /// once it settled after a resize; repeated every few seconds. Smaller
+    /// than the stream (a tab, a restored window), the host scales the
+    /// stream down to fit it — every frame encoded, sent and decoded that
+    /// much smaller — and back up (never past its own desktop) as it grows.
+    /// A host that doesn't know it ignores it.
+    View { width: u16, height: u16 },
 }
 
 /// Longest [`Control::Notice`] text (bytes): it fits one packet.
@@ -222,6 +236,16 @@ impl Control {
                 }
                 o.extend_from_slice(&text.as_bytes()[..end]);
             }
+            Self::AudioReport { frame_ms, lost } => {
+                o.push(17);
+                o.push(*frame_ms);
+                o.extend_from_slice(&lost.to_le_bytes());
+            }
+            Self::View { width, height } => {
+                o.push(18);
+                o.extend_from_slice(&width.to_le_bytes());
+                o.extend_from_slice(&height.to_le_bytes());
+            }
         }
         o
     }
@@ -264,6 +288,8 @@ impl Control {
             14 => Self::Camera { on: *b.get(1)? != 0 },
             15 => Self::CameraKeyframe,
             16 => Self::Notice { text: String::from_utf8_lossy(&b[1..b.len().min(1 + NOTICE_MAX)]).into_owned() },
+            17 => Self::AudioReport { frame_ms: *b.get(1)?, lost: u16_at(2)? },
+            18 => Self::View { width: u16_at(1)?, height: u16_at(3)? },
             _ => return None,
         })
     }
@@ -326,6 +352,8 @@ mod tests {
             Control::Camera { on: false },
             Control::CameraKeyframe,
             Control::Notice { text: "Discord records from FrontMic".into() },
+            Control::AudioReport { frame_ms: 20, lost: 3 },
+            Control::View { width: 1200, height: 800 },
         ];
         for c in all {
             assert_eq!(Control::parse(&c.to_bytes()), Some(c.clone()), "{c:?}");

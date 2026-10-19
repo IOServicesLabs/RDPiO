@@ -12,7 +12,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use rdp_channels::camera::{CamFormat, CameraDevice, MediaType};
@@ -62,6 +62,8 @@ pub(crate) unsafe fn vidcap_attributes() -> windows::core::Result<windows::Win32
 /// A Media Foundation webcam, captured on a worker thread into a frame queue.
 pub struct MfCamera {
     frames: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    /// Notified (under `frames`' lock) as each frame is queued.
+    ready: Arc<Condvar>,
     stop: Arc<AtomicBool>,
     /// On-demand mode (MS-RDPECAM): frames still owed to the server. The capture
     /// thread only encodes while this is non-zero, so every encoded H.264 frame
@@ -127,20 +129,24 @@ impl MfCamera {
 
     fn spawn(device_index: u32, media: MediaType, demand: Option<Arc<AtomicU32>>) -> Self {
         let frames = Arc::new(Mutex::new(VecDeque::new()));
+        let ready = Arc::new(Condvar::new());
         let stop = Arc::new(AtomicBool::new(false));
         let keyframe = Arc::new(AtomicBool::new(false));
-        let (frames_w, stop_w, demand_w, keyframe_w) = (frames.clone(), stop.clone(), demand.clone(), keyframe.clone());
+        let (frames_w, ready_w, stop_w, demand_w, keyframe_w) =
+            (frames.clone(), ready.clone(), stop.clone(), demand.clone(), keyframe.clone());
         let worker = std::thread::spawn(move || unsafe {
             // (Media Foundation's capture objects want COM on this thread.)
             crate::wasapi::com_init();
             if let Err(e) =
-                capture_loop(device_index, media, &frames_w, &stop_w, demand_w.as_deref(), &keyframe_w)
+                capture_loop(device_index, media, &frames_w, &ready_w, &stop_w, demand_w.as_deref(), &keyframe_w)
             {
                 tracing::warn!(error = %e, "camera capture loop ended");
             }
+            ready_w.notify_all();
         });
         Self {
             frames,
+            ready,
             stop,
             demand,
             keyframe,
@@ -171,6 +177,15 @@ impl MfCamera {
         self.frames.lock().ok()?.pop_front()
     }
 
+    /// Wait up to `timeout` for a frame to be queued (or the capture to end);
+    /// returns at once when one already is.
+    pub fn wait_frame(&self, timeout: std::time::Duration) {
+        let Ok(q) = self.frames.lock() else { return };
+        if q.is_empty() && !self.is_finished() {
+            let _ = self.ready.wait_timeout(q, timeout);
+        }
+    }
+
     /// Drain the most recent captured frame, if any (keeps only the latest to
     /// avoid unbounded queueing if the session falls behind).
     pub fn poll_frame(&self) -> Option<Vec<u8>> {
@@ -190,6 +205,55 @@ impl Drop for MfCamera {
     }
 }
 
+/// The camera's H.264 encoder: the GPU's (see `FrameEncoder`) where there is
+/// one, else Windows' software encoder on the processor.
+enum CameraEncoder {
+    /// With what to make the processor's one, should the GPU's fail.
+    Gpu(rdp_gpu::hyper::FrameEncoder, [u32; 4]),
+    Cpu(rdp_gpu::h264::H264Encoder),
+}
+
+impl CameraEncoder {
+    fn new(width: u32, height: u32, fps: u32, bitrate: u32) -> windows::core::Result<Self> {
+        if std::env::var_os("RDPIO_CAMERA_CPU").is_some() {
+            return Ok(Self::Cpu(rdp_gpu::h264::H264Encoder::new(width, height, fps, bitrate)?));
+        }
+        match rdp_gpu::hyper::FrameEncoder::new(width, height, fps, bitrate) {
+            Ok(e) => {
+                tracing::info!(encoder = e.name(), "camera encoded on the GPU");
+                Ok(Self::Gpu(e, [width, height, fps, bitrate]))
+            }
+            Err(e) => {
+                tracing::info!(reason = %e, "no GPU encoder for the camera; encoding on the processor");
+                Ok(Self::Cpu(rdp_gpu::h264::H264Encoder::new(width, height, fps, bitrate)?))
+            }
+        }
+    }
+
+    fn request_keyframe(&mut self) {
+        match self {
+            Self::Gpu(e, _) => e.request_keyframe(),
+            Self::Cpu(e) => e.request_keyframe(),
+        }
+    }
+
+    /// (A GPU encoder that fails — a driver reset, the GPU gone — is replaced
+    /// by the processor's, which starts with a keyframe.)
+    fn encode(&mut self, nv12: &[u8]) -> windows::core::Result<Vec<u8>> {
+        match self {
+            Self::Gpu(e, [w, h, fps, bitrate]) => match e.encode(nv12) {
+                Ok(out) => Ok(out),
+                Err(err) => {
+                    tracing::warn!(error = %err, "the camera's GPU encoder failed; encoding on the processor");
+                    *self = Self::Cpu(rdp_gpu::h264::H264Encoder::new(*w, *h, *fps, *bitrate)?);
+                    self.encode(nv12)
+                }
+            },
+            Self::Cpu(e) => e.encode(nv12),
+        }
+    }
+}
+
 /// Activate `device_index`, configure NV12 at the requested size, and pump
 /// frames into `frames` until `stop` is set — every frame, or with `demand`
 /// only as many as are owed. Runs on the capture worker thread.
@@ -197,6 +261,7 @@ unsafe fn capture_loop(
     device_index: u32,
     media: MediaType,
     frames: &Arc<Mutex<VecDeque<Vec<u8>>>>,
+    ready: &Condvar,
     stop: &Arc<AtomicBool>,
     demand: Option<&AtomicU32>,
     keyframe: &AtomicBool,
@@ -242,7 +307,7 @@ unsafe fn capture_loop(
     // be created we fall back to raw NV12 so the camera still streams.
     let fps = media.fps_num.max(1) / media.fps_den.max(1);
     let mut encoder = if media.format == CamFormat::H264 {
-        match rdp_gpu::h264::H264Encoder::new(media.width, media.height, fps, 2_000_000) {
+        match CameraEncoder::new(media.width, media.height, fps, 2_000_000) {
             Ok(e) => Some(e),
             Err(e) => {
                 tracing::warn!(error = %e, "H.264 camera encoder unavailable; sending raw NV12");
@@ -308,6 +373,7 @@ unsafe fn capture_loop(
                         None => {}
                     }
                     q.push_back(frame);
+                    ready.notify_all();
                 }
                 // The session worker sends it now (it sleeps until woken).
                 crate::net_wait::worker_wake::signal();
@@ -316,4 +382,41 @@ unsafe fn capture_loop(
         let _ = buffer.Unlock();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The first camera, on demand, H.264 at 720p: owed frames arrive (the
+    /// first a keyframe) and the waiting sender wakes for each. Needs a
+    /// camera (a virtual one does).
+    #[test]
+    #[ignore]
+    fn a_camera_on_demand_delivers_h264() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        println!("cameras: {:?}", MfCamera::enumerate().iter().map(|c| c.name.clone()).collect::<Vec<_>>());
+        if MfCamera::enumerate().is_empty() {
+            println!("no camera here");
+            return;
+        }
+        let media = MediaType { format: CamFormat::H264, width: 1280, height: 720, fps_num: 30, fps_den: 1 };
+        // (`RDPIO_TEST_CAMERA=n` picks another.)
+        let index = std::env::var("RDPIO_TEST_CAMERA").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let camera = MfCamera::start_on_demand(index, media);
+        camera.request_frames(30);
+        let (start, mut got, mut wakes) = (Instant::now(), Vec::new(), 0);
+        while got.len() < 30 && start.elapsed() < Duration::from_secs(15) && !camera.is_finished() {
+            camera.wait_frame(Duration::from_millis(250));
+            wakes += 1;
+            while let Some(f) = camera.next_frame() {
+                got.push(f);
+            }
+        }
+        println!("{} frames in {:.1} s, {wakes} wakes, first {} bytes", got.len(), start.elapsed().as_secs_f64(), got.first().map_or(0, |f| f.len()));
+        assert_eq!(got.len(), 30);
+        assert!(got[0].windows(4).any(|w| w[..3] == [0, 0, 1] && w[3] & 0x1f == 5), "the first frame isn't a keyframe");
+        assert!(wakes <= 45, "{wakes} wakes for 30 frames");
+    }
 }

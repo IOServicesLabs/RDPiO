@@ -505,6 +505,9 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     // and when (at which display epoch) it was last read.
     let (mut refresh_sent, mut refresh_hz) = (Instant::now() - Duration::from_secs(10), 0u32);
     let (mut refresh_read, mut refresh_epoch) = (Instant::now() - Duration::from_secs(60), u32::MAX);
+    // The window's size, and since when it's been that (see Control::View).
+    let (mut view_size, mut view_since) = ((0u32, 0u32), Instant::now());
+    let mut view_told = (0u32, 0u32);
     let mut last_title = String::new();
     let mut present_us_total = 0u64;
     let mut cpu_before = process_cpu_us();
@@ -589,6 +592,22 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
 
         // Input → host. Pointer positions map to where the picture is.
         let client = client_size(window);
+        if client != view_size {
+            (view_size, view_since) = (client, Instant::now());
+        }
+        // The window's size, to the host once it's settled (not at every
+        // step of a drag: each new stream size costs a keyframe) — in a
+        // window smaller than the stream, it streams smaller. Not a
+        // minimized or tiny one's (paused anyway).
+        let view_settled = view_since.elapsed() >= VIEW_SETTLE && view_size.0 >= 320 && view_size.1 >= 200;
+        if view_settled && (view_size != view_told || refresh_sent.elapsed() >= Duration::from_secs(3)) {
+            let (vw, vh) = (view_size.0.min(u16::MAX as u32) as u16, view_size.1.min(u16::MAX as u32) as u16);
+            shared.send(Kind::Control, &Control::View { width: vw, height: vh }.to_bytes());
+            if view_size != view_told && view_told != (0, 0) {
+                tracing::info!(width = vw, height = vh, "window resized; telling the host");
+            }
+            view_told = view_size;
+        }
         let view = if renderer.keeps_aspect() { rdp_gpu::fit_rect((w, h), client) } else { (0, 0, client.0, client.1) };
         let raw = window.drain_input();
         let had_input = !raw.is_empty();
@@ -1059,6 +1078,16 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     Ok(ended)
     };
     let result = play();
+    // Closed: whatever still has to stop (threads, devices) gets a few
+    // seconds; a process stuck there would stay "running" without a window,
+    // and the launcher would bring forward nothing on the next Connect.
+    if matches!(result, Ok(Ended::Closed)) {
+        let _ = std::thread::Builder::new().name("exit-watchdog".into()).spawn(|| {
+            std::thread::sleep(Duration::from_secs(10));
+            tracing::warn!("still closing after 10 s; leaving now");
+            std::process::exit(0);
+        });
+    }
     // (Back in an RDP session, the window has no video layer.)
     renderer.set_video_layer(false);
 
@@ -1152,6 +1181,7 @@ fn hint_lines(cpu_decode: bool) -> Vec<String> {
         "Ctrl+Shift+S   stats".to_string(),
         "Ctrl+Shift+O   office mode (crisp text) / game".to_string(),
         "Ctrl+Shift+K   Alt+Tab, Win: host / this PC".to_string(),
+        "Ctrl+Shift+F   fullscreen / window".to_string(),
     ];
     if cpu_decode {
         lines.push("No GPU video decoder: is the GPU driver installed?".to_string());
@@ -1242,6 +1272,13 @@ fn receive_loop(
     let (mut delay_min, mut delay_sum, mut delay_n) = (i64::MAX, 0i64, 0i64);
     let mut game_audio: Option<crate::hyper_audio::AudioSink> = None;
     let mut mic: Option<crate::hyper_audio::AudioSender> = None;
+    // The mic in 20 ms frames (what call apps send themselves), once the host
+    // says it takes them.
+    let mic_shape = Arc::new(crate::hyper_audio::AudioShape::default());
+    mic_shape.long.store(true, Ordering::Relaxed);
+    // Losses seen lately (video frames lost or repaired from parity): the
+    // host hears how it's going every 50 ms then, every 100 when it's calm.
+    let mut last_trouble = Instant::now();
     let mut camera: Option<crate::hyper_camera::CameraSender> = None;
     while !shared.stop.load(Ordering::Relaxed) {
         let datagrams = receiver.recv(&socket);
@@ -1333,6 +1370,7 @@ fn receive_loop(
                                 c.keyframe();
                             }
                         }
+                        Some(Control::AudioReport { frame_ms, lost }) => mic_shape.report(frame_ms, lost),
                         Some(Control::Notice { text }) => {
                             tracing::info!(%text, "notice from the host");
                             *shared.notice.lock().unwrap() = Some(text);
@@ -1355,6 +1393,7 @@ fn receive_loop(
                                     48_000,
                                     now_us,
                                     Arc::new(move |body: &[u8]| s.send(Kind::Audio, body)),
+                                    mic_shape.clone(),
                                 ));
                             } else if !on {
                                 if let Some(m) = mic.take() {
@@ -1402,7 +1441,11 @@ fn receive_loop(
                     }
                     // Game sound.
                     Kind::Audio => {
-                        game_audio.get_or_insert_with(|| crate::hyper_audio::AudioSink::start(None)).push(&body);
+                        let a = game_audio.get_or_insert_with(|| crate::hyper_audio::AudioSink::start(None));
+                        a.push(&body);
+                        if let Some(report) = a.report() {
+                            shared.send(Kind::Control, &report.to_bytes());
+                        }
                     }
                     _ => {}
                 }
@@ -1420,13 +1463,23 @@ fn receive_loop(
         }
         // A still screen sends no video: wake (and report) less often then.
         // (While video flows its packets wake us; the timeout only paces the
-        // feedback, every 50 ms.)
+        // feedback, every 50 or 100 ms.)
         if idle != (last_video.elapsed() > RECEIVE_IDLE) {
             idle = !idle;
             let _ = socket.set_read_timeout(Some(Duration::from_millis(if idle { 125 } else { 25 })));
         }
-        if last_feedback.elapsed() >= Duration::from_millis(if idle { 250 } else { 50 }) {
+        let every = if idle {
+            250
+        } else if last_trouble.elapsed() > Duration::from_secs(5) {
+            100
+        } else {
+            50
+        };
+        if last_feedback.elapsed() >= Duration::from_millis(every) {
             let s = reassembler.take_stats();
+            if s.frames_lost > 0 || s.recovered > 0 {
+                last_trouble = Instant::now();
+            }
             let fb = Feedback {
                 shards: s.shards,
                 recovered: s.recovered,
@@ -1503,6 +1556,9 @@ fn client_size(window: &Window) -> (u32, u32) {
     }
     (((r.right - r.left).max(1)) as u32, ((r.bottom - r.top).max(1)) as u32)
 }
+
+/// A resized window's size goes to the host once it stays this long.
+const VIEW_SETTLE: Duration = Duration::from_millis(800);
 
 /// Window input → stream input. Pointer positions are normalised to `view`,
 /// the part of the window that shows the stream (`(x, y, w, h)`: all of it,

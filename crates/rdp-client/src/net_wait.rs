@@ -90,6 +90,8 @@ pub struct SocketWait {
     socket: SOCKET,
     sock_event: WSAEVENT,
     wake: isize,
+    /// A second socket waited on too (the UDP multitransport tunnel's).
+    also: Option<(SOCKET, WSAEVENT)>,
 }
 
 // SAFETY: both members are kernel handles, valid across threads; the struct is
@@ -117,7 +119,38 @@ impl SocketWait {
             socket,
             sock_event,
             wake: worker_wake::handle(),
+            also: None,
         })
+    }
+
+    /// Wait on `socket` too (readable/closed) — non-blocking from now on,
+    /// like the first. Replaces any socket added before.
+    pub fn watch_also(&mut self, socket: std::os::windows::io::RawSocket) -> io::Result<()> {
+        self.unwatch_also();
+        let socket = SOCKET(socket as usize);
+        let event = unsafe { WSACreateEvent() }.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        if unsafe { WSAEventSelect(socket, Some(event), (FD_READ | FD_CLOSE) as i32) } != 0 {
+            let err = unsafe { WSAGetLastError() };
+            unsafe {
+                let _ = WSACloseEvent(event);
+            }
+            return Err(io::Error::from_raw_os_error(err.0));
+        }
+        self.also = Some((socket, event));
+        Ok(())
+    }
+
+    /// Stop waiting on the socket [`watch_also`](Self::watch_also) added
+    /// (it's blocking again).
+    pub fn unwatch_also(&mut self) {
+        if let Some((socket, event)) = self.also.take() {
+            unsafe {
+                let _ = WSAEventSelect(socket, None, 0);
+                let mut blocking_mode: u32 = 0;
+                let _ = ioctlsocket(socket, FIONBIO, &mut blocking_mode);
+                let _ = WSACloseEvent(event);
+            }
+        }
     }
 
     /// Block until the socket is readable/closed, a producer signals the
@@ -127,12 +160,15 @@ impl SocketWait {
         let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
         let sock_handle = HANDLE(self.sock_event.0 as *mut core::ffi::c_void);
         let wake_handle = HANDLE(self.wake as *mut core::ffi::c_void);
-        let handles: &[HANDLE] = if self.wake != 0 {
-            &[sock_handle, wake_handle]
-        } else {
-            &[sock_handle]
-        };
-        let rc = unsafe { WaitForMultipleObjects(handles, false, timeout_ms) };
+        let mut handles = vec![sock_handle];
+        if self.wake != 0 {
+            handles.push(wake_handle);
+        }
+        let also_at = handles.len() as u32;
+        if let Some((_, event)) = self.also {
+            handles.push(HANDLE(event.0 as *mut core::ffi::c_void));
+        }
+        let rc = unsafe { WaitForMultipleObjects(&handles, false, timeout_ms) };
         if rc == WAIT_OBJECT_0 {
             // Acknowledge the socket notification: WSAEnumNetworkEvents resets
             // the (manual-reset) event atomically. FD_READ re-arms on the next
@@ -142,6 +178,11 @@ impl SocketWait {
             unsafe {
                 let _ = WSAEnumNetworkEvents(self.socket, self.sock_event, &mut ne);
             }
+        } else if let Some((socket, event)) = self.also.filter(|_| rc.0 == WAIT_OBJECT_0.0 + also_at) {
+            let mut ne = WSANETWORKEVENTS::default();
+            unsafe {
+                let _ = WSAEnumNetworkEvents(socket, event, &mut ne);
+            }
         }
         // The wake event is auto-reset; timeouts need no bookkeeping.
     }
@@ -149,6 +190,7 @@ impl SocketWait {
 
 impl Drop for SocketWait {
     fn drop(&mut self) {
+        self.unwatch_also();
         unsafe {
             // Detach event notification and put the socket back into blocking
             // mode for whoever touches the transport during teardown.

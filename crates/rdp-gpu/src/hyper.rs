@@ -1311,6 +1311,13 @@ impl MfEncoder {
                 if video_codec == crate::h264::Codec::H264 {
                     set(&CODECAPI_AVEncH264CABACEnable, variant_bool(true), "CABAC");
                 }
+                // No finer than QP 12, as with NVENC directly (see rdp_nvenc.c):
+                // a still screen's spare bits otherwise go on invisible detail.
+                // (Not for the best-text preset, which is asked for the finest.)
+                let min_qp = std::env::var("RDPIO_NVENC_MINQP").ok().and_then(|v| v.parse().ok()).unwrap_or(12u32);
+                if min_qp > 0 && tuning.quality < MF_QUALITY {
+                    set(&CODECAPI_AVEncVideoMinQP, variant_u32(min_qp), "QP floor");
+                }
                 // Two long-term reference frames the stream controls (trust
                 // mode 1), to repair losses from (`RDPIO_HYPER_LTR=0`: none).
                 let slots = ltr_slots();
@@ -1890,6 +1897,80 @@ impl HwEncoder {
             Inner::Mf(mf) => mf.take_output(),
             Inner::Nv(_) => None,
         }
+    }
+}
+
+/// A hardware H.264 encoder for pictures in memory (a camera's NV12 frames),
+/// on the GPU driving the display: on a hybrid laptop the integrated one,
+/// whose encoder costs a sliver of what Windows' software encoder takes from
+/// the processor (a good share of a core at 720p30), and the discrete GPU
+/// stays asleep.
+pub struct FrameEncoder {
+    enc: HwEncoder,
+    context: ID3D11DeviceContext,
+    texture: ID3D11Texture2D,
+    size: (u32, u32),
+}
+
+impl FrameEncoder {
+    pub fn new(width: u32, height: u32, fps: u32, bitrate: u32) -> WinResult<Self> {
+        unsafe {
+            MFStartup(MF_VERSION, MFSTARTUP_LITE)?;
+            let adapter = crate::d3d11::display_adapter();
+            let driver_type = if adapter.is_some() {
+                D3D_DRIVER_TYPE_UNKNOWN
+            } else {
+                windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE
+            };
+            let (mut device, mut context) = (None, None);
+            D3D11CreateDevice(
+                adapter.as_ref(),
+                driver_type,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )?;
+            let (device, context): (ID3D11Device, ID3D11DeviceContext) = (device.expect("device"), context.expect("context"));
+            let _ = device.cast::<ID3D11Multithread>().map(|m| m.SetMultithreadProtected(true));
+            let luid = crate::d3d11::device_adapter_luid(&device);
+            // (The GOP is endless — keyframes only on request, after a loss —
+            // so one may take a few frames' worth.)
+            let tuning = Tuning { buffer_frames: 4, quality: 0 };
+            let enc = HwEncoder::new_tuned(&device, luid, width, height, fps, bitrate, false, crate::h264::Codec::H264, tuning)?;
+            let texture = texture(&device, (width, height), DXGI_FORMAT_NV12, D3D11_BIND_RENDER_TARGET.0 as u32)?;
+            Ok(Self { enc, context, texture, size: (width, height) })
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.enc.name
+    }
+
+    pub fn request_keyframe(&mut self) {
+        self.enc.request_keyframe();
+    }
+
+    /// Encode one NV12 picture (rows packed, the size it was made for): the
+    /// access units that came out, in order (none while the encoder holds
+    /// pictures back).
+    pub fn encode(&mut self, nv12: &[u8]) -> WinResult<Vec<u8>> {
+        let (w, h) = self.size;
+        if nv12.len() < (w * h * 3 / 2) as usize {
+            return Err(Error::new(windows::Win32::Foundation::E_INVALIDARG, "the picture is smaller than the encoder's"));
+        }
+        unsafe { self.context.UpdateSubresource(&self.texture, 0, None, nv12.as_ptr() as *const c_void, w, 0) };
+        let mut out = Vec::new();
+        if let Some(u) = self.enc.encode(&self.texture)? {
+            out.extend_from_slice(&u.data);
+        }
+        while let Some(u) = self.enc.take_output() {
+            out.extend_from_slice(&u.data);
+        }
+        Ok(out)
     }
 }
 
@@ -3107,6 +3188,67 @@ mod hardware {
     #[ignore]
     fn rgb_round_trip() {
         round_trip(Codec::H264, true);
+    }
+
+    /// A camera's pictures (NV12 in memory) encoded on the GPU decode to what
+    /// went in, for less of the processor than Windows' software encoder.
+    /// Prints both encoders' processor time per frame.
+    #[test]
+    #[ignore]
+    fn frames_from_memory_encode_on_the_gpu() {
+        let (w, h) = (1280u32, 720u32);
+        // A moving gradient with a bright square: something to code.
+        let frame = |i: u32| {
+            let mut f = vec![0u8; (w * h * 3 / 2) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    let inside = (x + i * 8) % w < 200 && y > 200 && y < 400;
+                    f[(y * w + x) as usize] = if inside { 230 } else { (16 + (x + y + i * 4) % 200) as u8 };
+                }
+            }
+            for v in &mut f[(w * h) as usize..] {
+                *v = 128;
+            }
+            f
+        };
+        let frames: Vec<Vec<u8>> = (0..60).map(frame).collect();
+        let cpu_ms = || unsafe {
+            use windows::Win32::Foundation::FILETIME;
+            use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+            let (mut a, mut b, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+            GetProcessTimes(GetCurrentProcess(), &mut a, &mut b, &mut k, &mut u).unwrap();
+            let t = |f: FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) as f64 / 10_000.0;
+            t(k) + t(u)
+        };
+        let mut gpu = FrameEncoder::new(w, h, 30, 2_000_000).unwrap();
+        println!("encoder: {}", gpu.name());
+        let mut dec = crate::h264::H264Decoder::new(w, h).unwrap();
+        let (mut psnrs, mut bytes) = (Vec::new(), 0usize);
+        let start = cpu_ms();
+        let mut stream = Vec::new();
+        for f in &frames {
+            stream.push(gpu.encode(f).unwrap());
+        }
+        let gpu_cpu = (cpu_ms() - start) / frames.len() as f64;
+        for (i, au) in stream.iter().enumerate() {
+            bytes += au.len();
+            for p in dec.decode(au).unwrap() {
+                if i >= 5 && p.nv12.len() >= (w * h) as usize {
+                    psnrs.push(psnr_luma(&frames[i], &p.nv12, w, h));
+                }
+            }
+        }
+        let mut sw = crate::h264::H264Encoder::new(w, h, 30, 2_000_000).unwrap();
+        let start = cpu_ms();
+        for f in &frames {
+            let _ = sw.encode(f).unwrap();
+        }
+        let sw_cpu = (cpu_ms() - start) / frames.len() as f64;
+        let psnr = psnrs.iter().sum::<f64>() / psnrs.len().max(1) as f64;
+        println!("processor per frame: GPU encoder {gpu_cpu:.2} ms, software {sw_cpu:.2} ms; {} KB/frame, luma {psnr:.1} dB", bytes / frames.len() / 1024);
+        assert!(stream.iter().any(|au| !au.is_empty()), "nothing came out");
+        assert!(psnrs.len() > 30, "only {} pictures decoded", psnrs.len());
+        assert!(psnr > 30.0, "luma {psnr:.1} dB");
     }
 
     /// An encoder that was shut down under us (as a lost device leaves it)

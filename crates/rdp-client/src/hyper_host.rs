@@ -101,6 +101,8 @@ pub(crate) fn clear_streaming() {
 pub(crate) fn recover_after_crash() {
     let Ok(text) = std::fs::read_to_string(marker_path()) else { return };
     tracing::warn!("previous Hyper stream didn't end cleanly; restoring the host and locking it");
+    // (Clocks it held stay held until a restart otherwise.)
+    GpuClockFloor::release();
     if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
         for key in ["output", "mic"] {
             match doc.get(key) {
@@ -247,6 +249,21 @@ fn stream_size(opts: &HostOptions, device_name: &str) -> Option<(u32, u32)> {
 pub(crate) fn client_stream_size(opts: &HostOptions, desktop: (u32, u32), want: &rdp_hyper::auth::Want) -> Option<(u32, u32)> {
     opts.stream_size.or_else(|| if want.fit { fit_within(desktop, (want.width, want.height)) } else { None })
 }
+
+/// `opts` with the stream fitted into the client's window as well as its
+/// screen (`Control::View`), where the window is smaller.
+fn viewed(opts: &HostOptions, view: Option<(u32, u32)>) -> HostOptions {
+    let fit_to = match (opts.fit_to, view) {
+        (Some((sw, sh)), Some((vw, vh))) => Some((sw.min(vw), sh.min(vh))),
+        (fit, None) => fit,
+        (None, view) => view,
+    };
+    HostOptions { fit_to, ..opts.clone() }
+}
+
+/// A new stream size for the client's window at most this often (each is a
+/// pipeline rebuild and a keyframe).
+const VIEW_REBUILD_EVERY: Duration = Duration::from_secs(2);
 
 /// `desktop` scaled down to fit within `screen`, its aspect kept, in even
 /// sizes (4:2:0 video needs them). `None` when it fits already, or for a
@@ -467,6 +484,10 @@ struct Shared {
     camera_allowed: bool,
     camera_started: AtomicBool,
     camera: Mutex<Option<crate::hyper_camera::HostCamera>>,
+    /// The size of the client's window (`Control::View`; `None`: not said),
+    /// and that it changed since the stream last followed it.
+    view: Mutex<Option<(u32, u32)>>,
+    view_changed: AtomicBool,
 }
 
 /// A captured frame: converted already (Desktop Duplication), or only seen —
@@ -576,40 +597,119 @@ impl Shared {
     }
 }
 
-/// The NVIDIA GPU's graphics and video (encoder) clocks now, MHz (NVML,
-/// which the driver installs; `None` elsewhere). For the log: an encoder on
-/// idle clocks takes several times longer per frame.
-fn gpu_clocks() -> Option<(u32, u32)> {
+type NvmlClock = unsafe extern "C" fn(*mut core::ffi::c_void, u32, *mut u32) -> i32;
+type NvmlLock = unsafe extern "C" fn(*mut core::ffi::c_void, u32, u32) -> i32;
+type NvmlReset = unsafe extern "C" fn(*mut core::ffi::c_void) -> i32;
+
+/// NVML, which the NVIDIA driver installs (`None` elsewhere): the first GPU.
+struct Nvml {
+    clock: NvmlClock,
+    max_clock: Option<NvmlClock>,
+    lock: Option<NvmlLock>,
+    reset: Option<NvmlReset>,
+    device: usize,
+}
+
+fn nvml() -> Option<&'static Nvml> {
     type Init = unsafe extern "C" fn() -> i32;
     type ByIndex = unsafe extern "C" fn(u32, *mut *mut core::ffi::c_void) -> i32;
-    type Clock = unsafe extern "C" fn(*mut core::ffi::c_void, u32, *mut u32) -> i32;
-    struct Nvml {
-        clock: Clock,
-        device: usize,
-    }
     static NVML: std::sync::OnceLock<Option<Nvml>> = std::sync::OnceLock::new();
-    let nvml = NVML
-        .get_or_init(|| unsafe {
-            use windows::core::{HSTRING, PCSTR};
-            use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-            // By full path from System32 (never a planted copy beside us).
-            let lib = LoadLibraryW(&HSTRING::from(crate::hyper_direct::system_tool("nvml.dll").as_os_str())).ok()?;
-            let init: Init = std::mem::transmute(GetProcAddress(lib, PCSTR(b"nvmlInit_v2\0".as_ptr()))?);
-            let by_index: ByIndex = std::mem::transmute(GetProcAddress(lib, PCSTR(b"nvmlDeviceGetHandleByIndex_v2\0".as_ptr()))?);
-            let clock: Clock = std::mem::transmute(GetProcAddress(lib, PCSTR(b"nvmlDeviceGetClockInfo\0".as_ptr()))?);
-            if init() != 0 {
-                return None;
-            }
-            let mut device = std::ptr::null_mut();
-            (by_index(0, &mut device) == 0).then_some(Nvml { clock, device: device as usize })
-        })
-        .as_ref()?;
+    NVML.get_or_init(|| unsafe {
+        use windows::core::{HSTRING, PCSTR};
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        // By full path from System32 (never a planted copy beside us).
+        let lib = LoadLibraryW(&HSTRING::from(crate::hyper_direct::system_tool("nvml.dll").as_os_str())).ok()?;
+        let init: Init = std::mem::transmute(GetProcAddress(lib, PCSTR(b"nvmlInit_v2\0".as_ptr()))?);
+        let by_index: ByIndex = std::mem::transmute(GetProcAddress(lib, PCSTR(b"nvmlDeviceGetHandleByIndex_v2\0".as_ptr()))?);
+        let clock: NvmlClock = std::mem::transmute(GetProcAddress(lib, PCSTR(b"nvmlDeviceGetClockInfo\0".as_ptr()))?);
+        let max_clock = GetProcAddress(lib, PCSTR(b"nvmlDeviceGetMaxClockInfo\0".as_ptr())).map(|f| std::mem::transmute::<_, NvmlClock>(f));
+        let lock = GetProcAddress(lib, PCSTR(b"nvmlDeviceSetGpuLockedClocks\0".as_ptr())).map(|f| std::mem::transmute::<_, NvmlLock>(f));
+        let reset = GetProcAddress(lib, PCSTR(b"nvmlDeviceResetGpuLockedClocks\0".as_ptr())).map(|f| std::mem::transmute::<_, NvmlReset>(f));
+        if init() != 0 {
+            return None;
+        }
+        let mut device = std::ptr::null_mut();
+        (by_index(0, &mut device) == 0).then_some(Nvml { clock, max_clock, lock, reset, device: device as usize })
+    })
+    .as_ref()
+}
+
+/// The NVIDIA GPU's graphics and video (encoder) clocks now, MHz (`None`
+/// without NVML). For the log: an encoder on idle clocks takes several times
+/// longer per frame.
+fn gpu_clocks() -> Option<(u32, u32)> {
+    let nvml = nvml()?;
     let read = |kind: u32| {
         let mut mhz = 0u32;
         (unsafe { (nvml.clock)(nvml.device as *mut _, kind, &mut mhz) } == 0).then_some(mhz)
     };
     // (NVML_CLOCK_GRAPHICS = 0, NVML_CLOCK_VIDEO = 3.)
     Some((read(0)?, read(3)?))
+}
+
+/// The NVIDIA GPU's graphics clock kept at or above a floor while a stream
+/// runs (and isn't paused). On a quiet desktop the GPU otherwise drops to its
+/// idle clocks (210-435 MHz on this host's RTX 4080 SUPER), where a frame's
+/// encode took 4-17 ms in live office streams against ~2.5 ms on clocks
+/// that are up — latency on every frame. Takes an administrator (the
+/// service's SYSTEM agent; others are told no, once); the clocks are let go
+/// on drop, and after a crash by the next agent (`recover_after_crash`), as
+/// a lock otherwise lasts until a restart. `RDPIO_GPU_CLOCK_FLOOR=MHz` sets
+/// the floor (0: none).
+pub(crate) struct GpuClockFloor;
+
+/// The selftest holds the clocks too (run as administrator), to measure what
+/// a real stream gets.
+static SELFTEST_CLOCKS: AtomicBool = AtomicBool::new(false);
+
+impl GpuClockFloor {
+    const DEFAULT_MHZ: u32 = 1500;
+
+    fn hold() -> Option<Self> {
+        static REFUSED: AtomicBool = AtomicBool::new(false);
+        let floor = std::env::var("RDPIO_GPU_CLOCK_FLOOR").ok().and_then(|v| v.parse().ok()).unwrap_or(Self::DEFAULT_MHZ);
+        if floor == 0 || REFUSED.load(Ordering::Relaxed) {
+            return None;
+        }
+        let nvml = nvml()?;
+        let (lock, max_clock) = (nvml.lock?, nvml.max_clock?);
+        let device = nvml.device as *mut core::ffi::c_void;
+        let mut max = 0u32;
+        // (NVML_CLOCK_GRAPHICS = 0.)
+        if unsafe { max_clock(device, 0, &mut max) } != 0 || max == 0 {
+            return None;
+        }
+        let floor = floor.min(max);
+        match unsafe { lock(device, floor, max) } {
+            0 => {
+                tracing::info!(floor_mhz = floor, max_mhz = max, "GPU clocks held up while streaming");
+                Some(Self)
+            }
+            code => {
+                REFUSED.store(true, Ordering::Relaxed);
+                tracing::info!(code, "GPU clocks can't be held up (needs the service's agent); encoding on whatever clocks the GPU picks");
+                None
+            }
+        }
+    }
+
+    /// Let the GPU pick its clocks again.
+    pub(crate) fn release() {
+        if let Some(nvml) = nvml() {
+            if let Some(reset) = nvml.reset {
+                unsafe {
+                    reset(nvml.device as *mut _);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for GpuClockFloor {
+    fn drop(&mut self) {
+        Self::release();
+        tracing::debug!("GPU clocks let go");
+    }
 }
 
 pub(crate) fn stream(
@@ -711,6 +811,8 @@ fn stream_inner(
         camera_allowed: route_audio,
         camera_started: AtomicBool::new(false),
         camera: Mutex::new(None),
+        view: Mutex::new(None),
+        view_changed: AtomicBool::new(false),
     });
     // Frames leave from their own thread: pacing one overlaps capturing and
     // encoding the next, and the capture loop never waits on the network.
@@ -739,9 +841,14 @@ fn stream_inner(
     let mic_sink = routing.mic_sink.clone();
     let rx_link = link.clone();
     let rx_clipboard = clipboard.clone();
+    // Game sound in 20 ms frames in office mode (a video's or a call's sound:
+    // half the packets), 10 in game mode — once the client says it takes them.
+    let audio_shape = Arc::new(crate::hyper_audio::AudioShape::default());
+    audio_shape.long.store(shared.office.load(Ordering::Relaxed), Ordering::Relaxed);
+    let rx_shape = audio_shape.clone();
     let receiver = std::thread::Builder::new()
         .name("hyper-host-rx".into())
-        .spawn(move || receive_loop(rx_socket, recv, rx_shared, desktop, mic_sink, rx_link, rx_clipboard))?;
+        .spawn(move || receive_loop(rx_socket, recv, rx_shared, desktop, mic_sink, rx_link, rx_clipboard, rx_shape))?;
 
     let audio_socket = socket.try_clone()?;
     let audio_shared = shared.clone();
@@ -751,6 +858,7 @@ fn stream_inner(
         128_000,
         qpc_us,
         Arc::new(move |body: &[u8]| audio_shared.send(&audio_socket, Kind::Audio, body)),
+        audio_shape,
     );
     // Tell the client to capture its mic only while a host app listens —
     // heard from Windows as apps start and stop recording (polled only where
@@ -835,6 +943,10 @@ fn stream_inner(
     let mut rebuilds: Vec<Instant> = Vec::new();
     let mut captures = CaptureTimes::default();
     let mut last_nudge = Instant::now();
+    // The client's window as the stream last followed it, and when.
+    let (mut applied_view, mut view_followed) = (None, Instant::now() - VIEW_REBUILD_EVERY);
+    // GPU clocks held up while a real stream runs unpaused (see GpuClockFloor).
+    let mut clocks: Option<GpuClockFloor> = None;
     // The loop lives in a closure so every exit — the client leaving, going
     // quiet, or an encoder/capture error — runs the same cleanup below:
     // threads stopped, the client told, the host's audio restored.
@@ -879,7 +991,7 @@ fn stream_inner(
                     native = opts.fit_to.and_then(|s| NativeResolution::apply(device_name, s));
                 }
             }
-            (cap, enc) = reopen_pipeline(device_name, opts, fps, bps, codec, tuning)?;
+            (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
             captures = CaptureTimes::default();
             (last_tex, skipped, last_present_us, credit) = (None, None, None, 1.0);
             resized(&shared, &socket, cap.stream, fps);
@@ -908,7 +1020,7 @@ fn stream_inner(
                 let bps = shared.rate.lock().unwrap().bitrate_bps();
                 cap.release();
                 enc.release();
-                (cap, enc) = reopen_pipeline(device_name, opts, fps, bps, codec, tuning)?;
+                (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                 captures = CaptureTimes::default();
                 (last_tex, skipped, last_present_us, credit) = (None, None, None, 1.0);
                 resized(&shared, &socket, cap.stream, fps);
@@ -916,6 +1028,34 @@ fn stream_inner(
                 tracing::info!(fps, client_hz = hz, "the client's screen changed its refresh rate; the stream follows");
                 continue;
             }
+        }
+        // The client's window grew or shrank: the stream fits it (scaled on
+        // the GPU, never past the client's screen or this desktop).
+        if shared.view_changed.load(Ordering::Relaxed) && view_followed.elapsed() >= VIEW_REBUILD_EVERY {
+            shared.view_changed.store(false, Ordering::Relaxed);
+            let view = *shared.view.lock().unwrap();
+            let before = stream_size(&viewed(opts, applied_view), device_name);
+            applied_view = view;
+            if stream_size(&viewed(opts, view), device_name) != before {
+                view_followed = Instant::now();
+                let bps = shared.rate.lock().unwrap().bitrate_bps();
+                cap.release();
+                enc.release();
+                (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
+                captures = CaptureTimes::default();
+                (last_tex, skipped, last_present_us, credit) = (None, None, None, 1.0);
+                resized(&shared, &socket, cap.stream, fps);
+                shared.keyframe.store(true, Ordering::Relaxed);
+                let (sw, sh) = cap.stream;
+                tracing::info!(width = sw, height = sh, "the client's window changed size; the stream follows");
+                continue;
+            }
+        }
+        let paused = shared.paused.load(Ordering::Relaxed);
+        if (route_audio || SELFTEST_CLOCKS.load(Ordering::Relaxed)) && !paused && clocks.is_none() {
+            clocks = GpuClockFloor::hold();
+        } else if paused {
+            clocks = None;
         }
         let want_key = shared.keyframe.swap(false, Ordering::Relaxed);
         let since_input_us = qpc_us().saturating_sub(shared.last_input_us.load(Ordering::Relaxed));
@@ -951,7 +1091,7 @@ fn stream_inner(
                     let bps = shared.rate.lock().unwrap().bitrate_bps();
                     cap.release();
                     enc.release();
-                    (cap, enc) = reopen_pipeline(device_name, opts, fps, bps, codec, tuning)?;
+                    (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                     captures = CaptureTimes::default();
                     capture_errors = 0;
                     (last_tex, skipped) = (None, None);
@@ -973,7 +1113,7 @@ fn stream_inner(
                 let bps = shared.rate.lock().unwrap().bitrate_bps();
                 cap.release();
                 enc.release();
-                (cap, enc) = reopen_pipeline(device_name, opts, fps, bps, codec, tuning)?;
+                (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                 captures = CaptureTimes::default();
                 let (nw, nh) = cap.stream;
                 *shared.status.lock().unwrap() = (nw as u16, nh as u16, fps as u16);
@@ -1124,7 +1264,7 @@ fn stream_inner(
                 rebuild(&mut rebuilds, &e.to_string())?;
                 cap.release();
                 enc.release();
-                (cap, enc) = reopen_pipeline(device_name, opts, fps, bps, codec, tuning)?;
+                (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                 (last_tex, skipped) = (None, None);
                 captures = CaptureTimes::default();
                 resized(&shared, &socket, cap.stream, fps);
@@ -1646,6 +1786,7 @@ fn receive_loop(
     mic_sink: Option<String>,
     link: Arc<crate::hyper_link::ReliableLink>,
     clipboard: Option<Arc<crate::hyper_clipboard::ClipboardSync>>,
+    audio_shape: Arc<crate::hyper_audio::AudioShape>,
 ) {
     let _ = socket.set_read_timeout(Some(Duration::from_millis(10)));
     // Input lands here: a game holding the CPU mustn't delay it.
@@ -1714,9 +1855,19 @@ fn receive_loop(
                 Some(Control::Mode { office, fast_text }) => {
                     shared.office.store(office, Ordering::Relaxed);
                     shared.fast_text.store(fast_text, Ordering::Relaxed);
+                    audio_shape.long.store(office, Ordering::Relaxed);
                 }
+                Some(Control::AudioReport { frame_ms, lost }) => audio_shape.report(frame_ms, lost),
                 Some(Control::Refresh { hz }) => {
                     shared.client_hz.store(hz as u32, Ordering::Relaxed);
+                }
+                Some(Control::View { width, height }) => {
+                    let view = Some((width as u32, height as u32));
+                    let mut v = shared.view.lock().unwrap();
+                    if *v != view {
+                        *v = view;
+                        shared.view_changed.store(true, Ordering::Relaxed);
+                    }
                 }
                 // The client has a camera: offer it to apps here, once.
                 Some(Control::Cameras { count }) => {
@@ -1784,7 +1935,11 @@ fn receive_loop(
             // The client's microphone, into the virtual mic.
             Kind::Audio => {
                 if let Some(sink) = &mic_sink {
-                    mic.get_or_insert_with(|| crate::hyper_audio::AudioSink::start(Some(sink.clone()))).push(&body);
+                    let m = mic.get_or_insert_with(|| crate::hyper_audio::AudioSink::start(Some(sink.clone())));
+                    m.push(&body);
+                    if let Some(report) = m.report() {
+                        shared.send(&socket, Kind::Control, &report.to_bytes());
+                    }
                 }
             }
             // A client fetching this host's newer rdpio while it streams (it
@@ -2357,6 +2512,7 @@ pub fn install(uninstall: bool, port: u16) -> Result<(), Box<dyn std::error::Err
 pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     use rdp_hyper::video::{Event, Reassembler};
 
+    SELFTEST_CLOCKS.store(true, Ordering::Relaxed);
     let key = random_key();
     let host_sock = UdpSocket::bind("127.0.0.1:0")?;
     let client = UdpSocket::bind("127.0.0.1:0")?;
@@ -2441,7 +2597,21 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     let reliable = crate::hyper_link::ReliableLink::new();
     let (mut shapes, mut visibility) = (0u32, 0u32);
     let mut switched = !office;
+    // `--view WxH`: a third of the way in, the client's window becomes that
+    // size (`Control::View`); the stream follows and is decoded at its size.
+    let view = std::env::args()
+        .skip_while(|a| a != "--view")
+        .nth(1)
+        .and_then(|v| v.split_once('x').and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))));
+    let mut stream_size = (monitor_w(), monitor_h());
+    let (mut view_told, mut since_resize) = (view.is_none(), None::<(Instant, u32, u64)>);
     while start.elapsed() < Duration::from_secs(secs) {
+        if !view_told && start.elapsed() > Duration::from_secs(secs) / 3 {
+            view_told = true;
+            let (width, height) = view.unwrap();
+            println!("the window becomes {width}x{height} after {frames} frames ({:.1} Mbps so far)", bytes as f64 * 8.0 / start.elapsed().as_secs_f64() / 1e6);
+            let _ = client.send(&csend.seal(Kind::Control, &Control::View { width, height }.to_bytes()));
+        }
         if !switched && start.elapsed() > Duration::from_secs(secs) / 2 {
             switched = true;
             println!("switching to game mode after {frames} frames");
@@ -2491,6 +2661,17 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
             }
             continue;
         }
+        if kind == Kind::Control {
+            if let Some(Control::Status { width, height, .. }) = Control::parse(&body) {
+                let size = (width as u32, height as u32);
+                if size != stream_size {
+                    println!("stream resized to {}x{} after {frames} frames", size.0, size.1);
+                    (stream_size, decoder) = (size, None);
+                    since_resize = Some((Instant::now(), frames, bytes));
+                }
+            }
+            continue;
+        }
         if kind != Kind::Video {
             continue;
         }
@@ -2523,7 +2704,7 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if decoder.is_none() {
                         let codec = if std::env::args().any(|a| a == "--hevc") { rdp_gpu::h264::Codec::Hevc } else { rdp_gpu::h264::Codec::H264 };
-                        decoder = Some(rdp_gpu::h264::H264GpuDecoder::with_codec(monitor_w(&f), monitor_h(&f), &dev, &ctx, codec)?);
+                        decoder = Some(rdp_gpu::h264::H264GpuDecoder::with_codec(stream_size.0, stream_size.1, &dev, &ctx, codec)?);
                     }
                     let out = match decoder.as_mut().unwrap().decode(&f.data) {
                         Ok(out) => out,
@@ -2564,14 +2745,20 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
         p(1.0),
         frozen.as_secs_f64() * 1e3
     );
+    if let Some((at, f0, b0)) = since_resize {
+        let s = at.elapsed().as_secs_f64();
+        println!("after the resize: {} frames decoded at {}x{}, {:.1} Mbps", frames - f0, stream_size.0, stream_size.1, (bytes - b0) as f64 * 8.0 / s / 1e6);
+    } else if view.is_some() {
+        println!("the stream never followed the window");
+    }
     Ok(())
 }
 
-/// The selftest decodes at the primary monitor's size.
-fn monitor_w(_f: &rdp_hyper::video::InFrame) -> u32 {
+/// The selftest starts decoding at the primary monitor's size.
+fn monitor_w() -> u32 {
     list_monitors().ok().and_then(|m| m.first().map(|m| m.width & !1)).unwrap_or(1920)
 }
-fn monitor_h(_f: &rdp_hyper::video::InFrame) -> u32 {
+fn monitor_h() -> u32 {
     list_monitors().ok().and_then(|m| m.first().map(|m| m.height & !1)).unwrap_or(1080)
 }
 
@@ -2782,6 +2969,36 @@ mod tests {
         assert_eq!(sharpen_frames(8 * 1024, 60), 8);
         assert_eq!(sharpen_frames(500_000, 60), 60, "a new page: a second's frames");
         assert_eq!(sharpen_frames(500_000, 1), 2);
+    }
+
+    /// Holds the GPU's clocks up and lets them go (as administrator; told no
+    /// otherwise). `cargo test -p rdp-client --bin rdpio gpu_clocks -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn gpu_clocks_are_held_and_let_go() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        println!("before: {:?}", gpu_clocks());
+        let held = GpuClockFloor::hold();
+        std::thread::sleep(Duration::from_millis(500));
+        println!("held: {}; clocks now {:?}", held.is_some(), gpu_clocks());
+        drop(held);
+        std::thread::sleep(Duration::from_millis(1500));
+        println!("let go: {:?}", gpu_clocks());
+    }
+
+    /// A window smaller than the client's screen fits the stream to it too;
+    /// a bigger one changes nothing; `--hyper-size` always wins.
+    #[test]
+    fn the_stream_fits_the_clients_window() {
+        let opts = HostOptions { port: 0, max_fps: None, max_mbps: 80, stream_size: None, fit_to: Some((2256, 1504)), office: false, fast_text: false, keep_monitors: true };
+        let fit = |view| viewed(&opts, view).fit_to.and_then(|s| fit_within((2560, 1440), s));
+        assert_eq!(fit(None), Some((2256, 1268)), "the screen alone");
+        assert_eq!(fit(Some((1200, 800))), Some((1200, 674)), "a tab");
+        assert_eq!(fit(Some((3840, 2160))), fit(None), "a window past the screen");
+        let handoff = HostOptions { fit_to: None, ..opts.clone() };
+        assert_eq!(viewed(&handoff, Some((1280, 720))).fit_to, Some((1280, 720)));
+        let sized = HostOptions { stream_size: Some((1280, 720)), ..opts };
+        assert_eq!(viewed(&sized, Some((640, 400))).stream_size, Some((1280, 720)));
     }
 
     #[test]

@@ -8,11 +8,11 @@
 //! VB-Audio CABLE) that is made the host's default mic meanwhile; like RDP's
 //! mic redirection, the client only captures while a host app is listening.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rdp_hyper::audio::{AudioPacket, Decode, Sequencer, FRAME_SAMPLES};
+use rdp_hyper::audio::{AudioPacket, Decode, Sequencer, FRAME_SAMPLES, LONGEST_FRAME_MS, MAX_FRAME_SAMPLES};
 
 use crate::wasapi::{self, Capture, DefaultSwitch, Flow, Player};
 
@@ -27,6 +27,49 @@ pub enum Source {
     Mic(Option<String>),
 }
 
+/// How a sender shapes its packets, from what the receiver reports
+/// ([`rdp_hyper::control::Control::AudioReport`]).
+#[derive(Default)]
+pub struct AudioShape {
+    /// The longest frame the receiver decodes (ms); 0 until it says (an
+    /// older rdpio never does: 10 ms frames, each with the one before).
+    peer_frame_ms: AtomicU32,
+    /// 20 ms frames wanted, where the receiver takes them: half the packets
+    /// (each wakes both ends' radios and receive threads) for 10 ms more
+    /// latency — a call's or a video's sound, not a game's.
+    pub long: AtomicBool,
+    /// When the receiver last reported losing a frame.
+    last_loss: Mutex<Option<Instant>>,
+}
+
+/// After a reported loss, packets carry the frame before theirs this long.
+const REDUNDANT_AFTER_LOSS: Duration = Duration::from_secs(30);
+
+impl AudioShape {
+    pub fn report(&self, frame_ms: u8, lost: u16) {
+        self.peer_frame_ms.store(frame_ms as u32, Ordering::Relaxed);
+        if lost > 0 {
+            *self.last_loss.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        }
+    }
+
+    /// Samples per channel in the next frame.
+    fn frame_samples(&self) -> usize {
+        if self.long.load(Ordering::Relaxed) && self.peer_frame_ms.load(Ordering::Relaxed) >= 20 {
+            FRAME_SAMPLES * 2
+        } else {
+            FRAME_SAMPLES
+        }
+    }
+
+    /// Each packet carries the frame before its own too: until the receiver
+    /// says it's losing none.
+    fn redundant(&self) -> bool {
+        self.peer_frame_ms.load(Ordering::Relaxed) == 0
+            || self.last_loss.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|t| t.elapsed() < REDUNDANT_AFTER_LOSS)
+    }
+}
+
 /// Capture → Opus → send, on its own thread.
 pub struct AudioSender {
     stop: Arc<AtomicBool>,
@@ -34,13 +77,13 @@ pub struct AudioSender {
 }
 
 impl AudioSender {
-    pub fn start(source: Source, channels: usize, bitrate: i32, clock: fn() -> u64, send: SendFn) -> Self {
+    pub fn start(source: Source, channels: usize, bitrate: i32, clock: fn() -> u64, send: SendFn, shape: Arc<AudioShape>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
         let thread = std::thread::Builder::new()
             .name("hyper-audio-tx".into())
             .spawn(move || {
-                if let Err(e) = send_loop(source, channels, bitrate, clock, send, &s) {
+                if let Err(e) = send_loop(source, channels, bitrate, clock, send, &shape, &s) {
                     tracing::warn!(error = %e, "Hyper audio capture stopped");
                 }
             })
@@ -90,14 +133,22 @@ fn send_loop(
     bitrate: i32,
     clock: fn() -> u64,
     send: SendFn,
+    shape: &AudioShape,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     wasapi::com_init();
     let ch = if channels == 1 { opus::Channels::Mono } else { opus::Channels::Stereo };
-    let mut enc = opus::Encoder::new(wasapi::RATE, ch, opus::Application::LowDelay)?;
+    // A microphone: Opus's speech mode, which can tell a pause in speech
+    // from speech (`dtx`) — a mic is never digitally silent, so without it
+    // a call sends every frame of its pauses too. (4 ms more look-ahead than
+    // the low-delay mode game sound keeps.)
+    let mic = matches!(source, Source::Mic(_));
+    let mut enc = opus::Encoder::new(wasapi::RATE, ch, if mic { opus::Application::Voip } else { opus::Application::LowDelay })?;
     enc.set_bitrate(opus::Bitrate::Bits(bitrate))?;
-    let frame_len = FRAME_SAMPLES * channels;
-    let mut pcm = Vec::with_capacity(frame_len * 4);
+    if mic {
+        enc.set_dtx(true)?;
+    }
+    let mut pcm = Vec::with_capacity(FRAME_SAMPLES * 2 * channels * 4);
     let mut out = vec![0u8; 1500];
     let mut prev: Option<Vec<u8>> = None;
     let mut seq = 0u32;
@@ -159,12 +210,18 @@ fn send_loop(
             capture = None;
             retry_at = opened_at + Duration::from_secs(1);
         }
-        while pcm.len() >= frame_len {
+        loop {
+            let frame_len = shape.frame_samples() * channels;
+            if pcm.len() < frame_len {
+                break;
+            }
             // (Encoded even when not sent: the encoder's state runs on.)
             silent_run = if is_silent(&pcm[..frame_len]) { silent_run.saturating_add(1) } else { 0 };
             let n = enc.encode_float(&pcm[..frame_len], &mut out)?;
             pcm.drain(..frame_len);
-            if silent_run > SILENT_TAIL {
+            // A pause in speech (`dtx`: a frame of a byte or two, nothing to
+            // decode — the receiver's concealment fades out), or silence.
+            if silent_run > SILENT_TAIL || n <= 2 {
                 // (Sequence numbers carry on from the last one sent: a pause,
                 // not a loss, to the receiver.)
                 prev = None;
@@ -174,7 +231,7 @@ fn send_loop(
             let frame = out[..n].to_vec();
             seq = seq.wrapping_add(1);
             let mut frames = Vec::with_capacity(2);
-            if let Some(p) = prev.take() {
+            if let Some(p) = prev.take().filter(|_| shape.redundant()) {
                 frames.push(p);
             }
             frames.push(frame.clone());
@@ -192,6 +249,9 @@ fn send_loop(
 pub struct AudioSink {
     tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Frames concealed (lost) since the last [`report`](Self::report).
+    lost: Arc<AtomicU32>,
+    last_report: Option<Instant>,
 }
 
 impl AudioSink {
@@ -199,11 +259,14 @@ impl AudioSink {
     pub fn start(device: Option<String>) -> Self {
         // ~0.6 s of 10 ms packets: a stalled device drops audio, not video.
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+        let lost = Arc::new(AtomicU32::new(0));
+        let lost_rx = lost.clone();
         let thread = std::thread::Builder::new()
             .name("hyper-audio-rx".into())
             .spawn(move || {
                 wasapi::com_init();
                 let mut r = AudioReceiver::new(device);
+                r.lost = lost_rx;
                 loop {
                     match rx.recv_timeout(Duration::from_secs(1)) {
                         Ok(body) => r.on_packet(&body),
@@ -213,13 +276,24 @@ impl AudioSink {
                 }
             })
             .ok();
-        Self { tx: Some(tx), thread }
+        Self { tx: Some(tx), thread, lost, last_report: None }
     }
 
     pub fn push(&self, body: &[u8]) {
         if let Some(tx) = &self.tx {
             let _ = tx.try_send(body.to_vec());
         }
+    }
+
+    /// What to tell the sender (`Control::AudioReport`), when due: at the
+    /// first packet, then every 2 s while packets come.
+    pub fn report(&mut self) -> Option<rdp_hyper::control::Control> {
+        if self.last_report.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+            return None;
+        }
+        self.last_report = Some(Instant::now());
+        let lost = self.lost.swap(0, Ordering::Relaxed).min(u16::MAX as u32) as u16;
+        Some(rdp_hyper::control::Control::AudioReport { frame_ms: LONGEST_FRAME_MS, lost })
     }
 }
 
@@ -320,6 +394,11 @@ pub struct AudioReceiver {
     underruns: u32,
     /// When the last packet came.
     last_packet: Option<Instant>,
+    /// Samples per channel in the last frame decoded: what concealment
+    /// stands in for.
+    frame_samples: usize,
+    /// Frames concealed, counted up for the sender's report.
+    lost: Arc<AtomicU32>,
     /// No (re)opening the output before this: 5 s after a failure, 1 s after
     /// a start (a device that dies at once isn't reopened on every packet).
     retry_at: Option<Instant>,
@@ -347,10 +426,12 @@ impl AudioReceiver {
             seq: Sequencer::new(),
             decoder: None,
             player: None,
-            pcm: vec![0.0; FRAME_SAMPLES * 2],
+            pcm: vec![0.0; MAX_FRAME_SAMPLES * 2],
             jitter: JitterTarget::new(Instant::now()),
             underruns: 0,
             last_packet: None,
+            frame_samples: FRAME_SAMPLES,
+            lost: Arc::new(AtomicU32::new(0)),
             retry_at: None,
         }
     }
@@ -420,13 +501,15 @@ impl AudioReceiver {
             tracing::debug!(ms, "audio jitter buffer");
             player.set_target_ms(ms);
         }
-        // Exactly one 10 ms frame per decode: concealment sizes its output
-        // from the buffer it's given.
-        let pcm = &mut self.pcm[..FRAME_SAMPLES * ch as usize];
+        // A frame decodes to however long it is; concealment sizes its output
+        // from the buffer it's given: as long as the last frame.
         for d in self.seq.push(&p) {
             let r = match d {
-                Decode::Frame(f) => dec.decode_float(&f, pcm, false),
-                Decode::Conceal => dec.decode_float(&[], pcm, false),
+                Decode::Frame(f) => dec.decode_float(&f, &mut self.pcm, false).inspect(|&n| self.frame_samples = n),
+                Decode::Conceal => {
+                    self.lost.fetch_add(1, Ordering::Relaxed);
+                    dec.decode_float(&[], &mut self.pcm[..self.frame_samples * ch as usize], false)
+                }
                 // A new stream from the sender (its mic was reopened).
                 Decode::Restart => {
                     let _ = dec.reset_state();
@@ -434,7 +517,7 @@ impl AudioReceiver {
                 }
             };
             if let Ok(n) = r {
-                player.push(&pcm[..n * ch as usize]);
+                player.push(&self.pcm[..n * ch as usize]);
             }
         }
     }
@@ -840,12 +923,44 @@ mod tests {
 
     use super::*;
 
+    /// Long frames and no copies only once the receiver says it takes them
+    /// and loses nothing; a loss brings the copies back.
+    #[test]
+    fn packets_follow_what_the_receiver_reports() {
+        let shape = AudioShape::default();
+        shape.long.store(true, Ordering::Relaxed);
+        assert_eq!((shape.frame_samples(), shape.redundant()), (FRAME_SAMPLES, true), "an older receiver");
+        shape.report(20, 0);
+        assert_eq!((shape.frame_samples(), shape.redundant()), (FRAME_SAMPLES * 2, false));
+        shape.report(20, 2);
+        assert!(shape.redundant(), "after a loss");
+        shape.long.store(false, Ordering::Relaxed);
+        assert_eq!(shape.frame_samples(), FRAME_SAMPLES, "a game's sound");
+        let ten_only = AudioShape::default();
+        ten_only.long.store(true, Ordering::Relaxed);
+        ten_only.report(10, 0);
+        assert_eq!(ten_only.frame_samples(), FRAME_SAMPLES);
+    }
+
+    /// A receiver plays 20 ms frames whole and conceals a lost one as long.
+    #[test]
+    fn long_frames_decode_and_conceal_whole() {
+        let mut enc = opus::Encoder::new(wasapi::RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        let tone: Vec<f32> = (0..FRAME_SAMPLES * 2).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
+        let mut out = vec![0u8; 1500];
+        let n = enc.encode_float(&tone, &mut out).unwrap();
+        let mut dec = opus::Decoder::new(wasapi::RATE, opus::Channels::Mono).unwrap();
+        let mut pcm = vec![0f32; MAX_FRAME_SAMPLES * 2];
+        assert_eq!(dec.decode_float(&out[..n], &mut pcm, false).unwrap(), FRAME_SAMPLES * 2);
+        assert_eq!(dec.decode_float(&[], &mut pcm[..FRAME_SAMPLES * 2], false).unwrap(), FRAME_SAMPLES * 2);
+    }
+
     /// A capture device that can't be opened doesn't end the sender (it
     /// retries, for when one appears), and dropping the sender doesn't wait
     /// out the retry.
     #[test]
     fn a_missing_device_is_retried_and_dropping_is_prompt() {
-        let sender = AudioSender::start(Source::Mic(Some("no such device".into())), 1, 32_000, || 0, Arc::new(|_: &[u8]| {}));
+        let sender = AudioSender::start(Source::Mic(Some("no such device".into())), 1, 32_000, || 0, Arc::new(|_: &[u8]| {}), Default::default());
         std::thread::sleep(Duration::from_millis(300));
         assert!(!sender.is_finished(), "the sender gave up");
         let t = Instant::now();
@@ -898,33 +1013,70 @@ mod tests {
             eprintln!("virtual devices missing or in use; skipped");
             return;
         };
-        let sink = Arc::new(AudioSink::start(Some(speakers.id.clone())));
-        let to_sink = sink.clone();
-        let sender = AudioSender::start(Source::Mic(Some(mic.id)), 1, 64_000, || 0, Arc::new(move |b: &[u8]| to_sink.push(b)));
-        let tone_out = Player::new(Some(mic_input.id), 1).expect("player");
-        let mut ear = Capture::new(Some(&speakers.id), Flow::Render, true, 2).expect("loopback");
-        let (mut phase, mut heard, start) = (0f32, Vec::new(), Instant::now());
-        let mut pushed = 0usize;
-        while start.elapsed() < Duration::from_secs(2) {
-            // Keep ~40 ms queued whatever the sleeps do.
-            while pushed < (start.elapsed().as_secs_f64() * wasapi::RATE as f64) as usize + 1920 {
-                let chunk: Vec<f32> = (0..FRAME_SAMPLES)
-                    .map(|_| {
-                        phase = (phase + 440.0 / wasapi::RATE as f32) % 1.0;
-                        (phase * std::f32::consts::TAU).sin() * 0.5
-                    })
-                    .collect();
-                tone_out.push(&chunk);
-                pushed += FRAME_SAMPLES;
+        // As an older host hears it (10 ms frames, each with the one before),
+        // then as this build's does (20 ms, no copies), which also leaves out
+        // the pause after the tone (faint noise: a room between words).
+        for long in [false, true] {
+            let sink = Arc::new(AudioSink::start(Some(speakers.id.clone())));
+            let to_sink = sink.clone();
+            let shape = Arc::new(AudioShape::default());
+            if long {
+                shape.long.store(true, Ordering::Relaxed);
+                shape.report(LONGEST_FRAME_MS, 0);
             }
-            std::thread::sleep(Duration::from_millis(10));
-            ear.read(&mut heard).expect("loopback read");
-            assert!(!sender.is_finished(), "the capture thread ended");
+            let (sent, bytes) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+            let (s, b) = (sent.clone(), bytes.clone());
+            let send = Arc::new(move |p: &[u8]| {
+                s.fetch_add(1, Ordering::Relaxed);
+                b.fetch_add(p.len() as u32, Ordering::Relaxed);
+                to_sink.push(p)
+            });
+            let sender = AudioSender::start(Source::Mic(Some(mic.id.clone())), 1, 64_000, || 0, send, shape);
+            let tone_out = Player::new(Some(mic_input.id.clone()), 1).expect("player");
+            let mut ear = Capture::new(Some(&speakers.id), Flow::Render, true, 2).expect("loopback");
+            let (mut phase, mut heard, start) = (0f32, Vec::new(), Instant::now());
+            let (mut pushed, mut noise) = (0usize, 1u32);
+            let mut during_tone = 0;
+            while start.elapsed() < Duration::from_secs(4) {
+                let tone = start.elapsed() < Duration::from_secs(2);
+                // Keep ~40 ms queued whatever the sleeps do.
+                while pushed < (start.elapsed().as_secs_f64() * wasapi::RATE as f64) as usize + 1920 {
+                    let chunk: Vec<f32> = (0..FRAME_SAMPLES)
+                        .map(|_| {
+                            phase = (phase + 440.0 / wasapi::RATE as f32) % 1.0;
+                            noise = noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            if tone {
+                                (phase * std::f32::consts::TAU).sin() * 0.5
+                            } else {
+                                (noise >> 8) as f32 / (1u32 << 24) as f32 * 0.002 - 0.001
+                            }
+                        })
+                        .collect();
+                    tone_out.push(&chunk);
+                    pushed += FRAME_SAMPLES;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                if tone {
+                    ear.read(&mut heard).expect("loopback read");
+                    during_tone = sent.load(Ordering::Relaxed);
+                }
+                assert!(!sender.is_finished(), "the capture thread ended");
+            }
+            drop(sender);
+            let after = sent.load(Ordering::Relaxed) - during_tone;
+            let tail = &heard[heard.len().saturating_sub(wasapi::RATE as usize)..];
+            let rms = (tail.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / tail.len().max(1) as f64).sqrt();
+            eprintln!(
+                "{}: heard back {} samples, rms over the last 0.5 s {rms:.3} (sent 0.354); {during_tone} packets in 2 s of tone ({} B), {after} in 2 s of pause",
+                if long { "20 ms" } else { "10 ms" },
+                heard.len(),
+                bytes.load(Ordering::Relaxed),
+            );
+            assert!(rms > 0.1, "the tone didn't make it through (rms {rms:.3})");
+            if long {
+                assert!(during_tone <= 110, "{during_tone} packets for 2 s of 20 ms frames");
+                assert!(after < 40, "{after} packets for 2 s of a pause");
+            }
         }
-        drop(sender);
-        let tail = &heard[heard.len().saturating_sub(wasapi::RATE as usize)..];
-        let rms = (tail.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / tail.len().max(1) as f64).sqrt();
-        eprintln!("heard back {} samples, rms over the last 0.5 s {rms:.3} (sent 0.354)", heard.len());
-        assert!(rms > 0.1, "the tone didn't make it through (rms {rms:.3})");
     }
 }

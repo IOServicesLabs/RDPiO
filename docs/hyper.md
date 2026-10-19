@@ -85,7 +85,12 @@ hosts). Pick it in the app (Discord, Teams, a browser); the laptop's camera, and
 its light, turn on only while an app on the host uses it. `rdpio
 --hyper-camera-test`, run as administrator on the host, checks the host side
 without a laptop. `RDPIO_HYPER_CAMERA=0` on the laptop keeps its camera to
-itself.
+itself. The laptop compresses the camera on the graphics chip that drives
+its screen (Quick Sync on an Intel laptop; on an NVIDIA desktop, measured:
+0.5 ms of processor time a frame against 2.9 for Windows' software
+encoder), falling back to the software encoder where there's none;
+`RDPIO_CAMERA_CPU=1` forces the software one. (RDP's camera redirection
+gets the same.)
 
 ## Connecting (the laptop)
 
@@ -106,6 +111,7 @@ The keys below are shown on screen for the first seconds of every stream.
 | Ctrl+Shift+K | Win, Alt+Tab, Alt+F4, Ctrl+Esc: to the host (the default) or to the laptop (Hyper only) |
 | Ctrl+Shift+S | Stats overlay: fps, latency, round trip, bitrate, loss (Hyper only; in plain RDP it reaches the remote app) |
 | Ctrl+Shift+O | Office mode on/off: crisp text (see below) or game mode (Hyper only) |
+| Ctrl+Shift+F | Fullscreen or a window, on the screen the window is on (Hyper only; the stream fits the window) |
 | Ctrl+Alt+End | Ctrl+Alt+Del on the host (lock screen, security options) |
 
 While the stream's window is in front, Win, Alt+Tab, Alt+F4 and Ctrl+Esc act
@@ -151,7 +157,19 @@ Plugged in or not, it does no work no one sees:
 - **No parity copies on a clean link.** After 10 s without a lost packet,
   small frames go without forward error correction (it would double them);
   the rare loss is repaired from a long-term reference, and the first loss
-  turns it back on.
+  turns it back on. The client reports back every 100 ms instead of 50 while
+  nothing is lost.
+- **The stream fits the window.** In a window smaller than the laptop's
+  screen (a Workspace tab, a restored window), the host scales the stream
+  down to it a moment after the window stops changing size — every frame
+  encoded, sent and decoded that much smaller (1200x800 instead of a
+  1440p desktop: 5.7 -> 2.2 Mbps in the selftest) — and back up as it grows.
+- **Fewer audio packets.** The microphone goes in 20 ms packets (what call
+  apps send themselves) and sends next to nothing in the pauses between
+  words; in office mode game sound goes in 20 ms packets too. Each packet
+  also carries a copy of the one before only after a loss. Measured through
+  the whole path: a tone 198 -> 99 packets in 2 s (51 -> 23 KB), a pause
+  87 -> 32. An older host or client gets 10 ms packets as before.
 
 The host helps too, plugged in or not:
 
@@ -306,8 +324,19 @@ lower `--hyper-mbps` on the host for slow uplinks.
   before. `RDPIO_HYPER_LTR=0` on the host turns it off.
 - Office mode re-sends a still picture for up to a second, each time
   sharper: the fast preset's text comes out at 33 dB, 45 dB half a second
-  later and 52 dB after a second, beyond the quality preset's 42 dB (which
+  later and ~48 dB after a second, beyond the quality preset's 42 dB (which
   costs ~8 ms on every frame).
+- No picture is coded finer than quantizer 12: past that, a still or nearly
+  still screen's spare bitrate went on detail no one sees. Text after a
+  second: 49.9 -> 47.9 dB (H.264), 51.8 -> 49.9 (HEVC), under one level of
+  error; a desktop with a little motion 4.3 -> 1.0 Mbps. `RDPIO_NVENC_MINQP=n`
+  on the host sets another floor (0: none).
+- While a stream runs, the host's NVIDIA GPU is kept at 1500 MHz or more: on
+  a quiet desktop it otherwise drops to its idle clocks, where a frame's
+  encode takes several times longer (2-3 ms more latency). Only the service's
+  agent (as SYSTEM, or the elevated logon task) can; the clocks are let go
+  when the stream ends or pauses, and after a crash by the next agent.
+  `RDPIO_GPU_CLOCK_FLOOR=MHz` on the host sets another floor (0: none).
 - Frames leave from their own thread, paced on a high-resolution timer, data
   first and error correction right after — the next frame's capture and
   encode never wait on the network.

@@ -698,6 +698,7 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
       <kbd>Ctrl+Shift+K</kbd><span>Hyper: Win, Alt+Tab, Alt+F4 to the host (the default) or to this PC</span>
       <kbd>Ctrl+Shift+O</kbd><span>Hyper: office mode on or off (crisp text) </span>
       <kbd>Ctrl+Shift+S</kbd><span>Hyper: stats — frame rate, latency, bitrate, loss</span>
+      <kbd>Ctrl+Shift+F</kbd><span>Hyper: full screen or a window</span>
       <kbd>Ctrl+Alt+End</kbd><span>Ctrl+Alt+Del on the remote PC</span>
     </div>
     <h2>Updates</h2>
@@ -773,7 +774,7 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
 
       <div class="tabpane stack" data-pane="display">
         <div class="card group">
-          <label class="switch"><div class="txt">Full screen<span>Borderless on this screen. Ctrl+Shift+Q leaves.</span></div><span class="toggle"><input type="checkbox" id="f-fullscreen"><i></i></span></label>
+          <label class="switch"><div class="txt">Full screen<span>Borderless on this screen. Ctrl+Shift+Q leaves; in Hyper, Ctrl+Shift+F switches to a window.</span></div><span class="toggle"><input type="checkbox" id="f-fullscreen"><i></i></span></label>
           <label class="switch" id="f-multimon-row"><div class="txt">Use all my monitors<span>RDP: the remote desktop spans every screen.</span></div><span class="toggle"><input type="checkbox" id="f-multimon"><i></i></span></label>
           <label class="switch"><div class="txt">Lowest latency<span>Show each frame the moment it's ready (may tear).</span></div><span class="toggle"><input type="checkbox" id="f-lowlat"><i></i></span></label>
           <label class="switch" id="f-vsync-row"><div class="txt">Smooth presentation<span>Hyper: wait for this screen's refresh (no tearing, a little more latency).</span></div><span class="toggle"><input type="checkbox" id="f-vsync"><i></i></span></label>

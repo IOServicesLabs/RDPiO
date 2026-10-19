@@ -89,7 +89,7 @@ fn adapter_name(adapter: &IDXGIAdapter) -> String {
 }
 
 /// The hardware adapter a monitor is attached to, the most frugal first.
-fn display_adapter() -> Option<IDXGIAdapter> {
+pub(crate) fn display_adapter() -> Option<IDXGIAdapter> {
     unsafe {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
         for i in 0..8 {
