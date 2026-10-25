@@ -167,6 +167,35 @@ impl Session {
 
     /// Authenticate and decrypt a received datagram.
     pub fn open(&mut self, datagram: &[u8]) -> Result<(Kind, Vec<u8>), OpenError> {
+        let (kind, seq) = self.check(datagram)?;
+        let header: [u8; HEADER_LEN] = datagram[..HEADER_LEN].try_into().unwrap();
+        let mut body = datagram[HEADER_LEN..].to_vec();
+        let plain_len = self
+            .key
+            .open_in_place(nonce(self.send_dir.reverse(), seq), Aad::from(header), &mut body)
+            .map_err(|_| OpenError::Auth)?
+            .len();
+        body.truncate(plain_len);
+        self.accept(seq);
+        Ok((kind, body))
+    }
+
+    /// [`Session::open`] without a copy: decrypts within `datagram` (a
+    /// receive buffer) and returns the body as part of it.
+    pub fn open_in_place<'a>(&mut self, datagram: &'a mut [u8]) -> Result<(Kind, &'a [u8]), OpenError> {
+        let (kind, seq) = self.check(datagram)?;
+        let (header, body) = datagram.split_at_mut(HEADER_LEN);
+        let header: [u8; HEADER_LEN] = (&*header).try_into().unwrap();
+        let plain = self
+            .key
+            .open_in_place(nonce(self.send_dir.reverse(), seq), Aad::from(header), body)
+            .map_err(|_| OpenError::Auth)?;
+        self.accept(seq);
+        Ok((kind, plain))
+    }
+
+    /// The header's checks, before decrypting: kind and sequence number.
+    fn check(&self, datagram: &[u8]) -> Result<(Kind, u64), OpenError> {
         if datagram.len() < OVERHEAD || datagram[0] != MAGIC {
             return Err(OpenError::NotOurs);
         }
@@ -179,16 +208,7 @@ impl Session {
         if !self.fresh(seq) {
             return Err(OpenError::Replay);
         }
-        let header: [u8; HEADER_LEN] = datagram[..HEADER_LEN].try_into().unwrap();
-        let mut body = datagram[HEADER_LEN..].to_vec();
-        let plain_len = self
-            .key
-            .open_in_place(nonce(self.send_dir.reverse(), seq), Aad::from(header), &mut body)
-            .map_err(|_| OpenError::Auth)?
-            .len();
-        body.truncate(plain_len);
-        self.accept(seq);
-        Ok((kind, body))
+        Ok((kind, seq))
     }
 
     fn fresh(&self, seq: u64) -> bool {
@@ -288,6 +308,40 @@ mod tests {
         assert_eq!(older.open(&p), Err(OpenError::Version(VERSION + 1)));
         let p = newer.seal(Kind::Update, b"chunk");
         assert_eq!(older.open(&p).unwrap(), (Kind::Update, b"chunk".to_vec()));
+    }
+
+    #[test]
+    fn opens_in_place_like_open() {
+        let (mut host, mut client) = pair();
+        let mut p = host.seal(Kind::Video, b"frame bytes");
+        assert_eq!(client.open_in_place(&mut p).unwrap(), (Kind::Video, &b"frame bytes"[..]));
+        // (Replay-checked the same way.)
+        let mut again = host.seal(Kind::Video, b"x");
+        let copy = again.clone();
+        client.open_in_place(&mut again).unwrap();
+        assert_eq!(client.open(&copy), Err(OpenError::Replay));
+    }
+
+    /// A/B: `cargo test -p rdp-hyper --release -- --ignored --nocapture open_bench`.
+    #[test]
+    #[ignore]
+    fn open_bench() {
+        let (mut host, mut client) = pair();
+        let body = [7u8; MAX_BODY];
+        let packets: Vec<Vec<u8>> = (0..200_000).map(|_| host.seal(Kind::Video, &body)).collect();
+        let t = std::time::Instant::now();
+        let mut n = 0usize;
+        for p in &packets[..100_000] {
+            n += client.open(p).unwrap().1.len();
+        }
+        let copy = t.elapsed();
+        let mut bufs: Vec<Vec<u8>> = packets[100_000..].to_vec();
+        let t = std::time::Instant::now();
+        for p in &mut bufs {
+            n += client.open_in_place(p).unwrap().1.len();
+        }
+        let in_place = t.elapsed();
+        println!("open: {:.0} ns/packet, open_in_place: {:.0} ns/packet ({n} bytes)", copy.as_nanos() as f64 / 1e5, in_place.as_nanos() as f64 / 1e5);
     }
 
     #[test]

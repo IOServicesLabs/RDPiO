@@ -47,6 +47,9 @@ pub fn password_secret(password: &str) -> [u8; 32] {
 /// What the client wants from the stream (sent in the clear with its hello).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Want {
+    /// Codecs it decodes in hardware, best first: "h264", "hevc", "av1". The
+    /// host takes the first it can encode and skips names it doesn't know, so
+    /// listing "av1" first costs nothing with a host that has no AV1.
     pub codecs: Vec<String>,
     pub width: u32,
     pub height: u32,
@@ -106,6 +109,7 @@ pub struct Offer {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// One of the client's [`Want::codecs`].
     pub codec: String,
     /// The protocol version the session speaks; 0 when the two builds have
     /// none in common — then the session only moves an update (see `update`).
@@ -120,6 +124,16 @@ pub struct Offer {
     /// session ([`crate::update`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub update: bool,
+    /// The host injects the client's fingers as Windows touch
+    /// ([`crate::input::InputEvent::Touch`]); without it, a touch screen
+    /// drives the mouse.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub touch: bool,
+    /// The host's addresses on its local networks ("10.0.0.5/24"), for a
+    /// client that signed in through a VPN: on the same network next time, it
+    /// can reach the host directly and skip the VPN's per-packet work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lan: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +319,7 @@ pub fn host_respond(secret: &[u8; 32], hello: &[u8], offer: Offer) -> Option<(Ve
 /// cookie gets only a cookie back — no SPAKE2 work, no state, no lockout entry
 /// — so spoofed hellos can neither burn the host's CPU nor lock a real client
 /// out by impersonating its address.
+#[derive(Clone)]
 pub struct CookieJar {
     key: hmac::Key,
 }
@@ -435,6 +450,16 @@ mod tests {
         assert_eq!(serde_json::from_str::<Want>(&json).unwrap(), fitted);
         let old = r#"{"codecs":["h264"],"width":1920,"height":1080,"refresh_hz":144}"#;
         assert!(!serde_json::from_str::<Want>(old).unwrap().fit);
+    }
+
+    /// A client that decodes AV1 lists it first; the hello carries the list
+    /// as it is (a host that doesn't know "av1" skips it).
+    #[test]
+    fn av1_travels_in_the_hello() {
+        let w = Want { codecs: vec!["av1".into(), "hevc".into(), "h264".into()], ..want() };
+        let (_, hello) = ClientAuth::start(&password_secret("pw"), w.clone());
+        let AuthMsg::Hello { want: got, .. } = AuthMsg::parse(&hello).unwrap() else { panic!() };
+        assert_eq!(got.codecs, w.codecs);
     }
 
     fn want() -> Want {

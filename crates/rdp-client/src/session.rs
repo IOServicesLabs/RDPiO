@@ -33,12 +33,12 @@ pub(crate) static CLIPBOARD_DIRTY: AtomicBool = AtomicBool::new(false);
 /// Set by the clipboard provider just before it writes a *remote* paste into the
 /// local clipboard, so the resulting change notification isn't echoed back to
 /// the server (which would loop). Consumed by [`clipboard_changed`].
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub(crate) static CLIPBOARD_SUPPRESS: AtomicBool = AtomicBool::new(false);
 
 /// Note a local clipboard change (called from the window's clipboard listener),
 /// unless it was self-induced by applying a remote paste.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub(crate) fn clipboard_changed() {
     if CLIPBOARD_SUPPRESS.swap(false, Ordering::SeqCst) {
         return; // our own SetClipboardData — don't echo it back
@@ -49,7 +49,7 @@ pub(crate) fn clipboard_changed() {
 
 /// Suppress the next local clipboard-change notification (the provider calls this
 /// before writing a remote paste locally).
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub(crate) fn suppress_clipboard_echo() {
     CLIPBOARD_SUPPRESS.store(true, Ordering::SeqCst);
 }
@@ -66,7 +66,7 @@ fn take_clipboard_changed() -> bool {
 /// thread sets `wanted` and blocks on `done`; the worker notices, streams the
 /// files to disk, and publishes their paths — which the UI thread then turns
 /// into a real `CF_HDROP`.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 #[derive(Default)]
 struct ClipFileHandoff {
     /// Entries the session currently offers (0 = nothing to paste).
@@ -77,23 +77,23 @@ struct ClipFileHandoff {
     ready: Option<Vec<std::path::PathBuf>>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 static CLIP_FILES: std::sync::Mutex<ClipFileHandoff> =
     std::sync::Mutex::new(ClipFileHandoff {
         offered: 0,
         wanted: false,
         ready: None,
     });
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 static CLIP_FILES_DONE: std::sync::Condvar = std::sync::Condvar::new();
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 fn clip_files() -> std::sync::MutexGuard<'static, ClipFileHandoff> {
     CLIP_FILES.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// The session announced `count` clipboard files (nothing transferred yet).
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub(crate) fn clipboard_files_offered(count: usize) {
     let mut g = clip_files();
     g.offered = count;
@@ -104,7 +104,7 @@ pub(crate) fn clipboard_files_offered(count: usize) {
 /// UI thread: a paste needs the files. Blocks (bounded) until the worker has
 /// staged them, and returns their local paths — empty if there is nothing to
 /// paste or the transfer failed.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub(crate) fn request_clipboard_files(timeout: std::time::Duration) -> Vec<std::path::PathBuf> {
     let mut g = clip_files();
     if g.offered == 0 {
@@ -137,14 +137,14 @@ pub(crate) fn request_clipboard_files(timeout: std::time::Duration) -> Vec<std::
 }
 
 /// Worker: whether a paste is waiting for the offered files. Clears the flag.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 fn take_clipboard_file_request() -> bool {
     let mut g = clip_files();
     std::mem::take(&mut g.wanted)
 }
 
 /// Worker: the files are staged at `paths` (empty = the transfer failed).
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub(crate) fn clipboard_files_ready(paths: Vec<std::path::PathBuf>) {
     let mut g = clip_files();
     g.ready = Some(paths);
@@ -154,7 +154,7 @@ pub(crate) fn clipboard_files_ready(paths: Vec<std::path::PathBuf>) {
 
 /// UI thread: our advertised copy was superseded on the local clipboard, so
 /// anything already staged for it is no longer reachable and can be dropped.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub(crate) fn clipboard_files_discarded() {
     let mut g = clip_files();
     g.offered = 0;
@@ -169,12 +169,17 @@ pub(crate) fn clipboard_files_discarded() {
 /// wants the remote desktop to adopt. Set by the UI when the window/monitor
 /// topology changes; drained by the graphics loop, which asks the server (via
 /// Display Control) to resize to match.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub(crate) static RESIZE_REQUEST: std::sync::Mutex<Option<Vec<gcc::MonitorDef>>> =
     std::sync::Mutex::new(None);
 
+/// Windows' display scale for the session (%), sent at connect and with each
+/// resize; 0 leaves it to Windows. (The Android client sets it from the
+/// tablet's density: 100% across a ~300 ppi screen is unreadably small.)
+pub(crate) static DESKTOP_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Request the remote desktop adopt `monitors` (called by the UI).
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub(crate) fn request_resize(monitors: Vec<gcc::MonitorDef>) {
     if let Ok(mut req) = RESIZE_REQUEST.lock() {
         *req = Some(monitors);
@@ -182,19 +187,19 @@ pub(crate) fn request_resize(monitors: Vec<gcc::MonitorDef>) {
     crate::net_wait::worker_wake::signal();
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 fn take_resize_request() -> Option<Vec<gcc::MonitorDef>> {
     RESIZE_REQUEST.lock().ok().and_then(|mut req| req.take())
 }
 
 /// Pending multi-touch contacts queued by the UI and drained by the graphics
 /// loop to be sent over the RDPEI dynamic channel.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 static TOUCH_QUEUE: std::sync::Mutex<Vec<rdp_channels::rdpei::RdpInputContact>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Queue a batch of touch contacts to be sent on the RDPEI channel.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub(crate) fn queue_touch(contacts: Vec<rdp_channels::rdpei::RdpInputContact>) {
     if let Ok(mut q) = TOUCH_QUEUE.lock() {
         q.extend(contacts);
@@ -202,7 +207,7 @@ pub(crate) fn queue_touch(contacts: Vec<rdp_channels::rdpei::RdpInputContact>) {
     crate::net_wait::worker_wake::signal();
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 fn take_touch_queue() -> Vec<rdp_channels::rdpei::RdpInputContact> {
     TOUCH_QUEUE.lock().ok().map_or(Vec::new(), |mut q| std::mem::take(&mut *q))
 }
@@ -213,10 +218,10 @@ fn take_touch_queue() -> Vec<rdp_channels::rdpei::RdpInputContact> {
 /// touch active) or keep them (promotion is the only touch support left).
 /// Tracks the live session: reset when a (re)connect starts, refreshed from
 /// the graphics channel state by the worker loop.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 static RDPEI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub(crate) fn rdpei_active() -> bool {
     RDPEI_ACTIVE.load(Ordering::Relaxed)
 }
@@ -229,7 +234,7 @@ static SERVER_ERROR_INFO: AtomicU32 = AtomicU32::new(0);
 
 /// See [`SERVER_ERROR_INFO`]. Read by the windowed driver once the session
 /// worker has exited, to decide whether to auto-reconnect.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub(crate) fn server_error_info() -> u32 {
     SERVER_ERROR_INFO.load(Ordering::SeqCst)
 }
@@ -540,6 +545,7 @@ pub fn activate<S: Read + Write>(
     if let Some(depth) = config.color_depth {
         core.high_color_depth = depth;
     }
+    core.desktop_scale = DESKTOP_SCALE.load(std::sync::atomic::Ordering::Relaxed);
     // Standard RDP Security can't carry EGFX: the legacy receive loop
     // (`run_session`/`pump_once`) services neither the RDPGFX dynamic channel nor
     // network auto-detect probes. Leaving the GFX flag set makes Win10/11 stream
@@ -936,7 +942,7 @@ impl ActiveSession {
     /// (the server strips the header before handing the DVC PDU to its manager).
     /// Sending DVC data without this header makes the server report
     /// ERRINFO_VCHANNELDATATOOSHORT and tear the connection down.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     fn send_dvc<S: Write>(
         &mut self,
         stream: &mut S,
@@ -951,7 +957,7 @@ impl ActiveSession {
 
     /// Install the OS clipboard provider, replacing the default no-op (so
     /// remote↔local clipboard text actually transfers). Platform-supplied.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     pub fn set_clipboard_provider(
         &mut self,
         provider: Box<dyn rdp_channels::cliprdr::ClipboardProvider + Send>,
@@ -988,7 +994,7 @@ impl ActiveSession {
     /// Start fetching the clipboard files the session offered, if a local paste
     /// is waiting for them. This is the lazy half of file redirection: nothing
     /// moves until [`request_clipboard_files`] flags a paste.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     fn pump_clipboard_files<S: Write>(&mut self, stream: &mut S) -> Result<(), ActivateError> {
         if !take_clipboard_file_request() {
             return Ok(());
@@ -1050,7 +1056,7 @@ impl ActiveSession {
 
     /// Install the OS audio sink, replacing the default null sink (so remote
     /// audio actually plays). Platform-supplied.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     pub fn set_audio_sink(
         &mut self,
         sink: Box<dyn rdp_channels::rdpsnd::AudioSink + Send>,
@@ -1061,7 +1067,7 @@ impl ActiveSession {
     /// Redirect a local printer into the session (announced over rdpdr; the
     /// server's print jobs are spooled to `sink`). Call before the session loop
     /// runs the rdpdr handshake. Platform-supplied.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     pub fn set_printer(
         &mut self,
         print_name: String,
@@ -1092,7 +1098,7 @@ impl ActiveSession {
 
     /// Let the audio sink close its device after a silence (see
     /// [`rdp_channels::rdpsnd::AudioSink::idle`]).
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     pub fn audio_idle(&mut self) {
         self.audio.sink.idle();
     }
@@ -1133,7 +1139,7 @@ impl ActiveSession {
     /// This lets the TLS worker — which owns the single, unsplittable SChannel
     /// context — send input itself; the legacy path uses a separate
     /// [`InputSender`] thread.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     pub fn send_input<S: Write>(
         &mut self,
         stream: &mut S,
@@ -1176,7 +1182,7 @@ impl ActiveSession {
 
     /// Stop (`None`) or resume (`Some` desktop rect, inclusive) the server's
     /// display updates (Suppress Output PDU, slow path).
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     pub fn send_suppress_output<S: Write>(
         &mut self,
         stream: &mut S,
@@ -1199,7 +1205,7 @@ impl ActiveSession {
 
     /// Ask the server to repaint desktop `areas` (Refresh Rect PDU, slow path),
     /// `(left, top, right, bottom)` inclusive.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     pub fn send_refresh_rect<S: Write>(
         &mut self,
         stream: &mut S,
@@ -1404,12 +1410,12 @@ fn take_refresh_requests() -> Vec<(u16, u16, u16, u16)> {
 /// `Window::output_hidden`), and the desktop size to resume, packed
 /// `hidden << 32 | width << 16 | height`. The graphics loop turns a change into
 /// a Suppress Output PDU: while hidden the server encodes and sends nothing.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 static OUTPUT_HIDDEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// UI thread: whether the session's picture can be seen, and the desktop size.
 /// Cheap to call every loop iteration; the worker is woken only on a change.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub(crate) fn set_output_hidden(hidden: bool, (w, h): (u32, u32)) {
     let packed = (hidden as u64) << 32 | (w.min(0xFFFF) as u64) << 16 | h.min(0xFFFF) as u64;
     if OUTPUT_HIDDEN.swap(packed, Ordering::Relaxed) >> 32 != packed >> 32 {
@@ -1418,7 +1424,7 @@ pub(crate) fn set_output_hidden(hidden: bool, (w, h): (u32, u32)) {
 }
 
 /// Whether the session should be suppressed now, and the desktop to resume.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 fn output_hidden() -> (bool, (u16, u16)) {
     let p = OUTPUT_HIDDEN.load(Ordering::Relaxed);
     (p >> 32 != 0, ((p >> 16) as u16, p as u16))
@@ -1498,7 +1504,7 @@ pub trait FrameSink {
     /// frame). Default: convert to RGBA on the CPU and delegate to [`blit`], so
     /// sinks without a GPU path still render. The windowed driver overrides
     /// this to convert on the GPU (D3D11 video processor).
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     fn blit_nv12(&mut self, x: u16, y: u16, w: u16, h: u16, nv12: &[u8], rects: &[(u16, u16, u16, u16)]) {
         let (yp, uv) = nv12.split_at((w as usize) * (h as usize));
         let Some(rgba) =
@@ -1548,14 +1554,14 @@ pub trait FrameSink {
     /// Copy a framebuffer rectangle (`sx`,`sy`,`w`,`h`) to (`dx`,`dy`) on the GPU
     /// (EGFX SurfaceToSurface). Default: ignore — only the windowed driver, which
     /// owns the framebuffer, can do this.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     fn copy_rect(&mut self, _sx: u16, _sy: u16, _w: u16, _h: u16, _dx: u16, _dy: u16) {}
     /// Stash a framebuffer rectangle into GPU cache `slot` (EGFX SurfaceToCache).
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     fn cache_rect(&mut self, _slot: u16, _sx: u16, _sy: u16, _w: u16, _h: u16) {}
     /// Blit GPU cache `slot` onto the framebuffer at (`dx`,`dy`) (EGFX
     /// CacheToSurface).
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     fn cache_blit(&mut self, _slot: u16, _dx: u16, _dy: u16) {}
     /// Present the accumulated framebuffer.
     fn present(&mut self);
@@ -1568,7 +1574,7 @@ pub trait FrameSink {
     /// The server reset the desktop to `w`×`h` (e.g. after a Display Control
     /// resize). Default: ignore — the windowed driver resizes its framebuffer.
     /// Only the Windows graphics loop drives this.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     fn resize(&mut self, _w: u16, _h: u16) {}
 }
 
@@ -1576,7 +1582,7 @@ pub trait FrameSink {
 /// graphics session loop starts it when the server opens the `AUDIO_INPUT`
 /// channel and polls it each wakeup, forwarding captured PCM to the server.
 /// Abstracted so the protocol wiring stays platform-independent and testable.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub trait MicSource: Send {
     /// Begin capturing PCM in this format. Called once, when capture opens.
     fn start(&mut self, channels: u16, samples_per_sec: u32, bits_per_sample: u16);
@@ -1611,7 +1617,7 @@ pub fn pump_once<S: Read + Write, F: FrameSink>(
         session.announce_clipboard(stream)?;
     }
     // ...and start staging the session's clipboard files if a paste wants them.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     session.pump_clipboard_files(stream)?;
 
     let pdu = read_tpkt_pdu(stream)?;
@@ -1781,7 +1787,7 @@ pub fn run_session<S: Read + Write, F: FrameSink>(
 ) -> Result<(), ActivateError> {
     // No RDPEI on the legacy path: never leave a previous graphics session's
     // flag swallowing touch-promoted mouse input here.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     RDPEI_ACTIVE.store(false, Ordering::Relaxed);
     SERVER_ERROR_INFO.store(0, Ordering::SeqCst);
     loop {
@@ -1838,7 +1844,7 @@ impl Drop for HeldSurface {
 /// A decoded rectangle ready to blit at (`x`,`y`). Either already-RGBA pixels
 /// (uncompressed surfaces, AVC444 full-chroma) or an NV12 frame (AVC420) that
 /// the sink converts on the GPU when it can, else on the CPU.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub enum GfxBlit {
     /// Top-down RGBA8, `w*h*4` bytes.
     Rgba {
@@ -1863,6 +1869,7 @@ pub enum GfxBlit {
     /// A GPU NV12 texture (zero-copy DXVA decode) to color-convert on the GPU.
     /// `rects` as in [`GfxBlit::Nv12`]. Read in place: `texture` is the
     /// decoder's surface array, `slice` the picture's, and `held` keeps it.
+    #[cfg(windows)]
     Texture {
         x: u16,
         y: u16,
@@ -1902,7 +1909,7 @@ pub enum GfxBlit {
 /// decodes H.264 (AVC420/444) via Media Foundation; non-graphics commands
 /// return no blits. (The demux/dispatch core it plugs into —
 /// [`rdp_graphics::channel::GraphicsChannel`] — is unit-tested cross-platform.)
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub trait GfxRenderer {
     fn render(&mut self, command: &rdp_pdu::gfx::GfxCommand) -> Vec<GfxBlit>;
 }
@@ -1910,7 +1917,7 @@ pub trait GfxRenderer {
 /// Pop one complete TPKT PDU off the front of `buf`, if a whole one is present.
 /// Returns `Ok(None)` when more bytes are still needed. Bytes are only removed
 /// once a full PDU is available, so a caller can accumulate across reads.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 fn take_buffered_tpkt(buf: &mut Vec<u8>) -> std::io::Result<Option<Vec<u8>>> {
     use rdp_pdu::x224::{read_tpkt_len, TPKT_HEADER_LEN};
     if buf.len() < TPKT_HEADER_LEN {
@@ -1940,7 +1947,7 @@ fn take_buffered_tpkt(buf: &mut Vec<u8>) -> std::io::Result<Option<Vec<u8>>> {
 /// [`read_tpkt_pdu`], partial bytes are retained in `buf` across timeouts, so a
 /// timeout between TLS records (or mid-PDU) never corrupts framing. Requires a
 /// read timeout on the socket; without one it blocks like a plain read.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 fn poll_tpkt_pdu<R: Read>(stream: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::ErrorKind;
     loop {
@@ -1999,7 +2006,7 @@ fn poll_tpkt_pdu<R: Read>(stream: &mut R, buf: &mut Vec<u8>) -> std::io::Result<
 /// decode rate (the correct flow control for a stateful codec — the server
 /// re-encodes from its current surface state rather than us skipping tiles). The
 /// loop exits when the sender is dropped (the connection closed).
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
     rx: std::sync::mpsc::Receiver<Vec<rdp_pdu::gfx::GfxCommand>>,
     renderer: &mut R,
@@ -2058,6 +2065,7 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
                         GfxBlit::Nv12 { x, y, w, h, nv12, rects } => {
                             sink.blit_nv12(x, y, w, h, &nv12, &rects)
                         }
+                        #[cfg(windows)]
                         GfxBlit::Texture { x, y, w, h, texture, slice, held, rects } => {
                             sink.blit_texture(x, y, w, h, &texture, slice, held, &rects)
                         }
@@ -2124,7 +2132,7 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
 /// channel are still painted directly (so a modern host renders even before — or
 /// without — EGFX). Used on the TLS/NLA path, where the worker owns a read+write
 /// transport; the legacy path uses [`run_session`].
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 #[allow(clippy::too_many_arguments)]
 pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     stream: &mut S,
@@ -2285,7 +2293,7 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         if let Some((monitors, since)) = pending_resize.take() {
             if since.elapsed() >= RESIZE_SETTLE {
                 if let (Some(ch), Some(pdu)) =
-                    (dvc_channel, graphics.request_resize(&monitors))
+                    (dvc_channel, graphics.request_resize(&monitors, DESKTOP_SCALE.load(std::sync::atomic::Ordering::Relaxed)))
                 {
                     session.send_dvc(stream, ch, &pdu)?;
                     let primary = monitors

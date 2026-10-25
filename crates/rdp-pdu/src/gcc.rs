@@ -91,6 +91,25 @@ pub struct ClientCoreData {
     pub connection_type: u8,
     /// The `selectedProtocol` from the X.224 Connection Confirm, echoed here.
     pub server_selected_protocol: u32,
+    /// Windows' display scale for the desktop (%: 100 = 96 DPI); 0 leaves it to
+    /// the server (the block then ends at `serverSelectedProtocol`).
+    pub desktop_scale: u32,
+}
+
+/// `desktopScaleFactor` and `deviceScaleFactor` for a display scale (%), as
+/// Windows takes them: the first 100-500, the second one of 100, 140 or 180
+/// (Store apps' scale) — `None` for 0 (the server's default).
+pub fn scale_factors(percent: u32) -> Option<(u32, u32)> {
+    if percent == 0 {
+        return None;
+    }
+    let desktop = percent.clamp(100, 500);
+    let device = match desktop {
+        ..140 => 100,
+        140..180 => 140,
+        _ => 180,
+    };
+    Some((desktop, device))
 }
 
 impl Default for ClientCoreData {
@@ -121,6 +140,7 @@ impl Default for ClientCoreData {
             // server skips detection.
             connection_type: CONNECTION_TYPE_LAN,
             server_selected_protocol: 0,
+            desktop_scale: 0,
         }
     }
 }
@@ -128,9 +148,13 @@ impl Default for ClientCoreData {
 impl ClientCoreData {
     /// Encoded payload length (excluding the 4-byte block header).
     const PAYLOAD_LEN: usize = 212;
+    /// With the physical size, orientation and scale fields after it.
+    const SCALED_PAYLOAD_LEN: usize = 212 + 18;
 
     pub fn encode(&self, out: &mut Vec<u8>) {
-        header(CS_CORE, (4 + Self::PAYLOAD_LEN) as u16, out);
+        let scale = scale_factors(self.desktop_scale);
+        let len = if scale.is_some() { Self::SCALED_PAYLOAD_LEN } else { Self::PAYLOAD_LEN };
+        header(CS_CORE, (4 + len) as u16, out);
         put_u32(self.version, out);
         put_u16(self.desktop_width, out);
         put_u16(self.desktop_height, out);
@@ -163,6 +187,13 @@ impl ClientCoreData {
         out.push(self.connection_type); // connectionType (read iff VALID_CONNECTION_TYPE)
         out.push(0); // pad1octet
         put_u32(self.server_selected_protocol, out);
+        if let Some((desktop, device)) = scale {
+            put_u32(0, out); // desktopPhysicalWidth (unknown: ignored)
+            put_u32(0, out); // desktopPhysicalHeight
+            put_u16(0, out); // desktopOrientation (landscape)
+            put_u32(desktop, out); // desktopScaleFactor
+            put_u32(device, out); // deviceScaleFactor
+        }
     }
 }
 
@@ -663,6 +694,21 @@ mod tests {
         assert_eq!(out.len(), 216);
         // serverSelectedProtocol is the last 4 bytes, little-endian.
         assert_eq!(&out[out.len() - 4..], &[0x02, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn cs_core_carries_a_display_scale_when_set() {
+        let core = ClientCoreData { desktop_scale: 225, ..Default::default() };
+        let mut out = Vec::new();
+        core.encode(&mut out);
+        assert_eq!(block_len(&out), 234);
+        assert_eq!(out.len(), 234);
+        let u32_at = |o: usize| u32::from_le_bytes([out[o], out[o + 1], out[o + 2], out[o + 3]]);
+        assert_eq!((u32_at(226), u32_at(230)), (225, 180));
+        assert_eq!(scale_factors(0), None);
+        assert_eq!(scale_factors(125), Some((125, 100)));
+        assert_eq!(scale_factors(150), Some((150, 140)));
+        assert_eq!(scale_factors(900), Some((500, 180)));
     }
 
     #[test]

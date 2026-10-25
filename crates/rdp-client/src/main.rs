@@ -1919,6 +1919,14 @@ mod hyper_overlay;
 mod wasapi;
 #[cfg(windows)]
 mod hyper_host;
+#[cfg(windows)]
+mod host_ab;
+#[cfg(windows)]
+mod hyper_rates;
+#[cfg(windows)]
+mod hyper_path;
+#[cfg(windows)]
+mod hyper_touch;
 // The Hyper virtual display (drivers/rdpio-display): a monitor at the
 // client's own resolution.
 #[cfg(windows)]

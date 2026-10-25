@@ -4,7 +4,8 @@
 //! the host hasn't acknowledged yet, oldest first, so a lost packet's events
 //! ride the next one — a dropped key-up can never leave a key stuck — and the
 //! host applies each sequence number exactly once, in order, never skipping
-//! one.
+//! one. Over a slow path the client bounds that ([`InputSender::capped_packets`]):
+//! the newest few events a packet, everything only on a timed resend.
 
 /// One input event, in host-neutral terms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +24,34 @@ pub enum InputEvent {
     Char { code: u16, down: bool },
     /// Ctrl+Alt+Del — can't be typed as keys; the host raises it itself.
     SecureAttention,
+    /// A finger on the client's touch screen, injected as Windows touch:
+    /// `id` tells contacts apart while they're down; position 0..=65535
+    /// across the stream. Only sent to a host whose offer says it takes it
+    /// ([`crate::auth::Offer::touch`]): an older host stops at an event it
+    /// can't read.
+    Touch { id: u8, phase: TouchPhase, x: u16, y: u16 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchPhase {
+    Down = 0,
+    Move = 1,
+    Up = 2,
+    /// The gesture was taken away (the client's system claimed it): lift
+    /// without a tap.
+    Cancel = 3,
+}
+
+impl TouchPhase {
+    fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Self::Down,
+            1 => Self::Move,
+            2 => Self::Up,
+            3 => Self::Cancel,
+            _ => return None,
+        })
+    }
 }
 
 impl InputEvent {
@@ -59,6 +88,11 @@ impl InputEvent {
                 out.push(down as u8);
             }
             Self::SecureAttention => out.push(7),
+            Self::Touch { id, phase, x, y } => {
+                out.extend_from_slice(&[8, id, phase as u8]);
+                out.extend_from_slice(&x.to_le_bytes());
+                out.extend_from_slice(&y.to_le_bytes());
+            }
         }
     }
 
@@ -75,21 +109,32 @@ impl InputEvent {
             5 => (Self::Wheel { delta: u16_at(1)? as i16, horizontal: *b.get(3)? != 0 }, 4),
             6 => (Self::Char { code: u16_at(1)?, down: *b.get(3)? != 0 }, 4),
             7 => (Self::SecureAttention, 1),
+            8 => (Self::Touch { id: *b.get(1)?, phase: TouchPhase::from_u8(*b.get(2)?)?, x: u16_at(3)?, y: u16_at(5)? }, 7),
             _ => return None,
         })
     }
 }
 
-/// Most events carried in one packet: the largest event is 5 bytes after a
-/// 5-byte header, within [`crate::wire::MAX_BODY`] (and the count is a byte).
-pub const MAX_PER_PACKET: usize = (crate::wire::MAX_BODY - 5) / 5;
+/// Most events carried in one packet: the largest event (a touch) is 7 bytes
+/// after a 5-byte header, within [`crate::wire::MAX_BODY`] (and the count is
+/// a byte).
+pub const MAX_PER_PACKET: usize = (crate::wire::MAX_BODY - 5) / 7;
 const _: () = assert!(MAX_PER_PACKET <= 255);
+
+/// Events every [`InputSender::capped_packets`] packet carries at least (the
+/// newest ones), sent before or not: a lost packet's events ride the next
+/// ones while the host's ack is on its way.
+pub const CAPPED_TAIL: usize = 16;
+/// Packets each event rides in [`InputSender::capped_packets`] before only a
+/// timed full resend ([`InputSender::packets`]) carries it again.
+pub const CAPPED_REPEATS: u8 = 3;
 
 /// Client side: numbers events and builds packets of everything unacknowledged.
 #[derive(Default)]
 pub struct InputSender {
-    /// `(seq, event)` not yet acknowledged by the host, oldest first.
-    pending: Vec<(u32, InputEvent)>,
+    /// `(seq, event, packets it went in)` not yet acknowledged by the host,
+    /// oldest first.
+    pending: Vec<(u32, InputEvent, u8)>,
     next_seq: u32,
     /// Highest sequence number already put in a packet.
     sent: u32,
@@ -106,7 +151,7 @@ impl InputSender {
     pub fn push(&mut self, ev: InputEvent) {
         let sent = self.sent;
         let unsent = |seq: u32| seq.wrapping_sub(sent) as i32 > 0;
-        if let (InputEvent::MouseRel { dx, dy }, Some((seq, InputEvent::MouseRel { dx: px, dy: py }))) =
+        if let (InputEvent::MouseRel { dx, dy }, Some((seq, InputEvent::MouseRel { dx: px, dy: py }, _))) =
             (ev, self.pending.last_mut())
         {
             if unsent(*seq) {
@@ -117,7 +162,7 @@ impl InputSender {
                 }
             }
         }
-        if let (InputEvent::MouseAbs { .. }, Some((seq, last @ InputEvent::MouseAbs { .. }))) =
+        if let (InputEvent::MouseAbs { .. }, Some((seq, last @ InputEvent::MouseAbs { .. }, _))) =
             (ev, self.pending.last_mut())
         {
             if unsent(*seq) {
@@ -125,13 +170,24 @@ impl InputSender {
                 return;
             }
         }
-        self.pending.push((self.next_seq, ev));
+        // A finger's moves too (not its down or up).
+        if let (
+            InputEvent::Touch { id, phase: TouchPhase::Move, .. },
+            Some((seq, last @ InputEvent::Touch { phase: TouchPhase::Move, .. }, _)),
+        ) = (ev, self.pending.last_mut())
+        {
+            if unsent(*seq) && matches!(*last, InputEvent::Touch { id: i, .. } if i == id) {
+                *last = ev;
+                return;
+            }
+        }
+        self.pending.push((self.next_seq, ev, 0));
         self.next_seq = self.next_seq.wrapping_add(1);
     }
 
     /// The host has applied everything up to and including `seq`.
     pub fn ack(&mut self, seq: u32) {
-        self.pending.retain(|(s, _)| s.wrapping_sub(seq) as i32 > 0);
+        self.pending.retain(|(s, _, _)| s.wrapping_sub(seq) as i32 > 0);
     }
 
     pub fn has_pending(&self) -> bool {
@@ -143,26 +199,61 @@ impl InputSender {
     /// a button shouldn't).
     pub fn unsent(&self) -> Option<bool> {
         let sent = self.sent;
-        let mut fresh = self.pending.iter().filter(|(seq, _)| seq.wrapping_sub(sent) as i32 > 0).peekable();
+        let mut fresh = self.pending.iter().filter(|(seq, _, _)| seq.wrapping_sub(sent) as i32 > 0).peekable();
         fresh.peek()?;
-        Some(fresh.all(|(_, e)| matches!(e, InputEvent::MouseRel { .. } | InputEvent::MouseAbs { .. })))
+        Some(fresh.all(|(_, e, _)| {
+            matches!(e, InputEvent::MouseRel { .. } | InputEvent::MouseAbs { .. } | InputEvent::Touch { phase: TouchPhase::Move, .. })
+        }))
     }
 
     /// Packet bodies for the unacknowledged events, oldest first, at most
     /// `max_packets` of them (anything beyond waits for acks to free room).
     /// Empty if nothing is pending.
     pub fn packets(&mut self, max_packets: usize) -> Vec<Vec<u8>> {
+        self.packets_from(0, max_packets)
+    }
+
+    /// Like [`Self::packets`], but bounded for a slow, deep-queued path: the
+    /// packets start at the newest [`CAPPED_TAIL`] events, or earlier at any
+    /// event not yet sent [`CAPPED_REPEATS`] times. Every packet carrying
+    /// every unacknowledged event costs, over a relayed 300 ms path with a
+    /// finger moving at 120 Hz, ~36 events a packet, 120 packets a second
+    /// (and two full packets each once a queue holds acks back for seconds:
+    /// over 2 Mbit/s of input on a 1 Mbit/s link — which deepens the queue).
+    /// Bounded, a packet stays under ~130 bytes; an event whose packets were
+    /// all lost waits for the caller's timed full resend instead (the host
+    /// applies nothing past a gap, never out of order).
+    pub fn capped_packets(&mut self, max_packets: usize) -> Vec<Vec<u8>> {
+        let tail = self.pending.len().saturating_sub(CAPPED_TAIL);
+        let start = self.pending.iter().position(|&(_, _, sends)| sends < CAPPED_REPEATS).map_or(tail, |i| i.min(tail));
+        self.packets_from(start, max_packets)
+    }
+
+    /// Whether a key, button, character or finger down/up went out in fewer
+    /// than [`CAPPED_REPEATS`] packets: worth sending again a few ms later
+    /// even with nothing new to send (motion is followed by more motion; a
+    /// lone key-up isn't).
+    pub fn wants_repeat(&self) -> bool {
+        self.pending.iter().any(|&(_, e, sends)| {
+            (1..CAPPED_REPEATS).contains(&sends)
+                && !matches!(e, InputEvent::MouseRel { .. } | InputEvent::MouseAbs { .. } | InputEvent::Touch { phase: TouchPhase::Move, .. })
+        })
+    }
+
+    fn packets_from(&mut self, start: usize, max_packets: usize) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        for events in self.pending.chunks(MAX_PER_PACKET).take(max_packets) {
-            let (first, _) = events[0];
+        let Some(rest) = self.pending.get_mut(start..) else { return out };
+        for events in rest.chunks_mut(MAX_PER_PACKET).take(max_packets) {
+            let (first, _, _) = events[0];
             let mut body = Vec::with_capacity(5 + events.len() * 5);
             body.extend_from_slice(&first.to_le_bytes());
             body.push(events.len() as u8);
-            for (_, e) in events {
+            for (_, e, sends) in events.iter_mut() {
                 e.write(&mut body);
+                *sends = sends.saturating_add(1);
             }
             out.push(body);
-            let (last, _) = events[events.len() - 1];
+            let (last, _, _) = events[events.len() - 1];
             if last.wrapping_sub(self.sent) as i32 > 0 {
                 self.sent = last;
             }
@@ -240,6 +331,7 @@ mod tests {
             InputEvent::Wheel { delta: -120, horizontal: true },
             InputEvent::Char { code: 0x263A, down: true },
             InputEvent::SecureAttention,
+            InputEvent::Touch { id: 3, phase: TouchPhase::Move, x: 40000, y: 9 },
         ];
         let mut tx = InputSender::new();
         for e in all {
@@ -288,6 +380,23 @@ mod tests {
         // Already sent → a new event, not merged into the old one.
         tx.push(InputEvent::MouseRel { dx: 1, dy: 1 });
         assert_eq!(rx.receive(&tx.packet().unwrap()), vec![InputEvent::MouseRel { dx: 1, dy: 1 }]);
+    }
+
+    #[test]
+    fn unsent_finger_moves_are_merged_per_finger() {
+        let t = |id, phase, x| InputEvent::Touch { id, phase, x, y: 0 };
+        let mut tx = InputSender::new();
+        tx.push(t(0, TouchPhase::Down, 1));
+        tx.push(t(0, TouchPhase::Move, 2));
+        tx.push(t(0, TouchPhase::Move, 3));
+        tx.push(t(1, TouchPhase::Move, 4));
+        tx.push(t(1, TouchPhase::Move, 5));
+        tx.push(t(0, TouchPhase::Up, 5));
+        let mut rx = InputReceiver::new();
+        assert_eq!(
+            rx.receive(&tx.packet().unwrap()),
+            [t(0, TouchPhase::Down, 1), t(0, TouchPhase::Move, 3), t(1, TouchPhase::Move, 5), t(0, TouchPhase::Up, 5)]
+        );
     }
 
     #[test]
@@ -343,6 +452,70 @@ mod tests {
         assert!(rx.receive(&ps[1]).is_empty(), "the first packet was lost");
         assert_eq!(rx.receive(&ps[0]).len(), MAX_PER_PACKET);
         assert_eq!(rx.receive(&ps[1]).len(), 10);
+    }
+
+    #[test]
+    fn capped_packets_stay_small_while_acks_are_held_up() {
+        let mut tx = InputSender::new();
+        let mut rx = InputReceiver::new();
+        let mv = |i: u16| InputEvent::Touch { id: 0, phase: TouchPhase::Move, x: i, y: i };
+        // Two seconds of a moving finger at 120 Hz, no ack back yet: every
+        // packet stays at the newest few events.
+        let mut biggest = 0;
+        for i in 0..240 {
+            tx.push(mv(i));
+            for p in tx.capped_packets(2) {
+                biggest = biggest.max(p.len());
+                rx.receive(&p);
+            }
+        }
+        assert!(biggest <= 5 + CAPPED_TAIL * 7, "{biggest} bytes");
+        // Nothing lost: the host has every move, in order.
+        assert_eq!(rx.applied(), 240);
+    }
+
+    #[test]
+    fn a_capped_burst_loss_is_mended_by_the_full_resend() {
+        let mut tx = InputSender::new();
+        let mut rx = InputReceiver::new();
+        tx.push(A);
+        tx.push(A_UP);
+        // An outage: every packet lost, until the key has used up its repeats
+        // and fallen out of the newest few.
+        for i in 0..(CAPPED_TAIL as i16 + 4) {
+            tx.push(InputEvent::MouseRel { dx: 1, dy: i });
+            let _lost = tx.capped_packets(2);
+        }
+        for i in 0..10 {
+            tx.push(InputEvent::MouseRel { dx: 2, dy: i });
+            // Past the gap: the host applies none of it, out of order.
+            for p in tx.capped_packets(2) {
+                assert!(rx.receive(&p).is_empty());
+            }
+        }
+        // The timed full resend starts at the key.
+        let got: Vec<_> = tx.packets(2).iter().flat_map(|p| rx.receive(p)).collect();
+        assert_eq!(&got[..2], &[A, A_UP]);
+        assert_eq!(got.len(), 2 + CAPPED_TAIL + 4 + 10);
+    }
+
+    #[test]
+    fn a_lone_key_up_asks_to_be_repeated_but_motion_does_not() {
+        let mut tx = InputSender::new();
+        tx.push(InputEvent::MouseRel { dx: 1, dy: 1 });
+        let _ = tx.capped_packets(2);
+        assert!(!tx.wants_repeat());
+        tx.push(A_UP);
+        assert!(!tx.wants_repeat(), "not sent yet: that's not a repeat");
+        for _ in 1..CAPPED_REPEATS {
+            let _ = tx.capped_packets(2);
+            assert!(tx.wants_repeat());
+        }
+        let _ = tx.capped_packets(2);
+        assert!(!tx.wants_repeat(), "sent {CAPPED_REPEATS} times");
+        // Once repeated enough, and with nothing new, a capped packet is still
+        // the newest few (a resend, not nothing).
+        assert!(!tx.capped_packets(2).is_empty());
     }
 
     #[test]

@@ -33,6 +33,10 @@ mimalloc.workspace = true
 # Hyper Accelerator protocol (`--hyper` / `--hyper-host`): pure Rust, so on
 # every platform (its Windows ends are cfg'd).
 rdp-hyper.workspace = true
+# RDSTLS v3 password wrap off Windows (CNG does it there; tests cross-check).
+aes = "0.8"
+rdp-asn1.workspace = true
+cbc = { version = "0.1", features = ["alloc"] }
 
 [target.'cfg(not(windows))'.dependencies]
 # Linux/Unix TLS for the RDP Enhanced Security path (SChannel's counterpart).
@@ -70,6 +74,7 @@ windows = { workspace = true, features = [
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input_Touch",
+    "Win32_UI_Input_Pointer",
     "Win32_Graphics_Gdi",
     "Win32_Security_Authentication_Identity",
     "Win32_Security_Credentials",

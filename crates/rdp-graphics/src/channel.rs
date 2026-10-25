@@ -359,13 +359,14 @@ impl GraphicsChannel {
     }
 
     /// Build a Display Control monitor-layout PDU requesting a desktop resize to
-    /// the supplied `monitors` layout (wrapped as DRDYNVC data), or `None` if the
-    /// Display Control channel isn't open.
+    /// the supplied `monitors` layout at display `scale` (%, 0 = 100%; wrapped
+    /// as DRDYNVC data), or `None` if the Display Control channel isn't open.
     pub fn request_resize(&self,
         monitors: &[rdp_pdu::gcc::MonitorDef],
+        scale: u32,
     ) -> Option<Vec<u8>> {
         self.disp_channel_id
-            .map(|id| drdynvc::data(id, &disp::monitor_layout(monitors)))
+            .map(|id| drdynvc::data(id, &disp::monitor_layout_scaled(monitors, scale)))
     }
 
     /// Whether the microphone (`AUDIO_INPUT`) channel is open.
@@ -577,13 +578,13 @@ mod tests {
             bottom: 719,
             primary: true,
         }];
-        assert!(gc.request_resize(monitors).is_none()); // channel not open yet
+        assert!(gc.request_resize(monitors, 0).is_none()); // channel not open yet
         let mut create = vec![0x10, 0x07]; // CREATE, cb=0, channelId=7
         create.extend_from_slice(disp::DISPLAYCONTROL_CHANNEL.as_bytes());
         create.push(0);
         let out = gc.process(&create);
         assert_eq!(out.responses, vec![drdynvc::create_response(7, 0)]); // accepted
-        let resize = gc.request_resize(monitors).unwrap();
+        let resize = gc.request_resize(monitors, 0).unwrap();
         assert_eq!(resize[0], 0x30); // DVC DATA wrapping the monitor-layout PDU
     }
 

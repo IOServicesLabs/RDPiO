@@ -17,7 +17,7 @@ pub enum Handshake {
     /// Client → host, as soon as the channel opens.
     ClientHello {
         protocol: u32,
-        /// Codecs the client decodes in hardware, best first ("h264", "hevc").
+        /// Codecs the client decodes in hardware, best first ("h264", "hevc", "av1").
         codecs: Vec<String>,
         /// The client window's size and the local display's refresh rate.
         width: u32,
@@ -158,7 +158,55 @@ pub enum Control {
     /// much smaller — and back up (never past its own desktop) as it grows.
     /// A host that doesn't know it ignores it.
     View { width: u16, height: u16 },
+    /// Host → client: how the client's packets reach the host (the host asks
+    /// its VPN), every few seconds. `relay`: the relay's name for
+    /// [`PathKind::Relay`] ("ord"), else empty. A client that doesn't know
+    /// it ignores it.
+    Path { kind: PathKind, relay: String },
 }
+
+/// How the client is reached, as the host sees it ([`Control::Path`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    /// Not known (no VPN the host can ask, or it doesn't know the client).
+    Unknown = 0,
+    /// The host's own local network.
+    Lan = 1,
+    /// Tailscale, peer to peer (UDP straight between the two).
+    Direct = 2,
+    /// Tailscale through one of its DERP relays: every packet over TCP via a
+    /// server elsewhere — expect lag, queues and drops.
+    Relay = 3,
+    /// Tailscale through a peer relay (another node of the tailnet).
+    PeerRelay = 4,
+}
+
+impl PathKind {
+    fn from_u8(b: u8) -> Self {
+        match b {
+            1 => Self::Lan,
+            2 => Self::Direct,
+            3 => Self::Relay,
+            4 => Self::PeerRelay,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// For the stats line and logs: "LAN", "direct", "relay ord".
+    pub fn describe(self, relay: &str) -> String {
+        match self {
+            Self::Unknown => "?".into(),
+            Self::Lan => "LAN".into(),
+            Self::Direct => "direct".into(),
+            Self::Relay if relay.is_empty() => "relay".into(),
+            Self::Relay => format!("relay {relay}"),
+            Self::PeerRelay => "peer relay".into(),
+        }
+    }
+}
+
+/// Longest relay name in a [`Control::Path`] (bytes).
+const RELAY_MAX: usize = 32;
 
 /// Longest [`Control::Notice`] text (bytes): it fits one packet.
 pub const NOTICE_MAX: usize = 600;
@@ -246,6 +294,15 @@ impl Control {
                 o.extend_from_slice(&width.to_le_bytes());
                 o.extend_from_slice(&height.to_le_bytes());
             }
+            Self::Path { kind, relay } => {
+                o.push(19);
+                o.push(*kind as u8);
+                let mut end = relay.len().min(RELAY_MAX);
+                while !relay.is_char_boundary(end) {
+                    end -= 1;
+                }
+                o.extend_from_slice(&relay.as_bytes()[..end]);
+            }
         }
         o
     }
@@ -290,6 +347,10 @@ impl Control {
             16 => Self::Notice { text: String::from_utf8_lossy(&b[1..b.len().min(1 + NOTICE_MAX)]).into_owned() },
             17 => Self::AudioReport { frame_ms: *b.get(1)?, lost: u16_at(2)? },
             18 => Self::View { width: u16_at(1)?, height: u16_at(3)? },
+            19 => Self::Path {
+                kind: PathKind::from_u8(*b.get(1)?),
+                relay: String::from_utf8_lossy(&b[2..b.len().min(2 + RELAY_MAX)]).into_owned(),
+            },
             _ => return None,
         })
     }
@@ -354,6 +415,8 @@ mod tests {
             Control::Notice { text: "Discord records from FrontMic".into() },
             Control::AudioReport { frame_ms: 20, lost: 3 },
             Control::View { width: 1200, height: 800 },
+            Control::Path { kind: PathKind::Relay, relay: "ord".into() },
+            Control::Path { kind: PathKind::Direct, relay: String::new() },
         ];
         for c in all {
             assert_eq!(Control::parse(&c.to_bytes()), Some(c.clone()), "{c:?}");

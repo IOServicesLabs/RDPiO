@@ -55,6 +55,13 @@ pub fn parse_caps(pdu: &[u8]) -> Option<DisplayCaps> {
 /// down to even values and floored at 200 per the spec's constraints. The
 /// returned PDU tells the server the new desktop topology to use.
 pub fn monitor_layout(monitors: &[rdp_pdu::gcc::MonitorDef]) -> Vec<u8> {
+    monitor_layout_scaled(monitors, 0)
+}
+
+/// [`monitor_layout`] with Windows' display scale for every monitor (%: see
+/// [`rdp_pdu::gcc::scale_factors`]; 0 = 100%).
+pub fn monitor_layout_scaled(monitors: &[rdp_pdu::gcc::MonitorDef], scale: u32) -> Vec<u8> {
+    let (desktop_scale, device_scale) = rdp_pdu::gcc::scale_factors(scale).unwrap_or((100, 100));
     let mut monitors = monitors.to_vec();
     if monitors.is_empty() {
         // Fall back to a safe single-monitor layout so callers never emit an
@@ -93,8 +100,8 @@ pub fn monitor_layout(monitors: &[rdp_pdu::gcc::MonitorDef]) -> Vec<u8> {
         body.extend_from_slice(&0u32.to_le_bytes()); // PhysicalWidth
         body.extend_from_slice(&0u32.to_le_bytes()); // PhysicalHeight
         body.extend_from_slice(&0u32.to_le_bytes()); // Orientation
-        body.extend_from_slice(&100u32.to_le_bytes()); // DesktopScaleFactor
-        body.extend_from_slice(&100u32.to_le_bytes()); // DeviceScaleFactor
+        body.extend_from_slice(&desktop_scale.to_le_bytes()); // DesktopScaleFactor
+        body.extend_from_slice(&device_scale.to_le_bytes()); // DeviceScaleFactor
     }
 
     let mut pdu = Vec::with_capacity(8 + body.len());
@@ -154,6 +161,15 @@ mod tests {
         // Width rounded down to even (1366), height floored even (768).
         assert_eq!(u32::from_le_bytes([pdu[28], pdu[29], pdu[30], pdu[31]]), 1366);
         assert_eq!(u32::from_le_bytes([pdu[32], pdu[33], pdu[34], pdu[35]]), 768);
+    }
+
+    #[test]
+    fn carries_the_display_scale() {
+        let pdu = monitor_layout_scaled(&[primary(3000, 2120)], 225);
+        assert_eq!(u32::from_le_bytes([pdu[48], pdu[49], pdu[50], pdu[51]]), 225);
+        assert_eq!(u32::from_le_bytes([pdu[52], pdu[53], pdu[54], pdu[55]]), 180);
+        let pdu = monitor_layout(&[primary(3000, 2120)]);
+        assert_eq!(u32::from_le_bytes([pdu[48], pdu[49], pdu[50], pdu[51]]), 100);
     }
 
     #[test]

@@ -176,7 +176,7 @@ The host helps too, plugged in or not:
 - **Still-screen trickle (office mode).** Nobody has touched the keyboard,
   mouse or controller for 0.3 s, and the screen changes only in small ways (a
   clock, a caret, a spinner)? Frames then go out at about 12 a second instead
-  of 60. The newest picture always gets through. The next input, or a big
+  of 60, and at 5 a second after 2 s with nobody at the controls. The newest picture always gets through. The next input, or a big
   change such as scrolling, a video or a new page, brings the full rate back
   with the very next frame.
 - **Sharpening scales with the change.** After a change, office mode
@@ -198,6 +198,14 @@ on an NVIDIA host it encodes faster than H.264 (1.2 vs 1.35 ms a 1080p frame)
 and looks better for the same bits (+0.3 to +2.3 dB at 6-25 Mbps, about a
 third less bandwidth for the same picture). A client decoding on its CPU gets
 H.264, the lighter of the two there. `--hyper-codec` forces either.
+
+**AV1** (RTX 40 hosts and newer, NVENC's AV1): a client that lists "av1" first
+gets it, 3-5 dB better than HEVC for the same bits. With an NVIDIA driver
+from 570 (NVENC API 13.0) it keeps long-term reference frames like HEVC, so a
+loss is repaired from an older frame; with an older driver every loss costs a
+keyframe (better on a clean link, worse on a lossy one). Only the Android
+app asks for it, and only when switched on (`debug.rdpio.av1`, see
+[android.md](android.md)); a host without AV1 skips the name.
 
 **Resolution, matched to the laptop:** with the **rdpio Display** driver on
 the host (`drivers/rdpio-display`, installed with the service when it ships
@@ -239,7 +247,9 @@ so.
 
 **Office mode** (`--hyper-office`, or Ctrl+Shift+O at any time): for work
 rather than games — text stays crisp, video still plays. The host encodes at
-60 fps, lets a frame take a quarter second's bits (a screen of new text
+60 fps with a bigger budget for bigger screens (30 Mbps at 1080p, up to 60
+for a 3000x2120 tablet: new text there is as sharp after half a second as
+it was after a full one), lets a frame take a quarter second's bits (a screen of new text
 arrives sharp instead of blurring and then sharpening over a second), uses
 the encoder's best-quality preset, prefers HEVC (when the laptop's GPU decodes
 it), runs its monitor at the laptop's resolution when the monitor offers that
@@ -284,8 +294,133 @@ fresh renderer and rejoins. Neither ends the session.
 Connect to the host's Tailscale/ZeroTier address. Packets never exceed 1200
 bytes (no fragmentation on either), lost packets are rebuilt from forward
 error correction rather than resent, and the bitrate backs off as soon as
-delay starts building. Prefer HEVC and consider `--hyper-size 1920x1080` and a
+delay starts building while the stream is actually using its budget (delay
+is measured to each frame's first packet, so a big frame's own time on the
+wire isn't mistaken for a queue, and Wi-Fi power-save bumps on a near-idle
+stream don't cut it). Prefer HEVC and consider `--hyper-size 1920x1080` and a
 lower `--hyper-mbps` on the host for slow uplinks.
+
+The host tells clients its local addresses when they sign in. A client that
+signed in through the VPN and later finds itself on one of those networks
+connects there directly next time (saving the VPN's own encryption of every
+packet), and falls back to the address it was given if the host doesn't
+answer there. `RDPIO_NO_LAN_PATH=1` on the Windows client turns this off
+(and `RDPIO_NO_RX_NAP=1` its office-mode receive batching).
+
+**Relayed paths and drops.** The host asks Tailscale (`tailscale status
+--json`, every 10 s) how the client is reached and logs it ("path to the
+client path=relay ord"); clients show it on their stats line and log
+"Tailscale is relaying this connection (no direct UDP): expect lag" — a DERP
+relay carries every packet over TCP via a server elsewhere (~1 Mbit/s,
+seconds of queue). On such a path:
+
+- Input packets carry the newest few events (a key or click until it went
+  three times, a lone key-up again 5 ms later) and everything unacknowledged
+  only once a round trip, instead of every unacknowledged event every time.
+- A client takes 1.5 s of silence as suspect (it pings every 200 ms) and
+  ~3 s as a drop, then signs in again at once, backing off from 250 ms. The
+  host ends the old stream as soon as that sign-in arrives (only from the
+  same IP, with a valid cookie) rather than after its own 6 s timeout.
+- The virtual monitor of a stream whose client dropped is kept 15 s: a
+  reconnect at the same size streams it again, skipping its removal and
+  re-adding (~2 s) and the shuffle of the desktop's windows.
+
+Sound on a bad path:
+
+- **Bitrate follows the link** (`audiorate`): game sound drops from 128 to
+  64 kbps when the video's rate falls below 3 Mbps and to 48 kbps (in 20 ms
+  packets, half the per-packet headers a relay adds) below 1.5; back up above
+  4 and 2. At 1 Mbps the full rate, headers and copies were a quarter of the
+  link.
+- **In-band FEC** (`opusfec`): receivers report every packet that never came
+  (before the copy of the previous frame each packet carries repaired it), and
+  the sender's Opus codes FEC sized for that loss — the mic always (speech
+  mode), game sound by switching from the low-delay mode (which can't) to the
+  general one (4 ms more look-ahead) while ≥2% is lost. Receivers decode the
+  last frame of a gap from it. Simulated (frame copies on, as they are under
+  loss): mic 22 → 33 dB at 10% loss, 16 → 27 dB at 10% in bursts; game sound
+  19 → 23 dB at 10%.
+- **Audio first** (`audiofirst`): the sound's sender thread runs at the video
+  sender's priority, so a game holding every core can't delay it. (Audio
+  never waited behind the video pacer: it's sent from its own thread, each
+  video packet sealed only as it goes.)
+- **Catch-up** (`catchup`): a backlog the jitter buffer holds 30 ms or more
+  over its target for half a second — a relay's queue letting go — is cut out
+  at once (0.5 s for 45 ms over, against 10 s of 0.5%-faster play), and every
+  cut, including the cap's, is joined where the sound before and after match
+  best and crossfaded over 5 ms instead of an abrupt splice (a click).
+
+The picture on a bad path (host; each a switch, on unless said):
+
+- **Standing queue** (`standingq`): even the fastest packet of each feedback
+  window 100 ms late for half a second is a queue the link can't drain (a relay
+  queues rather than drops): the bitrate is cut to what the link delivered
+  while it stood, every second until it drains.
+- **Drain mode** (`drain`): meanwhile the host encodes only 8 frames a second
+  (frames skipped before encoding, so every reference holds) until the queue
+  is gone — it drains at nearly the link's rate instead of a fifth of it.
+  Logged as "drain mode: …" / "drain mode over"; `drain_fps` in the perf line.
+- **One keyframe in flight** (`onekey`): clients ask for a keyframe every
+  ~100 ms until one decodes; on a relay a 300 KB keyframe takes seconds, and
+  each request answered queued another. Requests (and repairs only a keyframe
+  could give) are collapsed into the one on its way until the client's
+  feedback shows it arrived or was lost. `keys_collapsed` in the perf line.
+- **Key probe** (`keyprobe`): a keyframe still on its way after 250 ms
+  measures the link (the rate is cut to what arrives meanwhile) and only 8
+  frames a second follow it. At a stream's start nothing else tells the host
+  about the path until that first keyframe lands.
+- **Delivery gap** (`gapcut`): over half a second the client received under
+  half what the host sent — the link carries less, whatever the delay reads
+  yet — the rate is cut to what was delivered (and it doesn't grow under 80%).
+- **Warm start** (`warmstart`): the host remembers what each client address's
+  path sustained (`%ProgramData%\rdpio\hyper-rates.json`, a week) and starts
+  the next stream from there at 1.2x it (when that's under the usual 20 Mbps)
+  — the tablet's relay address and its LAN one are remembered apart. While
+  nothing pushes back it grows 6% a feedback window; an idle stream recovers
+  only to the highest rate the path has carried. Logged as "warm start".
+- **Frame rate follows the bitrate** (`fpsfollow`): with too few bits a pixel
+  per frame (under 0.015; 2250x1590 at 60 fps below ~3.2 Mbps) the host
+  encodes at half, then a third of the rate (never under 20 fps), with the
+  encoder's rate scaled so each frame gets the bits; back up once the rate
+  has held 3 s. Logged as "the frame rate follows the bitrate"; `enc_fps`.
+  In office mode (`officefps`) it goes on to 15 and 10 fps: text over a 1 Mbps
+  relay gets twice the bits a frame, and typing still sends the next picture
+  at once.
+- **Growth on a slow path** (`growcap`): after a cut for a standing queue, a
+  slow keyframe or a delivery gap (or a warm start under 3 Mbps), for a
+  minute the rate grows to at most twice what the path delivered over half a
+  second in the last 20 s. An idle office stream on the relay otherwise crept
+  0.5 → 11 Mbps (nothing pushes back while little is sent) and the next
+  scroll queued for seconds; simulated, that scroll's p95 went 662 → 121 ms.
+- **No gentle cuts under 3 Mbps** (`softslow`): the 7% cut for a queue 10 ms
+  over the baseline fired on a relay's own jitter on nearly every frame and
+  held a 1.2 Mbps relay at the 0.5 Mbps floor; under 3 Mbps only the hard
+  (30 ms) and standing-queue rules cut.
+
+The host's perf line names why the rate came down in each 5 s (`cuts=`:
+`probe`, `gap`, `standing`, `drain`, `loss`, `queue`, `soft`).
+- **Clean-path parity** (`fecfloor`): after 10 s without loss, big non-key
+  frames carry 2% parity instead of 5% (at least one parity packet a block
+  still; keyframes keep theirs).
+- **Slow pacing** (`slowpace=1`, off by default): on a slow or queued link
+  frames are paced at 1.2x the target instead of 2.5x, so they wait on the
+  host rather than in front of the audio in the relay. Simulated: audio p95
+  151 → 119 ms, video p95 216 → 325 ms.
+
+Simulated on a 1 Mbps relay (`cargo test -p rdp-hyper relay_ -- --nocapture`):
+a cold start's latency 10-30 s in went from ~20 s to ~0.1 s (29 keyframes
+to 1); warm started, the first picture comes at 0.4 s instead of 2.7 s.
+
+Host switches (`%PUBLIC%\rdpio-hyper-switches.txt`, `name=0` turns one off,
+read live): `pathinfo`, `inputdup` (Windows client), `fastreconnect`,
+`keepmonitor`, `vbvcap`, `presetfollow=1`, `introfresh=1` (the last two off
+by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
+`gapcut`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
+`growcap`, `softslow`, `fecfloor`,
+`slowpace=1` (off by default), `audiorate`, `opusfec`, `audiofirst` (read as a sender starts),
+`catchup` — the last three also on a Windows client, from its own
+`%PUBLIC%` file. The Android app's are `debug.rdpio.inputdup` and
+`debug.rdpio.fastreconnect` (see android.md).
 
 ## Latency notes
 
@@ -322,6 +457,18 @@ lower `--hyper-mbps` on the host for slow uplinks.
   likely lost again) and the picture is back after one round trip. With no
   confirmed reference, or a third repair within a second, it's a keyframe as
   before. `RDPIO_HYPER_LTR=0` on the host turns it off.
+- On a slow link no frame may hold it for long: office mode lets one frame
+  take a quarter second of the bitrate (a page of new text arrives sharp), but
+  under 30 Mbps that shrinks with the bitrate — 8 ms of the link per Mbps, at
+  least 100 ms (switch `vbvcap`). At 8 Mbps a 2250x1590 keyframe went from
+  188 to 96 KB; at 1 Mbps the largest ordinary frame from 32 to 10 KB. (A
+  keyframe of a screen full of text can't get much under ~45 KB at that size.)
+  Two more host switches, off by default: `presetfollow` (a slower NVENC
+  preset under 6 Mbps, back over 10 — measured no sharper, a few ms slower a
+  frame) and `introfresh` (a loss with no confirmed reference repaired by a
+  refresh spread over 30 frames instead of a keyframe, where a keyframe would
+  hold the link over 200 ms — Microsoft's decoders show nothing after a gap
+  until a keyframe, so it needs a client whose decoder carries on).
 - Office mode re-sends a still picture for up to a second, each time
   sharper: the fast preset's text comes out at 33 dB, 45 dB half a second
   later and ~48 dB after a second, beyond the quality preset's 42 dB (which

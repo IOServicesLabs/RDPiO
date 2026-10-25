@@ -19,6 +19,12 @@ use crate::session::{self, ActiveSession};
 use crate::tls::TlsStream;
 use crate::transport;
 
+// CredSSP: Windows' SSPI there, the portable NTLM implementation elsewhere.
+#[cfg(not(windows))]
+use rdp_nla::credssp as nla;
+#[cfg(windows)]
+use rdp_nla::sspi as nla;
+
 /// Bound activation reads so a silent server cannot hang startup.
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -73,6 +79,18 @@ impl Transport {
         match self {
             Transport::Tcp(s) => Some(s.as_raw_socket()),
             Transport::Tls(s) => Some(s.get_ref().as_raw_socket()),
+            Transport::WebSocket(s) => Some(s.raw_socket()),
+            Transport::WebSocketTls(s) => Some(s.get_ref().raw_socket()),
+        }
+    }
+
+    /// (The descriptor, on Unix.)
+    #[cfg(unix)]
+    pub fn raw_socket(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        match self {
+            Transport::Tcp(s) => Some(s.as_raw_fd()),
+            Transport::Tls(s) => Some(s.get_ref().as_raw_fd()),
             Transport::WebSocket(s) => Some(s.raw_socket()),
             Transport::WebSocketTls(s) => Some(s.get_ref().raw_socket()),
         }
@@ -492,7 +510,7 @@ fn secure(
             .remote_cert_der()
             .ok_or("server presented no certificate for NLA")?;
         let spn = format!("TERMSRV/{}", config.hostname);
-        rdp_nla::sspi::authenticate(
+        nla::authenticate(
             &mut tls,
             &spn,
             &cert,

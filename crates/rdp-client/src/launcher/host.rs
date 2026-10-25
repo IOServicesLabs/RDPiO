@@ -14,6 +14,8 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 pub struct Address {
     pub name: String,
     pub ip: String,
+    /// The network's prefix length (24 for a /24).
+    pub prefix: u8,
     /// "tailscale", "zerotier", "lan" or "other".
     pub kind: &'static str,
 }
@@ -216,7 +218,7 @@ pub fn addresses() -> Vec<Address> {
                 let kind = kind_of(ip, &name, routed);
                 // (Virtual machines' and WSL's switches: no other PC reaches those.)
                 if kind != "virtual" {
-                    out.push(Address { kind, name: name.clone(), ip: ip.to_string() });
+                    out.push(Address { kind, name: name.clone(), ip: ip.to_string(), prefix: ua.OnLinkPrefixLength });
                 }
             }
         }

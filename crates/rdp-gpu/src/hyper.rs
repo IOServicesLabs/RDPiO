@@ -1056,7 +1056,7 @@ unsafe fn texture(device: &ID3D11Device, (w, h): (u32, u32), format: windows::Wi
     Ok(t.expect("texture"))
 }
 
-/// One encoded access unit (Annex-B).
+/// One encoded access unit (Annex-B; AV1: one temporal unit of OBUs).
 pub struct Encoded {
     pub data: Vec<u8>,
     pub keyframe: bool,
@@ -1163,6 +1163,8 @@ const RATE_CONTROL_CBR: u32 = 0;
 const H264_PROFILE_HIGH: u32 = 100;
 /// `eAVEncH265VProfile_Main_420_8`.
 const HEVC_PROFILE_MAIN: u32 = 1;
+/// `eAVEncAV1VProfile_Main_420_8`.
+const AV1_PROFILE_MAIN: u32 = 1;
 
 /// Longest wait on the encoder: far beyond any real encode (a 4K keyframe on
 /// a busy GPU takes ~20 ms), short enough that a lost or wedged encoder (a
@@ -1183,6 +1185,98 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 fn hrd_bytes(bitrate: u32, fps: u32, frames: u32) -> u32 {
     (bitrate as u64 * frames.max(1) as u64 / 8 / fps.max(1) as u64).min(u32::MAX as u64) as u32
 }
+
+/// The bitrate (bps) from which a frame may take the [`Tuning`]'s whole
+/// buffer; below it the buffer shrinks with the bitrate (see [`frame_cap`]).
+const FULL_BUFFER_BPS: u64 = 30_000_000;
+
+/// The largest frame, in bytes, for `bitrate` at `fps` with a buffer of
+/// `frames` — capped on a slow link when `cap` (switch `vbvcap`). Office's
+/// buffer is a quarter second of bitrate: on a LAN a page of new text arrives
+/// sharp in one frame, but at a few Mbps that quarter second is the rate
+/// controller's guess, and a relayed link that really carries 1 Mbit/s took
+/// 2-3 s to deliver one such frame (keyframes of 240-380 KB). So the time a
+/// frame may take shrinks with the bitrate: 8 ms per Mbps (240 ms at 30 Mbps),
+/// never under 100 ms (12.5 Mbps and below) nor two frames' worth, and never
+/// over the tuning's own (game's two frames stay as they are). Measured
+/// (`hardware::bad_link`, HEVC 2250x1590, desktop-like): at 8 Mbps the first
+/// keyframe 188 -> 96 KB (193 -> 99 ms of the link), the largest P picture
+/// 32 -> 26 KB, luma -0.3 dB; at 3 Mbps keyframes 76 -> 60 KB; at 1 Mbps the
+/// largest P picture 32 -> 10 KB, bitrate kept (1.16 Mbps sent against
+/// 1.22). A keyframe of dense text can't get much under ~45 KB at that size
+/// (the quantizer runs out). Lower floors overshot: at 33 ms 1 Mbps sent
+/// 2.2 Mbps, every picture at the coarsest quantizer and still too big.
+fn frame_cap(bitrate: u32, fps: u32, frames: u32, cap: bool) -> u32 {
+    let full = hrd_bytes(bitrate, fps, frames);
+    if !cap || bitrate as u64 >= FULL_BUFFER_BPS {
+        return full;
+    }
+    let ms = (bitrate as u64 * 8 / 1_000_000).max(frame_cap_floor_ms());
+    let bytes = bitrate as u64 / 8 * ms / 1000;
+    (bytes.min(full as u64) as u32).max(hrd_bytes(bitrate, fps, 2).min(full))
+}
+
+/// The least link time [`frame_cap`] leaves a frame: 100 ms
+/// (`RDPIO_NVENC_CAP_MS=n` another, for measuring).
+fn frame_cap_floor_ms() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| std::env::var("RDPIO_NVENC_CAP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100))
+}
+
+/// How the encoder behaves on slow links: each part one of the host's A/B
+/// switches. Changed at any time with [`HwEncoder::set_link_tuning`] (NVENC
+/// directly; Media Foundation ignores it). Defaults from measurements
+/// (`hardware::bad_link`, HEVC 2250x1590): the frame cap on; the other two
+/// off — they cost and gained nothing measurable there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkTuning {
+    /// `vbvcap`: the largest frame follows the bitrate ([`frame_cap`]).
+    pub vbv_cap: bool,
+    /// `presetfollow`: a slower preset at low bitrates ([`preset_for`]).
+    pub preset_follow: bool,
+    /// `introfresh`: [`HwEncoder::request_recovery`] may repair a loss with a
+    /// gradual refresh instead of a keyframe.
+    pub intra_refresh: bool,
+}
+
+impl Default for LinkTuning {
+    fn default() -> Self {
+        Self { vbv_cap: true, preset_follow: false, intra_refresh: false }
+    }
+}
+
+/// The preset low bitrates get with `presetfollow`. Measured at 2250x1590
+/// (`hardware::bad_link`, 1-8 Mbps, desktop- and video-like pictures): P4
+/// and P5 code no better than P1 with ultra-low-latency tuning (luma within
+/// ±0.2 dB, the same with the low-latency or high-quality tuning) for more
+/// time a frame (idle GPU: P1 2.1-2.5 ms, P4 5.3-6; a GPU also streaming:
+/// P1 ~9, P4 ~11, P5 ~12.5) — so
+/// the switch is off by default; it's kept for trying on real content.
+const SLOW_LINK_PRESET: u32 = 4;
+/// Below this bitrate the slow-link preset; back to the fast one above
+/// [`FAST_PRESET_BPS`] (between: whichever it was, so a rate wobbling about
+/// one value doesn't flip it every frame).
+const SLOW_PRESET_BPS: u32 = 6_000_000;
+const FAST_PRESET_BPS: u32 = 10_000_000;
+
+/// The preset for `bitrate` given the one in use (`now`) and the base
+/// (`fast`, P1 unless `RDPIO_NVENC_PRESET` says otherwise).
+fn preset_for(bitrate: u32, now: u32, fast: u32) -> u32 {
+    let slow = SLOW_LINK_PRESET.max(fast);
+    if bitrate < SLOW_PRESET_BPS {
+        slow
+    } else if bitrate > FAST_PRESET_BPS {
+        fast
+    } else {
+        now
+    }
+}
+
+/// A keyframe that would hold the link longer than this is better spread
+/// over several pictures as a gradual refresh ([`HwEncoder::prefers_gradual`]).
+const GRADUAL_OVER: Duration = Duration::from_millis(200);
+/// Pictures a gradual refresh is spread over: half a second at 60 fps.
+const REFRESH_FRAMES: u32 = 30;
 
 /// Whether a bitrate of `now` (bps) is worth rebuilding an encoder whose HRD
 /// buffer was sized for `sized`, `since` the last rebuild. A rebuild stalls
@@ -1334,7 +1428,12 @@ impl MfEncoder {
             out.SetUINT64(&MF_MT_FRAME_RATE, frame_rate)?;
             out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
             out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-            out.SetUINT32(&MF_MT_MPEG2_PROFILE, if video_codec == crate::h264::Codec::H264 { H264_PROFILE_HIGH } else { HEVC_PROFILE_MAIN })?;
+            let profile = match video_codec {
+                crate::h264::Codec::H264 => H264_PROFILE_HIGH,
+                crate::h264::Codec::Hevc => HEVC_PROFILE_MAIN,
+                crate::h264::Codec::Av1 => AV1_PROFILE_MAIN,
+            };
+            out.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
             out.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
             out.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
             transform.SetOutputType(0, &out, 0)?;
@@ -1367,6 +1466,7 @@ impl MfEncoder {
                 .GetOutputCurrentType(0)
                 .ok()
                 .and_then(|t| blob(&t, &MF_MT_MPEG_SEQUENCE_HEADER))
+                .map(|h| if video_codec == crate::h264::Codec::Av1 { av1_config_obus(&h) } else { h })
                 .unwrap_or_default();
 
             let events: IMFMediaEventGenerator = transform.cast()?;
@@ -1710,6 +1810,14 @@ struct Nvenc {
     next: nvenc::Picture,
     /// A bitrate the driver refused, and when: not asked again for a while.
     refused: Option<(u32, Instant)>,
+    link: LinkTuning,
+    /// The base preset and the one in use.
+    fast_preset: u32,
+    preset: u32,
+    /// A preset the driver wouldn't change to: not asked again.
+    preset_refused: bool,
+    /// The last keyframe's size (bytes; 0: none yet).
+    last_key_bytes: usize,
 }
 
 /// NVENC's preset: P1, the fastest. Measured on a screen of new office text
@@ -1721,6 +1829,29 @@ struct Nvenc {
 /// picks another preset, for measuring.
 fn nvenc_preset() -> u32 {
     std::env::var("RDPIO_NVENC_PRESET").ok().and_then(|v| v.parse::<u32>().ok()).map_or(1, |p| p.clamp(1, 7))
+}
+
+impl Nvenc {
+    /// The preset for `bps` (switch `presetfollow`), changed in place where
+    /// it should change — NVENC takes a new preset through
+    /// NvEncReconfigureEncoder without a new session or a keyframe.
+    fn follow_preset(&mut self, bps: u32) {
+        let want = if self.link.preset_follow { preset_for(bps, self.preset, self.fast_preset) } else { self.fast_preset };
+        if want == self.preset || self.preset_refused {
+            return;
+        }
+        let Some(s) = self.session.as_mut() else { return };
+        match s.set_preset(want) {
+            Ok(()) => {
+                tracing::info!(from = self.preset, to = want, bps, "NVENC preset follows the bitrate");
+                self.preset = want;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, want, "NVENC kept its preset");
+                self.preset_refused = true;
+            }
+        }
+    }
 }
 
 /// The quality ([`Tuning::quality`]) from which Media Foundation's NVIDIA
@@ -1757,15 +1888,35 @@ impl HwEncoder {
         video_codec: crate::h264::Codec,
         tuning: Tuning,
     ) -> WinResult<Self> {
-        if tuning.quality < MF_QUALITY && std::env::var("RDPIO_NVENC").map_or(true, |v| v != "0") {
-            let preset = nvenc_preset();
+        // AV1 always goes to NVENC directly where it opens: the Media
+        // Foundation route has no quality setting for it to win on.
+        let av1 = video_codec == crate::h264::Codec::Av1;
+        if (av1 || tuning.quality < MF_QUALITY) && std::env::var("RDPIO_NVENC").map_or(true, |v| v != "0") {
+            // Opened with the default link tuning (the host changes it with
+            // set_link_tuning): the preset following the starting bitrate,
+            // the largest frame capped, a gradual refresh available.
+            let link = LinkTuning::default();
+            let fast_preset = nvenc_preset();
+            let preset = preset_for(bitrate, fast_preset, fast_preset);
+            // AV1 keeps long-term references only through API 13.0 (a driver
+            // from 570); without them its losses take a keyframe.
             let slots = ltr_slots();
-            let hevc = video_codec == crate::h264::Codec::Hevc;
-            let vbv = hrd_bytes(bitrate, fps, tuning.buffer_frames);
-            match nvenc::Session::open(device, hevc, (width, height), fps, bitrate, vbv, preset, slots, rgb) {
+            let vbv = frame_cap(bitrate, fps, tuning.buffer_frames, link.vbv_cap);
+            let opts = |intra_refresh| nvenc::Options { preset, ltr_frames: slots, argb: rgb, intra_refresh };
+            // A gradual refresh if the driver takes one beside the references;
+            // else without (losses then take a keyframe or a reference).
+            // (RDPIO_NVENC_REFRESH=n: n pictures a refresh; 0: none.)
+            let refresh = std::env::var("RDPIO_NVENC_REFRESH").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(REFRESH_FRAMES);
+            let opened = nvenc::Session::open(device, video_codec, (width, height), fps, bitrate, vbv, opts(refresh)).or_else(|e| {
+                tracing::info!(reason = %e, "NVENC: no gradual refresh here");
+                nvenc::Session::open(device, video_codec, (width, height), fps, bitrate, vbv, opts(0))
+            });
+            match opened {
                 Ok(session) => {
-                    let name = format!("NVIDIA NVENC {} (direct, P{preset})", video_codec.name().to_uppercase());
-                    tracing::info!(encoder = %name, width, height, fps, bitrate, rgb_input = rgb, ltr = slots > 0, "hardware encoder ready");
+                    let ltr = session.keeps_ltr(video_codec, slots);
+                    let name = format!("NVIDIA NVENC {} (direct, P{fast_preset})", video_codec.name().to_uppercase());
+                    tracing::info!(encoder = %name, width, height, fps, bitrate, rgb_input = rgb, ltr, preset, vbv_bytes = vbv,
+                        intra_refresh = session.intra_refresh(), api = session.api(), "hardware encoder ready");
                     return Ok(Self {
                         inner: Inner::Nv(Nvenc {
                             session: Some(session),
@@ -1775,10 +1926,15 @@ impl HwEncoder {
                             force_key: true,
                             next: nvenc::Picture::default(),
                             refused: None,
+                            link,
+                            fast_preset,
+                            preset,
+                            preset_refused: false,
+                            last_key_bytes: 0,
                         }),
                         name,
                         bitrate,
-                        ltr: slots > 0,
+                        ltr,
                         id: NEXT_ENCODER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     });
                 }
@@ -1802,7 +1958,7 @@ impl HwEncoder {
                 if nv.refused.is_some_and(|(r, t)| t.elapsed() < Duration::from_secs(5) && (r as i64 - bps as i64).unsigned_abs() < r as u64 / 10) {
                     return;
                 }
-                match s.set_bitrate(bps, hrd_bytes(bps, nv.fps, nv.tuning.buffer_frames)) {
+                match s.set_bitrate(bps, frame_cap(bps, nv.fps, nv.tuning.buffer_frames, nv.link.vbv_cap)) {
                     Ok(()) => {
                         self.bitrate = bps;
                         nv.refused = None;
@@ -1812,11 +1968,97 @@ impl HwEncoder {
                         nv.refused = Some((bps, Instant::now()));
                     }
                 }
+                nv.follow_preset(bps);
             }
         }
     }
 
-    /// See [`MfEncoder::set_quality`] (NVENC: the preset is fixed per session).
+    /// The host's switches for slow links (see [`LinkTuning`]); cheap when
+    /// nothing changed, so it can be called every frame.
+    pub fn set_link_tuning(&mut self, link: LinkTuning) {
+        let Inner::Nv(nv) = &mut self.inner else { return };
+        if nv.link == link {
+            return;
+        }
+        let cap_changed = nv.link.vbv_cap != link.vbv_cap;
+        tracing::info!(?link, "encoder link tuning");
+        nv.link = link;
+        if cap_changed {
+            // The largest frame again, for the same bitrate.
+            if let Some(s) = nv.session.as_mut() {
+                if let Err(e) = s.set_bitrate(self.bitrate, frame_cap(self.bitrate, nv.fps, nv.tuning.buffer_frames, link.vbv_cap)) {
+                    tracing::warn!(error = %e, "NVENC kept its frame cap");
+                }
+            }
+        }
+        nv.follow_preset(self.bitrate);
+    }
+
+    /// The NVENC preset in use (0: Media Foundation's encoder).
+    pub fn preset(&self) -> u32 {
+        match &self.inner {
+            Inner::Nv(nv) => nv.preset,
+            Inner::Mf(_) => 0,
+        }
+    }
+
+    /// Whether a lost picture is better repaired with a gradual refresh than
+    /// a keyframe: one is available (switch `introfresh`, a driver that does
+    /// it), and a keyframe — the last one's size, else the largest frame
+    /// allowed — would hold the link at the current bitrate longer than
+    /// [`GRADUAL_OVER`] (200 ms). On a LAN a keyframe takes a few ms: keep it.
+    pub fn prefers_gradual(&self) -> bool {
+        let Inner::Nv(nv) = &self.inner else { return false };
+        if !nv.link.intra_refresh || nv.session.as_ref().is_none_or(|s| s.intra_refresh() == 0) {
+            return false;
+        }
+        let key = if nv.last_key_bytes > 0 {
+            nv.last_key_bytes as u64
+        } else {
+            frame_cap(self.bitrate, nv.fps, nv.tuning.buffer_frames, nv.link.vbv_cap) as u64
+        };
+        key * 8 * 1000 > self.bitrate.max(1) as u64 * GRADUAL_OVER.as_millis() as u64
+    }
+
+    /// Repair a loss: `gradual` — a refresh spread over the next pictures
+    /// (each a P picture with a band of intra blocks; the picture is whole
+    /// again once the band has crossed it, ~half a second) where the encoder
+    /// can (see [`prefers_gradual`](Self::prefers_gradual)), else a keyframe.
+    /// Until the band has passed, the parts of the picture it hasn't reached
+    /// yet still show whatever the loss left (smearing, a stale patch).
+    /// Returns whether it's gradual. A decoder that is starting (or that
+    /// threw its references away) needs a real keyframe: ask for one then.
+    ///
+    /// Measured (`hardware::bad_link`): the refresh's pictures are small (at
+    /// 1/3/8 Mbps the largest 7/29/21 KB against keyframes of 46/46/53 KB),
+    /// but Microsoft's HEVC decoders — the GPU one the Windows client uses
+    /// and the software one — show nothing after a gap until the next
+    /// keyframe: the refresh's first pictures refer to the lost one. So it
+    /// only helps a client whose decoder carries on past a gap (to be tried
+    /// on the tablet's), and switch `introfresh` is off by default.
+    pub fn request_recovery(&mut self, gradual: bool) -> bool {
+        if gradual {
+            if let Inner::Nv(nv) = &mut self.inner {
+                if nv.link.intra_refresh && nv.session.as_ref().is_some_and(|s| s.intra_refresh() > 0) && !nv.force_key {
+                    nv.next.refresh = true;
+                    return true;
+                }
+            }
+        }
+        self.request_keyframe();
+        false
+    }
+
+    /// Pictures a gradual refresh takes (0: none available).
+    pub fn refresh_frames(&self) -> u32 {
+        match &self.inner {
+            Inner::Nv(nv) if nv.link.intra_refresh => nv.session.as_ref().map_or(0, |s| s.intra_refresh()),
+            _ => 0,
+        }
+    }
+
+    /// See [`MfEncoder::set_quality`] (NVENC: the preset follows the bitrate
+    /// instead, see [`LinkTuning::preset_follow`]).
     pub fn set_quality(&mut self, quality: u32) -> bool {
         match &mut self.inner {
             Inner::Mf(mf) => mf.set_quality(quality),
@@ -1874,6 +2116,9 @@ impl HwEncoder {
                 let pic = nvenc::Picture { keyframe: nv.force_key, ..nv.next };
                 let input = nv.frames_in;
                 let (data, keyframe, _) = s.encode(texture, pic, input).map_err(|e| Error::new(E_FAIL, e))?;
+                if keyframe {
+                    nv.last_key_bytes = data.len();
+                }
                 nv.frames_in += 1;
                 nv.force_key = false;
                 nv.next = nvenc::Picture::default();
@@ -2161,11 +2406,46 @@ pub fn can_encode(codec: crate::h264::Codec) -> bool {
             return yes;
         }
     }
-    let yes = unsafe { MFStartup(MF_VERSION, MFSTARTUP_LITE).is_ok() && pick_hardware_encoder(None, codec).is_ok() };
+    let yes = if codec == crate::h264::Codec::Av1 {
+        nvenc_opens(codec)
+    } else {
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_LITE).is_ok() && pick_hardware_encoder(None, codec).is_ok() }
+    };
     let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
     known.retain(|k| k.0 != codec);
     known.push((codec, yes, Instant::now()));
     yes
+}
+
+/// Whether NVENC opens a session for `codec` on the default GPU (AV1: only
+/// NVENC directly is relied on for it). A small session, opened and closed.
+fn nvenc_opens(codec: crate::h264::Codec) -> bool {
+    if std::env::var("RDPIO_NVENC").is_ok_and(|v| v == "0") {
+        return false;
+    }
+    let mut device = None;
+    let made = unsafe {
+        D3D11CreateDevice(
+            None,
+            windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )
+    };
+    let Some(device) = made.ok().and(device) else { return false };
+    let opts = nvenc::Options { preset: 1, ltr_frames: 0, argb: false, intra_refresh: 0 };
+    match nvenc::Session::open(&device, codec, (640, 360), 60, 2_000_000, 100_000, opts) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::info!(codec = codec.name(), reason = %e, "no NVENC encoder for it");
+            false
+        }
+    }
 }
 
 /// The client's decodable codecs, best first. `forced` limits it to one.
@@ -2280,9 +2560,15 @@ pub fn has_nal(annex_b: &[u8], nal_type: u8) -> bool {
 }
 
 /// Whether an Annex-B access unit carries its parameter sets (an SPS for
-/// H.264, a VPS for HEVC). They come before the first slice, so the scan stops
-/// there rather than reading through the whole picture.
+/// H.264, a VPS for HEVC; AV1: a sequence header OBU). They come before the
+/// first slice, so the scan stops there rather than reading through the whole
+/// picture.
 fn has_parameter_sets(annex_b: &[u8], codec: crate::h264::Codec) -> bool {
+    if codec == crate::h264::Codec::Av1 {
+        return av1_obus(annex_b)
+            .take_while(|o| !matches!(o.kind, OBU_FRAME_HEADER | OBU_TILE_GROUP | OBU_FRAME))
+            .any(|o| o.kind == OBU_SEQUENCE_HEADER);
+    }
     let mut i = 0;
     while i + 3 < annex_b.len() {
         if annex_b[i] == 0 && annex_b[i + 1] == 0 && annex_b[i + 2] == 1 {
@@ -2298,6 +2584,7 @@ fn has_parameter_sets(annex_b: &[u8], codec: crate::h264::Codec) -> bool {
                     0..=31 => return false,
                     _ => {}
                 },
+                crate::h264::Codec::Av1 => unreachable!(),
             }
             i += 3;
         } else {
@@ -2305,6 +2592,67 @@ fn has_parameter_sets(annex_b: &[u8], codec: crate::h264::Codec) -> bool {
         }
     }
     false
+}
+
+/// AV1 OBU types (spec 6.2.2).
+pub const OBU_SEQUENCE_HEADER: u8 = 1;
+pub const OBU_TEMPORAL_DELIMITER: u8 = 2;
+pub const OBU_FRAME_HEADER: u8 = 3;
+pub const OBU_TILE_GROUP: u8 = 4;
+pub const OBU_FRAME: u8 = 6;
+
+/// One OBU of a low-overhead AV1 stream: its type and payload.
+#[derive(Debug, Clone, Copy)]
+pub struct Obu<'a> {
+    pub kind: u8,
+    pub payload: &'a [u8],
+}
+
+/// The OBUs of a low-overhead AV1 stream (spec 5.3: each with its size
+/// field), in order; stops at the first malformed one, or one without a size
+/// (only the last may lack it).
+pub fn av1_obus(data: &[u8]) -> impl Iterator<Item = Obu<'_>> {
+    let mut rest = data;
+    std::iter::from_fn(move || {
+        let (&header, after) = rest.split_first()?;
+        if header & 0x80 != 0 {
+            rest = &[];
+            return None;
+        }
+        let kind = (header >> 3) & 0x0f;
+        let mut at = if header & 0x04 != 0 { 1 } else { 0 }; // extension byte
+        let size = if header & 0x02 != 0 {
+            let mut v = 0u64;
+            let mut n = 0;
+            loop {
+                let &b = after.get(at + n)?;
+                v |= ((b & 0x7f) as u64) << (7 * n);
+                n += 1;
+                if b & 0x80 == 0 || n == 8 {
+                    break;
+                }
+            }
+            at += n;
+            v as usize
+        } else {
+            after.len().checked_sub(at)?
+        };
+        let payload = after.get(at..at.checked_add(size)?)?;
+        rest = &after[at + size..];
+        Some(Obu { kind, payload })
+    })
+}
+
+/// The OBUs of an `av1C` record (ISO BMFF AV1 binding 2.3: 4 bytes, then the
+/// configuration OBUs), or the blob as it is when it's OBUs already. Empty
+/// when there's no sequence header in it.
+fn av1_config_obus(blob: &[u8]) -> Vec<u8> {
+    let obus = if blob.first() == Some(&0x81) && blob.len() > 4 { &blob[4..] } else { blob };
+    if av1_obus(obus).any(|o| o.kind == OBU_SEQUENCE_HEADER) {
+        obus.to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -2333,12 +2681,57 @@ mod tests {
     }
 
     #[test]
+    fn av1_sequence_headers_are_found() {
+        // Temporal delimiter, sequence header (3 bytes), frame (2 bytes).
+        let key = [0x12, 0x00, 0x0a, 0x03, 0xaa, 0xbb, 0xcc, 0x32, 0x02, 0x10, 0x20];
+        assert!(has_parameter_sets(&key, Codec::Av1));
+        let kinds: Vec<u8> = av1_obus(&key).map(|o| o.kind).collect();
+        assert_eq!(kinds, [OBU_TEMPORAL_DELIMITER, OBU_SEQUENCE_HEADER, OBU_FRAME]);
+        // A frame first: nothing after it counts.
+        assert!(!has_parameter_sets(&[0x12, 0x00, 0x32, 0x01, 0x10, 0x0a, 0x01, 0xaa], Codec::Av1));
+        assert!(!has_parameter_sets(&[], Codec::Av1));
+        // Truncated: a size past the end yields nothing more.
+        assert_eq!(av1_obus(&[0x12, 0x00, 0x0a, 0x09, 0xaa]).count(), 1);
+        // An av1C record's OBUs, and OBUs as they are.
+        let av1c = [0x81, 0x00, 0x0c, 0x00, 0x0a, 0x03, 0xaa, 0xbb, 0xcc];
+        assert_eq!(av1_config_obus(&av1c), &av1c[4..]);
+        assert_eq!(av1_config_obus(&av1c[4..]), &av1c[4..]);
+        assert!(av1_config_obus(&[0x81, 0, 0, 0]).is_empty());
+        assert_eq!(Codec::from_name("av1"), Some(Codec::Av1));
+    }
+
+    #[test]
     fn hrd_buffer_is_two_frames_in_bytes() {
         assert_eq!(hrd_bytes(20_000_000, 120, 2), 41_666);
         assert_eq!(hrd_bytes(80_000_000, 60, 2), 333_333);
         assert_eq!(hrd_bytes(4_000_000_000, 1, 2), 1_000_000_000);
         assert_eq!(hrd_bytes(5_000_000, 0, 2), 1_250_000);
         assert_eq!(hrd_bytes(40_000_000, 60, 30), 2_500_000);
+    }
+
+    #[test]
+    fn frame_cap_follows_a_slow_link() {
+        // Office's quarter second (15 frames at 60 fps).
+        let office = |bps| frame_cap(bps, 60, 15, true);
+        // Off, or from 30 Mbps: the whole buffer.
+        assert_eq!(frame_cap(8_000_000, 60, 15, false), 250_000);
+        assert_eq!(office(40_000_000), 1_250_000);
+        // Under it: 8 ms of link per Mbps, at least 100 ms.
+        assert_eq!(office(20_000_000), 2_500_000 * 160 / 1000);
+        assert_eq!(office(8_000_000), 100_000);
+        assert_eq!(office(1_000_000), 12_500);
+        // Never past the tuning's own (game: two frames).
+        assert_eq!(frame_cap(8_000_000, 60, 2, true), hrd_bytes(8_000_000, 60, 2));
+    }
+
+    #[test]
+    fn preset_follows_with_hysteresis() {
+        assert_eq!(preset_for(5_000_000, 1, 1), SLOW_LINK_PRESET);
+        assert_eq!(preset_for(8_000_000, SLOW_LINK_PRESET, 1), SLOW_LINK_PRESET);
+        assert_eq!(preset_for(8_000_000, 1, 1), 1);
+        assert_eq!(preset_for(11_000_000, SLOW_LINK_PRESET, 1), 1);
+        // A slower base preset (RDPIO_NVENC_PRESET) is never made faster.
+        assert_eq!(preset_for(5_000_000, 6, 6), 6);
         // Rebuilds: big moves only, and not in quick succession…
         let s = Duration::from_secs;
         assert!(!needs_rebuild(30_000_000, 20_000_000, s(60)), "1.5x up isn't worth one");
@@ -2657,6 +3050,437 @@ mod hardware {
         }
     }
 
+    /// AV1 against HEVC on NVENC: a desktop-like moving picture (a page of
+    /// text scrolling, a "video" window of noisy gradient sliding over it), 300
+    /// frames at 60 fps, at the same bitrates. Checks AV1's stream shape (one
+    /// temporal unit per picture: a temporal delimiter, one shown frame, a
+    /// sequence header on keyframes only, every byte in an OBU) and keyframes
+    /// on request; prints bytes per frame, encode time and — where Windows has
+    /// an AV1 decoder (the AV1 Video Extension) — the decoded luma PSNR.
+    /// `AV1_SIZE=3000x2120` for the tablet's screen.
+    /// `cargo test --release -p rdp-gpu --lib hyper::hardware::av1_against_hevc -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn av1_against_hevc() {
+        #[link(name = "winmm")]
+        extern "system" {
+            fn timeBeginPeriod(ms: u32) -> u32;
+        }
+        unsafe {
+            timeBeginPeriod(1);
+            let (w, h) = std::env::var("AV1_SIZE")
+                .ok()
+                .and_then(|s| s.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))))
+                .unwrap_or((1920u32, 1080u32));
+            let (fps, n) = (60u32, 300u32);
+            let (bw, bh) = (w + 400, h + 1200);
+            let page = text_picture(bw, bh);
+            let (vw, vh) = (w / 4 & !1, h / 4 & !1);
+            let frame = |i: u32| {
+                let (ox, oy) = ((i * 2) % 400, (i * 4) % 1200);
+                let mut bgra = vec![0u8; (w * h * 4) as usize];
+                for y in 0..h {
+                    let src = (((y + oy) * bw + ox) * 4) as usize;
+                    bgra[(y * w * 4) as usize..((y + 1) * w * 4) as usize].copy_from_slice(&page[src..src + (w * 4) as usize]);
+                }
+                // The "video": a gradient that drifts, with grain, moving right.
+                let (vx, vy) = ((i * 3) % (w - vw), h / 3);
+                let mut x32 = i.wrapping_mul(2_654_435_761) | 1;
+                for y in 0..vh {
+                    for x in 0..vw {
+                        x32 ^= x32 << 13;
+                        x32 ^= x32 >> 17;
+                        x32 ^= x32 << 5;
+                        let at = (((vy + y) * w + vx + x) * 4) as usize;
+                        let g = ((x + i * 2) * 255 / vw.max(1)) as u8;
+                        bgra[at] = g.wrapping_add((x32 >> 28) as u8);
+                        bgra[at + 1] = ((y * 255 / vh.max(1)) as u8).wrapping_add((x32 >> 24 & 7) as u8);
+                        bgra[at + 2] = 255 - g;
+                    }
+                }
+                nv12_of(&bgra, w, h)
+            };
+            let frames: Vec<Vec<u8>> = (0..n).map(frame).collect();
+            let (mut device, mut context) = (None, None);
+            D3D11CreateDevice(None, windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, None, D3D11_SDK_VERSION,
+                Some(&mut device), None, Some(&mut context)).unwrap();
+            let (device, context): (ID3D11Device, ID3D11DeviceContext) = (device.unwrap(), context.unwrap());
+            let _ = device.cast::<ID3D11Multithread>().map(|m| m.SetMultithreadProtected(true));
+            let tex = texture(&device, (w, h), DXGI_FORMAT_NV12, D3D11_BIND_RENDER_TARGET.0 as u32).unwrap();
+            assert!(can_encode(Codec::Av1), "no AV1 encoder (NVENC) here");
+            let av1_decodes = crate::h264::H264GpuDecoder::with_codec(w, h, &device, &context, Codec::Av1).is_ok();
+            println!("{w}x{h} {fps} fps, {n} frames; Windows decodes AV1 on the GPU: {av1_decodes}");
+            let rates: Vec<u32> = std::env::var("AV1_MBPS")
+                .ok()
+                .map(|s| s.split(',').filter_map(|v| v.parse().ok()).collect())
+                .unwrap_or_else(|| vec![4, 8, 12, 16, 24]);
+            for &mbps in &rates {
+                for codec in [Codec::Hevc, Codec::Av1] {
+                    let mut enc = HwEncoder::new(&device, None, w, h, fps, mbps * 1_000_000, false, codec).unwrap();
+                    assert!(enc.name.contains("NVENC"), "{} isn't NVENC directly", enc.name);
+                    // AV1 keeps long-term references where the driver has
+                    // NVENC API 13.0 (570 on).
+                    assert_eq!(enc.ltr, codec != Codec::Av1 || nvenc::driver_api() >= (13, 0));
+                    let mut dec = if codec != Codec::Av1 || av1_decodes {
+                        Some(crate::h264::H264GpuDecoder::with_codec(w, h, &device, &context, codec).unwrap())
+                    } else {
+                        None
+                    };
+                    let (mut enc_ms, mut psnrs, mut bytes, mut keys, mut decoded) = (Vec::new(), Vec::new(), 0usize, Vec::new(), 0usize);
+                    for (i, f) in frames.iter().enumerate() {
+                        context.UpdateSubresource(&tex, 0, None, f.as_ptr() as *const c_void, w, 0);
+                        if i == 150 {
+                            enc.request_keyframe();
+                        }
+                        let t = Instant::now();
+                        let u = enc.encode(&tex).unwrap().expect("NVENC holds nothing back");
+                        enc_ms.push(t.elapsed().as_secs_f64() * 1e3);
+                        bytes += u.data.len();
+                        if u.keyframe {
+                            keys.push(i);
+                        }
+                        assert_eq!(u.keyframe, has_parameter_sets(&u.data, codec), "frame {i}: keyframe {} but parameter sets disagree", u.keyframe);
+                        if codec == Codec::Av1 {
+                            let obus: Vec<Obu> = av1_obus(&u.data).collect();
+                            let parsed: usize = obus.iter().map(|o| o.payload.len()).sum::<usize>();
+                            assert!(parsed < u.data.len() && u.data.len() - parsed <= obus.len() * 9, "frame {i}: bytes outside OBUs");
+                            let end = obus.last().map_or(0, |o| o.payload.as_ptr() as usize + o.payload.len() - u.data.as_ptr() as usize);
+                            assert_eq!(end, u.data.len(), "frame {i}: trailing bytes after the last OBU");
+                            assert_eq!(obus[0].kind, OBU_TEMPORAL_DELIMITER, "frame {i}: no temporal delimiter first");
+                            assert_eq!(obus.iter().filter(|o| o.kind == OBU_TEMPORAL_DELIMITER).count(), 1, "frame {i}: one temporal unit");
+                            let shown = obus.iter().filter(|o| matches!(o.kind, OBU_FRAME | OBU_FRAME_HEADER)).count();
+                            assert_eq!(shown, 1, "frame {i}: {shown} frames in one temporal unit ({:?})", obus.iter().map(|o| o.kind).collect::<Vec<_>>());
+                            if i < 2 || i == 150 {
+                                println!("  {mbps} Mbps frame {i}: OBUs {:?}, {} bytes", obus.iter().map(|o| (o.kind, o.payload.len())).collect::<Vec<_>>(), u.data.len());
+                            }
+                        }
+                        if let Some(d) = dec.as_mut() {
+                            let out = d.decode(&u.data).unwrap();
+                            decoded += out.len();
+                            if i >= 10 {
+                                for d in out {
+                                    let mut td = D3D11_TEXTURE2D_DESC::default();
+                                    d.texture.GetDesc(&mut td);
+                                    let all = read_back(&device, &context, &d.texture, (td.Width, td.Height));
+                                    let mut px = Vec::with_capacity((w * h * 3 / 2) as usize);
+                                    for row in (0..h).chain(td.Height..td.Height + h / 2) {
+                                        let at = (row * td.Width) as usize;
+                                        px.extend_from_slice(&all[at..at + w as usize]);
+                                    }
+                                    psnrs.push(psnr_luma(f, &px, w, h));
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(keys, [0, 150], "{}: keyframes at the start and on request only", codec.name());
+                    if dec.is_some() {
+                        assert!(decoded + 2 >= frames.len(), "{}: {decoded} of {} pictures decoded", codec.name(), frames.len());
+                    }
+                    let mean = psnrs.iter().sum::<f64>() / psnrs.len().max(1) as f64;
+                    enc_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    println!(
+                        "{mbps:>2} Mbps {:>4}: {:>6} bytes/frame ({:5.2} Mbps) | luma {} | encode p50 {:.2} p90 {:.2} ms",
+                        codec.name(),
+                        bytes / frames.len(),
+                        bytes as f64 * 8.0 * fps as f64 / frames.len() as f64 / 1e6,
+                        if psnrs.is_empty() { "  n/a  ".to_string() } else { format!("{mean:5.2} dB") },
+                        enc_ms[enc_ms.len() / 2],
+                        enc_ms[enc_ms.len() * 9 / 10],
+                    );
+                }
+            }
+            // BGRA in (the host's way at desktop size): AV1 opens and codes it.
+            let rgb = picture(&device, (w, h), true, 1, 32);
+            let mut enc = HwEncoder::new(&device, None, w, h, fps, 8_000_000, true, Codec::Av1).unwrap();
+            let u = enc.encode(&rgb).unwrap().unwrap();
+            assert!(u.keyframe && has_parameter_sets(&u.data, Codec::Av1));
+            println!("BGRA input: {} ({} bytes keyframe)", enc.name, u.data.len());
+        }
+    }
+
+    /// The encoder on a slow link (`LinkTuning`): HEVC at the tablet's stream
+    /// size (2250x1590, 60 fps, office's quarter-second buffer, NVENC's fast
+    /// path), on a desktop-like picture (a page of text, still but for two
+    /// short scrolls, a small noisy "video" sliding over it) and a video-like
+    /// one (the whole screen
+    /// a moving noisy gradient), at 1, 3 and 8 Mbps, per configuration:
+    /// - `old`: no frame cap, P1 (as before);
+    /// - `cap`: the largest frame follows the bitrate (`vbvcap`);
+    /// - `cap+P4`, `cap+P5`: and a slower preset (`presetfollow`);
+    /// - `cap+IR`: and a loss repaired with a gradual refresh (`introfresh`).
+    /// 150 pictures: a keyframe first, one asked for at 60; 90-92 never reach
+    /// the decoder and 93 repairs it (a keyframe, or the refresh). Prints the
+    /// keyframes' sizes (and the link time at the bitrate), the largest
+    /// P picture, encode time, luma PSNR (all pictures; the first ten; the
+    /// last 20, after any repair) and the repair's largest picture.
+    /// `BAD_LINK_SIZE=WxH`, `BAD_LINK_MBPS=1,3,8`, `BAD_LINK_CONFIGS=old,cap`,
+    /// `BAD_LINK_CONTENT=desktop|video`.
+    /// `cargo test --release -p rdp-gpu --lib hyper::hardware::bad_link -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bad_link() {
+        #[link(name = "winmm")]
+        extern "system" {
+            fn timeBeginPeriod(ms: u32) -> u32;
+        }
+        unsafe {
+            timeBeginPeriod(1);
+            let (w, h) = std::env::var("BAD_LINK_SIZE")
+                .ok()
+                .and_then(|s| s.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))))
+                .unwrap_or((2250u32, 1590u32));
+            let (fps, n) = (60u32, 150usize);
+            let rates: Vec<u32> = std::env::var("BAD_LINK_MBPS")
+                .ok()
+                .map(|s| s.split(',').filter_map(|v| v.parse().ok()).collect())
+                .unwrap_or_else(|| vec![1, 3, 8]);
+            // (label, vbvcap, preset, repair gradually, pictures a refresh at open)
+            let all = [
+                ("old", false, 1u32, false, 0u32),
+                ("cap", true, 1, false, 0),
+                ("cap+IRo", true, 1, false, 30),
+                ("cap+P4", true, 4, false, 0),
+                ("cap+P5", true, 5, false, 0),
+                ("cap+IR", true, 1, true, 30),
+            ];
+            let wanted = std::env::var("BAD_LINK_CONFIGS").ok();
+            let configs: Vec<_> = all.iter().filter(|c| wanted.as_ref().is_none_or(|w| w.split(',').any(|x| x == c.0))).copied().collect();
+            let contents: Vec<&str> = match std::env::var("BAD_LINK_CONTENT") {
+                Ok(c) => vec![if c == "video" { "video" } else { "desktop" }],
+                Err(_) => vec!["desktop", "video"],
+            };
+            let (mut device, mut context) = (None, None);
+            D3D11CreateDevice(None, windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, None, D3D11_SDK_VERSION,
+                Some(&mut device), None, Some(&mut context)).unwrap();
+            let (device, context): (ID3D11Device, ID3D11DeviceContext) = (device.unwrap(), context.unwrap());
+            let _ = device.cast::<ID3D11Multithread>().map(|m| m.SetMultithreadProtected(true));
+            let tex = texture(&device, (w, h), DXGI_FORMAT_NV12, D3D11_BIND_RENDER_TARGET.0 as u32).unwrap();
+            println!("{w}x{h} {fps} fps HEVC, NVENC API offered by the driver {:?}", nvenc::driver_api());
+            for content in contents {
+                let frames: Vec<Vec<u8>> = if content == "desktop" {
+                    let (bw, bh) = (w + 400, h + 600);
+                    let page = text_picture(bw, bh);
+                    let (vw, vh) = (w / 4 & !1, h / 4 & !1);
+                    // Still but for a scroll at 30-45 (4 rows a frame) and at
+                    // 100-110, and the video window moving all along.
+                    (0..n as u32)
+                        .map(|i| {
+                            let scrolled = i.clamp(30, 45) - 30 + i.clamp(100, 110) - 100;
+                            let (ox, oy) = (0, (scrolled * 4) % 600);
+                            let mut bgra = vec![0u8; (w * h * 4) as usize];
+                            for y in 0..h {
+                                let src = (((y + oy) * bw + ox) * 4) as usize;
+                                bgra[(y * w * 4) as usize..((y + 1) * w * 4) as usize].copy_from_slice(&page[src..src + (w * 4) as usize]);
+                            }
+                            let (vx, vy) = ((i * 3) % (w - vw), h / 3);
+                            let mut x32 = i.wrapping_mul(2_654_435_761) | 1;
+                            for y in 0..vh {
+                                for x in 0..vw {
+                                    x32 ^= x32 << 13;
+                                    x32 ^= x32 >> 17;
+                                    x32 ^= x32 << 5;
+                                    let at = (((vy + y) * w + vx + x) * 4) as usize;
+                                    let g = ((x + i * 2) * 255 / vw.max(1)) as u8;
+                                    bgra[at] = g.wrapping_add((x32 >> 28) as u8);
+                                    bgra[at + 1] = ((y * 255 / vh.max(1)) as u8).wrapping_add((x32 >> 24 & 7) as u8);
+                                    bgra[at + 2] = 255 - g;
+                                }
+                            }
+                            nv12_of(&bgra, w, h)
+                        })
+                        .collect()
+                } else {
+                    // Straight to NV12: a moving gradient with grain and a
+                    // bright disc crossing it (a film-like full screen).
+                    (0..n as u32)
+                        .map(|i| {
+                            let mut v = vec![128u8; (w * h * 3 / 2) as usize];
+                            let mut x32 = i.wrapping_mul(2_654_435_761) | 1;
+                            let (cx, cy, r) = ((200 + i * 12) as i64, (h / 2) as i64, (h / 5) as i64);
+                            for y in 0..h {
+                                for x in 0..w {
+                                    x32 ^= x32 << 13;
+                                    x32 ^= x32 >> 17;
+                                    x32 ^= x32 << 5;
+                                    let (dx, dy) = (x as i64 - cx, y as i64 - cy);
+                                    let base = if dx * dx + dy * dy < r * r { 200 } else { 30 + (x / 12 + y / 9 + i * 2) % 150 };
+                                    v[(y * w + x) as usize] = (base + (x32 >> 29)) as u8;
+                                }
+                            }
+                            for y in 0..h / 2 {
+                                for x in (0..w).step_by(2) {
+                                    let i2 = (w * h + y * w + x) as usize;
+                                    v[i2] = (100 + (x / 16 + i) % 60) as u8;
+                                    v[i2 + 1] = (110 + (y / 8 + i) % 40) as u8;
+                                }
+                            }
+                            v
+                        })
+                        .collect()
+                };
+                // Warm up (the GPU's clocks): a second of encoding first.
+                {
+                    let mut enc = HwEncoder::new(&device, None, w, h, fps, 8_000_000, false, Codec::Hevc).unwrap();
+                    for f in frames.iter().take(60) {
+                        context.UpdateSubresource(&tex, 0, None, f.as_ptr() as *const c_void, w, 0);
+                        enc.encode(&tex).unwrap();
+                    }
+                }
+                for &mbps in &rates {
+                    let bps = mbps * 1_000_000;
+                    for &(label, cap, preset, gradual, refresh) in &configs {
+                        std::env::set_var("RDPIO_NVENC_PRESET", preset.to_string());
+                        std::env::set_var("RDPIO_NVENC_REFRESH", refresh.to_string());
+                        let tuning = Tuning { buffer_frames: (fps / 4).max(2), quality: 0 };
+                        let mut enc = HwEncoder::new_tuned(&device, None, w, h, fps, bps, false, Codec::Hevc, tuning).unwrap();
+                        enc.set_link_tuning(LinkTuning { vbv_cap: cap, preset_follow: false, intra_refresh: gradual });
+                        assert_eq!(enc.preset(), preset);
+                        let mut dec = crate::h264::H264GpuDecoder::with_codec(w, h, &device, &context, Codec::Hevc).unwrap();
+                        let (mut enc_ms, mut psnrs, mut sizes, mut keys, mut errors) = (Vec::new(), vec![f64::NAN; n], Vec::new(), Vec::new(), 0);
+                        let mut repair_max = 0usize;
+                        let mut gradual_used = false;
+                        // A software decoder beside it (Microsoft's): how a
+                        // decoder that carries on past a gap sees a refresh.
+                        let mut soft = if gradual { crate::h264::H264Decoder::with_codec(w, h, Codec::Hevc).ok() } else { None };
+                        let mut soft_psnr = vec![f64::NAN; n];
+                        for (i, f) in frames.iter().enumerate() {
+                            context.UpdateSubresource(&tex, 0, None, f.as_ptr() as *const c_void, w, 0);
+                            if i == 60 {
+                                enc.request_keyframe();
+                            }
+                            if i == 93 {
+                                gradual_used = enc.request_recovery(gradual);
+                            }
+                            let t = Instant::now();
+                            let u = enc.encode(&tex).unwrap().expect("NVENC holds nothing back");
+                            enc_ms.push(t.elapsed().as_secs_f64() * 1e3);
+                            sizes.push(u.data.len());
+                            if u.keyframe {
+                                keys.push((i, u.data.len()));
+                            }
+                            if (93..123).contains(&i) {
+                                repair_max = repair_max.max(u.data.len());
+                            }
+                            if (90..93).contains(&i) {
+                                continue; // lost
+                            }
+                            if let Some(s) = soft.as_mut() {
+                                if let Ok(out) = s.decode(&u.data) {
+                                    for d in out {
+                                        soft_psnr[i] = psnr_luma(f, &d.nv12, w, h);
+                                    }
+                                }
+                            }
+                            match dec.decode(&u.data) {
+                                Ok(out) => {
+                                    for d in out {
+                                        let mut td = D3D11_TEXTURE2D_DESC::default();
+                                        d.texture.GetDesc(&mut td);
+                                        let all = read_back(&device, &context, &d.texture, (td.Width, td.Height));
+                                        let mut px = Vec::with_capacity((w * h * 3 / 2) as usize);
+                                        for row in (0..h).chain(td.Height..td.Height + h / 2) {
+                                            let at = (row * td.Width) as usize;
+                                            px.extend_from_slice(&all[at..at + w as usize]);
+                                        }
+                                        psnrs[i] = psnr_luma(f, &px, w, h);
+                                    }
+                                }
+                                Err(_) => errors += 1,
+                            }
+                        }
+                        let mean_of = |p: &[f64], r: core::ops::Range<usize>| {
+                            let v: Vec<f64> = p[r].iter().copied().filter(|p| p.is_finite()).collect();
+                            v.iter().sum::<f64>() / v.len().max(1) as f64
+                        };
+                        let mean = |r: core::ops::Range<usize>| mean_of(&psnrs, r);
+                        let soft_note = format!(
+                            " | soft decoder: 93-122 {:5.2} last20 {:5.2} dB ({} of 57 shown)",
+                            mean_of(&soft_psnr, 93..123),
+                            mean_of(&soft_psnr, n - 20..n),
+                            soft_psnr[93..].iter().filter(|p| p.is_finite()).count()
+                        );
+                        let link_ms = |b: usize| b as f64 * 8.0 / bps as f64 * 1e3;
+                        let p_max = sizes.iter().enumerate().filter(|(i, _)| !keys.iter().any(|k| k.0 == *i) && !(93..123).contains(i)).map(|(_, s)| *s).max().unwrap_or(0);
+                        let total: usize = sizes.iter().sum();
+                        let mut sorted = enc_ms.clone();
+                        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        println!(
+                            "{content:>7} {mbps:>2} Mbps {label:<7}: keys {} | P max {:>4} KB | {:5.2} Mbps sent | luma all {:5.2} first10 {:5.2} 70-89 {:5.2} last20 {:5.2} dB | repair {} max {:>4} KB ({:>4.0} ms) | enc p50 {:.2} p90 {:.2} ms{}",
+                            keys.iter().map(|(i, b)| format!("#{i} {:>4} KB ({:>4.0} ms)", b / 1024, link_ms(*b))).collect::<Vec<_>>().join(", "),
+                            p_max / 1024,
+                            total as f64 * 8.0 * fps as f64 / n as f64 / 1e6,
+                            mean(0..n),
+                            mean(0..10),
+                            mean(70..90),
+                            mean(n - 20..n),
+                            if gradual_used { "gradual" } else { "keyframe" },
+                            repair_max / 1024,
+                            link_ms(repair_max),
+                            sorted[sorted.len() / 2],
+                            sorted[sorted.len() * 9 / 10],
+                            if errors > 0 { format!(" | {errors} decode errors") } else { String::new() },
+                        );
+                        if gradual_used {
+                            println!("{:>30}GPU decoder: {} of 57 shown after the loss{soft_note}", "", psnrs[93..].iter().filter(|p| p.is_finite()).count());
+                        }
+                    }
+                }
+            }
+            std::env::remove_var("RDPIO_NVENC_PRESET");
+            std::env::remove_var("RDPIO_NVENC_REFRESH");
+        }
+    }
+
+    /// The preset follows the bitrate in place: P1 at 20 Mbps, P4 once the
+    /// rate drops under 6, P1 again over 10 — no new session, no keyframe —
+    /// and AV1 keeps long-term references where the driver has API 13.0
+    /// (with the capabilities the driver reports).
+    /// `cargo test --release -p rdp-gpu --lib hyper::hardware::preset_follows_the_bitrate -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn preset_follows_the_bitrate() {
+        unsafe {
+            let (w, h) = (1280u32, 720u32);
+            let (mut device, mut context) = (None, None);
+            D3D11CreateDevice(None, windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, None, D3D11_SDK_VERSION,
+                Some(&mut device), None, Some(&mut context)).unwrap();
+            let device: ID3D11Device = device.unwrap();
+            let pics: Vec<ID3D11Texture2D> = (0..4).map(|s| picture(&device, (w, h), false, s, 24)).collect();
+            for codec in [Codec::Hevc, Codec::Av1, Codec::H264] {
+                let mut enc = HwEncoder::new(&device, None, w, h, 60, 20_000_000, false, codec).unwrap();
+                enc.set_link_tuning(LinkTuning { preset_follow: true, ..LinkTuning::default() });
+                assert_eq!(enc.preset(), 1, "{}", codec.name());
+                let mut keys = 0;
+                for (i, bps) in [20u32, 20, 5, 5, 8, 8, 12, 12].iter().enumerate() {
+                    enc.set_bitrate(bps * 1_000_000);
+                    let want = match i { 0 | 1 => 1, 2..=5 => 4, _ => 1 };
+                    assert_eq!(enc.preset(), want, "{} at {bps} Mbps", codec.name());
+                    let u = enc.encode(&pics[i % 4]).unwrap().unwrap();
+                    keys += u.keyframe as u32;
+                }
+                assert_eq!(keys, 1, "{}: a keyframe only first", codec.name());
+                if let Inner::Nv(nv) = &enc.inner {
+                    let s = nv.session.as_ref().unwrap();
+                    println!(
+                        "{}: API {}, ltr {}, max LTR frames {}, intra refresh {} ({} frames)",
+                        codec.name(),
+                        s.api(),
+                        enc.ltr,
+                        s.cap(nvenc::CAP_MAX_LTR_FRAMES),
+                        s.cap(nvenc::CAP_INTRA_REFRESH),
+                        s.intra_refresh()
+                    );
+                    if codec == Codec::Av1 && nvenc::driver_api() >= (13, 0) {
+                        assert!(enc.ltr && s.cap(nvenc::CAP_MAX_LTR_FRAMES) > 0, "AV1 keeps long-term references on API 13.0");
+                    }
+                }
+            }
+        }
+    }
+
     /// BGRA in, the colours out right: colour bars through the encoder's own
     /// RGB conversion and back, against BT.709 limited range (what clients
     /// decode with), NVENC directly and through Media Foundation. A wrong
@@ -2734,7 +3558,11 @@ mod hardware {
     #[ignore]
     fn text_quality_by_tuning() {
         unsafe {
-            let (w, h) = (1920u32, 1080u32);
+            // TEXT_SIZE=3000x2120 for a tablet's screen.
+            let (w, h) = std::env::var("TEXT_SIZE")
+                .ok()
+                .and_then(|s| s.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))))
+                .unwrap_or((1920u32, 1080u32));
             let src = text_picture(w, h);
             let reference = nv12_of(&src, w, h);
             println!("4:2:0 alone (no codec): {:.1} dB (luma exact)", psnr(&src, &reference, w, h));
@@ -2775,7 +3603,7 @@ mod hardware {
                     v.split(';')
                         .map(|c| {
                             let p: Vec<&str> = c.split(',').collect();
-                            let codec = if p[0] == "hevc" { Codec::Hevc } else { Codec::H264 };
+                            let codec = Codec::from_name(p[0]).unwrap_or(Codec::H264);
                             let t = Tuning { buffer_frames: p[3].parse().unwrap(), quality: p[4].parse().unwrap() };
                             (c.to_string(), codec, p[1].parse().unwrap(), p[2].parse::<u32>().unwrap() * 1_000_000, t)
                         })
@@ -2872,11 +3700,20 @@ mod hardware {
                 device.CreateTexture2D(&desc, Some(&init), Some(&mut t)).unwrap();
                 t.unwrap()
             };
-            for codec in [Codec::H264, Codec::Hevc] {
+            // (AV1: long-term references on NVENC API 13.0; decoded on the
+            // GPU where Windows has the AV1 Video Extension.)
+            for codec in [Codec::H264, Codec::Hevc, Codec::Av1] {
                 let mut enc = HwEncoder::new_tuned(&device, None, w, h, 60, 20_000_000, false, codec, Tuning::GAMING).unwrap();
-                let mut dec = crate::h264::H264Decoder::with_codec(w, h, codec).unwrap();
-                // The GPU decoder clients use, read back to compare.
-                let mut gpu = crate::h264::H264GpuDecoder::with_codec(w, h, &device, &context, codec).unwrap();
+                if !enc.ltr {
+                    println!("{}: no long-term references here", codec.name());
+                    continue;
+                }
+                let Ok(mut gpu) = crate::h264::H264GpuDecoder::with_codec(w, h, &device, &context, codec) else {
+                    println!("{}: no GPU decoder here", codec.name());
+                    continue;
+                };
+                let mut dec = crate::h264::H264Decoder::with_codec(w, h, codec).ok();
+                // (The GPU decoder above is the one clients use, read back to compare.)
                 let context = context.clone();
                 let mut line = Vec::new();
                 for i in 0..9u32 {
@@ -2897,6 +3734,7 @@ mod hardware {
                     let shown = if deliver {
                         let mut out = Vec::new();
                         for u in &units {
+                            let Some(dec) = dec.as_mut() else { break };
                             match dec.decode(&u.data) {
                                 // Matched against every frame so far: a decoder may hand pictures out late.
                                 Ok(fs) => out.extend(fs.into_iter().map(|f| {

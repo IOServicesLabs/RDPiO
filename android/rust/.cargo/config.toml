@@ -1,0 +1,17 @@
+# The app is for one tablet (a OnePlus Pad 2, Snapdragon 8 Gen 3), so the core
+# is built for what every Snapdragon since the 845 has (ARMv8.2), not the
+# ARMv8.0 floor:
+#
+# - `lse`: one-instruction atomics (casal, ldaddal, swpal). Every Mutex, Arc
+#   and channel between the receive, decode and sound threads is atomics; on
+#   v8.0 they're load/store-exclusive loops (or a call to libgcc's outline
+#   helpers, which check for LSE at run time each time).
+# - `rcpc`: ldapr, the cheaper acquire load (Arc's and the channels' loads).
+# - `dotprod`, `fp16`, `crc`: for LLVM's vectoriser (Opus, the FEC's
+#   arithmetic) and crc32 instructions where a CRC is computed.
+#
+# Read when cargo runs from this folder (build-rust.sh does); cargo-ndk passes
+# only its linker, not RUSTFLAGS, so these reach rustc (check: llvm-objdump -d
+# librdpio.so | grep -c casal).
+[target.aarch64-linux-android]
+rustflags = ["-C", "target-feature=+lse,+rcpc,+dotprod,+fp16,+crc"]

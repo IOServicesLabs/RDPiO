@@ -227,18 +227,191 @@ fn rsa_pkcs1_encrypt(cert_der: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(not(windows))]
-fn aes256_cbc_encrypt(_key: &[u8], _plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    Err("RDSTLS v3 credential encoding requires Windows CNG".into())
-}
+use portable::{aes256_cbc_encrypt, rsa_pkcs1_encrypt};
 
-#[cfg(not(windows))]
-fn rsa_pkcs1_encrypt(_cert_der: &[u8], _data: &[u8]) -> Result<Vec<u8>, String> {
-    Err("RDSTLS v3 credential encoding requires Windows CNG".into())
+/// The same two operations without CNG (Android, Linux): RustCrypto AES and
+/// the crate's own bignum RSA. Built on Windows too so tests can hold them
+/// against CNG.
+#[cfg(any(not(windows), test))]
+mod portable {
+    use rdp_asn1::der;
+    use rdp_crypto::BigUint;
+
+    /// AES-256-CBC, IV 0, PKCS#7 padding (CNG's BCRYPT_BLOCK_PADDING).
+    pub(super) fn aes256_cbc_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+        let enc = cbc::Encryptor::<aes::Aes256>::new_from_slices(key, &[0u8; 16])
+            .map_err(|_| format!("AES-256 key is {} bytes, not 32", key.len()))?;
+        Ok(enc.encrypt_padded_vec_mut::<Pkcs7>(plaintext))
+    }
+
+    /// RSA PKCS#1 v1.5 (type 2) with the certificate's public key; the result
+    /// is big-endian and as long as the modulus, like CNG's.
+    pub(super) fn rsa_pkcs1_encrypt(cert_der: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+        let spki = rdp_nla::x509::extract_public_key(cert_der)
+            .map_err(|e| format!("target cert public key: {e:?}"))?;
+        let (n, e) = rsa_key(&spki).ok_or("target cert key isn't RSA")?;
+        let mut random = vec![0u8; n.len()];
+        if !crate::rng::fill(&mut random) {
+            return Err("no randomness for RSA padding".into());
+        }
+        rsa_pkcs1_encrypt_with(&n, &e, data, &random)
+    }
+
+    /// RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER },
+    /// both big-endian without the sign byte.
+    fn rsa_key(spki: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut input = spki;
+        let mut seq = der::expect(&mut input, der::TAG_SEQUENCE).ok()?;
+        let n = der::expect(&mut seq, der::TAG_INTEGER).ok()?;
+        let e = der::expect(&mut seq, der::TAG_INTEGER).ok()?;
+        let strip = |v: &[u8]| {
+            let first = v.iter().position(|&b| b != 0).unwrap_or(v.len());
+            v[first..].to_vec()
+        };
+        Some((strip(n), strip(e)))
+    }
+
+    /// The padding and exponentiation, with the padding's random bytes given
+    /// (zeros in it are skipped).
+    pub(super) fn rsa_pkcs1_encrypt_with(
+        n: &[u8],
+        e: &[u8],
+        data: &[u8],
+        random: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let k = n.len();
+        if data.len() + 11 > k {
+            return Err(format!("{} bytes don't fit a {}-bit RSA key", data.len(), k * 8));
+        }
+        // EM = 00 02 PS 00 M, PS at least 8 non-zero random bytes.
+        let ps_len = k - 3 - data.len();
+        let mut ps = random.iter().copied().filter(|&b| b != 0);
+        let mut em = Vec::with_capacity(k);
+        em.extend_from_slice(&[0, 2]);
+        for _ in 0..ps_len {
+            // (Out of non-zero randomness: a fixed byte keeps it valid.)
+            em.push(ps.next().unwrap_or(0x5A));
+        }
+        em.push(0);
+        em.extend_from_slice(data);
+
+        let c = BigUint::from_bytes_be(&em).modpow(&BigUint::from_bytes_be(e), &BigUint::from_bytes_be(n));
+        let mut out = c.to_bytes_le(k);
+        out.reverse();
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_aes_pads_like_cng() {
+        // PKCS#7 always adds a block's worth at most, a whole one on a boundary.
+        let key: Vec<u8> = (0..32u8).collect();
+        let out = portable::aes256_cbc_encrypt(&key, b"").unwrap();
+        assert_eq!(out.len(), 16, "empty input still gets a full padding block");
+        let out = portable::aes256_cbc_encrypt(&key, &[7u8; 16]).unwrap();
+        assert_eq!(out.len(), 32);
+        assert!(portable::aes256_cbc_encrypt(&key[..16], b"x").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_aes_matches_cng() {
+        let key: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(37)).collect();
+        for len in [0usize, 1, 15, 16, 17, 34, 100] {
+            let msg: Vec<u8> = (0..len as u8).collect();
+            assert_eq!(
+                portable::aes256_cbc_encrypt(&key, &msg).unwrap(),
+                aes256_cbc_encrypt(&key, &msg).unwrap(),
+                "len {len}"
+            );
+        }
+    }
+
+    /// A throwaway 1024-bit test key: encrypt with the portable code, decrypt
+    /// with d, and find the PKCS#1 frame.
+    #[test]
+    fn portable_rsa_round_trips() {
+        use rdp_crypto::BigUint;
+        let n = hex(N_HEX);
+        let d = hex(D_HEX);
+        let msg = b"rdstls password blob";
+        let random: Vec<u8> = (0..200u32).map(|i| (i * 7 + 3) as u8).collect();
+        let c = portable::rsa_pkcs1_encrypt_with(&n, &[1, 0, 1], msg, &random).unwrap();
+        assert_eq!(c.len(), n.len());
+        let m = BigUint::from_bytes_be(&c).modpow(&BigUint::from_bytes_be(&d), &BigUint::from_bytes_be(&n));
+        let mut em = m.to_bytes_le(n.len());
+        em.reverse();
+        assert_eq!(&em[..2], &[0, 2]);
+        let zero = em[2..].iter().position(|&b| b == 0).unwrap() + 2;
+        assert!(zero >= 10, "at least 8 padding bytes");
+        assert_eq!(&em[zero + 1..], msg);
+        assert!(portable::rsa_pkcs1_encrypt_with(&n, &[1, 0, 1], &[0u8; 120], &random).is_err());
+    }
+
+    /// Decrypt with the test key and unwrap PKCS#1 v1.5 type 2.
+    fn rsa_open(c: &[u8]) -> Vec<u8> {
+        use rdp_crypto::BigUint;
+        let n = hex(N_HEX);
+        let m = BigUint::from_bytes_be(c).modpow(&BigUint::from_bytes_be(&hex(D_HEX)), &BigUint::from_bytes_be(&n));
+        let mut em = m.to_bytes_le(n.len());
+        em.reverse();
+        assert_eq!(&em[..2], &[0, 2]);
+        let zero = em[2..].iter().position(|&b| b == 0).unwrap() + 2;
+        em[zero + 1..].to_vec()
+    }
+
+    #[test]
+    fn portable_rsa_reads_the_certificate() {
+        let cert = hex(CERT_HEX);
+        let a = portable::rsa_pkcs1_encrypt(&cert, b"hello").unwrap();
+        let b = portable::rsa_pkcs1_encrypt(&cert, b"hello").unwrap();
+        assert_ne!(a, b, "random padding");
+        assert_eq!(rsa_open(&a), b"hello");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cng_rsa_opens_the_same_way() {
+        // The reference: CNG's output unwraps identically, so the portable
+        // padding and byte order match what the Windows build sends.
+        let cert = hex(CERT_HEX);
+        let c = rsa_pkcs1_encrypt(&cert, b"hello").unwrap();
+        assert_eq!(c.len(), 128);
+        assert_eq!(rsa_open(&c), b"hello");
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        let s: String = s.split_whitespace().collect();
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    const N_HEX: &str = "
+        b8418881963a5679d690cf50b320a80a7288c07f8e1c3f94d463dd3429b94245da055019a28ab9276f1814f037b1ced1
+        7f563a2794630c6f6acbb49a0a2b09881c2aa1acae6d70defa5d767a17e16c6c4fdbd5a8a65e3f67a555945e7d338c5d
+        998046b2f38f1f7431641df9bde1de10108ef94fd85858153373efd66972d9f5
+    ";
+    const D_HEX: &str = "
+        b7ebe260c81e4f77aaf03da0e64d30afcd08286eaae213ad721c850fae9e5842f58fdc16daa2f2932457bb7ed5794d62
+        dd62ab061b1e8ba923c756ed743ce57320492e8c6f2e30333a91f547189c3644258e1923ceccd0a35753c856b61c3458
+        2166c28ab311f413444b8d33bc49bfb53e1fb3a4021f9346a4243e1592bc9e79
+    ";
+    /// A self-signed certificate for the same key.
+    const CERT_HEX: &str = "
+        308201a030820109a003020102020101300d06092a864886f70d01010b050030163114301206035504030c0b72647374
+        6c732d74657374301e170d3236303130313030303030305a170d3336303130313030303030305a301631143012060355
+        04030c0b726473746c732d7465737430819f300d06092a864886f70d010101050003818d0030818902818100b8418881
+        963a5679d690cf50b320a80a7288c07f8e1c3f94d463dd3429b94245da055019a28ab9276f1814f037b1ced17f563a27
+        94630c6f6acbb49a0a2b09881c2aa1acae6d70defa5d767a17e16c6c4fdbd5a8a65e3f67a555945e7d338c5d998046b2
+        f38f1f7431641df9bde1de10108ef94fd85858153373efd66972d9f50203010001300d06092a864886f70d01010b0500
+        038181005b70250dd54895480e3eb21785f461988fb7b6021b641227e92fee6db634bd797f00a5e42569687db77da6c3
+        999905116ab29ec9aa85e7c43d6178ac6f25183231a057225503804a03449f4b0e7d336f2d97aa27ea0f0f0d294d0a47
+        722b7adf45830ace32c25d8a0b76854df4110451d108549ba322dde0ee0475a998dff55b
+    ";
 
     #[test]
     fn base64_crlf_matches_known_vector() {

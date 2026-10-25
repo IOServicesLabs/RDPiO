@@ -19,7 +19,7 @@ use rdp_gpu::Renderer;
 use rdp_graphics::redirect::DvcRedirector;
 use rdp_hyper::control::{self, Control, Feedback, Handshake, CHANNEL_NAME, PROTOCOL};
 use rdp_hyper::input::{InputEvent, InputSender};
-use rdp_hyper::video::{Event, Reassembler};
+use rdp_hyper::video::{Event, FrameBuffers, Reassembler};
 use rdp_hyper::wire::{Direction, Kind, Session};
 
 use crate::window::{Frame, RawInput, Window};
@@ -41,6 +41,8 @@ pub struct Link {
     update_only: bool,
     /// The host's rdpio version.
     host_app: String,
+    /// The host's local addresses (see `rdp_hyper::lan`).
+    lan: Vec<String>,
 }
 
 /// This process downloaded an update (installed when it ends).
@@ -146,7 +148,7 @@ impl DvcRedirector for HyperRedirector {
                 let _ = std::thread::Builder::new().name("hyper-probe".into()).spawn(move || {
                     match probe(host, &key) {
                         Ok((socket, send, recv)) => {
-                            *LINK.lock().unwrap() = Some(Link { socket, send, recv, size: (width, height), fps, codec, update: false, update_only: false, host_app: String::new() });
+                            *LINK.lock().unwrap() = Some(Link { socket, send, recv, size: (width, height), fps, codec, update: false, update_only: false, host_app: String::new(), lan: Vec::new() });
                             outbound.lock().unwrap().push(Handshake::ClientReady.to_bytes());
                             // (The session worker sleeps until there's something to send.)
                             crate::net_wait::worker_wake::signal();
@@ -276,6 +278,8 @@ struct Shared {
     heard: AtomicBool,
     /// Frames handed to the UI thread and not yet taken (the decode backlog).
     queued: AtomicU32,
+    /// Decoded frames' buffers, given back to the receive thread's reassembler.
+    frames: FrameBuffers,
     /// The newest long-term reference frame decoded (`u32::MAX`: none), told
     /// to the host with the feedback.
     ltr_decoded: AtomicU32,
@@ -417,6 +421,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         lost: AtomicBool::new(false),
         heard: AtomicBool::new(false),
         queued: AtomicU32::new(0),
+        frames: FrameBuffers::default(),
         ltr_decoded: AtomicU32::new(u32::MAX),
         cameras: AtomicU32::new(u32::MAX),
         notice: Mutex::new(None),
@@ -483,6 +488,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     // packet is lost); restored: a keyframe brings the picture back.
     let (mut paused, mut pause_sent) = (false, Instant::now());
     let mut last_input_send = Instant::now();
+    let mut last_full_input_send = Instant::now();
     let mut awaiting_key = true;
     // What the decoder holds is sound (only frames went missing): a repair
     // frame from the host will do instead of a keyframe. Not after a decode
@@ -661,13 +667,27 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             Some(true) => last_input_send.elapsed() >= INPUT_MOTION_EVERY,
             None => false,
         };
-        if input.has_pending() && (due || last_input_send.elapsed() > Duration::from_millis(15)) {
+        // `inputdup`: each packet carries the newest few events (and any key
+        // or click until it went three times), a lone key-up goes again 5 ms
+        // later, and everything unacknowledged only once a round trip — not
+        // every unacknowledged event in every packet, which on a slow relayed
+        // path is more input than the link carries (see `capped_packets`).
+        let capped = crate::host_ab::ab("inputdup", true);
+        let rtt = Duration::from_micros(shared.clock.lock().unwrap().rtt_us as u64);
+        let resend_after = if capped { (rtt + rtt / 4 + Duration::from_millis(10)).clamp(Duration::from_millis(15), Duration::from_secs(1)) } else { Duration::from_millis(15) };
+        let full = last_full_input_send.elapsed() > resend_after;
+        let repeat = capped && input.wants_repeat() && last_input_send.elapsed() >= Duration::from_millis(5);
+        if input.has_pending() && (due || full || repeat) {
             // Oldest first; a burst bigger than a packet takes two at a time
             // (the rest follows as the host acknowledges).
-            for p in input.packets(2) {
+            let packets = if capped && !full { input.capped_packets(2) } else { input.packets(2) };
+            for p in packets {
                 shared.send(Kind::Input, &p);
             }
             last_input_send = Instant::now();
+            if full || !capped {
+                last_full_input_send = last_input_send;
+            }
         }
 
         if fine_timer.is_some() && last_activity.elapsed() > FINE_TIMER_IDLE {
@@ -737,13 +757,14 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                     }
                     awaiting_key = true;
                 }
-                Event::Frame(f) => {
+                Event::Frame(mut f) => {
                     shared.queued.fetch_sub(1, Ordering::Relaxed);
                     if awaiting_key && !f.keyframe && !(f.recovery && can_repair) {
                         continue;
                     }
                     let t_dec = Instant::now();
                     let result = decoder.decode(&f.data);
+                    shared.frames.give(std::mem::take(&mut f.data));
                     let dec_us = t_dec.elapsed().as_micros() as u64;
                     (dec_us_total, dec_us_max) = (dec_us_total + dec_us, dec_us_max.max(dec_us));
                     decode_us_avg = (decode_us_avg * 7 + dec_us) / 8;
@@ -1260,7 +1281,7 @@ fn receive_loop(
 ) {
     let _ = socket.set_read_timeout(Some(Duration::from_millis(25)));
     crate::net_tune::raise_thread();
-    let mut reassembler = Reassembler::new();
+    let mut reassembler = Reassembler::with_buffers(shared.frames.clone());
     // Several datagrams per call where the kernel coalesces them.
     let mut receiver = crate::udp_batch::Receiver::new(&socket);
     let mut last_feedback = Instant::now();
@@ -1269,6 +1290,10 @@ fn receive_loop(
     let mut last_video = Instant::now();
     let mut idle = false;
     let mut ping_id = 0u32;
+    // The path the host last reported (logged when it changes).
+    let mut path_seen: Option<String> = None;
+    // Silence being probed (see rdp_hyper::liveness), logged once a spell.
+    let mut probing = false;
     let (mut delay_min, mut delay_sum, mut delay_n) = (i64::MAX, 0i64, 0i64);
     let mut game_audio: Option<crate::hyper_audio::AudioSink> = None;
     let mut mic: Option<crate::hyper_audio::AudioSender> = None;
@@ -1280,8 +1305,19 @@ fn receive_loop(
     // host hears how it's going every 50 ms then, every 100 when it's calm.
     let mut last_trouble = Instant::now();
     let mut camera: Option<crate::hyper_camera::CameraSender> = None;
+    // In office mode, a millisecond's nap after a batch: a frame's datagrams
+    // then come several to a call instead of a wake-up each (through a VPN
+    // they trickle in one by one; on the tablet: the receive thread's CPU
+    // 11% of a core -> 4%), for up to a millisecond on a frame.
+    // (RDPIO_NO_RX_NAP=1: no nap.)
+    let nap = std::env::var_os("RDPIO_NO_RX_NAP").is_none();
+    let mut got = false;
     while !shared.stop.load(Ordering::Relaxed) {
+        if got && nap && crate::window::office_mode() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let datagrams = receiver.recv(&socket);
+        got = datagrams.as_ref().is_ok_and(|d| d.len() > 0);
         for d in datagrams.into_iter().flatten() {
             let n = d.len();
             if let Ok((kind, body)) = recv.open(d) {
@@ -1302,8 +1338,10 @@ fn receive_loop(
                                 // Delay from when the host sent the frame (its
                                 // capture time plus its own encode — and any hold
                                 // for frame-rate matching), so host-side time
-                                // doesn't read as network queueing.
-                                let d = now as i64 - (f.capture_us + f.encode_us as u64) as i64;
+                                // doesn't read as network queueing. To its first
+                                // shard: a big frame's own length on the wire
+                                // (a page of new text) isn't a queue either.
+                                let d = f.first_rx_us as i64 - (f.capture_us + f.encode_us as u64) as i64;
                                 delay_min = delay_min.min(d);
                                 delay_sum += d;
                                 delay_n += 1;
@@ -1337,6 +1375,18 @@ fn receive_loop(
                             shared.host_bye.store(true, Ordering::Relaxed);
                             shared.stop.store(true, Ordering::Relaxed);
                             crate::window::signal_frame();
+                        }
+                        // How the host reaches us (LAN, Tailscale direct or relayed).
+                        Some(Control::Path { kind, relay }) => {
+                            let now = kind.describe(&relay);
+                            if path_seen.as_deref() != Some(now.as_str()) {
+                                tracing::info!(path = %now, "path to the host");
+                                static RELAY_HINTED: AtomicBool = AtomicBool::new(false);
+                                if kind == rdp_hyper::control::PathKind::Relay && !RELAY_HINTED.swap(true, Ordering::Relaxed) {
+                                    tracing::warn!("Tailscale is relaying this connection (no direct UDP): expect lag");
+                                }
+                                path_seen = Some(now);
+                            }
                         }
                         // The host's console moved to another session (a
                         // sign-in, a user switch): sign in again at once, not
@@ -1454,12 +1504,30 @@ fn receive_loop(
         // Until the host's video comes, allow for its setup (a virtual monitor
         // or a display mode, audio, encoder: several seconds); after that, 6 s
         // of silence is a dropped connection.
-        let silence = if shared.heard.load(Ordering::Relaxed) { Duration::from_secs(6) } else { Duration::from_secs(15) };
-        if last_rx.elapsed() > silence {
-            tracing::warn!(secs = silence.as_secs(), "nothing from the Hyper host");
-            shared.lost.store(true, Ordering::Relaxed);
-            shared.stop.store(true, Ordering::Relaxed);
-            crate::window::signal_frame();
+        // (`fastreconnect`: suspect after 1.5 s, dropped after 3 — see
+        // rdp_hyper::liveness. This client pings at least once a second.)
+        use rdp_hyper::liveness::{verdict, Verdict, PROBE_EVERY};
+        let rtt = Duration::from_micros(shared.clock.lock().unwrap().rtt_us as u64);
+        let silent = last_rx.elapsed();
+        match verdict(silent, shared.heard.load(Ordering::Relaxed), false, rtt, crate::host_ab::ab("fastreconnect", true)) {
+            Verdict::Lost if !shared.stop.load(Ordering::Relaxed) => {
+                tracing::warn!(ms = silent.as_millis() as u64, "nothing from the Hyper host");
+                shared.lost.store(true, Ordering::Relaxed);
+                shared.stop.store(true, Ordering::Relaxed);
+                crate::window::signal_frame();
+            }
+            Verdict::Probe => {
+                if !probing {
+                    probing = true;
+                    tracing::info!(ms = silent.as_millis() as u64, "nothing from the Hyper host lately; probing");
+                }
+                if last_ping.elapsed() >= PROBE_EVERY {
+                    ping_id += 1;
+                    shared.send(Kind::Control, &Control::Ping { id: ping_id, client_us: now_us() }.to_bytes());
+                    last_ping = Instant::now();
+                }
+            }
+            _ => probing = false,
         }
         // A still screen sends no video: wake (and report) less often then.
         // (While video flows its packets wake us; the timeout only paces the
@@ -1631,6 +1699,45 @@ fn password_cache_path(host: &str) -> Option<std::path::PathBuf> {
     Some(dir.join(format!("{safe}.bin")))
 }
 
+/// `host`'s local addresses as its latest offer gave them (beside the saved
+/// password: a line of "addr/prefix" each).
+fn lan_path(host: &str) -> Option<std::path::PathBuf> {
+    password_cache_path(host).map(|p| p.with_extension("lan"))
+}
+
+/// Sign in directly on the host's local network when this PC is on it (it
+/// skips the VPN's own per-packet work: see `rdp_hyper::lan`), else at `addr`.
+fn connect_via(host: &str, addr: SocketAddr, password: &str, want: rdp_hyper::auth::Want) -> Result<Link, String> {
+    let remembered: Vec<String> = lan_path(host).and_then(|p| std::fs::read_to_string(p).ok()).map_or_else(Vec::new, |t| t.lines().map(String::from).collect());
+    let mine: Vec<(std::net::Ipv4Addr, u8)> =
+        crate::launcher::host::addresses().into_iter().filter_map(|a| Some((a.ip.parse().ok()?, a.prefix))).collect();
+    let remember = |link: &Link| {
+        if let Some(p) = lan_path(host) {
+            if link.lan.is_empty() {
+                let _ = std::fs::remove_file(p);
+            } else {
+                let _ = std::fs::write(p, link.lan.join("
+"));
+            }
+        }
+    };
+    if std::env::var_os("RDPIO_NO_LAN_PATH").is_none() {
+        if let Some(direct) = rdp_hyper::lan::direct(&remembered, &mine, addr) {
+            match connect_direct(direct, password, want.clone()) {
+                Ok(link) => {
+                    tracing::info!(%direct, via = %addr, "Hyper: signed in over the local network, not through the VPN");
+                    remember(&link);
+                    return Ok(link);
+                }
+                Err(e) => tracing::info!(%direct, error = %e, "Hyper: the host's local address didn't sign in; using the one given"),
+            }
+        }
+    }
+    let link = connect_direct(addr, password, want)?;
+    remember(&link);
+    Ok(link)
+}
+
 /// This PC's primary screen's display scale, in percent (0 if unknown).
 fn primary_scale_percent() -> u32 {
     use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
@@ -1720,6 +1827,7 @@ pub fn connect_direct(host: SocketAddr, password: &str, want: rdp_hyper::auth::W
                             update: true,
                             update_only: true,
                             host_app: offer.app,
+                            lan: offer.lan,
                         });
                     }
                     let (min, max) = crate::updater::protocols();
@@ -1742,6 +1850,7 @@ pub fn connect_direct(host: SocketAddr, password: &str, want: rdp_hyper::auth::W
                             update: from_host,
                             update_only: false,
                             host_app: offer.app,
+                            lan: offer.lan,
                         }),
                         Err(_) => Err("wrong Hyper password".into()),
                     };
@@ -1816,7 +1925,7 @@ pub fn run_direct(
     tracing::info!(%addr, fps = want.refresh_hz, "Hyper direct: signing in");
     // An update fetched from the host goes in when this ends.
     let _install = InstallOnExit;
-    let link = match connect_direct(addr, &password, want.clone()) {
+    let link = match connect_via(host, addr, &password, want.clone()) {
         Ok(l) => l,
         Err(e) => {
             if e.contains("wrong Hyper password") {
@@ -1907,8 +2016,9 @@ pub fn run_direct(
         }
         let mut relinked = None;
         for attempt in 1..=15 {
-            // (The first try at once: the host may only have moved sessions.)
-            let until = Instant::now() + if attempt == 1 { Duration::from_millis(300) } else { Duration::from_secs(2) };
+            // (The first try at once: the host may only have moved sessions,
+            // and it ends a stream we gave up on as our sign-in arrives.)
+            let until = Instant::now() + rdp_hyper::liveness::reconnect_wait(attempt, crate::host_ab::ab("fastreconnect", true));
             while Instant::now() < until {
                 if matches!(window.pump(), Frame::Quit) {
                     return Ok(());
@@ -1920,9 +2030,9 @@ pub fn run_direct(
             // Sign in on a worker so the window stays responsive (and
             // closable) for the seconds an attempt can take.
             let (done_tx, done_rx) = mpsc::channel();
-            let (pw, w) = (password.clone(), want.clone());
+            let (pw, w, h) = (password.clone(), want.clone(), host.to_string());
             std::thread::spawn(move || {
-                let _ = done_tx.send(connect_direct(addr, &pw, w));
+                let _ = done_tx.send(connect_via(&h, addr, &pw, w));
             });
             let result = loop {
                 if matches!(window.pump(), Frame::Quit) {

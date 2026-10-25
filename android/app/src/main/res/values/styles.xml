@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">rdpio</string>
+    <string name="key_capture_label">rdpio: PC shortcuts</string>
+    <string name="key_capture_description">While an rdpio stream is in front, sends the keys Android keeps for itself (Alt+Tab, the Windows key and its shortcuts, Alt+F4) to your PC. It reads no screen content, and other apps get their keys as usual.</string>
+
+    <color name="ink">#0E0F0F</color>
+    <color name="panel">#17191A</color>
+    <color name="line">#2A2D2E</color>
+    <color name="text">#EDEFEE</color>
+    <color name="muted">#9AA19E</color>
+    <color name="accent">#22C38E</color>
+    <color name="danger">#F0726A</color>
+
+    <style name="Theme.Rdpio" parent="android:Theme.Material.NoActionBar">
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:colorPrimary">@color/ink</item>
+        <item name="android:colorBackground">@color/ink</item>
+        <item name="android:windowBackground">@color/ink</item>
+        <item name="android:statusBarColor">@color/ink</item>
+        <item name="android:navigationBarColor">@color/ink</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColorSecondary">@color/muted</item>
+    </style>
+
+    <style name="Theme.Rdpio.Stream">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">always</item>
+    </style>
+</resources>

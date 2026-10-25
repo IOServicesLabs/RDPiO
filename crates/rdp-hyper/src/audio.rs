@@ -4,9 +4,11 @@
 //! Each packet carries the newest Opus frame (10 ms; 20 ms where the receiver
 //! says it takes them, [`crate::control::Control::AudioReport`]) plus — while
 //! the receiver loses any, or hasn't said — the one before it, so a single
-//! lost packet costs nothing (its frame rides the next packet). Longer gaps
-//! are filled by the decoder's packet-loss concealment, briefly, then silence
-//! — never by waiting.
+//! lost packet costs nothing (its frame rides the next packet). Where the
+//! sender codes Opus in-band FEC (a speech-mode frame carries a coarse copy
+//! of the one before), the last frame of a longer gap is decoded from it.
+//! The rest is filled by the decoder's packet-loss concealment, briefly, then
+//! silence — never by waiting.
 
 /// Samples per channel in one 10 ms frame at 48 kHz.
 pub const FRAME_SAMPLES: usize = 480;
@@ -61,12 +63,27 @@ impl AudioPacket {
     }
 }
 
+/// The path's audio packet loss (%) for a sender's Opus in-band FEC, from a
+/// receiver's report: `lost` of the `sent` packets since the last one, after
+/// `prev`. Up at once, down by a quarter a report (a burst of loss is often
+/// followed by another), and at most 30 (more FEC only steals bits from the
+/// sound).
+pub fn loss_pct(prev: u32, lost: u32, sent: u32) -> u32 {
+    let now = if sent == 0 { 0 } else { (lost * 100).div_ceil(sent.max(lost)) };
+    now.max(prev * 3 / 4).min(30)
+}
+
 /// What the receiver should decode next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decode {
     Frame(Vec<u8>),
     /// A frame that never arrived: run packet-loss concealment.
     Conceal,
+    /// A frame that never arrived, just before the one given: decode it from
+    /// that packet's in-band FEC copy (Opus `decode(…, fec = true)`, which
+    /// conceals where the packet carries none — a CELT frame). Only from a
+    /// sequencer with [`Sequencer::set_fec`] on.
+    Fec(Vec<u8>),
     /// The sender started a new stream (its numbering restarted): reset the
     /// decoder before the frames that follow.
     Restart,
@@ -88,11 +105,23 @@ pub struct Sequencer {
     /// numbering starts over but its clock doesn't, which tells a restart
     /// from a very late packet.
     newest_capture_us: u64,
+    /// Recover the frame just before a gap's end from the next frame's
+    /// in-band FEC ([`Decode::Fec`]).
+    fec: bool,
+    /// Packets that never came (counted before redundancy or FEC repaired
+    /// anything): what the receiver reports, so the sender knows the path's
+    /// real loss even while its copies hide all of it.
+    pub lost_packets: u32,
 }
 
 impl Sequencer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Use the in-band FEC Opus frames carry (when the sender codes it).
+    pub fn set_fec(&mut self, on: bool) {
+        self.fec = on;
     }
 
     /// Frames to decode, in order, for one received packet.
@@ -108,12 +137,22 @@ impl Sequencer {
             next = first;
         } else if ahead < 0 {
             return out; // everything in this packet already played (or late)
+        } else if self.next.is_some() && ahead > 0 {
+            // Packets between the last and this one never came (a pause in
+            // the sender's sound skips no numbers). A long stall counts as a
+            // few, not as the whole stall's worth.
+            self.lost_packets = self.lost_packets.saturating_add((ahead as u32).min(50));
         }
-        // Frames between `next` and what this packet carries are lost.
+        // Frames between `next` and what this packet carries are lost; the
+        // last of them may ride this packet's first frame as FEC.
         let gap = first.wrapping_sub(next) as i32;
         if gap > 0 {
-            for _ in 0..(gap as u32).min(MAX_CONCEAL) {
+            let fec = self.fec as u32;
+            for _ in 0..(gap as u32 - fec).min(MAX_CONCEAL) {
                 out.push(Decode::Conceal);
+            }
+            if self.fec {
+                out.push(Decode::Fec(p.frames[0].clone()));
             }
         }
         for (i, f) in p.frames.iter().enumerate() {
@@ -142,9 +181,45 @@ mod tests {
             .filter_map(|d| match d {
                 Decode::Frame(f) => Some(Some(f[0])),
                 Decode::Conceal => Some(None),
+                // (Marked as the frame it rides on, plus 100.)
+                Decode::Fec(f) => Some(Some(f[0] + 100)),
                 Decode::Restart => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn loss_rises_at_once_and_decays() {
+        assert_eq!(loss_pct(0, 0, 200), 0);
+        assert_eq!(loss_pct(0, 10, 200), 5);
+        assert_eq!(loss_pct(5, 0, 200), 3);
+        assert_eq!(loss_pct(3, 0, 0), 2, "nothing sent: decays");
+        assert_eq!(loss_pct(0, 150, 200), 30, "capped");
+    }
+
+    /// With FEC on, the last frame of a gap is decoded from the next frame's
+    /// FEC data, the rest concealed; every missing packet is counted.
+    #[test]
+    fn fec_recovers_the_frame_before_a_gap_ends() {
+        let mut s = Sequencer::new();
+        s.set_fec(true);
+        s.push(&packet(1));
+        // Packets 2 and 3 lost: frame 2 is gone, 3 rides packet 4 as its
+        // redundant copy and carries frame 2's FEC.
+        assert_eq!(frames(s.push(&packet(4))), vec![Some(103), Some(3), Some(4)]);
+        assert_eq!(s.lost_packets, 2);
+        // Without redundancy: packet 6 lost, frame 6 from packet 7's FEC.
+        let single = |seq: u32| AudioPacket { frames: vec![vec![seq as u8]], ..packet(seq) };
+        s.push(&single(5));
+        assert_eq!(frames(s.push(&single(7))), vec![Some(107), Some(7)]);
+        // A longer gap: concealment, then FEC for its last frame.
+        assert_eq!(frames(s.push(&single(11))), vec![None, None, Some(111), Some(11)]);
+        assert_eq!(s.lost_packets, 6);
+        // Off: concealment only, as before.
+        let mut plain = Sequencer::new();
+        plain.push(&single(1));
+        assert_eq!(frames(plain.push(&single(3))), vec![None, Some(3)]);
+        assert_eq!(plain.lost_packets, 1);
     }
 
     #[test]

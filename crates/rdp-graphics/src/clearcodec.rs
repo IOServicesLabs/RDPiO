@@ -155,15 +155,25 @@ pub fn needs_seed(data: &[u8], width: u16, height: u16) -> bool {
     true
 }
 
+/// The visible part of `n` region pixels starting at region column `x`, row
+/// `y` (region at `x0,y0`) in a `w`×`h` tile: `(dst byte offset, pixel count)`.
+/// Regions never start left of / above the tile, so only the right and bottom
+/// edges clip — once per row instead of a bounds check per pixel.
 #[inline]
-fn put(dst: &mut [u8], w: usize, h: usize, x: usize, y: usize, r: u8, g: u8, b: u8) {
-    if x < w && y < h {
-        let o = (y * w + x) * 4;
-        dst[o] = r;
-        dst[o + 1] = g;
-        dst[o + 2] = b;
-        dst[o + 3] = 0xFF;
+fn row_span(
+    w: usize,
+    h: usize,
+    x0: usize,
+    y0: usize,
+    x: usize,
+    y: usize,
+    n: usize,
+) -> Option<(usize, usize)> {
+    let (dx, dy) = (x0 + x, y0 + y);
+    if dy >= h || dx >= w || n == 0 {
+        return None;
     }
+    Some(((dy * w + dx) * 4, n.min(w - dx)))
 }
 
 impl ClearDecoder {
@@ -336,60 +346,48 @@ impl ClearDecoder {
                 }
 
                 // Short vBar (hit or miss) → compose a full column, emit it, cache it.
-                let (short_rgba, short_count, y_on): (Vec<u8>, usize, usize);
-                if header & 0xC000 == 0x4000 {
+                let (short_idx, y_on) = if header & 0xC000 == 0x4000 {
                     // Short vBar cache hit; a fresh yOn byte follows.
                     let idx = (header & 0x3FFF) as usize;
-                    let e = self.short_vbar.get(idx)?;
-                    short_rgba = e.rgba.clone();
-                    short_count = e.count;
-                    y_on = r.u8()? as usize;
+                    if idx >= SHORT_VBAR_CACHE {
+                        return None;
+                    }
+                    (idx, r.u8()? as usize)
                 } else {
                     // Short vBar cache miss: header packs yOn(8) and yOff(6),
                     // then `count` raw B,G,R pixels follow.
-                    y_on = (header & 0x00FF) as usize;
+                    let y_on = (header & 0x00FF) as usize;
                     let y_off = ((header >> 8) & 0x3F) as usize;
                     if y_off < y_on {
                         return None;
                     }
-                    short_count = y_off - y_on;
-                    let mut sp = vec![0u8; short_count * 4];
-                    for k in 0..short_count {
-                        let (b, g, rr) = (r.u8()?, r.u8()?, r.u8()?);
-                        sp[k * 4] = rr;
-                        sp[k * 4 + 1] = g;
-                        sp[k * 4 + 2] = b;
-                        sp[k * 4 + 3] = 0xFF;
-                    }
+                    let count = y_off - y_on;
+                    let bgr = r.take(count * 3)?;
+                    // Refill the evicted slot's buffer in place (no allocation
+                    // once the cache is warm).
                     let cur = self.short_vbar_cursor;
                     self.short_vbar_cursor = (cur + 1) % SHORT_VBAR_CACHE;
-                    short_rgba = sp.clone();
-                    self.short_vbar[cur] = Pixels {
-                        count: short_count,
-                        rgba: sp,
-                    };
-                }
+                    let slot = &mut self.short_vbar[cur];
+                    slot.count = count;
+                    slot.rgba.clear();
+                    slot.rgba
+                        .extend(bgr.chunks_exact(3).flat_map(|p| [p[2], p[1], p[0], 0xFF]));
+                    (cur, y_on)
+                };
 
-                // Compose the full column: bg, then the short pixels.
-                let mut v = background_column(vbar_height, cr, cg, cb);
-                for k in 0..short_count {
-                    let y = y_on + k;
-                    if y >= vbar_height {
-                        break;
-                    }
-                    let (s, o) = (k * 4, y * 4);
-                    if s + 3 < short_rgba.len() {
-                        v[o..o + 4].copy_from_slice(&short_rgba[s..s + 4]);
-                    }
-                }
-                // Emit, then move the composed column into the cache (no clone).
-                emit_column(dst, w, h, dx, y_start, vbar_height, &v);
+                // Compose the full column — bg, then the short pixels — into
+                // the evicted vBar slot's buffer, emit it, and leave it cached.
                 let cur = self.vbar_cursor;
                 self.vbar_cursor = (cur + 1) % VBAR_CACHE;
-                self.vbar[cur] = Pixels {
-                    count: vbar_height,
-                    rgba: v,
-                };
+                let short = &self.short_vbar[short_idx];
+                let v = &mut self.vbar[cur];
+                v.count = vbar_height;
+                fill_background(&mut v.rgba, vbar_height, cr, cg, cb);
+                if y_on < vbar_height {
+                    let n = short.count.min(vbar_height - y_on) * 4;
+                    v.rgba[y_on * 4..y_on * 4 + n].copy_from_slice(&short.rgba[..n]);
+                }
+                emit_column(dst, w, h, dx, y_start, vbar_height, &v.rgba);
             }
         }
         Some(())
@@ -466,7 +464,8 @@ fn subcodecs(data: &[u8], w: usize, h: usize, dst: &mut [u8]) -> [usize; 3] {
     counts
 }
 
-/// RAW subcodec: `rw*rh` B,G,R triples, row-major, into the region.
+/// RAW subcodec: `rw*rh` B,G,R triples, row-major, into the region. A short
+/// payload stops mid-region (at the last whole pixel).
 fn raw_region(
     data: &[u8],
     x0: usize,
@@ -477,13 +476,60 @@ fn raw_region(
     h: usize,
     dst: &mut [u8],
 ) {
-    let mut r = Reader::new(data);
+    let n = (data.len() / 3).min(rw * rh);
     for y in 0..rh {
-        for x in 0..rw {
-            let (Some(b), Some(g), Some(rr)) = (r.u8(), r.u8(), r.u8()) else {
-                return;
-            };
-            put(dst, w, h, x0 + x, y0 + y, rr, g, b);
+        let start = y * rw;
+        if start >= n {
+            break;
+        }
+        let Some((o, vis)) = row_span(w, h, x0, y0, 0, y, (n - start).min(rw)) else {
+            continue;
+        };
+        let src = &data[start * 3..(start + vis) * 3];
+        for (d, s) in dst[o..o + vis * 4]
+            .chunks_exact_mut(4)
+            .zip(src.chunks_exact(3))
+        {
+            d.copy_from_slice(&[s[2], s[1], s[0], 0xFF]);
+        }
+    }
+}
+
+/// Raster cursor over a `rw`-wide region: fills `n` pixels of one colour
+/// row-span by row-span (no per-pixel div/mod or bounds check).
+struct Span {
+    x: usize,
+    y: usize,
+}
+
+impl Span {
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn fill(
+        &mut self,
+        dst: &mut [u8],
+        w: usize,
+        h: usize,
+        x0: usize,
+        y0: usize,
+        rw: usize,
+        mut n: usize,
+        col: [u8; 3],
+    ) {
+        let px = [col[0], col[1], col[2], 0xFF];
+        while n > 0 {
+            let seg = n.min(rw - self.x);
+            if let Some((o, vis)) = row_span(w, h, x0, y0, self.x, self.y, seg) {
+                for d in dst[o..o + vis * 4].chunks_exact_mut(4) {
+                    d.copy_from_slice(&px);
+                }
+            }
+            n -= seg;
+            self.x += seg;
+            if self.x == rw {
+                self.x = 0;
+                self.y += 1;
+            }
         }
     }
 }
@@ -521,9 +567,7 @@ fn rlex_region(
 
     let region = rw * rh;
     let mut idx = 0usize;
-    let place = |dst: &mut [u8], idx: usize, col: [u8; 3]| {
-        put(dst, w, h, x0 + idx % rw, y0 + idx / rw, col[0], col[1], col[2]);
-    };
+    let mut cur = Span { x: 0, y: 0 };
 
     while r.remaining() >= 2 && idx < region {
         let tmp = r.u8()?;
@@ -536,19 +580,15 @@ fn rlex_region(
             return None;
         }
         // (a) `run` pixels of the start colour.
-        for _ in 0..run {
-            if idx >= region {
-                break;
-            }
-            place(dst, idx, palette[start_index]);
-            idx += 1;
-        }
+        let n = (run as usize).min(region - idx);
+        cur.fill(dst, w, h, x0, y0, rw, n, palette[start_index]);
+        idx += n;
         // (b) the "suite": one pixel per index from start_index..=stop_index.
         for si in start_index..=stop_index {
             if idx >= region {
                 break;
             }
-            place(dst, idx, palette[si]);
+            cur.fill(dst, w, h, x0, y0, rw, 1, palette[si]);
             idx += 1;
         }
     }
@@ -609,20 +649,40 @@ fn nscodec_region(
     let co = nsc_plane(next(co_bc), chroma_orig);
     let cg = nsc_plane(next(cg_bc), chroma_orig);
 
-    for y in 0..rh {
-        for x in 0..rw {
-            let yv = *luma.get(y * luma_stride + x).unwrap_or(&0) as i16;
-            let ci = if subsample {
-                (y >> 1) * chroma_stride + (x >> 1)
-            } else {
-                y * rw + x
-            };
-            let cov = (((*co.get(ci).unwrap_or(&0) as i16) << shift) as i8) as i16;
-            let cgv = (((*cg.get(ci).unwrap_or(&0) as i16) << shift) as i8) as i16;
-            let r = (yv + cov - cgv).clamp(0, 255) as u8;
-            let g = (yv + cgv).clamp(0, 255) as u8;
-            let b = (yv - cov - cgv).clamp(0, 255) as u8;
-            put(dst, w, h, x0 + x, y0 + y, r, g, b);
+    // Planes are exactly `*_orig` bytes, so every in-region index is in
+    // range; clip to the tile once, then convert whole rows. The chroma
+    // colour-loss shift (with its i8 wrap) is a 256-entry table.
+    let chroma: [i16; 256] = std::array::from_fn(|v| (((v as i16) << shift) as i8) as i16);
+    let rows = rh.min(h.saturating_sub(y0));
+    let cols = rw.min(w.saturating_sub(x0));
+    if cols == 0 {
+        return Some(());
+    }
+    let px = |yv: u8, co: u8, cg: u8| -> [u8; 4] {
+        let (yv, cov, cgv) = (yv as i16, chroma[co as usize], chroma[cg as usize]);
+        [
+            (yv + cov - cgv).clamp(0, 255) as u8,
+            (yv + cgv).clamp(0, 255) as u8,
+            (yv - cov - cgv).clamp(0, 255) as u8,
+            0xFF,
+        ]
+    };
+    for y in 0..rows {
+        let lrow = &luma[y * luma_stride..][..cols];
+        let o = ((y0 + y) * w + x0) * 4;
+        let drow = dst[o..o + cols * 4].chunks_exact_mut(4);
+        if subsample {
+            let c = (y >> 1) * chroma_stride;
+            let (corow, cgrow) = (&co[c..][..cols.div_ceil(2)], &cg[c..][..cols.div_ceil(2)]);
+            for (x, (d, &yv)) in drow.zip(lrow).enumerate() {
+                d.copy_from_slice(&px(yv, corow[x >> 1], cgrow[x >> 1]));
+            }
+        } else {
+            let c = y * rw;
+            let (corow, cgrow) = (&co[c..][..cols], &cg[c..][..cols]);
+            for (((d, &yv), &cov), &cgv) in drow.zip(lrow).zip(corow).zip(cgrow) {
+                d.copy_from_slice(&px(yv, cov, cgv));
+            }
         }
     }
     Some(())
@@ -658,6 +718,35 @@ fn nsc_rle(input: &[u8], orig_size: usize) -> Vec<u8> {
     let mut i = 0usize;
     let mut pos = 0usize;
     while pos + 4 < orig_size {
+        // Fast path: a whole token's bytes are present and this isn't the
+        // single-literal slot before the tail. Short runs are one 8-byte
+        // store; bytes past the run are rewritten by later tokens or the tail,
+        // or re-zeroed below if the input stops early.
+        if let (Some(b), true) = (input.get(i..i + 7), pos + 5 < orig_size) {
+            let value = b[0];
+            if b[1] != value {
+                out[pos] = value;
+                pos += 1;
+                i += 1;
+                continue;
+            }
+            let len = if b[2] < 0xFF {
+                i += 3;
+                b[2] as usize + 2
+            } else {
+                i += 7;
+                u32::from_le_bytes([b[3], b[4], b[5], b[6]]) as usize
+            };
+            if len <= 8 && pos + 8 <= orig_size {
+                out[pos..pos + 8].fill(value);
+                pos += len;
+            } else {
+                let end = (pos + len).min(orig_size);
+                out[pos..end].fill(value);
+                pos = end;
+            }
+            continue;
+        }
         let Some(&value) = input.get(i) else { break };
         i += 1;
         if pos + 5 == orig_size {
@@ -675,14 +764,16 @@ fn nsc_rle(input: &[u8], orig_size: usize) -> Vec<u8> {
                 u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize
             };
             let end = (pos + len).min(orig_size);
-            for p in &mut out[pos..end] {
-                *p = value;
-            }
+            out[pos..end].fill(value);
             pos = end;
         } else {
             out[pos] = value;
             pos += 1;
         }
+    }
+    // An early stop leaves the rest zero: undo the fast path's overshoot.
+    if pos + 4 < orig_size {
+        out[pos..(pos + 8).min(orig_size - 4)].fill(0);
     }
     // Tail: the last 4 bytes are stored literally.
     for k in 0..4 {
@@ -711,20 +802,32 @@ fn emit_column(
     let rows = vbar_height
         .min(column.len() / 4)
         .min(h.saturating_sub(y_start));
-    for y in 0..rows {
-        let s = y * 4;
-        let d = ((y_start + y) * w + dx) * 4;
-        dst[d..d + 4].copy_from_slice(&column[s..s + 4]);
+    if rows == 0 {
+        return;
+    }
+    // Stride down the tile: one pixel per destination row.
+    let d0 = (y_start * w + dx) * 4;
+    for (d, s) in dst[d0..]
+        .chunks_mut(w * 4)
+        .zip(column[..rows * 4].chunks_exact(4))
+    {
+        d[..4].copy_from_slice(s);
     }
 }
 
 /// A `count`-pixel RGBA column filled with the band background colour.
 fn background_column(count: usize, r: u8, g: u8, b: u8) -> Vec<u8> {
-    let mut v = vec![0u8; count * 4];
+    let mut v = Vec::new();
+    fill_background(&mut v, count, r, g, b);
+    v
+}
+
+/// Resize `v` to a `count`-pixel column of the band background colour,
+/// reusing its allocation.
+fn fill_background(v: &mut Vec<u8>, count: usize, r: u8, g: u8, b: u8) {
+    v.resize(count * 4, 0);
     let pixel = [r, g, b, 0xFF];
-    let pattern = u8x16::new([
-        r, g, b, 0xFF, r, g, b, 0xFF, r, g, b, 0xFF, r, g, b, 0xFF,
-    ]);
+    let pattern = u8x16::new([r, g, b, 0xFF, r, g, b, 0xFF, r, g, b, 0xFF, r, g, b, 0xFF]);
     let pattern = pattern.to_array();
     let mut chunks = v.chunks_exact_mut(16);
     for chunk in &mut chunks {
@@ -733,8 +836,11 @@ fn background_column(count: usize, r: u8, g: u8, b: u8) -> Vec<u8> {
     for px in chunks.into_remainder().chunks_exact_mut(4) {
         px.copy_from_slice(&pixel);
     }
-    v
 }
+
+#[cfg(test)]
+#[path = "clearcodec_ref.rs"]
+mod reference;
 
 #[cfg(test)]
 mod tests {
@@ -747,7 +853,7 @@ mod tests {
         let (w, h) = (4usize, 4usize);
         let mut dst = vec![0u8; w * h * 4];
         let column = vec![0xAAu8; 8 * 4]; // 8 rows offered
-        // yStart 2 in a 4-row tile → only rows 2..4 may be written.
+                                          // yStart 2 in a 4-row tile → only rows 2..4 may be written.
         emit_column(&mut dst, w, h, 1, 2, 8, &column);
         assert_eq!(&dst[(2 * w + 1) * 4..(2 * w + 1) * 4 + 4], &[0xAA; 4]);
         assert_eq!(&dst[(3 * w + 1) * 4..(3 * w + 1) * 4 + 4], &[0xAA; 4]);
@@ -772,7 +878,9 @@ mod tests {
     fn residual_solid_fill() {
         // One run of 4 red pixels (B=0,G=0,R=255, run=4) over a 2x2 tile.
         let res = [0x00, 0x00, 0xFF, 0x04];
-        let out = ClearDecoder::new().decode(&stream(&res, &[], &[]), 2, 2).unwrap();
+        let out = ClearDecoder::new()
+            .decode(&stream(&res, &[], &[]), 2, 2)
+            .unwrap();
         assert_eq!(out.len(), 16);
         for px in out.chunks_exact(4) {
             assert_eq!(px, [0xFF, 0x00, 0x00, 0xFF]); // RGBA red
@@ -783,7 +891,9 @@ mod tests {
     fn residual_run_escalation_and_partial() {
         // Blue (B=255) run of 3 then green (G=255) run of 1 over a 2x2 tile.
         let res = [0xFF, 0x00, 0x00, 0x03, 0x00, 0xFF, 0x00, 0x01];
-        let out = ClearDecoder::new().decode(&stream(&res, &[], &[]), 2, 2).unwrap();
+        let out = ClearDecoder::new()
+            .decode(&stream(&res, &[], &[]), 2, 2)
+            .unwrap();
         assert_eq!(&out[0..4], [0x00, 0x00, 0xFF, 0xFF]); // blue
         assert_eq!(&out[12..16], [0x00, 0xFF, 0x00, 0xFF]); // last pixel green
     }
@@ -799,7 +909,9 @@ mod tests {
         sub.extend_from_slice(&3u32.to_le_bytes()); // byteCount
         sub.push(SUBCODEC_RAW);
         sub.extend_from_slice(&[10, 20, 30]); // B,G,R
-        let out = ClearDecoder::new().decode(&stream(&[], &[], &sub), 1, 1).unwrap();
+        let out = ClearDecoder::new()
+            .decode(&stream(&[], &[], &sub), 1, 1)
+            .unwrap();
         assert_eq!(out, vec![30, 20, 10, 0xFF]); // RGBA
     }
 
@@ -823,7 +935,9 @@ mod tests {
         sub.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         sub.push(SUBCODEC_RLEX);
         sub.extend_from_slice(&payload);
-        let out = ClearDecoder::new().decode(&stream(&[], &[], &sub), 2, 1).unwrap();
+        let out = ClearDecoder::new()
+            .decode(&stream(&[], &[], &sub), 2, 1)
+            .unwrap();
         // pixel0 = run(start=red), pixel1 = suite[1]=blue.
         assert_eq!(&out[0..4], [0xFF, 0x00, 0x00, 0xFF]); // red
         assert_eq!(&out[4..8], [0x00, 0x00, 0xFF, 0xFF]); // blue
@@ -870,7 +984,9 @@ mod tests {
         // An empty composition (no residual / bands / subcodec layers) must
         // return the seed untouched — the persistent-surface contract a partial
         // ClearCodec update relies on. Before the seed fix this came back black.
-        let seed = vec![1, 2, 3, 0xFF, 4, 5, 6, 0xFF, 7, 8, 9, 0xFF, 10, 11, 12, 0xFF];
+        let seed = vec![
+            1, 2, 3, 0xFF, 4, 5, 6, 0xFF, 7, 8, 9, 0xFF, 10, 11, 12, 0xFF,
+        ];
         let out = ClearDecoder::new()
             .decode_seeded(&stream(&[], &[], &[]), 2, 2, Some(&seed))
             .unwrap();
@@ -947,7 +1063,11 @@ mod tests {
     #[test]
     fn needs_seed_residual_and_partial_region_are_true() {
         // A residual may be a partial run → seed needed.
-        assert!(needs_seed(&stream(&[0x00, 0x00, 0xFF, 0x04], &[], &[]), 2, 2));
+        assert!(needs_seed(
+            &stream(&[0x00, 0x00, 0xFF, 0x04], &[], &[]),
+            2,
+            2
+        ));
         // A RAW region not covering the whole tile → seed needed.
         let mut sub = Vec::new();
         sub.extend_from_slice(&1u16.to_le_bytes()); // x = 1 (not whole tile)
@@ -965,8 +1085,406 @@ mod tests {
         let mut dec = ClearDecoder::new();
         for seed in 0u16..1500 {
             let b = seed.to_le_bytes();
-            let junk = [b[0], b[1], b[1] ^ 0x5a, b[0].wrapping_add(9), 0xFF, 0x00, b[0]];
+            let junk = [
+                b[0],
+                b[1],
+                b[1] ^ 0x5a,
+                b[0].wrapping_add(9),
+                0xFF,
+                0x00,
+                b[0],
+            ];
             let _ = dec.decode(&junk, 4, 4);
+        }
+    }
+
+    /// Deterministic xorshift for the generated streams.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+        fn u8(&mut self) -> u8 {
+            self.next() as u8
+        }
+    }
+
+    fn run_length(out: &mut Vec<u8>, n: u32) {
+        if n < 0xFF {
+            out.push(n as u8);
+        } else if n < 0xFFFF {
+            out.push(0xFF);
+            out.extend_from_slice(&(n as u16).to_le_bytes());
+        } else {
+            out.push(0xFF);
+            out.extend_from_slice(&0xFFFFu16.to_le_bytes());
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+    }
+
+    fn gen_residual(rng: &mut Rng, w: usize, h: usize) -> Vec<u8> {
+        let colours: Vec<[u8; 3]> = (0..4).map(|_| [rng.u8(), rng.u8(), rng.u8()]).collect();
+        let mut out = Vec::new();
+        let mut left = w * h;
+        while left > 0 {
+            let run = if rng.below(8) == 0 {
+                rng.below(left as u64) + 1
+            } else {
+                rng.below(40) + 1
+            };
+            let run = (run as usize).min(left);
+            out.extend_from_slice(&colours[rng.below(4) as usize]);
+            run_length(&mut out, run as u32);
+            left -= run;
+        }
+        out
+    }
+
+    /// Text-like bands: glyph columns as short-vBar misses, repeats as short
+    /// and full vBar cache hits. `vbars`/`shorts` track the decoder's cursors
+    /// so hits reference entries that exist.
+    fn gen_bands(
+        rng: &mut Rng,
+        w: usize,
+        h: usize,
+        vbars: &mut usize,
+        shorts: &mut usize,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut y = 0;
+        while y < h {
+            let bh = (rng.below(24) as usize + 8).min(h - y);
+            let x0 = rng.below(8) as usize;
+            let x1 = (x0 + rng.below(w as u64) as usize).min(w + 2); // may overhang
+            out.extend_from_slice(&(x0 as u16).to_le_bytes());
+            out.extend_from_slice(&(x1 as u16).to_le_bytes());
+            out.extend_from_slice(&(y as u16).to_le_bytes());
+            out.extend_from_slice(&((y + bh - 1) as u16).to_le_bytes());
+            out.extend_from_slice(&[0xF0, 0xF0, 0xF0]);
+            for _ in x0..=x1 {
+                let k = rng.below(10);
+                if k < 3 && *vbars > 0 {
+                    let idx = *vbars - 1 - rng.below((*vbars).min(64) as u64) as usize;
+                    out.extend_from_slice(&(0x8000 | idx as u16).to_le_bytes());
+                } else if k < 5 && *shorts > 0 {
+                    let idx = *shorts - 1 - rng.below((*shorts).min(64) as u64) as usize;
+                    out.extend_from_slice(&(0x4000 | idx as u16).to_le_bytes());
+                    out.push(rng.below(bh as u64) as u8);
+                    *vbars += 1;
+                } else {
+                    let on = rng.below(bh as u64 / 2 + 1) as usize;
+                    let off = (on + rng.below(bh as u64 + 2 - on as u64) as usize).min(63);
+                    out.extend_from_slice(&(((off as u16) << 8) | on as u16).to_le_bytes());
+                    for _ in on..off {
+                        let v = rng.u8() | 0x80;
+                        out.extend_from_slice(&[v / 2, v / 2, v]);
+                    }
+                    *shorts += 1;
+                    *vbars += 1;
+                }
+            }
+            y += bh;
+        }
+        out
+    }
+
+    fn region(x: usize, y: usize, rw: usize, rh: usize, id: u8, payload: &[u8]) -> Vec<u8> {
+        let mut s = Vec::new();
+        for v in [x, y, rw, rh] {
+            s.extend_from_slice(&(v as u16).to_le_bytes());
+        }
+        s.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        s.push(id);
+        s.extend_from_slice(payload);
+        s
+    }
+
+    fn gen_raw(rng: &mut Rng, rw: usize, rh: usize) -> Vec<u8> {
+        (0..rw * rh * 3).map(|_| rng.u8()).collect()
+    }
+
+    fn gen_rlex(rng: &mut Rng, rw: usize, rh: usize) -> Vec<u8> {
+        let n = rng.below(7) as usize + 2;
+        let mut out = vec![n as u8];
+        for _ in 0..n {
+            out.extend_from_slice(&[rng.u8(), rng.u8(), rng.u8()]);
+        }
+        let bits = 32 - (n as u32 - 1).leading_zeros();
+        let mut left = rw * rh;
+        while left > 0 {
+            let stop = rng.below(n as u64) as usize;
+            let depth = rng.below(stop as u64 + 1).min(2) as usize;
+            let run = rng.below(30) as usize;
+            out.push(((depth << bits) | stop) as u8);
+            run_length(&mut out, run as u32);
+            left = left.saturating_sub(run + depth + 1);
+        }
+        out
+    }
+
+    /// NSCodec RLE encoder (the inverse of `nsc_rle`).
+    fn nsc_encode(plane: &[u8]) -> Vec<u8> {
+        let n = plane.len();
+        if n <= 4 {
+            return plane.to_vec();
+        }
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos + 4 < n {
+            let v = plane[pos];
+            if pos + 5 == n {
+                out.push(v);
+                pos += 1;
+                continue;
+            }
+            let mut l = 1;
+            while pos + l < n - 4 && plane[pos + l] == v {
+                l += 1;
+            }
+            if l >= 2 {
+                out.extend_from_slice(&[v, v]);
+                if l - 2 < 0xFF {
+                    out.push((l - 2) as u8);
+                } else {
+                    out.push(0xFF);
+                    out.extend_from_slice(&(l as u32).to_le_bytes());
+                }
+                pos += l;
+            } else {
+                out.push(v);
+                pos += 1;
+            }
+        }
+        out.extend_from_slice(&plane[n - 4..]);
+        out
+    }
+
+    fn gen_nscodec(rng: &mut Rng, rw: usize, rh: usize) -> Vec<u8> {
+        let sub = rng.below(2) == 0;
+        let loss = rng.below(3) as u8 + 1;
+        let temp_w = (rw + 7) & !7;
+        let temp_h = (rh + 1) & !1;
+        let (luma, chroma) = if sub {
+            (temp_w * rh, (temp_w / 2) * (temp_h / 2))
+        } else {
+            (rw * rh, rw * rh)
+        };
+        // Smooth gradients with flat stretches, like window chrome / photos.
+        let plane = |len: usize, rng: &mut Rng| -> Vec<u8> {
+            let mut v = rng.u8();
+            (0..len)
+                .map(|_| {
+                    if rng.below(4) == 0 {
+                        v = v.wrapping_add(rng.below(5) as u8).wrapping_sub(2);
+                    }
+                    v
+                })
+                .collect()
+        };
+        let planes = [plane(luma, rng), plane(chroma, rng), plane(chroma, rng)];
+        let enc: Vec<Vec<u8>> = planes
+            .iter()
+            .map(|p| {
+                if rng.below(4) == 0 {
+                    p.clone()
+                } else {
+                    nsc_encode(p)
+                }
+            })
+            .collect();
+        let mut out = Vec::new();
+        for e in &enc {
+            out.extend_from_slice(&(e.len() as u32).to_le_bytes());
+        }
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&[loss, sub as u8, 0, 0]);
+        for e in &enc {
+            out.extend_from_slice(e);
+        }
+        out
+    }
+
+    /// One generated stream of `kind` for a `w`×`h` tile (regions may overhang
+    /// the tile to exercise clipping).
+    fn gen_stream(
+        rng: &mut Rng,
+        kind: u8,
+        w: usize,
+        h: usize,
+        vbars: &mut usize,
+        shorts: &mut usize,
+    ) -> Vec<u8> {
+        let rect = |rng: &mut Rng, full: bool| -> (usize, usize, usize, usize) {
+            if full {
+                (0, 0, w, h)
+            } else {
+                let x = rng.below(w as u64 + 4) as usize;
+                let y = rng.below(h as u64 + 4) as usize;
+                (
+                    x,
+                    y,
+                    rng.below(w as u64) as usize + 1,
+                    rng.below(h as u64) as usize + 1,
+                )
+            }
+        };
+        let full = rng.below(3) != 0;
+        match kind {
+            0 => stream(&gen_residual(rng, w, h), &[], &[]),
+            1 => {
+                let res = gen_residual(rng, w, h);
+                stream(&res, &gen_bands(rng, w, h, vbars, shorts), &[])
+            }
+            2 => {
+                let (x, y, rw, rh) = rect(rng, full);
+                stream(
+                    &[],
+                    &[],
+                    &region(x, y, rw, rh, SUBCODEC_RAW, &gen_raw(rng, rw, rh)),
+                )
+            }
+            3 => {
+                let (x, y, rw, rh) = rect(rng, full);
+                stream(
+                    &[],
+                    &[],
+                    &region(x, y, rw, rh, SUBCODEC_RLEX, &gen_rlex(rng, rw, rh)),
+                )
+            }
+            _ => {
+                let (x, y, rw, rh) = rect(rng, full);
+                stream(
+                    &[],
+                    &[],
+                    &region(x, y, rw, rh, SUBCODEC_NSCODEC, &gen_nscodec(rng, rw, rh)),
+                )
+            }
+        }
+    }
+
+    /// `nsc_rle` (with its overshooting fast path) against the reference on
+    /// encoded planes, truncated ones and raw garbage, including run lengths
+    /// that overrun the plane.
+    #[test]
+    fn nsc_rle_matches_reference() {
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        for k in 0..4000 {
+            let n = rng.below(300) as usize + 1;
+            let mut v = rng.u8();
+            let plane: Vec<u8> = (0..n)
+                .map(|_| {
+                    if rng.below(3) == 0 {
+                        v = v.wrapping_add(rng.below(3) as u8);
+                    }
+                    v
+                })
+                .collect();
+            let mut input = match k % 3 {
+                0 => nsc_encode(&plane),
+                1 => (0..rng.below(64))
+                    .map(|_| (rng.below(4) * 0x55) as u8)
+                    .collect(),
+                _ => (0..rng.below(64)).map(|_| rng.u8() | 0xFC).collect(),
+            };
+            if k % 5 == 0 && !input.is_empty() {
+                input.truncate(rng.below(input.len() as u64) as usize);
+            }
+            assert_eq!(
+                nsc_rle(&input, n),
+                reference::nsc_rle(&input, n),
+                "case {k}"
+            );
+            if k % 3 == 0 && k % 5 != 0 {
+                assert_eq!(nsc_rle(&input, n), plane);
+            }
+        }
+    }
+
+    /// The live decoder must match the pre-rewrite reference byte for byte on
+    /// every layer kind, odd tile sizes, overhanging regions, warm vBar caches
+    /// and corrupted streams.
+    #[test]
+    fn matches_reference_decoder() {
+        let mut new = ClearDecoder::new();
+        let mut old = reference::ClearDecoder::new();
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut vbars, mut shorts) = (0, 0);
+        for i in 0..3000 {
+            let kind = (i % 5) as u8;
+            let w = rng.below(70) as usize + 1;
+            let h = rng.below(40) as usize + 1;
+            let mut s = gen_stream(&mut rng, kind, w, h, &mut vbars, &mut shorts);
+            if i % 3 == 0 {
+                for _ in 0..rng.below(4) + 1 {
+                    let k = rng.below(s.len() as u64) as usize;
+                    s[k] ^= 1 << rng.below(8);
+                }
+            }
+            if i % 7 == 0 {
+                s.truncate(rng.below(s.len() as u64) as usize + 1);
+            }
+            let seed: Vec<u8> = (0..w * h * 4).map(|_| rng.u8()).collect();
+            let seed = (i % 2 == 0).then_some(&seed[..]);
+            assert_eq!(
+                new.decode_seeded(&s, w as u16, h as u16, seed),
+                old.decode_seeded(&s, w as u16, h as u16, seed),
+                "stream {i} kind {kind} {w}x{h}"
+            );
+        }
+    }
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    }
+
+    /// `cargo test -p rdp-graphics --release -- --ignored --nocapture bench_clearcodec`
+    #[test]
+    #[ignore]
+    fn bench_clearcodec() {
+        let (w, h) = (256usize, 64usize);
+        for (kind, name) in [
+            (0u8, "residual"),
+            (1, "text bands"),
+            (2, "raw"),
+            (3, "rlex"),
+            (4, "nscodec"),
+        ] {
+            let mut rng = Rng(7 + kind as u64);
+            let (mut vbars, mut shorts) = (0, 0);
+            let streams: Vec<Vec<u8>> = (0..200)
+                .map(|_| gen_stream(&mut rng, kind, w, h, &mut vbars, &mut shorts))
+                .collect();
+            let seed = vec![0x40u8; w * h * 4];
+            let mut times = [Vec::new(), Vec::new()];
+            for _ in 0..9 {
+                let mut new = ClearDecoder::new();
+                let mut old = reference::ClearDecoder::new();
+                let t0 = std::time::Instant::now();
+                for s in &streams {
+                    std::hint::black_box(old.decode_seeded(s, w as u16, h as u16, Some(&seed)));
+                }
+                times[0].push(t0.elapsed().as_secs_f64());
+                let t0 = std::time::Instant::now();
+                for s in &streams {
+                    std::hint::black_box(new.decode_seeded(s, w as u16, h as u16, Some(&seed)));
+                }
+                times[1].push(t0.elapsed().as_secs_f64());
+            }
+            let px = (streams.len() * w * h) as f64;
+            let (old, new) = (median(times[0].clone()), median(times[1].clone()));
+            println!(
+                "clearcodec {name:10} {w}x{h}  ref {:7.1} Mpx/s  new {:7.1} Mpx/s  x{:.2}",
+                px / old / 1e6,
+                px / new / 1e6,
+                old / new
+            );
         }
     }
 }

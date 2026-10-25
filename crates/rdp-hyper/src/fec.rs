@@ -55,7 +55,8 @@ fn inv(a: u8) -> u8 {
 
 /// `out ^= c * src`, byte-wise — the hot loop. Multiplication by `c` is
 /// linear over XOR, so `c * s = c * (s & 15) ^ c * (s & 240)`: two 16-entry
-/// tables, which AVX2 looks up 32 bytes at a time (PSHUFB).
+/// tables, which AVX2 looks up 32 bytes at a time (PSHUFB), and an ARM CPU
+/// (the Android client's Snapdragon) 16 at a time (NEON's TBL).
 fn mul_add(out: &mut [u8], src: &[u8], c: u8) {
     match c {
         0 => {}
@@ -67,11 +68,17 @@ fn mul_add(out: &mut [u8], src: &[u8], c: u8) {
                 lo[x as usize] = mul(c, x);
                 hi[x as usize] = mul(c, x << 4);
             }
+            #[allow(unused_mut, unused_assignments)]
             let mut done = 0;
             #[cfg(target_arch = "x86_64")]
             if std::arch::is_x86_feature_detected!("avx2") {
                 // SAFETY: AVX2 is present (checked above).
                 done = unsafe { mul_add_avx2(out, src, &lo, &hi) };
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // SAFETY: NEON is part of AArch64.
+                done = unsafe { mul_add_neon(out, src, &lo, &hi) };
             }
             for (o, s) in out[done..].iter_mut().zip(&src[done..]) {
                 *o ^= lo[(s & 15) as usize] ^ hi[(s >> 4) as usize];
@@ -102,6 +109,27 @@ unsafe fn mul_add_avx2(out: &mut [u8], src: &[u8], lo: &[u8; 16], hi: &[u8; 16])
     n
 }
 
+/// The NEON body of [`mul_add`]; returns how many bytes it did (a multiple
+/// of 16 — the caller finishes the tail).
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_add_neon(out: &mut [u8], src: &[u8], lo: &[u8; 16], hi: &[u8; 16]) -> usize {
+    use std::arch::aarch64::*;
+    let n = out.len().min(src.len()) & !15;
+    let lo_t = vld1q_u8(lo.as_ptr());
+    let hi_t = vld1q_u8(hi.as_ptr());
+    let mask = vdupq_n_u8(0x0F);
+    let mut i = 0;
+    while i < n {
+        let s = vld1q_u8(src.as_ptr().add(i));
+        let l = vqtbl1q_u8(lo_t, vandq_u8(s, mask));
+        let h = vqtbl1q_u8(hi_t, vshrq_n_u8::<4>(s));
+        let o = vld1q_u8(out.as_ptr().add(i));
+        vst1q_u8(out.as_mut_ptr().add(i), veorq_u8(o, veorq_u8(l, h)));
+        i += 16;
+    }
+    n
+}
+
 /// Coefficient of data shard `j` in parity shard `i` (block of `k` data shards).
 fn cauchy(k: usize, i: usize, j: usize) -> u8 {
     inv(((k + i) as u8) ^ (j as u8))
@@ -126,45 +154,55 @@ pub fn encode(data: &[&[u8]], m: usize) -> Vec<Vec<u8>> {
 /// Rebuild missing data shards in place. `shards` holds the `k` data shards
 /// then the `m` parity shards, `None` where lost. Returns `false` if fewer
 /// than `k` shards arrived (unrecoverable). Parity shards are not rebuilt.
+///
+/// Only the lost shards' equations are solved: with `e` data shards lost and
+/// `e` parity shards `p` used, `p - (the arrived data's share of p)` is the
+/// lost shards' share, an `e x e` Cauchy system (invertible, like every
+/// square piece of a Cauchy matrix) — not the whole `k x k` one.
 pub fn reconstruct(shards: &mut [Option<Vec<u8>>], k: usize) -> bool {
     let m = shards.len() - k;
-    if shards[..k].iter().all(Option::is_some) {
+    let missing: Vec<usize> = (0..k).filter(|&j| shards[j].is_none()).collect();
+    if missing.is_empty() {
         return true;
     }
-    // Pick k present shards: data first (identity rows), then parity.
-    let present: Vec<usize> = (0..k + m).filter(|&i| shards[i].is_some()).take(k).collect();
-    if present.len() < k {
+    let parity: Vec<usize> = (0..m).filter(|&i| shards[k + i].is_some()).take(missing.len()).collect();
+    if parity.len() < missing.len() {
         return false;
     }
-    let len = shards[present[0]].as_ref().map(Vec::len).unwrap_or(0);
-    // Rows of the encoding matrix for the shards we have.
-    let mut a: Vec<Vec<u8>> = present
+    let e = missing.len();
+    let len = shards[k + parity[0]].as_ref().map(Vec::len).unwrap_or(0);
+    // Each used parity shard less what the arrived data shards put into it.
+    let mut residual: Vec<Vec<u8>> = parity
         .iter()
-        .map(|&s| {
-            if s < k {
-                (0..k).map(|j| (j == s) as u8).collect()
-            } else {
-                (0..k).map(|j| cauchy(k, s - k, j)).collect()
+        .map(|&i| {
+            let mut r = shards[k + i].clone().unwrap_or_default();
+            for j in (0..k).filter(|j| shards[*j].is_some()) {
+                if let Some(d) = shards[j].as_deref() {
+                    mul_add(&mut r, d, cauchy(k, i, j));
+                }
             }
+            r
         })
         .collect();
-    // Invert `a` (Gauss-Jordan); `b` becomes a^-1.
-    let mut b: Vec<Vec<u8>> = (0..k).map(|r| (0..k).map(|c| (r == c) as u8).collect()).collect();
-    for col in 0..k {
-        let Some(pivot) = (col..k).find(|&r| a[r][col] != 0) else {
+    // Invert the e x e system (Gauss-Jordan): rows the parity used, columns
+    // the lost shards.
+    let mut a: Vec<Vec<u8>> = parity.iter().map(|&i| missing.iter().map(|&j| cauchy(k, i, j)).collect()).collect();
+    let mut b: Vec<Vec<u8>> = (0..e).map(|r| (0..e).map(|c| (r == c) as u8).collect()).collect();
+    for col in 0..e {
+        let Some(pivot) = (col..e).find(|&r| a[r][col] != 0) else {
             return false;
         };
         a.swap(col, pivot);
         b.swap(col, pivot);
         let f = inv(a[col][col]);
-        for c in 0..k {
+        for c in 0..e {
             a[col][c] = mul(a[col][c], f);
             b[col][c] = mul(b[col][c], f);
         }
-        for r in 0..k {
+        for r in 0..e {
             if r != col && a[r][col] != 0 {
                 let f = a[r][col];
-                for c in 0..k {
+                for c in 0..e {
                     let (ac, bc) = (a[col][c], b[col][c]);
                     a[r][c] ^= mul(f, ac);
                     b[r][c] ^= mul(f, bc);
@@ -172,15 +210,19 @@ pub fn reconstruct(shards: &mut [Option<Vec<u8>>], k: usize) -> bool {
             }
         }
     }
-    // Missing data shard j = sum over present shards of a^-1[j][idx] * shard.
-    let missing: Vec<usize> = (0..k).filter(|&j| shards[j].is_none()).collect();
-    let mut rebuilt = Vec::with_capacity(missing.len());
-    for &j in &missing {
+    // Lost shard missing[x] = sum over r of a^-1[x][r] * residual[r]; with
+    // one lost (the usual case) that's the residual scaled, in place.
+    if e == 1 {
         let mut out = vec![0u8; len];
-        for (idx, &s) in present.iter().enumerate() {
-            if let Some(src) = shards[s].as_deref() {
-                mul_add(&mut out, src, b[j][idx]);
-            }
+        mul_add(&mut out, &residual[0], b[0][0]);
+        shards[missing[0]] = Some(out);
+        return true;
+    }
+    let mut rebuilt = Vec::with_capacity(e);
+    for x in 0..e {
+        let mut out = vec![0u8; len];
+        for (r, res) in residual.iter_mut().enumerate() {
+            mul_add(&mut out, res, b[x][r]);
         }
         rebuilt.push(out);
     }

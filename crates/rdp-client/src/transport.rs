@@ -139,7 +139,7 @@ pub fn connect(
 /// Reconnect requesting only legacy Standard RDP Security (`PROTOCOL_RDP`).
 /// Used as a runtime fallback when the TLS/NLA upgrade fails on a server that
 /// also allows the legacy path. (Only the Windows connect path invokes this.)
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub fn connect_legacy(
     config: &ClientConfig,
 ) -> Result<(TcpStream, Connector, SecurityProtocol), NegotiateError> {

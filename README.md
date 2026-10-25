@@ -42,6 +42,9 @@ and a Hyper host needs it to pass updates on to the devices that connect.
 connection on the laptop. The full walkthrough is in
 [docs/hyper.md](docs/hyper.md).
 
+**On an Android tablet**: the same Hyper stream, with touch, trackpad, mouse
+and keyboard. See [docs/android.md](docs/android.md).
+
 **Running many machines**: the launcher's **Workspace** keeps saved
 connections in folders (right-click, or drag them onto a folder) and opens
 sessions side by side in tabs inside the launcher window: Ctrl+Tab between

@@ -77,11 +77,40 @@ impl<S: Read + Write> Read for TlsStream<S> {
 }
 
 impl<S: Read + Write> Write for TlsStream<S> {
+    // As the SChannel path does (`write_all_riding_wouldblock`): on a
+    // non-blocking socket a full send buffer is `WouldBlock`, and a TLS
+    // record must still go out whole — so ride it out, and leave nothing
+    // pending in rustls (a read would otherwise try to send it first and
+    // report `WouldBlock` with data waiting).
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
+        let n = riding_wouldblock(|| self.inner.write(buf))?;
+        riding_wouldblock(|| {
+            while self.inner.conn.wants_write() {
+                self.inner.conn.write_tls(&mut self.inner.sock)?;
+            }
+            Ok(())
+        })?;
+        Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        riding_wouldblock(|| self.inner.flush())
+    }
+}
+
+/// Retry `f` while the socket says `WouldBlock` (bounded: a peer that stops
+/// reading for this long is a dead connection). Blocking sockets never do.
+fn riding_wouldblock<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match f() {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "send buffer stayed full while writing a TLS record"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            other => return other,
+        }
     }
 }
 

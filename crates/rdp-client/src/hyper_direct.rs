@@ -1196,6 +1196,12 @@ impl SignIn {
         self.secret = secret;
     }
 
+    /// What a running stream needs to tell its client's new sign-in (see
+    /// [`comeback`]): cookies minted and checked exactly as here.
+    fn comeback(&self) -> Comeback {
+        Comeback { cookies: self.cookies.clone(), epoch: self.epoch }
+    }
+
     pub(crate) fn new(secret: [u8; 32]) -> Self {
         Self {
             secret,
@@ -1361,6 +1367,71 @@ impl SignIn {
     }
 }
 
+/// A client back while its old stream still runs. A client that takes its
+/// stream for dead (a relayed link that dropped) signs in again from a new
+/// port; the stream's receive thread hears it, and rather than ignoring it
+/// until the old stream times out (6 s, then the client's 2 s retries: 10-20 s
+/// a drop) it answers the cookie round (stateless) and, once a hello proves
+/// the client's address, ends the stream at once and hands the hello to the
+/// sign-in. Only from the streaming client's own IP, and only with a valid
+/// cookie: nobody else, and no spoofed packet, can end a stream so. Switch
+/// `fastreconnect`.
+struct Comeback {
+    cookies: auth::CookieJar,
+    epoch: Instant,
+}
+
+/// Set while the agent streams.
+static COMEBACK: Mutex<Option<Comeback>> = Mutex::new(None);
+/// The hello that ends the stream, for the sign-in.
+static RETURNING: Mutex<Option<(Vec<u8>, SocketAddr)>> = Mutex::new(None);
+static RETURNING_SET: AtomicBool = AtomicBool::new(false);
+
+/// An auth datagram `d` from `from` reached the stream with client `peer`
+/// (on the stream's receive thread). See [`Comeback`].
+pub(crate) fn comeback(socket: &UdpSocket, d: &[u8], from: SocketAddr, peer: SocketAddr) {
+    if from.ip() != peer.ip() || RETURNING_SET.load(Ordering::Relaxed) || !crate::host_ab::ab("fastreconnect", true) {
+        return;
+    }
+    let Some(AuthMsg::Hello { want, .. }) = AuthMsg::parse(d) else { return };
+    let guard = COMEBACK.lock().unwrap();
+    let Some(c) = guard.as_ref() else { return };
+    let now_s = c.epoch.elapsed().as_secs();
+    let valid = want.cookie.as_deref().and_then(auth::cookie_from_hex).is_some_and(|k| c.cookies.check(from, &k, now_s));
+    if !valid {
+        let _ = socket.send_to(&AuthMsg::Cookie { cookie: c.cookies.make(from, now_s) }.to_datagram(), from);
+        return;
+    }
+    tracing::info!(client = %from, "the client is signing in again; ending its old stream now");
+    *RETURNING.lock().unwrap() = Some((d.to_vec(), from));
+    RETURNING_SET.store(true, Ordering::Relaxed);
+}
+
+/// Whether the streaming client is back (the stream should end now).
+pub(crate) fn client_returning() -> bool {
+    RETURNING_SET.load(Ordering::Relaxed)
+}
+
+fn take_returning() -> Option<(Vec<u8>, SocketAddr)> {
+    RETURNING_SET.store(false, Ordering::Relaxed);
+    RETURNING.lock().unwrap().take()
+}
+
+/// The virtual monitor of a stream whose client dropped, kept a while: a
+/// reconnect at the same size and rate streams it again, without removing
+/// and re-adding it (~2 s, measured: added → streaming 1.1 s, scale 0.4 s,
+/// removal 0.8 s) and without the desktop's windows being shuffled to the
+/// host's screens and back. Switch `keepmonitor`.
+struct KeptMonitor {
+    monitor: crate::virtual_display::VirtualMonitor,
+    /// Width, height, refresh rate and scale it was made for.
+    made_for: (u32, u32, u32, u32),
+    until: Instant,
+}
+
+/// How long a dropped client's monitor is kept.
+const KEEP_MONITOR: Duration = Duration::from_secs(15);
+
 /// Hand a signed-in client this host's rdpio over its session, until it has
 /// it (or goes quiet). Nothing else happens meanwhile: no display changes, no
 /// stream.
@@ -1436,8 +1507,14 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
     // After a network drop the console stays unlocked this long so the client
     // can come back to where it was; then it locks.
     let mut grace_until: Option<Instant> = None;
+    // A dropped client's virtual monitor, for a quick reconnect (see KeptMonitor).
+    let mut kept: Option<KeptMonitor> = None;
+    // The hello that ended the last stream (see Comeback), handled first.
+    let mut returning: Option<(Vec<u8>, SocketAddr)> = None;
     loop {
         if stop_requested() {
+            // (The host's own screens back before the console locks.)
+            drop(kept.take());
             if grace_until.is_some() {
                 lock_session(); // a dropped client's console doesn't stay open
                 crate::hyper_host::clear_streaming();
@@ -1446,13 +1523,28 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
             return Ok(());
         }
         sign_in.tick();
+        if kept.as_ref().is_some_and(|k| Instant::now() > k.until) {
+            tracing::info!("no quick reconnect; removing the kept virtual monitor");
+            drop(kept.take());
+        }
         if grace_until.is_some_and(|t| Instant::now() > t) {
             tracing::info!("client didn't come back; locking the console");
             grace_until = None;
+            drop(kept.take());
             lock_session();
             crate::hyper_host::clear_streaming();
         }
-        let Ok((n, from)) = socket.recv_from(&mut buf) else { continue };
+        let (n, from) = match returning.take() {
+            Some((d, from)) => {
+                let n = d.len().min(buf.len());
+                buf[..n].copy_from_slice(&d[..n]);
+                (n, from)
+            }
+            None => {
+                let Ok(r) = socket.recv_from(&mut buf) else { continue };
+                r
+            }
+        };
         if auth::is_auth(&buf[..n]) && stamp_checked.elapsed() > Duration::from_secs(1) {
             stamp_checked = Instant::now();
             let now = secret_stamp();
@@ -1480,6 +1572,14 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
                 height,
                 fps: opts.max_fps.map_or(want.refresh_hz, |cap| want.refresh_hz.min(cap)).max(30),
                 codec: rdp_gpu::hyper::choose_codec(&want.codecs, (width, height))?.name().into(),
+                // A touch screen's fingers become Windows touch here.
+                touch: true,
+                // Where a client through a VPN can find this PC directly.
+                lan: crate::launcher::host::addresses()
+                    .into_iter()
+                    .filter(|a| a.kind == "lan")
+                    .map(|a| format!("{}/{}", a.ip, a.prefix))
+                    .collect(),
                 // (Versions and updates: filled in by the sign-in.)
                 ..Default::default()
             })
@@ -1497,13 +1597,32 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
         // host's monitor, consolidated and at the client's refresh rate) and
         // this PC's settings allow it.
         let settings = host_settings();
-        let virtual_monitor = match (&virtual_display, client.fit_to) {
-            (Some(vd), Some((w, h))) if opts.stream_size.is_none() && settings.virtual_display && settings.match_resolution => vd
-                .show(w, h, client.fps, None)
-                .inspect(|m| crate::virtual_display::set_scale(&m.device_name, client.scale))
-                .inspect_err(|e| tracing::warn!(error = %e, "no virtual monitor; streaming the host's own"))
-                .ok(),
-            _ => None,
+        // A monitor kept from a dropped stream at this very size: streamed again.
+        let kept_monitor = kept.take();
+        let (virtual_monitor, made_for) = match (&virtual_display, client.fit_to) {
+            (Some(vd), Some((w, h))) if opts.stream_size.is_none() && settings.virtual_display && settings.match_resolution => {
+                let made_for = (w, h, client.fps, client.scale);
+                match kept_monitor {
+                    Some(k) if k.made_for == made_for => {
+                        tracing::info!(device = %k.monitor.device_name, "a quick reconnect: streaming the kept virtual monitor");
+                        (Some(k.monitor), Some(made_for))
+                    }
+                    other => {
+                        // (A different size: the old one goes first.)
+                        drop(other);
+                        let m = vd
+                            .show(w, h, client.fps, None)
+                            .inspect(|m| crate::virtual_display::set_scale(&m.device_name, client.scale))
+                            .inspect_err(|e| tracing::warn!(error = %e, "no virtual monitor; streaming the host's own"))
+                            .ok();
+                        (m, Some(made_for))
+                    }
+                }
+            }
+            _ => {
+                drop(kept_monitor);
+                (None, None)
+            }
         };
         let device_name = virtual_monitor.as_ref().map_or_else(|| monitor.device_name.clone(), |v| v.device_name.clone());
         let consolidated =
@@ -1519,10 +1638,22 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
         // At the client's screen size (as offered), refitted if the desktop
         // changes mode mid-stream.
         let stream_opts = HostOptions { fit_to: client.fit_to, office: client.office, fast_text: client.fast_text, ..opts.clone() };
+        *COMEBACK.lock().unwrap() = Some(sign_in.comeback());
+        let _ = take_returning();
         let end = crate::hyper_host::stream(socket.try_clone()?, client.addr, client.recv, client.send, &stream_opts, &device_name, fps, client.codec, true);
+        COMEBACK.lock().unwrap().take();
+        returning = take_returning();
         drop(display);
         drop(consolidated);
-        drop(virtual_monitor);
+        // A dropped client (not one that said goodbye) likely comes straight
+        // back: its monitor stays a while.
+        match (virtual_monitor, made_for) {
+            (Some(monitor), Some(made_for)) if matches!(end, Ok(crate::hyper_host::StreamEnd::Lost)) && crate::host_ab::ab("keepmonitor", true) => {
+                tracing::info!(secs = KEEP_MONITOR.as_secs(), "keeping the virtual monitor for a quick reconnect");
+                kept = Some(KeptMonitor { monitor, made_for, until: Instant::now() + KEEP_MONITOR });
+            }
+            (m, _) => drop(m),
+        }
         // The stream's marker stays until the console is locked: a crash
         // before that is still recovered (and locked) by the next agent.
         match end {
@@ -1530,7 +1661,7 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
                 tracing::info!("client lost; holding the session for 20 s");
                 grace_until = Some(Instant::now() + RECONNECT_GRACE);
             }
-            Ok(crate::hyper_host::StreamEnd::Bye) => {
+            Ok(crate::hyper_host::StreamEnd::Bye | crate::hyper_host::StreamEnd::Stopping) => {
                 lock_session();
                 crate::hyper_host::clear_streaming();
             }
@@ -1606,6 +1737,39 @@ mod tests {
         s.tick();
         assert!(s.pending.is_empty());
         assert!(s.lockout.check(victim.ip(), Instant::now()).is_ok(), "spoofing can't lock the victim out");
+    }
+
+    #[test]
+    fn a_returning_client_ends_its_stream_only_with_a_cookie_from_its_own_ip() {
+        let host = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let secret = auth::password_secret("correct horse battery staple");
+        let s = SignIn::new(secret);
+        *COMEBACK.lock().unwrap() = Some(s.comeback());
+        let _ = take_returning();
+        // The stream's client: same IP, the old port.
+        let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let from = client.local_addr().unwrap();
+        let (_, hello) = auth::ClientAuth::start(&secret, want());
+        // From another IP: nothing at all.
+        comeback(&host, &hello, "10.9.9.9:5000".parse().unwrap(), peer);
+        assert!(!client_returning());
+        // Without a cookie: a cookie back, the stream goes on.
+        comeback(&host, &hello, from, peer);
+        assert!(!client_returning());
+        let mut buf = [0u8; 2048];
+        let n = client.recv(&mut buf).unwrap();
+        let Some(AuthMsg::Cookie { cookie }) = AuthMsg::parse(&buf[..n]) else { panic!("no cookie") };
+        // With it: the stream ends, and the sign-in gets that very hello.
+        let mut w = want();
+        w.cookie = Some(auth::cookie_to_hex(&cookie));
+        let (_, hello) = auth::ClientAuth::start(&secret, w);
+        comeback(&host, &hello, from, peer);
+        assert!(client_returning());
+        assert_eq!(take_returning(), Some((hello, from)));
+        assert!(!client_returning());
+        COMEBACK.lock().unwrap().take();
     }
 
     #[test]

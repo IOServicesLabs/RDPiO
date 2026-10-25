@@ -165,6 +165,11 @@ impl ReverseConnectStream {
     pub fn raw_socket(&self) -> std::os::windows::io::RawSocket {
         self.inner.raw_socket()
     }
+
+    #[cfg(unix)]
+    pub fn raw_socket(&self) -> std::os::unix::io::RawFd {
+        self.inner.raw_socket()
+    }
 }
 
 impl Read for ReverseConnectStream {

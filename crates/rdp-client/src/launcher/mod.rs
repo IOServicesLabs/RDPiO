@@ -32,7 +32,7 @@
 //!
 //! Without the WebView2 runtime, [`run`] fails and `main` opens the hub.
 
-mod host;
+pub(crate) mod host;
 pub mod profile;
 
 pub use host::LauncherPipe;

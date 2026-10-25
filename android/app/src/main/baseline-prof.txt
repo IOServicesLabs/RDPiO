@@ -1,0 +1,41 @@
+# Baseline profile: what ART compiles ahead of time (speed-profile) instead of
+# interpreting, then JIT-compiling, during the first minutes of a stream.
+# H: hot, S: run at startup, P: run after startup; `**` matches anything, also
+# a class's inner classes and lambdas (`StreamActivity$onCreate$1`...).
+# AGP puts it in the APK (assets/dexopt/baseline.prof, rewritten for R8's
+# names); profileinstaller applies it on a sideloaded install.
+
+# The stream: its activity, input, upscaler, overlay, menu and the JNI core.
+HSPLio/ioservices/rdpio/StreamActivity**;->**(**)**
+HSPLio/ioservices/rdpio/StreamInput**;->**(**)**
+HSPLio/ioservices/rdpio/Upscaler**;->**(**)**
+HSPLio/ioservices/rdpio/Native**;->**(**)**
+HSPLio/ioservices/rdpio/Perf**;->**(**)**
+HSPLio/ioservices/rdpio/Screen**;->**(**)**
+HSPLio/ioservices/rdpio/KeyCapture**;->**(**)**
+HSPLio/ioservices/rdpio/StreamMenu**;->**(**)**
+HSPLio/ioservices/rdpio/CameraFeed**;->**(**)**
+HSPLio/ioservices/rdpio/KeepAlive**;->**(**)**
+Lio/ioservices/rdpio/StreamActivity**;
+Lio/ioservices/rdpio/StreamInput**;
+Lio/ioservices/rdpio/Upscaler**;
+Lio/ioservices/rdpio/Native**;
+Lio/ioservices/rdpio/Perf**;
+Lio/ioservices/rdpio/Screen**;
+Lio/ioservices/rdpio/KeyCapture**;
+Lio/ioservices/rdpio/StreamMenu**;
+Lio/ioservices/rdpio/CameraFeed**;
+Lio/ioservices/rdpio/KeepAlive**;
+
+# Getting to the stream: the PC list and its store.
+HSPLio/ioservices/rdpio/MainActivity**;->**(**)**
+HSPLio/ioservices/rdpio/Store**;->**(**)**
+Lio/ioservices/rdpio/MainActivity**;
+Lio/ioservices/rdpio/Store**;
+
+# What of Kotlin's library the stream's code calls on every event.
+HSPLkotlin/jvm/internal/Intrinsics;->**(**)**
+HSPLkotlin/collections/**;->**(**)**
+HSPLkotlin/text/**;->**(**)**
+HSPLkotlin/ranges/**;->**(**)**
+Lkotlin/jvm/internal/Intrinsics;

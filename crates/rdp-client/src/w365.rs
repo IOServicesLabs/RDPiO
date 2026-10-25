@@ -281,6 +281,9 @@ pub fn refresh_token(
     body.insert("grant_type", "refresh_token");
     body.insert("client_id", client_id);
     body.insert("refresh_token", refresh);
+    // Without a scope the v2 endpoint may mint the token for another of the
+    // granted resources, which the AVD feed and broker then refuse.
+    body.insert("scope", AUTH_CODE_SCOPE);
 
     let resp: serde_json::Value = ureq::post(&token_url)
         .set("Content-Type", "application/x-www-form-urlencoded")
@@ -496,47 +499,11 @@ pub fn discover_cached_cloud_pcs() -> Vec<crate::feed::FeedEntry> {
                 continue;
             }
         };
-        // The cache file is a JSON envelope; the actual `.rdp` is `cached_item`.
-        let rdp_contents = match serde_json::from_str::<serde_json::Value>(&raw) {
-            Ok(v) => v
-                .get("cached_item")
-                .and_then(|c| c.as_str())
-                .map(String::from),
-            // Tolerate a bare `.rdp` (some builds wrote them unwrapped).
-            Err(_) if raw.contains("resourceprovider") => Some(raw.clone()),
-            Err(_) => None,
-        };
-        let Some(rdp_contents) = rdp_contents else { continue };
-
-        let settings = crate::feed::parse_rdp_file(&rdp_contents);
-        // Only ARM Reverse-Connect resources can be brokered by rdpio.
-        if settings.get("resourceprovider").map(String::as_str) != Some("arm") {
-            continue;
-        }
-        let lbi = match settings.get("loadbalanceinfo") {
-            Some(l) if !l.is_empty() => l.clone(),
-            _ => continue,
-        };
-        if !seen_lbi.insert(lbi.clone()) {
+        let Some(entry) = cached_cloud_pc(&raw) else { continue };
+        let lbi = entry.load_balance_info.clone().unwrap_or_default();
+        if !seen_lbi.insert(lbi) {
             continue; // same Cloud PC under a different cache id
         }
-
-        let mut entry = crate::feed::FeedEntry::default();
-        entry.display_name = settings
-            .get("remotedesktopname")
-            .filter(|s| !s.is_empty())
-            .cloned()
-            .unwrap_or_else(|| "Cloud PC".to_string());
-        // `remoteapplicationprogram` is `||<resourceId>`; the GUID distinguishes
-        // Cloud PCs that share a SKU display name. Used only as a picker label.
-        entry.resource_id = settings
-            .get("remoteapplicationprogram")
-            .map(|s| s.trim_start_matches('|').to_string())
-            .unwrap_or_default();
-        entry.tenant_id = settings.get("aadtenantid").cloned().unwrap_or_default();
-        entry.gateway_fqdn = settings.get("gatewayhostname").cloned().unwrap_or_default();
-        entry.load_balance_info = Some(lbi.into_bytes());
-        entry.rdp_file = Some(rdp_contents);
         entries.push(entry);
     }
 
@@ -548,9 +515,65 @@ pub fn discover_cached_cloud_pcs() -> Vec<crate::feed::FeedEntry> {
     entries
 }
 
+/// One Cloud PC from a Windows App cache file (a JSON envelope whose
+/// `cached_item` is the `.rdp`) or a bare `.rdp`: None unless it's an ARM
+/// Reverse-Connect resource, the only kind rdpio can broker.
+pub fn cached_cloud_pc(raw: &str) -> Option<crate::feed::FeedEntry> {
+    let rdp_contents = match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) => v.get("cached_item").and_then(|c| c.as_str()).map(String::from),
+        // Tolerate a bare `.rdp` (some builds wrote them unwrapped).
+        Err(_) if raw.contains("resourceprovider") => Some(raw.to_string()),
+        Err(_) => None,
+    }?;
+
+    let settings = crate::feed::parse_rdp_file(&rdp_contents);
+    if settings.get("resourceprovider").map(String::as_str) != Some("arm") {
+        return None;
+    }
+    let lbi = settings.get("loadbalanceinfo").filter(|l| !l.is_empty())?.clone();
+
+    let mut entry = crate::feed::FeedEntry::default();
+    entry.display_name = settings
+        .get("remotedesktopname")
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "Cloud PC".to_string());
+    // `remoteapplicationprogram` is `||<resourceId>`; the GUID distinguishes
+    // Cloud PCs that share a SKU display name. Used only as a picker label.
+    entry.resource_id = settings
+        .get("remoteapplicationprogram")
+        .map(|s| s.trim_start_matches('|').to_string())
+        .unwrap_or_default();
+    entry.tenant_id = settings.get("aadtenantid").cloned().unwrap_or_default();
+    entry.gateway_fqdn = settings.get("gatewayhostname").cloned().unwrap_or_default();
+    entry.load_balance_info = Some(lbi.into_bytes());
+    entry.rdp_file = Some(rdp_contents);
+    Some(entry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_cloud_pc_from_a_cache_envelope_or_a_bare_rdp() {
+        let rdp = "full address:s:x\r\nresourceprovider:s:arm\r\nloadbalanceinfo:s:lbi-1\r\nremotedesktopname:s:My Cloud PC\r\n";
+        let envelope = serde_json::json!({ "cached_item": rdp }).to_string();
+        for raw in [envelope.as_str(), rdp] {
+            let e = cached_cloud_pc(raw).expect("an ARM Cloud PC");
+            assert_eq!(e.display_name, "My Cloud PC");
+            assert_eq!(e.load_balance_info.as_deref(), Some(&b"lbi-1"[..]));
+        }
+        assert!(cached_cloud_pc("full address:s:x\r\nloadbalanceinfo:s:y\r\n").is_none());
+    }
+
+    #[test]
+    #[ignore]
+    fn reads_this_pcs_windows_app_cache() {
+        for e in discover_cached_cloud_pcs() {
+            println!("{} ({} bytes of .rdp)", e.display_name, e.rdp_file.map_or(0, |r| r.len()));
+        }
+    }
 
     #[test]
     fn url_encode_escapes_space_and_slash() {

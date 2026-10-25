@@ -550,6 +550,11 @@ fn activate_only(edid: (u16, u16)) -> Result<String, Activation> {
         if r != 0 {
             let first = r;
             r = SetDisplayConfig(Some(&[path]), None, SDC_APPLY | SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES);
+            // ERROR_ACCESS_DENIED: the console is switching desktops (locking,
+            // say, as the host's restart does), not a layout Windows refuses.
+            if r == 5 && first == 5 {
+                return Err(Activation::NotYet(format!("SetDisplayConfig {first} / {r} (the desktop is switching)")));
+            }
             if r != 0 {
                 return Err(Activation::Refused(format!("SetDisplayConfig {first} / {r}")));
             }

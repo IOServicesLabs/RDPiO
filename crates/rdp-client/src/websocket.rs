@@ -164,6 +164,13 @@ impl WebSocketStream {
         self.ws.get_ref().get_ref().as_raw_socket()
     }
 
+    /// (The descriptor, on Unix.)
+    #[cfg(unix)]
+    pub fn raw_socket(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.ws.get_ref().get_ref().as_raw_fd()
+    }
+
     /// Read the next whole inbound **binary** WebSocket message, preserving frame
     /// boundaries. Unlike the [`Read`] impl (which flattens all messages into one
     /// byte stream for the RDP tunnel), the Shortpath rendezvous signaling treats

@@ -44,6 +44,10 @@ pub enum Codec {
     /// H.265 — about a third smaller than H.264 at the same quality. Decoding
     /// needs Windows' HEVC decoder (the "HEVC Video Extensions").
     Hevc,
+    /// AV1 — fewer bits again at the same quality. A low-overhead OBU stream
+    /// (a temporal delimiter, and a sequence header on each keyframe), not
+    /// Annex B. Only a client that asks for it gets it (none by default).
+    Av1,
 }
 
 impl Codec {
@@ -51,6 +55,7 @@ impl Codec {
         match self {
             Self::H264 => MFVideoFormat_H264,
             Self::Hevc => windows::Win32::Media::MediaFoundation::MFVideoFormat_HEVC,
+            Self::Av1 => windows::Win32::Media::MediaFoundation::MFVideoFormat_AV1,
         }
     }
 
@@ -58,6 +63,7 @@ impl Codec {
         match self {
             Self::H264 => "h264",
             Self::Hevc => "hevc",
+            Self::Av1 => "av1",
         }
     }
 
@@ -65,6 +71,7 @@ impl Codec {
         match s {
             "h264" => Some(Self::H264),
             "hevc" => Some(Self::Hevc),
+            "av1" => Some(Self::Av1),
             _ => None,
         }
     }

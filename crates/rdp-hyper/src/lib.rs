@@ -13,6 +13,7 @@
 //!   lost packets are rebuilt without a resend round trip.
 //! - [`input`]: client input that survives loss without stuck keys.
 //! - [`rate`]: delay- and loss-driven bitrate and FEC control.
+//! - [`audio`] + [`playout`]: Opus packets, and the jitter buffer that plays them.
 //!
 //! Platform-neutral; the capture/encode/decode ends live in `rdp-gpu` and
 //! `rdp-client`.
@@ -22,7 +23,10 @@ pub mod auth;
 pub mod control;
 pub mod fec;
 pub mod input;
+pub mod lan;
+pub mod liveness;
 pub mod messages;
+pub mod playout;
 pub mod rate;
 pub mod reliable;
 pub mod update;

@@ -20,7 +20,7 @@ use rdp_gpu::hyper::{list_monitors, DesktopCapture, HwEncoder};
 use rdp_hyper::control::{self, Control, Handshake, CHANNEL_NAME, PROTOCOL};
 use rdp_hyper::input::{InputEvent, InputReceiver};
 use rdp_hyper::rate::{Limits, RateController};
-use rdp_hyper::video::{packetize_data, parity, OutFrame};
+use rdp_hyper::video::{packetize_shards, parity_shards, FrameBuffers, OutFrame, Shards};
 use rdp_hyper::wire::{random_key, Direction, Kind, Session};
 use windows::core::PCSTR;
 use windows::Win32::Foundation::HANDLE;
@@ -61,6 +61,9 @@ pub(crate) enum StreamEnd {
     /// The console moved to another session (a sign-out, a user switch): the
     /// agent there takes over, and the client reconnects to it.
     Moved,
+    /// The service is stopping (an update, a restart): put back and locked
+    /// like a goodbye, but the client is told to reconnect, not that it's over.
+    Stopping,
 }
 
 /// While a stream runs, what the host changed is written here, so a crashed
@@ -528,6 +531,12 @@ impl Captured {
 const TRICKLE_AFTER_INPUT_US: u64 = 300_000;
 /// ~12 fps.
 const TRICKLE_INTERVAL_US: u64 = 83_333;
+/// Nobody at the controls for this long: [`TRICKLE_DEEP_INTERVAL_US`]. (The
+/// office log: 5-14 fps of a still desktop, each frame a whole-screen decode
+/// and present on the client.)
+const TRICKLE_DEEP_AFTER_US: u64 = 2_000_000;
+/// 5 fps: still ahead of a caret's half-second blink.
+const TRICKLE_DEEP_INTERVAL_US: u64 = 200_000;
 /// An encoded frame this small changed little (at any resolution: a big
 /// change costs tens of kilobytes).
 const SMALL_FRAME: usize = 4096;
@@ -557,7 +566,8 @@ impl Trickle {
         let on = office && since_input_us > TRICKLE_AFTER_INPUT_US && self.small_streak >= TRICKLE_STREAK;
         let ended = self.on && !on;
         self.on = on;
-        (if on { interval_us.max(TRICKLE_INTERVAL_US) } else { interval_us }, ended)
+        let trickle = if since_input_us > TRICKLE_DEEP_AFTER_US { TRICKLE_DEEP_INTERVAL_US } else { TRICKLE_INTERVAL_US };
+        (if on { interval_us.max(trickle) } else { interval_us }, ended)
     }
 
     /// A frame went out: a new picture's size says how much changed.
@@ -782,9 +792,20 @@ fn stream_inner(
     // Office mode: the desktop at the client's own resolution, where the
     // monitor has it (crisp text, nothing scaled). Before the capture opens.
     let mut native = if office && route_audio { opts.fit_to.and_then(|s| NativeResolution::apply(device_name, s)) } else { None };
-    let start_bps = if office { 30_000_000 } else { 20_000_000 };
-    let limits = Limits { min_bps: 1_500_000, start_bps: start_bps.min(max_bps), max_bps };
-    let (mut cap, mut enc) = open_pipeline(device_name, opts, fps, limits.start_bps, codec, tuning)?;
+    // Warm start: a little over what this client's path sustained last time,
+    // where that's under the usual start (`warmstart=0`: always the usual).
+    let remembered = crate::hyper_rates::recall(peer.ip());
+    let warm = remembered.filter(|_| crate::host_ab::ab("warmstart", true)).map(|b| (b as u64 * 6 / 5).min(u32::MAX as u64) as u32);
+    let open_bps = resting_bps(office, (1920, 1080)).min(max_bps);
+    let (mut cap, mut enc) = open_pipeline(device_name, opts, fps, warm.map_or(open_bps, |w| w.min(open_bps)), codec, tuning)?;
+    // (The encoder takes the rate for the stream's real size with its first frame.)
+    let limits = Limits { min_bps: Limits::default().min_bps, start_bps: resting_bps(office, cap.stream).min(max_bps), max_bps };
+    let mut rate = RateController::new(limits);
+    rate.set_switches(rate_switches());
+    if let Some(w) = warm.filter(|&w| w < limits.start_bps) {
+        rate.warm_start(w);
+        tracing::info!(remembered_kbps = remembered.unwrap_or(0) / 1000, start_kbps = rate.bitrate_bps() / 1000, "warm start: this client's path sustained less last time");
+    }
     // Office mode on the host's text: greyscale smoothing (not for a selftest).
     let mut grey_text = if office && route_audio { GreyText::apply() } else { None };
     let (w, h) = cap.stream;
@@ -793,7 +814,7 @@ fn stream_inner(
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
         keyframe: AtomicBool::new(true),
-        rate: Mutex::new(RateController::new(limits)),
+        rate: Mutex::new(rate),
         send,
         peer: Mutex::new(peer),
         last_rx: Mutex::new(Instant::now()),
@@ -845,6 +866,9 @@ fn stream_inner(
     // half the packets), 10 in game mode — once the client says it takes them.
     let audio_shape = Arc::new(crate::hyper_audio::AudioShape::default());
     audio_shape.long.store(shared.office.load(Ordering::Relaxed), Ordering::Relaxed);
+    // Game sound's bitrate follows the video's (`audiorate`).
+    let link_shared = shared.clone();
+    let _ = audio_shape.link_bps.set(Box::new(move || link_shared.rate.lock().unwrap().bitrate_bps()));
     let rx_shape = audio_shape.clone();
     let receiver = std::thread::Builder::new()
         .name("hyper-host-rx".into())
@@ -905,8 +929,20 @@ fn stream_inner(
             }
         })
     });
+    // How the client is reached (LAN, Tailscale direct or relayed): logged,
+    // and told to the client for its stats line.
+    let _path = {
+        let (peer_shared, send_shared, sock) = (shared.clone(), shared.clone(), socket.try_clone()?);
+        crate::hyper_path::PathReport::start(
+            move || *peer_shared.peer.lock().unwrap(),
+            move |body: &[u8]| send_shared.send(&sock, Kind::Control, body),
+        )
+    };
 
     let mut frame_id = 0u32;
+    // Each frame's packet bodies go in one buffer from here, given back once
+    // the sender is done with them (not a Vec a packet).
+    let shard_buffers = FrameBuffers::default();
     let mut last_tex = None;
     let mut capture_errors = 0u32;
     let mut last_size_check = Instant::now();
@@ -937,6 +973,14 @@ fn stream_inner(
     // Trickling (see TRICKLE_AFTER_INPUT_US), and frames sent so (for the log).
     let (mut trickle, mut trickle_frames) = (Trickle::default(), 0u32);
     let mut ltr = Ltr::new(0);
+    // The frame rate follows the bitrate (`fpsfollow`), and the rate it
+    // follows to now; drain mode as last logged; when the switches were last
+    // read, and the path's rate last remembered.
+    let (mut frame_rate, mut enc_fps, mut drain_logged) = (rdp_hyper::rate::FrameRate::default(), fps, None);
+    let (mut switches_read, mut rate_saved) = (Instant::now(), Instant::now());
+    let mut fps_follow = crate::host_ab::ab("fpsfollow", true);
+    // Office mode may go on down to 10 fps (`FrameRate::follow_office`).
+    let mut office_fps = crate::host_ab::ab("officefps", true);
     // A failed encoder or a lost GPU (driver reset, device removed) costs a
     // pipeline rebuild, not the session — in direct mode ending the stream
     // would lock the PC. A burst of failures still gives up.
@@ -956,8 +1000,12 @@ fn stream_inner(
             tracing::info!("client went quiet; ending the stream");
             return Ok(StreamEnd::Lost);
         }
+        if crate::hyper_direct::client_returning() {
+            return Ok(StreamEnd::Lost);
+        }
         // The service is stopping (or the PC shutting down): end as if the
-        // client said goodbye, so everything is put back and locked — unless
+        // client said goodbye, so everything is put back and locked, but have
+        // it reconnect (an update is back in seconds) — unless
         // the console moved to another session, whose agent the client
         // reconnects to.
         if crate::hyper_direct::stop_requested() {
@@ -965,8 +1013,8 @@ fn stream_inner(
                 tracing::info!("the console moved to another session; ending the stream for the agent there");
                 return Ok(StreamEnd::Moved);
             }
-            tracing::info!("Hyper service stopping; ending the stream");
-            return Ok(StreamEnd::Bye);
+            tracing::info!("Hyper service stopping; ending the stream (the client reconnects)");
+            return Ok(StreamEnd::Stopping);
         }
         // Office or game mode, as the client asks (Ctrl+Shift+O): a new
         // encoder (frame budget, preset) and frame rate, and the host's text
@@ -997,7 +1045,7 @@ fn stream_inner(
             resized(&shared, &socket, cap.stream, fps);
             shared.keyframe.store(true, Ordering::Relaxed);
             // Office text wants a bigger budget to come back to after a lull.
-            shared.rate.lock().unwrap().set_resting(if office { 30_000_000 } else { 20_000_000 });
+            shared.rate.lock().unwrap().set_resting(resting_bps(office, cap.stream));
             if mode_changed {
                 grey_text = None; // (the old setting back first)
                 if office && route_audio {
@@ -1046,6 +1094,7 @@ fn stream_inner(
                 (last_tex, skipped, last_present_us, credit) = (None, None, None, 1.0);
                 resized(&shared, &socket, cap.stream, fps);
                 shared.keyframe.store(true, Ordering::Relaxed);
+                shared.rate.lock().unwrap().set_resting(resting_bps(office, cap.stream));
                 let (sw, sh) = cap.stream;
                 tracing::info!(width = sw, height = sh, "the client's window changed size; the stream follows");
                 continue;
@@ -1059,10 +1108,48 @@ fn stream_inner(
         }
         let want_key = shared.keyframe.swap(false, Ordering::Relaxed);
         let since_input_us = qpc_us().saturating_sub(shared.last_input_us.load(Ordering::Relaxed));
-        let (pace_us, resumed) = trickle.pace(office, since_input_us, interval_us);
+        let (mut pace_us, resumed) = trickle.pace(office, since_input_us, interval_us);
         if resumed {
             // Input (or a big change): the next picture goes at once.
             credit = credit.max(1.0);
+        }
+        // The rate controller's switches (A/B, %PUBLIC%\rdpio-hyper-switches.txt).
+        if switches_read.elapsed() >= Duration::from_secs(1) {
+            switches_read = Instant::now();
+            shared.rate.lock().unwrap().set_switches(rate_switches());
+            fps_follow = crate::host_ab::ab("fpsfollow", true);
+            office_fps = crate::host_ab::ab("officefps", true);
+        }
+        // Fewer frames when the bitrate can't make them sharp (the encoder's
+        // rate is scaled to match, below), and only a few while a standing
+        // queue drains or a slow keyframe crosses (see `RateController`):
+        // frames skipped before they're encoded, so every reference holds.
+        let now_ms = qpc_us() / 1000;
+        let (bps_now, drain) = {
+            let r = shared.rate.lock().unwrap();
+            (r.bitrate_bps(), r.drain_fps(now_ms))
+        };
+        let (sw, sh) = cap.stream;
+        let pixels = sw as u64 * sh as u64;
+        let follow = match (fps_follow, office && office_fps) {
+            (false, _) => fps,
+            (true, true) => frame_rate.follow_office(bps_now, pixels, fps, now_ms),
+            (true, false) => frame_rate.follow(bps_now, pixels, fps, now_ms),
+        };
+        if follow != enc_fps {
+            tracing::info!(fps = follow, of = fps, kbps = bps_now / 1000, "the frame rate follows the bitrate");
+            enc_fps = follow;
+        }
+        pace_us = pace_us.max(1_000_000 / enc_fps.max(1) as u64);
+        if drain.is_some() != drain_logged.is_some() {
+            match drain {
+                Some(d) => tracing::info!(fps = d, kbps = bps_now / 1000, "drain mode: a queue stands on the path (or a keyframe crawls over it)"),
+                None => tracing::info!("drain mode over"),
+            }
+            drain_logged = drain;
+        }
+        if let Some(d) = drain {
+            pace_us = pace_us.max(1_000_000 / d.max(1) as u64);
         }
         // While a skipped frame waits, wait for a newer one only until its turn.
         let until_us = |t: u64| t.saturating_sub(qpc_us()).div_ceil(1000).min(10) as u32;
@@ -1227,8 +1314,23 @@ fn stream_inner(
             let r = shared.rate.lock().unwrap();
             (r.bitrate_bps(), r.fec(), r.pace())
         };
-        if (bps as i64 - enc.bitrate as i64).unsigned_abs() > enc.bitrate as u64 / 20 {
-            enc.set_bitrate(bps);
+        // The encoder's slow-link switches (rdp_gpu::hyper::LinkTuning; a
+        // no-op unless one changed): the largest frame following the bitrate,
+        // a slower preset at low bitrates, losses repaired gradually.
+        enc.set_link_tuning(rdp_gpu::hyper::LinkTuning {
+            vbv_cap: crate::host_ab::ab("vbvcap", true),
+            preset_follow: crate::host_ab::ab("presetfollow", false),
+            intra_refresh: crate::host_ab::ab("introfresh", false),
+        });
+        // Encoding fewer frames than it was opened for (the frame rate
+        // following the bitrate), the encoder gets the rate scaled up to
+        // match: its budget a frame is its rate over its frame rate, so each
+        // frame gets the stream's rate over the frames it really gets — the
+        // sharper pictures this is for. (Drain mode's skips aren't scaled:
+        // they're meant to send less.)
+        let enc_bps = (bps as u64 * fps as u64 / enc_fps.clamp(1, fps.max(1)) as u64).min(u32::MAX as u64) as u32;
+        if (enc_bps as i64 - enc.bitrate as i64).unsigned_abs() > enc.bitrate as u64 / 20 {
+            enc.set_bitrate(enc_bps);
         }
         // Long-term references: keep one now and then; repair a loss from
         // the newest the client has (else a keyframe). After the bitrate
@@ -1243,8 +1345,11 @@ fn stream_inner(
         let recover = shared.recover.swap(false, Ordering::Relaxed);
         match ltr.plan(enc.next_input(), recover, want_key || !enc.ltr, Instant::now()) {
             LtrPlan::Keyframe => {
-                tracing::info!("frames lost and no reference the client has: a keyframe");
-                enc.request_keyframe();
+                // A gradual refresh instead where a keyframe would hold a slow
+                // link > 200 ms (switch `introfresh`); a keyframe the client
+                // asked for (want_key) stays a keyframe.
+                let gradual = enc.request_recovery(enc.prefers_gradual());
+                tracing::info!(gradual, "frames lost and no reference the client has: {}", if gradual { "a gradual refresh" } else { "a keyframe" });
             }
             LtrPlan::Encode { mark, from } => {
                 if let Some(slot) = mark {
@@ -1300,17 +1405,26 @@ fn stream_inner(
             let encode_us = qpc_us().saturating_sub(capture_us) as u32;
             let (is_ltr, recovery) = ltr.sent(out.input, frame_id, out.keyframe);
             // The data shards now; the sender thread adds parity once they're out.
-            let fec = shared.rate.lock().unwrap().parity_for(out.data.len(), out.keyframe);
-            let data = packetize_data(
+            let (fec, pace_cap) = {
+                let mut r = shared.rate.lock().unwrap();
+                // (A keyframe on its way: the client's repeated requests for
+                // one are collapsed into it — see `receive_loop`.)
+                if out.keyframe {
+                    r.note_keyframe(frame_id, out.data.len(), qpc_us() / 1000);
+                }
+                (r.parity_for(out.data.len(), out.keyframe), r.pace_cap_bps())
+            };
+            let data = packetize_shards(
                 &OutFrame { frame_id, data: &out.data, keyframe: out.keyframe, ltr: is_ltr, recovery, capture_us, encode_us },
                 fec,
+                &shard_buffers,
             );
             frame_id = frame_id.wrapping_add(1);
             frames += 1;
             bytes += out.data.len() as u64;
             encode_us_total += encode_us as u64;
             acquire_us_total += acquired_us.saturating_sub(capture_us);
-            if frame_tx.send(Outgoing { data, payload: out.data.len(), bps, fps, pace, fec }).is_err() {
+            if frame_tx.send(Outgoing { data, payload: out.data.len(), bps, fps: enc_fps, pace, fec, pace_cap }).is_err() {
                 return Err("the packet sender stopped".into());
             }
         }
@@ -1323,6 +1437,20 @@ fn stream_inner(
             let pace_ms = shared.pace_us.swap(0, Ordering::Relaxed) as f64
                 / shared.paced.swap(0, Ordering::Relaxed).max(1) as f64
                 / 1000.0;
+            // (Taken before the log line: a guard in its arguments lives to
+            // the end of the statement, and a second lock() there deadlocks.)
+            let (keys_collapsed, cuts) = {
+                let mut r = shared.rate.lock().unwrap();
+                (r.take_collapsed(), r.take_cuts())
+            };
+            // Why the rate came down, if it did: "standing:2 gap:1".
+            let cuts = rdp_hyper::rate::CUT_NAMES
+                .iter()
+                .zip(cuts)
+                .filter(|(_, n)| *n > 0)
+                .map(|(name, n)| format!("{name}:{n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             tracing::info!(
                 target: "perf",
                 fps = format!("{:.1}", frames as f64 / secs),
@@ -1332,6 +1460,11 @@ fn stream_inner(
                 encode_ms = format!("{:.2}", enc_us_total as f64 / frames.max(1) as f64 / 1000.0),
                 pace_ms = format!("{pace_ms:.2}"),
                 target_mbps = bps / 1_000_000,
+                target_kbps = bps / 1000,
+                enc_fps,
+                drain_fps = drain.unwrap_or(0),
+                keys_collapsed,
+                cuts,
                 fec_pct = (fec * 100.0) as u32,
                 trickle_pct = trickle_frames * 100 / frames.max(1),
                 audio_pps = format!("{:.0}", crate::hyper_audio::take_sent() as f64 / secs),
@@ -1342,19 +1475,30 @@ fn stream_inner(
             trickle_frames = 0;
             enc_us_total = 0;
             report = Instant::now();
+            // What this client's path sustains, for the next stream's warm
+            // start (now and then: a stream can end in a crash).
+            if rate_saved.elapsed() >= Duration::from_secs(30) {
+                rate_saved = Instant::now();
+                if let Some(s) = shared.rate.lock().unwrap().sustained_bps() {
+                    crate::hyper_rates::remember(shared.peer.lock().unwrap().ip(), s);
+                }
+            }
         }
     }
     Ok(StreamEnd::Bye)
     };
     let result = run();
     shared.stop.store(true, Ordering::Relaxed);
+    if let Some(s) = shared.rate.lock().unwrap().sustained_bps() {
+        crate::hyper_rates::remember(shared.peer.lock().unwrap().ip(), s);
+    }
     drop(frame_tx); // the sender finishes the frame in hand, then ends
     let _ = sender.join();
     // Goodbye only for a real end: a client that went quiet may come back,
     // and one whose console moved reconnects to the agent there.
     let farewell = match result {
         Ok(StreamEnd::Bye) => Some(Control::Bye),
-        Ok(StreamEnd::Moved) => Some(Control::Reconnect),
+        Ok(StreamEnd::Moved | StreamEnd::Stopping) => Some(Control::Reconnect),
         _ => None,
     };
     if let Some(f) = farewell {
@@ -1587,6 +1731,36 @@ fn open_pipeline(
 /// Office mode's frame rate: text and video, not games.
 const OFFICE_FPS: u32 = 60;
 
+/// The rate controller's switches for A/B tests (`host_ab`; docs/hyper.md).
+fn rate_switches() -> rdp_hyper::rate::Switches {
+    use crate::host_ab::ab;
+    rdp_hyper::rate::Switches {
+        standing_queue: ab("standingq", true),
+        drain: ab("drain", true),
+        one_keyframe: ab("onekey", true),
+        fec_floor: ab("fecfloor", true),
+        key_probe: ab("keyprobe", true),
+        gap_cut: ab("gapcut", true),
+        slow_pace: ab("slowpace", false),
+        grow_cap: ab("growcap", true),
+        soft_slow: ab("softslow", true),
+    }
+}
+
+/// The rate a stream starts at and an idle one comes back to. Office text
+/// wants more, and more again for more pixels: a page of new text costs bits
+/// by its area. 30 Mbps at 1080p; a 3000x2120 tablet gets 60 (measured on
+/// tablet-sized text: the first frame's luma 26 → 34 dB, and 45 dB in half a
+/// second instead of a second), never more (the delay-based control still
+/// backs off where the link can't carry it).
+fn resting_bps(office: bool, (w, h): (u32, u32)) -> u32 {
+    if !office {
+        return 20_000_000;
+    }
+    let scaled = 30_000_000u64 * w as u64 * h as u64 / (1920 * 1080);
+    scaled.clamp(30_000_000, 60_000_000) as u32
+}
+
 /// The frame rate and encoder tuning for a mode: office — crisp text (see
 /// [`rdp_gpu::hyper::Tuning::office`]) at up to 60 fps; game — the client's
 /// own rate, tuned for latency.
@@ -1666,14 +1840,17 @@ pub(crate) fn font_smoothing_here(kind: u32) -> Option<u32> {
 
 /// One encoded frame for the sender thread.
 struct Outgoing {
-    /// The data shards' packet bodies ([`packetize_data`]).
-    data: Vec<Vec<u8>>,
+    /// The data shards' packet bodies ([`packetize_shards`]).
+    data: Shards,
     /// Encoded size (the rate controller turns wire bytes back into this).
     payload: usize,
     bps: u32,
     fps: u32,
     pace: f32,
     fec: f32,
+    /// Send no faster than this (bits per second; see
+    /// `RateController::pace_cap_bps`), and let a newer frame wait its turn.
+    pace_cap: Option<u32>,
 }
 
 /// The sender thread. Each frame's packets are spread over `pace` of a frame
@@ -1696,13 +1873,20 @@ fn sender_loop(socket: UdpSocket, shared: Arc<Shared>, frames: std::sync::mpsc::
     // Each micro-burst's datagrams (one frame's are all one size) go to the
     // kernel in one call.
     let mut batch = crate::udp_batch::SendBatch::default();
+    // Each frame's parity bodies (reused frame to frame).
+    let mut parity = Shards::default();
     while let Some(f) = next.take().or_else(|| frames.recv().ok()) {
         let start = Instant::now();
         let peer = *shared.peer.lock().unwrap();
         let data_bytes: usize = f.data.iter().map(|b| b.len() + rdp_hyper::wire::OVERHEAD).sum();
         let window = (f.pace as f64 / f.fps.max(1) as f64).max(1e-4);
         let total = data_bytes as f64 * (1.0 + f.fec as f64);
-        let rate = (f.bps as f64 * 2.5).max(total * 8.0 / window) / 8.0; // bytes/s
+        let rate = match f.pace_cap {
+            // A slow or queued link: the frame waits here, not in front of
+            // the audio in the relay (see `RateController::pace_cap_bps`).
+            Some(cap) => cap.max(100_000) as f64 / 8.0,
+            None => (f.bps as f64 * 2.5).max(total * 8.0 / window) / 8.0, // bytes/s
+        };
         // Sealed bytes so far (the schedule) and body bytes (what the client
         // reports as delivered, for the rate controller).
         let (mut sent, mut bodies) = (0usize, 0usize);
@@ -1714,7 +1898,7 @@ fn sender_loop(socket: UdpSocket, shared: Arc<Shared>, frames: std::sync::mpsc::
             // millisecond is slept off (the timer's own granularity) — a
             // small frame goes out at once, a keyframe is spread.
             let ahead = sent as f64 / rate - start.elapsed().as_secs_f64();
-            if next.is_none() && ahead > 0.000_5 {
+            if (next.is_none() || f.pace_cap.is_some()) && ahead > 0.000_5 {
                 batch.flush(&socket);
                 timer.sleep(Duration::from_secs_f64(ahead));
             }
@@ -1729,7 +1913,8 @@ fn sender_loop(socket: UdpSocket, shared: Arc<Shared>, frames: std::sync::mpsc::
             send(body, &mut batch);
         }
         batch.flush(&socket);
-        for body in &parity(&f.data) {
+        parity_shards(&f.data, &mut parity);
+        for body in &parity {
             send(body, &mut batch);
         }
         batch.flush(&socket);
@@ -1792,6 +1977,11 @@ fn receive_loop(
     // Input lands here: a game holding the CPU mustn't delay it.
     crate::net_tune::raise_thread();
     let mut input = InputReceiver::new();
+    // This stream's fingers (see `hyper_touch::apply`).
+    let touch_owner = {
+        static STREAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        STREAMS.fetch_add(1, Ordering::Relaxed)
+    };
     // Input acks are batched (a 1000 Hz mouse would otherwise get 1000 status
     // packets a second back); the trailing one still goes out within ~10 ms.
     let mut acked = 0u32;
@@ -1801,12 +1991,19 @@ fn receive_loop(
     let mut last_feedback = Instant::now();
     let mut buf = [0u8; 2048];
     while !shared.stop.load(Ordering::Relaxed) {
+        crate::hyper_touch::keep_alive();
         if input.applied() != acked && last_ack.elapsed() >= Duration::from_millis(4) {
             acked = input.applied();
             last_ack = Instant::now();
             shared.send_status(&socket);
         }
         let Ok((n, from)) = socket.recv_from(&mut buf) else { continue };
+        // The client signing in again (it took this stream for dead).
+        if rdp_hyper::auth::is_auth(&buf[..n]) {
+            let peer = *shared.peer.lock().unwrap();
+            crate::hyper_direct::comeback(&socket, &buf[..n], from, peer);
+            continue;
+        }
         let Ok((kind, body)) = recv.open(&buf[..n]) else { continue };
         *shared.last_rx.lock().unwrap() = Instant::now();
         {
@@ -1826,7 +2023,7 @@ fn receive_loop(
                 for e in &events {
                     held.note(e);
                 }
-                inject(&events, desktop);
+                inject(&events, desktop, touch_owner);
                 shared.input_ack.store(input.applied(), Ordering::Relaxed);
                 if last_ack.elapsed() >= Duration::from_millis(4) {
                     acked = input.applied();
@@ -1839,12 +2036,20 @@ fn receive_loop(
                     let pong = Control::Pong { id, client_us, host_us: qpc_us() };
                     shared.send(&socket, Kind::Control, &pong.to_bytes());
                 }
+                // While a keyframe is still on its way to the client, its
+                // requests (repeated every ~100 ms until one decodes) and
+                // repairs (only a keyframe could give one: the last cleared
+                // every reference) are collapsed into it (`onekey`).
                 Some(Control::KeyframeRequest) => {
-                    shared.keyframe.store(true, Ordering::Relaxed);
+                    if !shared.rate.lock().unwrap().collapse_keyframe_request(qpc_us() / 1000) {
+                        shared.keyframe.store(true, Ordering::Relaxed);
+                    }
                     shared.paused.store(false, Ordering::Relaxed);
                 }
                 Some(Control::Recover) => {
-                    shared.recover.store(true, Ordering::Relaxed);
+                    if !shared.rate.lock().unwrap().collapse_keyframe_request(qpc_us() / 1000) {
+                        shared.recover.store(true, Ordering::Relaxed);
+                    }
                     shared.paused.store(false, Ordering::Relaxed);
                 }
                 Some(Control::Paused { paused }) => {
@@ -1960,15 +2165,16 @@ fn receive_loop(
     }
     // A client that vanished mid-press would leave keys or buttons stuck down
     // on the host (a held W keeps the character running).
+    crate::hyper_touch::release_all(touch_owner);
     let leftovers = held.release_all();
     if !leftovers.is_empty() {
         tracing::info!(count = leftovers.len(), "releasing keys/buttons the client left held");
-        inject(&leftovers, desktop);
+        inject(&leftovers, desktop, touch_owner);
     }
 }
 
 /// Replay client input on this desktop.
-fn inject(events: &[InputEvent], _desktop: (u32, u32)) {
+fn inject(events: &[InputEvent], _desktop: (u32, u32), owner: u64) {
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
     let mut inputs = Vec::with_capacity(events.len());
     let mouse = |dx: i32, dy: i32, data: i32, flags: MOUSE_EVENT_FLAGS| INPUT {
@@ -2028,6 +2234,16 @@ fn inject(events: &[InputEvent], _desktop: (u32, u32)) {
                 inputs.push(mouse(0, 0, delta as i32, flags));
             }
             InputEvent::SecureAttention => send_sas(),
+            InputEvent::Touch { id, phase, x, y } => {
+                // In order with the mouse and keys before it.
+                if !inputs.is_empty() {
+                    unsafe {
+                        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+                    }
+                    inputs.clear();
+                }
+                crate::hyper_touch::apply(owner, id, phase, x, y);
+            }
         }
     }
     if !inputs.is_empty() {
@@ -2933,6 +3149,15 @@ mod tests {
     }
 
     #[test]
+    fn office_text_gets_bits_by_the_screens_area() {
+        assert_eq!(resting_bps(false, (3000, 2120)), 20_000_000);
+        assert_eq!(resting_bps(true, (1280, 800)), 30_000_000);
+        assert_eq!(resting_bps(true, (1920, 1080)), 30_000_000);
+        assert_eq!(resting_bps(true, (2256, 1504)), 49_088_888);
+        assert_eq!(resting_bps(true, (3000, 2120)), 60_000_000);
+    }
+
+    #[test]
     fn a_still_screen_trickles_until_someone_acts() {
         let frame = 16_667; // 60 fps
         let mut t = Trickle::default();
@@ -2959,6 +3184,8 @@ mod tests {
             t.encoded(300, false, false);
         }
         assert_eq!(t.pace(true, 800_000, frame).0, TRICKLE_INTERVAL_US);
+        // Hands off for longer: ~5 fps.
+        assert_eq!(t.pace(true, 2_500_000, frame).0, TRICKLE_DEEP_INTERVAL_US);
         // Game mode never trickles.
         assert_eq!(t.pace(false, 800_000, 8_333).0, 8_333);
     }
