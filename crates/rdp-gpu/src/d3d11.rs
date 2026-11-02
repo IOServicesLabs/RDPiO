@@ -831,8 +831,17 @@ impl D3D11Renderer {
         // unwind (it would drop this one twice): a panic aborts, and a GPU
         // that refuses leaves a software renderer.
         unsafe {
+            // D3D11 destroys a swapchain lazily: until the context is cleared
+            // and flushed after its release, the window keeps it, and a new
+            // flip-model swapchain there fails with E_ACCESSDENIED (seen on
+            // unplugging, moving to the integrated GPU: rendering fell to
+            // WARP). The decoder still holds this device, so its context lives.
+            let context = self.context.clone();
             let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 std::ptr::drop_in_place(self as *mut Self);
+                context.ClearState();
+                context.Flush();
+                drop(context);
                 Self::create(hwnd.0 as isize, w, h, false).or_else(|e| {
                     tracing::warn!(error = %e, "no renderer on the chosen GPU; rendering in software");
                     Self::create(hwnd.0 as isize, w, h, true)
