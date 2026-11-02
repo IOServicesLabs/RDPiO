@@ -124,8 +124,10 @@ const SUSTAINED_MIN_WINDOWS: u32 = 40;
 /// [`RateController::probe_due`]): how fast it arrives is what the link
 /// carries, not the pacer's rate.
 const PROBE_EVERY_MS: u64 = 1_000;
-/// (At least the packets the client times a frame from.)
-const PROBE_MIN_BYTES: usize = 9_000;
+/// (Smaller frames go in packets as small as need be for the client to time
+/// one: a slow stream's frames are a packet or a few, and without probes it
+/// stayed at the floor — every radio bump its queue, the link never shown.)
+const PROBE_MIN_BYTES: usize = 2_000;
 /// The link carries the most its probes showed over this long (ms): two
 /// probes' worth, so a link something else has taken shows within it. With
 /// none (frames too small to probe with), the last rate stands: a queue it
@@ -286,6 +288,10 @@ pub struct RateController {
     /// When the client had the newest keyframe (`None`: not yet).
     key_landed_ms: Option<u64>,
     key_probe: (u64, u64),
+    /// Whether that keyframe cut the rate already: once it lands (or is
+    /// lost) the client's word takes a window or two, and the count meanwhile
+    /// only falls — read again, it cut a LAN from 60 Mbps to 1 in three steps.
+    key_probe_cut: bool,
     /// The same while a queue stands: what the link delivers while it's
     /// full is its capacity.
     standing_delivered: (u64, u64),
@@ -360,6 +366,7 @@ impl RateController {
             key_sent_ms: 0,
             key_landed_ms: None,
             key_probe: (0, 0),
+            key_probe_cut: false,
             standing_delivered: (0, 0),
             gap: Default::default(),
             slow_until_ms: 0,
@@ -506,7 +513,7 @@ impl RateController {
             (KEY_WAIT_BASE_MS + 2.0 * transmit_ms + queue_ms).clamp(KEY_WAIT_MIN_MS, KEY_WAIT_MAX_MS)
         };
         self.key_wait = Some((frame_id as u64 + 1, now_ms + wait as u64));
-        (self.key_sent_ms, self.key_probe, self.key_landed_ms) = (now_ms, (0, 0), None);
+        (self.key_sent_ms, self.key_probe, self.key_landed_ms, self.key_probe_cut) = (now_ms, (0, 0), None, false);
     }
 
     /// The client asks for a keyframe (or a repair only a keyframe can give)
@@ -722,9 +729,13 @@ impl RateController {
                 self.key_probe.0 += fb.bytes;
                 self.key_probe.1 += window_ms;
             }
-            if now_ms.saturating_sub(self.key_sent_ms) >= KEY_PROBE_MS && self.key_probe.1 >= 100 {
+            // (Not on a LAN its probes show carries well over the stream: a
+            // keyframe slow over that was held up by the radio, or lost.)
+            let roomy = self.lan && self.link_bps.is_some_and(|l| l / self.overhead > 2.0 * self.bitrate);
+            if now_ms.saturating_sub(self.key_sent_ms) >= KEY_PROBE_MS && self.key_probe.1 >= 100 && !self.key_probe_cut && !roomy {
                 let link = rate_of(self.key_probe, self.overhead) * 0.85;
                 if link < self.bitrate {
+                    self.key_probe_cut = true;
                     self.bitrate = link.max(self.limits.min_bps as f64);
                     self.hold_until_ms = now_ms + HOLD_MS;
                     self.last_cut_ms = Some(now_ms);
@@ -742,7 +753,12 @@ impl RateController {
         // from it, and the half second it's sent in is all gap. A stream's
         // first keyframe crossing two Wi-Fi hops cut a LAN to the floor.)
         let probing = self.switches.key_probe && self.key_in_flight(now_ms);
-        if let Some((_, link)) = gap.filter(|&(ratio, _)| self.switches.gap_cut && ratio < GAP_CUT && !probing) {
+        // (Nor on a LAN its probes show carries far more than was sent: what
+        // the radio held up comes in a burst — the link never filled. Read
+        // as the link, an office stream's idle half second cut it to 0.3
+        // Mbps, and each bump after that was its queue.)
+        let held = |(ratio, got): (f64, f64)| self.lan && self.link_bps.is_some_and(|l| l / self.overhead > 2.0 * got / ratio.max(0.01));
+        if let Some((_, link)) = gap.filter(|&g| self.switches.gap_cut && g.0 < GAP_CUT && !probing && !held(g)) {
             if link * 0.85 < self.bitrate {
                 self.bitrate = (link * 0.85).max(self.limits.min_bps as f64);
                 self.hold_until_ms = now_ms + HOLD_MS;
@@ -880,8 +896,11 @@ impl RateController {
             let warm = self.warm_cap.is_some() && self.last_cut_ms.is_none() && self.bitrate < self.resting
                 || self.link_bps.is_some_and(|l| self.bitrate < l / self.overhead * LINK_RAMP_BELOW);
             // (A warm start's idle stream recovers only as far as the path
-            // has shown it carries.)
-            let resting = self.warm_cap.map_or(self.resting, |c| c.min(self.resting));
+            // has shown it carries — on the LAN, half what its probes show:
+            // an office screen idles far below its budget, and held to that,
+            // the next scroll smeared at 4 Mbps over a 200 Mbps link.)
+            let shown = self.link_bps.map_or(0.0, |l| l / self.overhead / 2.0);
+            let resting = self.warm_cap.map_or(self.resting, |c| c.max(shown).min(self.resting));
             // Never into a queue. A window with no frame done but bytes
             // arriving has a frame crawling over a slow link: no delay to
             // read, so the last one counts. (A link carrying less than we
@@ -915,8 +934,9 @@ impl RateController {
                 && self.bitrate < resting
                 && self.last_cut_ms.is_none_or(|t| now_ms.saturating_sub(t) >= RECOVER_AFTER_MS)
             {
-                // Idle and clean for a while: back toward the resting rate.
-                self.bitrate = (self.bitrate * 1.02).min(resting).min(ceiling);
+                // Idle and clean for a while: back toward the resting rate
+                // (fast while far below what the link has shown).
+                self.bitrate = (self.bitrate * if warm { WARM_RAMP } else { 1.02 }).min(resting).min(ceiling);
             }
         }
         self.bitrate = self.bitrate.clamp(self.limits.min_bps as f64, self.limits.max_bps as f64);
@@ -1792,6 +1812,10 @@ mod tests {
                 }
                 if std::env::var_os("SIM_TRACE").is_some() && t % 1_000_000 < 16_667 {
                     println!("  {:>3} s: {:>6} kbps, drain {:?}, queue {} ms, link {:?}", t / 1_000_000, bps / 1000, r.drain_fps(now_ms), r.queue_min_us / 1000, r.link_bps().map(|l| l / 1000));
+                    let c = r.cuts;
+                    if c.iter().any(|&n| n > 0) {
+                        println!("        cuts so far: {:?}", CUT_NAMES.iter().zip(c).filter(|p| p.1 > 0).collect::<Vec<_>>());
+                    }
                 }
                 let fps = if setup.fps_follow { fr.follow(bps, SIM_PIXELS, SIM_FPS, now_ms) } else { SIM_FPS };
                 let mut interval = 1_000_000 / fps as u64;
@@ -1854,8 +1878,9 @@ mod tests {
                 delay_sum += delay;
                 win.frames += 1;
                 win.shards += bytes.div_ceil(1176) as u32;
-                // (Timed as the clients do: big frames, first packet to last.)
-                if floor.prompt(delay, first) && probe && bytes.div_ceil(1176) >= 8 {
+                // (Timed as the clients do: first packet to last — a probe goes in
+                // enough packets for that, however small.)
+                if floor.prompt(delay, first) && probe {
                     win.link_kbps = win.link_kbps.max((bytes as u64 * 8 * 1000 / (arrive - first).max(150)) as u32);
                 }
                 if key {
@@ -1927,6 +1952,22 @@ mod tests {
         assert!(median(&measured) > median(&unmeasured) * 2);
         // (And no queue of its own for it: pictures as prompt as before.)
         assert!(measured.stats(10_000, 30_000).1 <= unmeasured.stats(10_000, 30_000).1 + 5.0);
+    }
+
+    /// An office screen on the LAN's Wi-Fi, warm-started from a bad stream's
+    /// 700 kbps (the host's log): small frames, so nothing used to probe
+    /// with, and every radio bump read as the stream's queue held it there.
+    #[test]
+    fn a_slow_lan_stream_still_finds_the_link() {
+        let link = |_| 600_000_000.0;
+        let scroll: fn(u64) -> bool = |ms| ms % 5_000 < 1_000;
+        let office = Setup { wifi: true, lan: true, warm_bps: Some(700_000), active: Some(scroll), ..Setup::after() };
+        let r = simulate(office, 30, link);
+        r.print("office on lan wifi, warm at 700 kbps", &[(0, 10_000), (10_000, 30_000)]);
+        let mut t = r.targets[10..].to_vec();
+        t.sort();
+        println!("median target 10-30 s: {} kbps", t[t.len() / 2] / 1000);
+        assert!(t[t.len() / 2] >= 10_000_000, "{}", t[t.len() / 2]);
     }
 
     /// The same LAN, then something else takes the Wi-Fi (20 Mbit/s left for

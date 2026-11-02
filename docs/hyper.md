@@ -401,8 +401,9 @@ The picture on a bad path (host; each a switch, on unless said):
   held a 1.2 Mbps relay at the 0.5 Mbps floor; under 3 Mbps only the hard
   (30 ms) and standing-queue rules cut.
 - **Link probes on the LAN** (`linkprobe`): with the client on one of the
-  host's own networks, a frame of 9 KB or more goes out unpaced once a
-  second, flagged; the client times it first packet to last (only if it came
+  host's own networks, a frame of 2 KB or more goes out unpaced once a
+  second, flagged, in 8 packets at least (smaller ones if need be: any
+  client reassembles them); the client times it first packet to last (only if it came
   on time: one held up comes out in a burst) and reports that rate. A queue
   the stream's own bytes couldn't have made on that link (4 Mbit/s for 100 ms
   is 1 ms of a 400 Mbit/s one) doesn't cut the rate or stop it growing — a
@@ -412,8 +413,14 @@ The picture on a bad path (host; each a switch, on unless said):
   it delivered. Far below the link the rate grows 6% a window. Simulated
   (`cargo test -p rdp-hyper lan_ -- --nocapture`): on Wi-Fi bumps, 1.7 → 56
   Mbps at 60 fps instead of 20; with something taking the Wi-Fi (600 → 20
-  Mbit/s), video p95 1368 → 699 ms. `link_mbps` in the perf line. Not over
-  Tailscale: a relay hands packets over in bunches.
+  Mbit/s), video p95 1368 → 699 ms. On a link that has shown over twice
+  what was sent, a delivery gap or a slow keyframe is the radio holding
+  packets (or one lost), not the link's rate: neither cuts, and a keyframe
+  cuts once at most. An idle stream there recovers toward half the link
+  (6% a window), not a warm start's old ceiling: an office screen warm-started
+  at 700 kbps sat at 0.5-4.5 Mbps (each scroll a smear) and now holds ~47
+  (`a_slow_lan_stream_still_finds_the_link`). `link_mbps` in the perf line.
+  Not over Tailscale: a relay hands packets over in bunches.
 
 The host's perf line names why the rate came down in each 5 s (`cuts=`:
 `probe`, `gap`, `standing`, `drain`, `loss`, `queue`, `soft`).
