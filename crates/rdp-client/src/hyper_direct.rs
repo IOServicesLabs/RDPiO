@@ -1030,6 +1030,49 @@ pub(crate) fn lock_as_user(session: u32) -> windows::core::Result<()> {
 /// and wait (up to 3 s) for it: its exit code, if it finished. Needs SYSTEM
 /// (the user's token).
 pub(crate) fn run_as_user(session: u32, args: &str) -> windows::core::Result<Option<u32>> {
+    spawn_as_user(session, args, None)
+}
+
+/// Most a [`output_as_user`] run may write.
+const USER_OUTPUT_MAX: u64 = 8 * 1024 * 1024;
+
+/// [`run_as_user`], with what it wrote to its stdout. One still running at
+/// the deadline is ended (its output is never half-read as complete).
+pub(crate) fn output_as_user(session: u32, args: &str) -> windows::core::Result<Option<(u32, Vec<u8>)>> {
+    use std::io::Read;
+    use std::os::windows::io::FromRawHandle;
+    use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAGS, HANDLE_FLAG_INHERIT};
+    use windows::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows::Win32::System::Pipes::CreatePipe;
+    unsafe {
+        let (mut read, mut write) = (HANDLE::default(), HANDLE::default());
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: true.into(),
+        };
+        CreatePipe(&mut read, &mut write, Some(&sa as *const _), 64 * 1024)?;
+        // Only the write end goes to the child; ours is read meanwhile (a
+        // long list mustn't fill the pipe and stall it).
+        let reader = std::fs::File::from_raw_handle(read.0 as _);
+        if let Err(e) = SetHandleInformation(read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) {
+            let _ = CloseHandle(write);
+            return Err(e);
+        }
+        let drain = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = reader.take(USER_OUTPUT_MAX).read_to_end(&mut out);
+            out
+        });
+        let code = spawn_as_user(session, args, Some(write));
+        // (The child's copy closes as it exits: then the read ends.)
+        let _ = CloseHandle(write);
+        let out = drain.join().unwrap_or_default();
+        code.map(|c| c.map(|c| (c, out)))
+    }
+}
+
+fn spawn_as_user(session: u32, args: &str, stdout: Option<HANDLE>) -> windows::core::Result<Option<u32>> {
     use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
     use windows::Win32::System::Threading::*;
     unsafe {
@@ -1047,11 +1090,16 @@ pub(crate) fn run_as_user(session: u32, args: &str) -> windows::core::Result<Opt
         let exe = std::env::current_exe().map_err(|e| windows::core::Error::new(windows::Win32::Foundation::E_FAIL, e.to_string()))?;
         let mut cmd_w = wide(&format!("\"{}\" {args}", exe.display()));
         let mut desktop = wide(r"winsta0\default");
-        let si = STARTUPINFOW {
+        let mut si = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
             lpDesktop: PWSTR(desktop.as_mut_ptr()),
             ..Default::default()
         };
+        // (Inherited: only handles made inheritable are — the pipe's end.)
+        if let Some(out) = stdout {
+            si.dwFlags = STARTF_USESTDHANDLES;
+            si.hStdOutput = out;
+        }
         let mut pi = PROCESS_INFORMATION::default();
         CreateProcessAsUserW(
             Some(token),
@@ -1059,7 +1107,7 @@ pub(crate) fn run_as_user(session: u32, args: &str) -> windows::core::Result<Opt
             Some(PWSTR(cmd_w.as_mut_ptr())),
             None,
             None,
-            false,
+            stdout.is_some(),
             CREATE_NO_WINDOW,
             None,
             PCWSTR::null(),
@@ -1067,6 +1115,9 @@ pub(crate) fn run_as_user(session: u32, args: &str) -> windows::core::Result<Opt
             &mut pi,
         )?;
         let finished = WaitForSingleObject(pi.hProcess, 3000) == WAIT_OBJECT_0;
+        if !finished && stdout.is_some() {
+            let _ = TerminateProcess(pi.hProcess, 1);
+        }
         let mut code = 0u32;
         let code = (finished && GetExitCodeProcess(pi.hProcess, &mut code).is_ok()).then_some(code);
         let _ = CloseHandle(pi.hThread);
