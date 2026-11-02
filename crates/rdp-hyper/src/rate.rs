@@ -96,6 +96,9 @@ const KEY_WAIT_MAX_MS: f64 = 10_000.0;
 /// 300 KB keyframe on a 1 Mbps relay were tens of seconds of backlog. A LAN
 /// delivers a keyframe well within this.
 const KEY_PROBE_MS: u64 = 250;
+/// A queue within this long (ms) of a keyframe going out is (mostly) that
+/// keyframe's, draining: it's cut for once, not every window.
+const KEY_QUEUE_MS: u64 = 1_000;
 /// The delivery gap: over this long (ms)…
 const GAP_MS: u64 = 500;
 /// …delivered under this share of what was sent cuts to what's delivered,
@@ -190,6 +193,8 @@ pub struct RateController {
     hold_until_ms: u64,
     /// When the last decrease was.
     last_cut_ms: Option<u64>,
+    /// (when, the queue) the last cut for a queue was made for.
+    queue_cut: Option<(u64, i64)>,
     /// The rate an idle stream returns to (the starting one, or what the mode
     /// asks for).
     resting: f64,
@@ -250,6 +255,8 @@ pub struct RateController {
     /// When the keyframe in flight went out (ms), and the bytes delivered
     /// (and ms) since the first arrived after it (see [`KEY_PROBE_MS`]).
     key_sent_ms: u64,
+    /// When the client had the newest keyframe (`None`: not yet).
+    key_landed_ms: Option<u64>,
     key_probe: (u64, u64),
     /// The same while a queue stands: what the link delivers while it's
     /// full is its capacity.
@@ -287,6 +294,7 @@ impl RateController {
             minima: Default::default(),
             hold_until_ms: 0,
             last_cut_ms: None,
+            queue_cut: None,
             resting: limits.start_bps as f64,
             sent_payload: 0,
             sent_wire: 0,
@@ -317,6 +325,7 @@ impl RateController {
             warm_cap: None,
             warm_retune: None,
             key_sent_ms: 0,
+            key_landed_ms: None,
             key_probe: (0, 0),
             standing_delivered: (0, 0),
             gap: Default::default(),
@@ -424,7 +433,7 @@ impl RateController {
             (KEY_WAIT_BASE_MS + 2.0 * transmit_ms + queue_ms).clamp(KEY_WAIT_MIN_MS, KEY_WAIT_MAX_MS)
         };
         self.key_wait = Some((frame_id as u64 + 1, now_ms + wait as u64));
-        (self.key_sent_ms, self.key_probe) = (now_ms, (0, 0));
+        (self.key_sent_ms, self.key_probe, self.key_landed_ms) = (now_ms, (0, 0), None);
     }
 
     /// The client asks for a keyframe (or a repair only a keyframe can give)
@@ -636,7 +645,11 @@ impl RateController {
         // less than we send, whatever the delay says yet (on a relay, the
         // delay of the frames that tell is seconds away).
         let gap = self.delivery_gap();
-        if let Some((_, link)) = gap.filter(|&(ratio, _)| self.switches.gap_cut && ratio < GAP_CUT) {
+        // (Not while a keyframe is on its way: the probe above reads the link
+        // from it, and the half second it's sent in is all gap. A stream's
+        // first keyframe crossing two Wi-Fi hops cut a LAN to the floor.)
+        let probing = self.switches.key_probe && self.key_in_flight(now_ms);
+        if let Some((_, link)) = gap.filter(|&(ratio, _)| self.switches.gap_cut && ratio < GAP_CUT && !probing) {
             if link * 0.85 < self.bitrate {
                 self.bitrate = (link * 0.85).max(self.limits.min_bps as f64);
                 self.hold_until_ms = now_ms + HOLD_MS;
@@ -726,17 +739,37 @@ impl RateController {
             self.note_sustained();
             return;
         }
+        // A keyframe's queue gets one cut: the windows after it still see that
+        // queue draining (a stream's first keyframe over two Wi-Fi hops: seven
+        // 0.75 cuts in a row, 30 Mbps to 4 on a LAN). Again once it's had the
+        // hold to drain, or has grown half again since. (A queue from the link
+        // carrying less is cut every window: holding off there let a relay's
+        // drop to 0.8 Mbps queue 6x longer.)
+        if self.key_landed_ms.is_none() && self.key_wait.is_some_and(|(need, _)| self.resolved >= need) {
+            self.key_landed_ms = Some(now_ms);
+        }
+        // (The stream's first, landed within the probe's time: a link that
+        // carries it. One crawling over a slow link is the probe's, and its
+        // queue is the link's.)
+        let after_key = self.key_wait.is_some_and(|(need, _)| need == 1)
+            && self.key_landed_ms.is_some_and(|t| t.saturating_sub(self.key_sent_ms) < KEY_PROBE_MS)
+            && now_ms.saturating_sub(self.key_sent_ms) < KEY_QUEUE_MS;
+        let recut = !after_key
+            || self.queue_cut.is_none_or(|(t, q)| now_ms.saturating_sub(t) >= HOLD_MS || queue_us > q * 3 / 2);
         let decrease = if fb.frames_lost > 0 {
             Some((0.75, CUT_LOSS))
-        } else if queue_us > QUEUE_HARD_US && busy {
+        } else if queue_us > QUEUE_HARD_US && busy && recut {
             Some((0.75, CUT_QUEUE))
-        } else if queue_us > QUEUE_SOFT_US && busy && !(self.switches.soft_slow && self.bitrate < SLOW_PACE_BELOW_BPS) {
+        } else if queue_us > QUEUE_SOFT_US && busy && recut && !(self.switches.soft_slow && self.bitrate < SLOW_PACE_BELOW_BPS) {
             Some((0.93, CUT_SOFT))
         } else {
             None
         };
         if let Some((f, why)) = decrease {
             self.cuts[why] += 1;
+            if why != CUT_LOSS {
+                self.queue_cut = Some((now_ms, queue_us));
+            }
             self.bitrate *= f;
             // A lost frame alone (random Wi-Fi loss) shouldn't cut below what
             // demonstrably gets through — in encoder terms: delivered bytes
@@ -1083,6 +1116,23 @@ mod tests {
             r.update(&fb(3_000, 5_500, 0, 0), 50, t * 50);
         }
         assert_eq!(r.bitrate_bps(), 30_000_000);
+    }
+
+    /// The Razer hosting over Wi-Fi to Wi-Fi on a LAN: the stream's first
+    /// keyframe lands at once, and the queue it leaves drains over a few
+    /// windows. That's one cut, not one a window (seven: 30 Mbps to 4, then
+    /// the floor).
+    #[test]
+    fn the_first_keyframes_queue_is_cut_for_once() {
+        let mut r = RateController::new(Limits::default());
+        let start = r.bitrate_bps() as f64;
+        r.note_keyframe(0, 400_000, 0);
+        for t in 1..=8u64 {
+            let full = r.bitrate_bps() as u64 / 8 / 20;
+            r.update(&fb(full, 5_000 + 40_000, 0, 0), 50, t * 50);
+        }
+        assert_eq!(r.take_cuts()[CUT_QUEUE], 1);
+        assert!(r.bitrate_bps() as f64 >= start * 0.75 - 1.0);
     }
 
     /// While the stream really uses its budget, a modest queue still backs
