@@ -495,6 +495,7 @@ fn is_device_name(name: &str) -> bool {
 /// isn't that copy's — the newer change has its own notification.
 fn send_files(link: Arc<ReliableLink>, seq: u32) {
     let transfer = TRANSFER.fetch_add(1, Ordering::SeqCst) + 1;
+    tracing::info!(transfer, "files copied here; reading their names");
     let _ = std::thread::Builder::new().name("hyper-files".into()).spawn(move || {
         crate::net_tune::eco_thread();
         let Some(roots) = copied_paths(seq) else { return };
@@ -514,7 +515,9 @@ fn copied_paths(seq: u32) -> Option<Vec<PathBuf>> {
     for _ in 0..10 {
         let roots = unsafe { crate::clipboard::copied_paths() };
         if unsafe { GetClipboardSequenceNumber() } != seq {
-            return None; // a newer change, with its own notification
+            // A newer change, with its own notification.
+            tracing::info!("the clipboard changed again before the copied files were read; sending the newer copy");
+            return None;
         }
         match roots {
             Some(roots) if !roots.is_empty() => return Some(roots),
