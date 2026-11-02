@@ -27,7 +27,7 @@ use rdp_hyper::auth::{self, AuthMsg, Lockout, Offer};
 use rdp_hyper::control::Control;
 use rdp_hyper::wire::{Direction, Kind, Session};
 use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID, WAIT_OBJECT_0, WAIT_TIMEOUT};
 
 use crate::hyper_host::{qpc_us, HostOptions};
 
@@ -1610,8 +1610,12 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
                     other => {
                         // (A different size: the old one goes first.)
                         drop(other);
+                        // Rendered on the fastest GPU (a hybrid laptop's
+                        // discrete one), where the encoder is: left to
+                        // Windows, it's the integrated GPU the panel hangs off.
+                        let render_adapter = rdp_gpu::gpu::chosen_adapter_luid().map(|l| LUID { LowPart: l as u32, HighPart: (l >> 32) as i32 });
                         let m = vd
-                            .show(w, h, client.fps, None)
+                            .show(w, h, client.fps, render_adapter)
                             .inspect(|m| crate::virtual_display::set_scale(&m.device_name, client.scale))
                             .inspect_err(|e| tracing::warn!(error = %e, "no virtual monitor; streaming the host's own"))
                             .ok();
