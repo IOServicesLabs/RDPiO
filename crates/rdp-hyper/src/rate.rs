@@ -120,6 +120,26 @@ const WARM_RAMP: f64 = 1.06;
 const WARM_RETUNE_MS: u64 = 30_000;
 /// Feedback windows a sustained rate needs before it's worth remembering.
 const SUSTAINED_MIN_WINDOWS: u32 = 40;
+/// On the LAN, a big frame goes out unpaced this often (ms; see
+/// [`RateController::probe_due`]): how fast it arrives is what the link
+/// carries, not the pacer's rate.
+const PROBE_EVERY_MS: u64 = 1_000;
+/// (At least the packets the client times a frame from.)
+const PROBE_MIN_BYTES: usize = 9_000;
+/// The link carries the most its probes showed over this long (ms): two
+/// probes' worth, so a link something else has taken shows within it. With
+/// none (frames too small to probe with), the last rate stands: a queue it
+/// let build is still cut (see `ours` in [`RateController::update`]).
+const LINK_WINDOW_MS: u64 = 2_000;
+/// …and isn't read for this long (ms) after the link showed it carries far
+/// less (a gap, a slow keyframe, a standing queue): the queue's drained by
+/// then, and the next probe tells. (10 s: the radio's bumps meanwhile held a
+/// LAN at the floor long after the congestion was gone.)
+const LINK_DOUBT_MS: u64 = 3_000;
+/// Under this share of what the link has shown, the rate grows as a warm
+/// start does ([`WARM_RAMP`]): it's far from anything the link pushes back on.
+const LINK_RAMP_BELOW: f64 = 0.1;
+const LINK_MAX_BPS: f64 = 5_000_000_000.0;
 /// A path that has shown it carries little (a cut for a standing queue, a
 /// slow keyframe, a gap) stays slow this long (ms) after the last such cut,
 /// and meanwhile the rate grows to at most [`GROW_HEADROOM`] times the most
@@ -252,6 +272,14 @@ pub struct RateController {
     /// When a warm start retunes, and the slow path it set (see
     /// [`WARM_RETUNE_MS`]).
     warm_retune: Option<(u64, u64)>,
+    /// The client is on the host's own network (see [`RateController::set_lan`]).
+    lan: bool,
+    /// What the link has shown it carries (wire bits per second).
+    link_bps: Option<f64>,
+    /// Its measurements over the last [`LINK_WINDOW_MS`]: (when, bits per second).
+    link_seen: std::collections::VecDeque<(u64, f64)>,
+    link_doubt_until_ms: u64,
+    last_probe_ms: Option<u64>,
     /// When the keyframe in flight went out (ms), and the bytes delivered
     /// (and ms) since the first arrived after it (see [`KEY_PROBE_MS`]).
     key_sent_ms: u64,
@@ -324,6 +352,11 @@ impl RateController {
             sustained_n: 0,
             warm_cap: None,
             warm_retune: None,
+            lan: false,
+            link_bps: None,
+            link_seen: Default::default(),
+            link_doubt_until_ms: 0,
+            last_probe_ms: None,
             key_sent_ms: 0,
             key_landed_ms: None,
             key_probe: (0, 0),
@@ -397,6 +430,46 @@ impl RateController {
     /// front of the audio: a 36 KB keyframe at 1 Mbps was ~290 ms of video
     /// ahead of every audio packet. At 1.2x the target, the frame waits here
     /// instead, and audio and input acks slot in between its packets.
+    /// The client is on the host's own network: how fast its frames arrive
+    /// is trusted as what the link carries, and a queue the stream's own
+    /// bytes couldn't have made (a Wi-Fi radio's delay) doesn't cut the rate.
+    /// (Not over Tailscale: a relay hands packets over in bunches.)
+    pub fn set_lan(&mut self, lan: bool) {
+        self.lan = lan;
+    }
+
+    /// Whether a frame of `bytes` should go out unpaced, as a probe of the
+    /// link: on the LAN, a big enough one a second unless a queue stands.
+    /// (Slow pacing too: on a LAN a probe is a millisecond's burst, and only
+    /// it shows the link has room again.)
+    pub fn probe_due(&mut self, bytes: usize, now_ms: u64) -> bool {
+        let due = self.lan
+            && bytes >= PROBE_MIN_BYTES
+            && !self.draining
+            && self.standing_since_ms.is_none()
+            && self.last_probe_ms.is_none_or(|t| now_ms.saturating_sub(t) >= PROBE_EVERY_MS);
+        if due {
+            self.last_probe_ms = Some(now_ms);
+        }
+        due
+    }
+
+    /// What the link has shown it carries (bits per second), if measured.
+    pub fn link_bps(&self) -> Option<u32> {
+        self.link_bps.map(|l| l as u32)
+    }
+
+    /// The link carries far less than it seemed — `carried` (encoder terms)
+    /// while a queue stood on it: that's its rate, until probes show more
+    /// again after a while. (Not forgotten: a stream at the floor sends no
+    /// frame big enough to time, and the radio's bumps would read as its
+    /// queue again.)
+    fn doubt_link(&mut self, carried: f64, now_ms: u64) {
+        self.link_bps = self.lan.then_some(carried * self.overhead);
+        self.link_doubt_until_ms = now_ms + LINK_DOUBT_MS;
+        self.link_seen.clear();
+    }
+
     pub fn pace_cap_bps(&self) -> Option<u32> {
         let constrained = self.draining || self.standing_since_ms.is_some() || self.bitrate < SLOW_PACE_BELOW_BPS;
         (self.switches.slow_pace && constrained).then_some((self.bitrate * 1.2) as u32)
@@ -579,6 +652,15 @@ impl RateController {
             self.clean_since_ms = Some(now_ms);
         }
         self.clean = self.clean_since_ms.is_some_and(|t| now_ms.saturating_sub(t) >= CLEAN_AFTER_MS);
+        if self.lan && fb.link_kbps > 0 && now_ms >= self.link_doubt_until_ms {
+            self.link_seen.push_back((now_ms, (fb.link_kbps as f64 * 1000.0).min(LINK_MAX_BPS)));
+        }
+        while self.link_seen.front().is_some_and(|&(t, _)| now_ms.saturating_sub(t) > LINK_WINDOW_MS) {
+            self.link_seen.pop_front();
+        }
+        if let Some(most) = self.link_seen.iter().map(|&(_, b)| b).reduce(f64::max) {
+            self.link_bps = Some(most);
+        }
 
         let mut queue_min_us = 0;
         let queue_us = if fb.frames > 0 {
@@ -598,6 +680,16 @@ impl RateController {
         } else {
             0
         };
+
+        // Could the stream's own bytes have made this queue? Not on a fast
+        // link: 4 Mbit/s for 100 ms is 1 ms of a 400 Mbit/s one. Both ends on
+        // Wi-Fi, a LAN's round trip was 18 ms at p95 and 53 at p99 whatever
+        // was sent — and every such bump cut the rate, down to the floor.
+        // (A radio's bump is one frame's; a queue still there a window later
+        // is the stream's, whatever the link showed: something else took it.)
+        let recent: u64 = self.gap.iter().rev().take(2).map(|e| e.1).sum();
+        let ours = self.link_bps.is_none_or(|l| recent as f64 * 8.0 / l * 1e6 >= QUEUE_SOFT_US as f64)
+            || (fb.frames > 0 && queue_us > QUEUE_HARD_US && self.last_queue_us > QUEUE_HARD_US);
 
         // Bulk yields first: it halves at the first sign of queueing or a
         // lost frame, and grows only while something is waiting to go.
@@ -638,6 +730,7 @@ impl RateController {
                     self.last_cut_ms = Some(now_ms);
                     self.slow_until_ms = now_ms + SLOW_PATH_MS;
                     self.cuts[CUT_PROBE] += 1;
+                    self.doubt_link(link, now_ms);
                 }
             }
         }
@@ -656,6 +749,7 @@ impl RateController {
                 self.last_cut_ms = Some(now_ms);
                 self.slow_until_ms = now_ms + SLOW_PATH_MS;
                 self.cuts[CUT_GAP] += 1;
+                self.doubt_link(link, now_ms);
                 self.bulk = BULK_MIN;
                 // (Once: the next check needs a fresh half second.)
                 self.gap.clear();
@@ -734,6 +828,7 @@ impl RateController {
             self.last_cut_ms = Some(now_ms);
             self.slow_until_ms = now_ms + SLOW_PATH_MS;
             self.cuts[CUT_STANDING] += 1;
+            self.doubt_link(link, now_ms);
             self.bulk = BULK_MIN;
             self.bitrate = self.bitrate.clamp(self.limits.min_bps as f64, self.limits.max_bps as f64);
             self.note_sustained();
@@ -758,9 +853,9 @@ impl RateController {
             || self.queue_cut.is_none_or(|(t, q)| now_ms.saturating_sub(t) >= HOLD_MS || queue_us > q * 3 / 2);
         let decrease = if fb.frames_lost > 0 {
             Some((0.75, CUT_LOSS))
-        } else if queue_us > QUEUE_HARD_US && busy && recut {
+        } else if queue_us > QUEUE_HARD_US && busy && ours && recut {
             Some((0.75, CUT_QUEUE))
-        } else if queue_us > QUEUE_SOFT_US && busy && recut && !(self.switches.soft_slow && self.bitrate < SLOW_PACE_BELOW_BPS) {
+        } else if queue_us > QUEUE_SOFT_US && busy && ours && recut && !(self.switches.soft_slow && self.bitrate < SLOW_PACE_BELOW_BPS) {
             Some((0.93, CUT_SOFT))
         } else {
             None
@@ -782,7 +877,8 @@ impl RateController {
             self.last_cut_ms = Some(now_ms);
         } else if now_ms >= self.hold_until_ms {
             // A warm start grows fast until something first pushes back.
-            let warm = self.warm_cap.is_some() && self.last_cut_ms.is_none() && self.bitrate < self.resting;
+            let warm = self.warm_cap.is_some() && self.last_cut_ms.is_none() && self.bitrate < self.resting
+                || self.link_bps.is_some_and(|l| self.bitrate < l / self.overhead * LINK_RAMP_BELOW);
             // (A warm start's idle stream recovers only as far as the path
             // has shown it carries.)
             let resting = self.warm_cap.map_or(self.resting, |c| c.min(self.resting));
@@ -793,9 +889,9 @@ impl RateController {
             // recovering in those windows grew 9 → 13 Mbps into a 0.8 Mbps
             // relay before the standing-queue rule could act.)
             let calm = if fb.frames > 0 {
-                queue_us <= QUEUE_SOFT_US
+                queue_us <= QUEUE_SOFT_US || !ours
             } else {
-                fb.bytes == 0 || self.last_queue_us <= QUEUE_SOFT_US
+                fb.bytes == 0 || self.last_queue_us <= QUEUE_SOFT_US || !ours
             } && !(self.switches.gap_cut && gap.is_some_and(|(ratio, _)| ratio < GAP_GROW));
             // On a slow path, never past what it has shown it carries (with
             // headroom), however clean an idle stream looks.
@@ -803,7 +899,9 @@ impl RateController {
                 // (This window too: a path keeping up as the rate ramps
                 // shows it before the half second does.)
                 let carried = self.carried.iter().map(|&(_, b)| b).fold(used, f64::max);
-                (carried * GROW_HEADROOM).max(self.limits.min_bps as f64).max(self.bitrate)
+                // (Or half what the link has shown since, on the LAN.)
+                let link = self.link_bps.map_or(0.0, |l| l / self.overhead / 2.0);
+                (carried * GROW_HEADROOM).max(link).max(self.limits.min_bps as f64).max(self.bitrate)
             } else {
                 f64::INFINITY
             };
@@ -914,6 +1012,7 @@ mod tests {
             delay_min_us: 5_000,
             delay_avg_us: delay_avg,
             window_us: 50_000,
+            link_kbps: 0,
         }
     }
 
@@ -1512,6 +1611,13 @@ mod tests {
         /// An office screen: little changes except while this says (a
         /// scroll); `None`, every frame uses its budget.
         active: Option<fn(u64) -> bool>,
+        /// Both ends on a LAN's Wi-Fi instead of the relay: 2 ms each way,
+        /// and the radios' delay bumps, whatever is sent. `lan` is what the
+        /// host was told ([`RateController::set_lan`]).
+        wifi: bool,
+        lan: bool,
+        /// (Without them: a wired LAN.)
+        bumps: bool,
     }
 
     impl Setup {
@@ -1533,11 +1639,14 @@ mod tests {
                 warm_bps: None,
                 key_every_ms: None,
                 active: None,
+                wifi: false,
+                lan: false,
+                bumps: true,
             }
         }
 
         fn after() -> Self {
-            Self { switches: Switches::default(), fps_follow: true, warm_bps: None, key_every_ms: None, active: None }
+            Self { switches: Switches::default(), fps_follow: true, warm_bps: None, key_every_ms: None, active: None, wifi: false, lan: false, bumps: true }
         }
     }
 
@@ -1549,6 +1658,8 @@ mod tests {
         shown: Vec<(u64, f64, usize)>,
         /// Every audio packet: (when sent, ms; its one-way delay, ms).
         audio: Vec<(u64, f64)>,
+        /// The target each second (bits per second).
+        targets: Vec<u32>,
     }
 
     impl Run {
@@ -1606,6 +1717,19 @@ mod tests {
     const SIM_FPS: u32 = 60;
     /// One way, either direction (an RTT of 80 ms through Chicago).
     const SIM_ONE_WAY_US: u64 = 40_000;
+    const SIM_LAN_ONE_WAY_US: u64 = 2_000;
+
+    /// A Wi-Fi radio's extra delay for a frame sent at `t` (µs), not caused
+    /// by the stream: one frame in ten 10-50 ms, one in fifty 50-90 (the
+    /// Razer and the desktop's LAN: RTT p50 6 ms, p95 18, p99 53).
+    fn wifi_bump(t: u64) -> u64 {
+        let h = t.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
+        match h % 100 {
+            0..=1 => 50_000 + h % 40_000,
+            2..=11 => 10_000 + h % 40_000,
+            _ => 0,
+        }
+    }
 
     /// A keyframe's size at a bitrate: the log's 240-380 KB at 20 Mbps, down
     /// to a floor (even the coarsest keyframe of a whole screen is tens of KB).
@@ -1622,6 +1746,10 @@ mod tests {
         use std::collections::VecDeque;
         let mut r = RateController::new(Limits::default());
         r.set_switches(setup.switches);
+        r.set_lan(setup.lan);
+        let one_way = if setup.wifi { SIM_LAN_ONE_WAY_US } else { SIM_ONE_WAY_US };
+        // (A radio delivers in order: a bumped frame holds up the next.)
+        let mut last_arrival = 0u64;
         if let Some(w) = setup.warm_bps {
             r.warm_start(w);
         }
@@ -1631,7 +1759,7 @@ mod tests {
         let mut free_at = 0u64;
         // The host's pacer: each frame's time leaving it.
         let mut pacing: VecDeque<(u64, u64, usize)> = VecDeque::new();
-        let mut wire: VecDeque<(u64, u64, usize, bool, u64)> = VecDeque::new();
+        let mut wire: VecDeque<(u64, u64, usize, bool, u64, bool)> = VecDeque::new();
         // Each frame's first and last byte's arrival, and its size.
         let mut arriving: VecDeque<(u64, u64, usize)> = VecDeque::new();
         let mut requests: VecDeque<u64> = VecDeque::new();
@@ -1640,6 +1768,7 @@ mod tests {
         let mut next_capture = 0u64;
         let (mut awaiting, mut last_request) = (true, None::<u64>);
         let (mut win, mut delay_sum, mut window_start) = (Feedback::default(), 0i64, 0u64);
+        let mut floor = crate::video::DelayFloor::default();
         for t in (0..secs * 1_000_000).step_by(1_000) {
             let now_ms = t / 1000;
             while requests.front().is_some_and(|&a| a <= t) {
@@ -1658,8 +1787,11 @@ mod tests {
             if t >= next_capture {
                 next_capture += 1_000_000 / SIM_FPS as u64;
                 let bps = r.bitrate_bps();
+                if t % 1_000_000 == 0 {
+                    run.targets.push(bps);
+                }
                 if std::env::var_os("SIM_TRACE").is_some() && t % 1_000_000 < 16_667 {
-                    println!("  {:>3} s: {:>6} kbps, drain {:?}, queue {} ms", t / 1_000_000, bps / 1000, r.drain_fps(now_ms), r.queue_min_us / 1000);
+                    println!("  {:>3} s: {:>6} kbps, drain {:?}, queue {} ms, link {:?}", t / 1_000_000, bps / 1000, r.drain_fps(now_ms), r.queue_min_us / 1000, r.link_bps().map(|l| l / 1000));
                 }
                 let fps = if setup.fps_follow { fr.follow(bps, SIM_PIXELS, SIM_FPS, now_ms) } else { SIM_FPS };
                 let mut interval = 1_000_000 / fps as u64;
@@ -1688,8 +1820,9 @@ mod tests {
                     // (A frame still being paced goes at once when the next
                     // one comes, as in the host's sender — except under the
                     // cap, where the next one waits its turn.)
-                    let cap = r.pace_cap_bps();
-                    let pace = cap.map_or(bps as f64 * 2.5, |c| c as f64);
+                    let probe = r.probe_due(bytes, now_ms);
+                    let cap = r.pace_cap_bps().filter(|_| !probe);
+                    let pace = if probe { f64::INFINITY } else { cap.map_or(bps as f64 * 2.5, |c| c as f64) };
                     let mut host_start = t;
                     if let Some(p) = pacing.back_mut() {
                         if cap.is_some() {
@@ -1702,13 +1835,17 @@ mod tests {
                     pacing.push_back((host_start, pacer_free, on_wire));
                     let start = free_at.max(host_start);
                     free_at = (start + (on_wire as f64 * 8e6 / capacity(now_ms)) as u64).max(pacer_free);
-                    wire.push_back((free_at + SIM_ONE_WAY_US, t, on_wire, key, start + SIM_ONE_WAY_US));
-                    arriving.push_back((start + SIM_ONE_WAY_US, free_at + SIM_ONE_WAY_US, on_wire));
+                    let bump = if setup.wifi && setup.bumps { wifi_bump(t) } else { 0 };
+                    let first = (start + one_way + bump).max(last_arrival);
+                    let arrive = (free_at + one_way + bump).max(first);
+                    last_arrival = arrive;
+                    wire.push_back((arrive, t, on_wire, key, first, probe));
+                    arriving.push_back((first, arrive, on_wire));
                     frame_id += 1;
                 }
             }
             while wire.front().is_some_and(|w| w.0 <= t) {
-                let (arrive, capture, bytes, key, first) = wire.pop_front().unwrap();
+                let (arrive, capture, bytes, key, first, probe) = wire.pop_front().unwrap();
                 // (Feedback times a frame's first packet, as the clients do.)
                 let delay = (first - capture) as i64;
                 if win.frames == 0 || delay < win.delay_min_us {
@@ -1717,6 +1854,10 @@ mod tests {
                 delay_sum += delay;
                 win.frames += 1;
                 win.shards += bytes.div_ceil(1176) as u32;
+                // (Timed as the clients do: big frames, first packet to last.)
+                if floor.prompt(delay, first) && probe && bytes.div_ceil(1176) >= 8 {
+                    win.link_kbps = win.link_kbps.max((bytes as u64 * 8 * 1000 / (arrive - first).max(150)) as u32);
+                }
                 if key {
                     awaiting = false;
                     run.first_picture_ms.get_or_insert(now_ms);
@@ -1734,11 +1875,11 @@ mod tests {
                 let in_host: f64 =
                     pacing.iter().map(|&(a, b, n)| n as f64 * b.saturating_sub(t.max(a)) as f64 / (b - a).max(1) as f64).sum();
                 let queued_us = free_at.saturating_sub(t) as f64 - in_host * 8e6 / capacity(now_ms);
-                run.audio.push((now_ms, (SIM_ONE_WAY_US as f64 + queued_us.max(0.0)) / 1000.0));
+                run.audio.push((now_ms, (one_way as f64 + queued_us.max(0.0)) / 1000.0));
             }
             if awaiting && last_request.is_none_or(|l| t >= l + 100_000) {
                 last_request = Some(t);
-                requests.push_back(t + SIM_ONE_WAY_US);
+                requests.push_back(t + one_way);
             }
             if t >= window_start + 50_000 {
                 // The bytes that arrived in the window (packets arrive all
@@ -1756,11 +1897,56 @@ mod tests {
                     win.delay_avg_us = delay_sum / win.frames as i64;
                 }
                 win.window_us = 50_000;
-                feedback.push_back((t + SIM_ONE_WAY_US, win));
+                feedback.push_back((t + one_way, win));
                 (win, delay_sum, window_start) = (Feedback::default(), 0, t);
             }
         }
         run
+    }
+
+    /// Two laptops on one LAN's Wi-Fi (600 Mbit/s, the radios' delay bumps
+    /// whatever is sent), the picture moving all the time. The delay bumps
+    /// used to cut it toward the floor; measured, the link shows they aren't
+    /// the stream's own.
+    #[test]
+    fn lan_wifi_jitter_is_not_congestion() {
+        let link = |_| 600_000_000.0;
+        let phases = [(0, 10_000), (10_000, 30_000)];
+        let wifi = Setup { wifi: true, ..Setup::after() };
+        let unmeasured = simulate(wifi, 30, link);
+        let measured = simulate(Setup { lan: true, ..wifi }, 30, link);
+        let median = |r: &Run| {
+            let mut t = r.targets[10..].to_vec();
+            t.sort();
+            t[t.len() / 2]
+        };
+        unmeasured.print("wifi lan, link unmeasured", &phases);
+        measured.print("wifi lan, link measured", &phases);
+        println!("median target 10-30 s: {} kbps unmeasured, {} measured", median(&unmeasured) / 1000, median(&measured) / 1000);
+        assert!(median(&measured) >= Limits::default().start_bps, "{}", median(&measured));
+        assert!(median(&measured) > median(&unmeasured) * 2);
+        // (And no queue of its own for it: pictures as prompt as before.)
+        assert!(measured.stats(10_000, 30_000).1 <= unmeasured.stats(10_000, 30_000).1 + 5.0);
+    }
+
+    /// The same LAN, then something else takes the Wi-Fi (20 Mbit/s left for
+    /// 10 s): the measured link mustn't keep the stream from backing off.
+    #[test]
+    fn lan_congestion_still_backs_off() {
+        let link = |ms: u64| if (10_000..20_000).contains(&ms) { 20_000_000.0 } else { 600_000_000.0 };
+        let phases = [(10_000, 20_000), (20_000, 30_000)];
+        let wifi = Setup { wifi: true, ..Setup::after() };
+        let unmeasured = simulate(wifi, 30, link);
+        // (Today's controller where it gets going: a wired LAN, no bumps.)
+        let wired = simulate(Setup { bumps: false, ..wifi }, 30, link);
+        let measured = simulate(Setup { lan: true, ..wifi }, 30, link);
+        unmeasured.print("congested lan, unmeasured", &phases);
+        wired.print("congested wired, unmeasured", &phases);
+        measured.print("congested lan, measured", &phases);
+        let settle = |r: &Run| r.settled(10_000, 150.0).unwrap().saturating_sub(10_000);
+        println!("pictures late by >150 ms until {} ms (wired), {} (measured)", settle(&wired), settle(&measured));
+        assert!(settle(&measured) <= settle(&wired) + 500, "{} vs {}", settle(&measured), settle(&wired));
+        assert!(measured.stats(10_000, 20_000).1 <= wired.stats(10_000, 20_000).1 * 1.25);
     }
 
     /// The first connection over the relay (1 Mbps, nothing remembered),

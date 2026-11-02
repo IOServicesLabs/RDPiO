@@ -802,6 +802,8 @@ fn stream_inner(
     let limits = Limits { min_bps: Limits::default().min_bps, start_bps: resting_bps(office, cap.stream).min(max_bps), max_bps };
     let mut rate = RateController::new(limits);
     rate.set_switches(rate_switches());
+    // On the LAN, the link's own rate is measured (`linkprobe=0`: not).
+    rate.set_lan(crate::host_ab::ab("linkprobe", true) && crate::hyper_path::on_lan(peer.ip()));
     if let Some(w) = warm.filter(|&w| w < limits.start_bps) {
         rate.warm_start(w);
         tracing::info!(remembered_kbps = remembered.unwrap_or(0) / 1000, start_kbps = rate.bitrate_bps() / 1000, "warm start: this client's path sustained less last time");
@@ -1405,17 +1407,17 @@ fn stream_inner(
             let encode_us = qpc_us().saturating_sub(capture_us) as u32;
             let (is_ltr, recovery) = ltr.sent(out.input, frame_id, out.keyframe);
             // The data shards now; the sender thread adds parity once they're out.
-            let (fec, pace_cap) = {
+            let (fec, pace_cap, probe) = {
                 let mut r = shared.rate.lock().unwrap();
                 // (A keyframe on its way: the client's repeated requests for
                 // one are collapsed into it — see `receive_loop`.)
                 if out.keyframe {
                     r.note_keyframe(frame_id, out.data.len(), qpc_us() / 1000);
                 }
-                (r.parity_for(out.data.len(), out.keyframe), r.pace_cap_bps())
+                (r.parity_for(out.data.len(), out.keyframe), r.pace_cap_bps(), r.probe_due(out.data.len(), qpc_us() / 1000))
             };
             let data = packetize_shards(
-                &OutFrame { frame_id, data: &out.data, keyframe: out.keyframe, ltr: is_ltr, recovery, capture_us, encode_us },
+                &OutFrame { frame_id, data: &out.data, keyframe: out.keyframe, ltr: is_ltr, recovery, capture_us, encode_us, probe },
                 fec,
                 &shard_buffers,
             );
@@ -1424,7 +1426,7 @@ fn stream_inner(
             bytes += out.data.len() as u64;
             encode_us_total += encode_us as u64;
             acquire_us_total += acquired_us.saturating_sub(capture_us);
-            if frame_tx.send(Outgoing { data, payload: out.data.len(), bps, fps: enc_fps, pace, fec, pace_cap }).is_err() {
+            if frame_tx.send(Outgoing { data, payload: out.data.len(), bps, fps: enc_fps, pace, fec, pace_cap, probe }).is_err() {
                 return Err("the packet sender stopped".into());
             }
         }
@@ -1439,9 +1441,9 @@ fn stream_inner(
                 / 1000.0;
             // (Taken before the log line: a guard in its arguments lives to
             // the end of the statement, and a second lock() there deadlocks.)
-            let (keys_collapsed, cuts) = {
+            let (keys_collapsed, cuts, link) = {
                 let mut r = shared.rate.lock().unwrap();
-                (r.take_collapsed(), r.take_cuts())
+                (r.take_collapsed(), r.take_cuts(), r.link_bps())
             };
             // Why the rate came down, if it did: "standing:2 gap:1".
             let cuts = rdp_hyper::rate::CUT_NAMES
@@ -1465,6 +1467,7 @@ fn stream_inner(
                 drain_fps = drain.unwrap_or(0),
                 keys_collapsed,
                 cuts,
+                link_mbps = link.map_or(0, |l| l / 1_000_000),
                 fec_pct = (fec * 100.0) as u32,
                 trickle_pct = trickle_frames * 100 / frames.max(1),
                 audio_pps = format!("{:.0}", crate::hyper_audio::take_sent() as f64 / secs),
@@ -1851,6 +1854,9 @@ struct Outgoing {
     /// Send no faster than this (bits per second; see
     /// `RateController::pace_cap_bps`), and let a newer frame wait its turn.
     pace_cap: Option<u32>,
+    /// Unpaced: the client times it for what the link carries (see
+    /// `RateController::probe_due`).
+    probe: bool,
 }
 
 /// The sender thread. Each frame's packets are spread over `pace` of a frame
@@ -1882,6 +1888,7 @@ fn sender_loop(socket: UdpSocket, shared: Arc<Shared>, frames: std::sync::mpsc::
         let window = (f.pace as f64 / f.fps.max(1) as f64).max(1e-4);
         let total = data_bytes as f64 * (1.0 + f.fec as f64);
         let rate = match f.pace_cap {
+            _ if f.probe => f64::INFINITY,
             // A slow or queued link: the frame waits here, not in front of
             // the audio in the relay (see `RateController::pace_cap_bps`).
             Some(cap) => cap.max(100_000) as f64 / 8.0,
@@ -2851,6 +2858,7 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
                 delay_avg_us: 0,
                 window_us: last_fb.elapsed().as_micros() as u32,
                 ltr_frame: ltr_decoded,
+                link_kbps: s.link_kbps,
             };
             let _ = client.send(&csend.seal(Kind::Control, &Control::Feedback(fb).to_bytes()));
             last_fb = Instant::now();

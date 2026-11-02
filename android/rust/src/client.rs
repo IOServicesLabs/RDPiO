@@ -767,7 +767,7 @@ impl Client {
                                     let l = live.clone();
                                     let mut frame_id = 0u32;
                                     let sink: capture::CameraSink = Box::new(move |data: &[u8], keyframe: bool| {
-                                        let out = rdp_hyper::video::OutFrame { frame_id, data, keyframe, ltr: false, recovery: false, capture_us: now_us(), encode_us: 0 };
+                                        let out = rdp_hyper::video::OutFrame { frame_id, data, keyframe, ltr: false, recovery: false, capture_us: now_us(), encode_us: 0, probe: false };
                                         for body in rdp_hyper::video::packetize(&out, 0.1) {
                                             l.send(Kind::Camera, &body);
                                         }
@@ -872,6 +872,7 @@ impl Client {
                     delay_avg_us: if delay_n > 0 { delay_sum / delay_n } else { 0 },
                     window_us: last_feedback.elapsed().as_micros() as u32,
                     ltr_frame: Some(self.ltr_decoded.load(Ordering::Relaxed)).filter(|&v| v != u32::MAX),
+                    link_kbps: s.link_kbps,
                 };
                 live.send(Kind::Control, &Control::Feedback(fb).to_bytes());
                 let (calls, packets) = rx.take_counts();

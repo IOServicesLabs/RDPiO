@@ -133,6 +133,7 @@ fn send_loop(send: &Arc<dyn Fn(&[u8]) + Send + Sync>, clock: fn() -> u64, stop: 
                 recovery: false,
                 capture_us: clock(),
                 encode_us: 0,
+                probe: false,
             };
             for body in rdp_hyper::video::packetize(&out, 0.1) {
                 send(&body);
