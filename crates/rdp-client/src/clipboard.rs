@@ -64,6 +64,35 @@ unsafe fn open_clipboard_retrying(owner: Option<HWND>) -> bool {
     false
 }
 
+/// The paths of the files copied to the clipboard (its `CF_HDROP`); `None`
+/// if it couldn't be opened or has no file list. Only snapshots the list:
+/// walking a big tree with the clipboard open would block every other app.
+pub(crate) unsafe fn copied_paths() -> Option<Vec<PathBuf>> {
+    if !open_clipboard_retrying(None) {
+        return None;
+    }
+    let roots = (|| {
+        let handle = GetClipboardData(CF_HDROP).ok()?;
+        let hdrop = HDROP(handle.0);
+        // 0xFFFFFFFF → number of files in the drop.
+        let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
+        let mut out = Vec::new();
+        for i in 0..count {
+            // Query the path length (chars, excl. NUL), then fetch it.
+            let len = DragQueryFileW(hdrop, i, None) as usize;
+            if len == 0 {
+                continue;
+            }
+            let mut buf = vec![0u16; len + 1];
+            let n = DragQueryFileW(hdrop, i, Some(&mut buf)) as usize;
+            out.push(PathBuf::from(String::from_utf16_lossy(&buf[..n])));
+        }
+        Some(out)
+    })();
+    let _ = CloseClipboard();
+    roots
+}
+
 /// `CF_DIB` — a device-independent bitmap (`BITMAPINFO` + pixels): the format
 /// Windows apps put screenshots and copied images on the clipboard as.
 pub(crate) const CF_DIB: u32 = 8;
@@ -225,6 +254,18 @@ impl Win32Clipboard {
         self.collect_dir(path, &base, 1, out);
     }
 
+    /// Make `roots` (copied paths, see [`copied_paths`]) the outbound copy:
+    /// its entries, folders walked, index-aligned for `read_file`.
+    pub(crate) fn list_files(&mut self, roots: &[PathBuf]) -> Vec<ClipFile> {
+        self.files.clear();
+        self.upload = None; // the index→path mapping is about to change
+        let mut out = Vec::new();
+        for root in roots {
+            self.collect_entry(root, &mut out);
+        }
+        out
+    }
+
     /// Recurse `dir`, emitting entries named `prefix\\...`.
     fn collect_dir(&mut self, dir: &Path, prefix: &str, depth: usize, out: &mut Vec<ClipFile>) {
         if depth > MAX_TREE_DEPTH || out.len() >= MAX_TREE_ENTRIES {
@@ -325,38 +366,9 @@ impl ClipboardProvider for Win32Clipboard {
                 tracing::debug!("skipping clipboard enumeration; the session's own offer owns it");
                 return Vec::new();
             }
-            if !open_clipboard_retrying(None) {
-                return Vec::new();
-            }
-            let roots = (|| {
-                let handle = GetClipboardData(CF_HDROP).ok()?;
-                let hdrop = HDROP(handle.0);
-                // 0xFFFFFFFF → number of files in the drop.
-                let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
-                let mut out = Vec::new();
-                for i in 0..count {
-                    // Query the path length (chars, excl. NUL), then fetch it.
-                    let len = DragQueryFileW(hdrop, i, None) as usize;
-                    if len == 0 {
-                        continue;
-                    }
-                    let mut buf = vec![0u16; len + 1];
-                    let n = DragQueryFileW(hdrop, i, Some(&mut buf)) as usize;
-                    out.push(PathBuf::from(String::from_utf16_lossy(&buf[..n])));
-                }
-                Some(out)
-            })()
-            .unwrap_or_default();
-            let _ = CloseClipboard();
-            roots
+            copied_paths().unwrap_or_default()
         };
-        self.files.clear();
-        self.upload = None; // the index→path mapping is about to change
-        let mut out = Vec::new();
-        for root in &roots {
-            self.collect_entry(root, &mut out);
-        }
-        out
+        self.list_files(&roots)
     }
 
     fn read_file(&mut self, index: u32, offset: u64, len: u32) -> Option<Vec<u8>> {

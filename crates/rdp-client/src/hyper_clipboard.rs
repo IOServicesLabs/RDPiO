@@ -495,19 +495,44 @@ fn is_device_name(name: &str) -> bool {
 /// isn't that copy's — the newer change has its own notification.
 fn send_files(link: Arc<ReliableLink>, seq: u32) {
     let transfer = TRANSFER.fetch_add(1, Ordering::SeqCst) + 1;
+    tracing::info!(transfer, "files copied here; reading their names");
     let _ = std::thread::Builder::new().name("hyper-files".into()).spawn(move || {
         crate::net_tune::eco_thread();
-        // Only files the user signed in here could read themselves.
+        let Some(roots) = copied_paths(seq) else { return };
+        // Only files the user signed in here could read themselves (the list
+        // is read as ourselves: the clipboard isn't the user's to guard, and
+        // as SYSTEM impersonating them, Explorer's list never came).
         if let Some(user) = SessionUser::current() {
-            user.act(|| send_files_now(&link, transfer, seq));
+            user.act(|| send_files_now(&link, transfer, &roots));
         }
     });
 }
 
-fn send_files_now(link: &ReliableLink, transfer: u32, seq: u32) {
+/// The paths copied in clipboard change `seq`, once Explorer hands them over
+/// (it renders the list on request, and can still be busy publishing a big
+/// copy); `None`, logged, if they never come or a newer change came first.
+fn copied_paths(seq: u32) -> Option<Vec<PathBuf>> {
+    for _ in 0..10 {
+        let roots = unsafe { crate::clipboard::copied_paths() };
+        if unsafe { GetClipboardSequenceNumber() } != seq {
+            // A newer change, with its own notification.
+            tracing::info!("the clipboard changed again before the copied files were read; sending the newer copy");
+            return None;
+        }
+        match roots {
+            Some(roots) if !roots.is_empty() => return Some(roots),
+            _ => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    tracing::warn!("files were copied, but the clipboard never gave their names");
+    None
+}
+
+fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
     let mut cb = crate::clipboard::Win32Clipboard::new();
-    let files = cb.get_files();
-    if files.is_empty() || unsafe { GetClipboardSequenceNumber() } != seq {
+    let files = cb.list_files(roots);
+    if files.is_empty() {
+        tracing::warn!(paths = roots.len(), "files were copied, but none of them could be read");
         return;
     }
     let entries: Vec<FileEntry> =
