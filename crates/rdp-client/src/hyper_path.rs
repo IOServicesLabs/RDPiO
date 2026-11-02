@@ -75,6 +75,13 @@ impl Drop for PathReport {
     }
 }
 
+/// Whether `ip` is on one of this host's own networks.
+pub fn on_lan(ip: IpAddr) -> bool {
+    let lan: Vec<String> =
+        crate::launcher::host::addresses().into_iter().filter(|a| a.kind == "lan").map(|a| format!("{}/{}", a.ip, a.prefix)).collect();
+    rdp_hyper::lan::on_lan(&lan, ip)
+}
+
 /// The path to `ip`: the LAN by address, Tailscale's by asking it.
 fn path_of(ip: IpAddr, lan: &[String]) -> (PathKind, String) {
     if rdp_hyper::lan::on_lan(lan, ip) {

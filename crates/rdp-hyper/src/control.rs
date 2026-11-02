@@ -87,6 +87,10 @@ pub struct Feedback {
     /// The newest long-term reference frame the client decoded (see
     /// [`crate::video::OutFrame::ltr`]).
     pub ltr_frame: Option<u32>,
+    /// How fast the window's fastest big frame came in, first packet to last
+    /// (kbit/s; see [`crate::video::Stats::link_kbps`]): what the path carries
+    /// at least. 0: not measured (too little sent, or an older client).
+    pub link_kbps: u32,
 }
 
 /// Binary messages inside [`crate::wire::Kind::Control`] packets.
@@ -237,6 +241,7 @@ impl Control {
                 o.extend_from_slice(&f.delay_avg_us.to_le_bytes());
                 o.extend_from_slice(&f.window_us.to_le_bytes());
                 o.extend_from_slice(&f.ltr_frame.unwrap_or(u32::MAX).to_le_bytes());
+                o.extend_from_slice(&f.link_kbps.to_le_bytes());
             }
             Self::Status { input_ack, width, height, fps, bitrate_kbps, fec_permille } => {
                 o.push(5);
@@ -325,6 +330,7 @@ impl Control {
                 delay_avg_us: u64_at(33)? as i64,
                 window_us: u32_at(41).unwrap_or(0),
                 ltr_frame: u32_at(45).filter(|&v| v != u32::MAX),
+                link_kbps: u32_at(49).unwrap_or(0),
             }),
             5 => Self::Status {
                 input_ack: u32_at(1)?,
@@ -396,6 +402,7 @@ mod tests {
                 delay_avg_us: 7,
                 window_us: 50_000,
                 ltr_frame: Some(77),
+                link_kbps: 400_000,
             }),
             Control::Feedback(Feedback { frames: 3, ..Default::default() }),
             Control::Recover,

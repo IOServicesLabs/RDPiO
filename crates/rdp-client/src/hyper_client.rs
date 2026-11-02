@@ -1558,6 +1558,7 @@ fn receive_loop(
                 delay_avg_us: if delay_n > 0 { delay_sum / delay_n } else { 0 },
                 window_us: last_feedback.elapsed().as_micros() as u32,
                 ltr_frame: Some(shared.ltr_decoded.load(Ordering::Relaxed)).filter(|&v| v != u32::MAX),
+                link_kbps: s.link_kbps,
             };
             shared.send(Kind::Control, &Control::Feedback(fb).to_bytes());
             (delay_min, delay_sum, delay_n) = (i64::MAX, 0, 0);
