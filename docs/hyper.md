@@ -377,7 +377,11 @@ The picture on a bad path (host; each a switch, on unless said):
   the next stream from there at 1.2x it (when that's under the usual 20 Mbps)
   — the tablet's relay address and its LAN one are remembered apart. While
   nothing pushes back it grows 6% a feedback window; an idle stream recovers
-  only to the highest rate the path has carried. Logged as "warm start".
+  only to the highest rate the path has carried. 30 s in, that ceiling and
+  the slow path it set lift and the stream tunes as a fresh one would (a
+  slow path from a real cut since stays): one bad start, Wi-Fi power save
+  read as a queue, otherwise held a LAN laptop at 0.5-2 Mbps every stream
+  that week. Logged as "warm start".
 - **Frame rate follows the bitrate** (`fpsfollow`): with too few bits a pixel
   per frame (under 0.015; 2250x1590 at 60 fps below ~3.2 Mbps) the host
   encodes at half, then a third of the rate (never under 20 fps), with the

@@ -110,6 +110,11 @@ const SLOW_PACE_BELOW_BPS: f64 = 3_000_000.0;
 /// A warm start (see [`RateController::warm_start`]) grows this much a
 /// window while the path stays clear, up to the resting rate.
 const WARM_RAMP: f64 = 1.06;
+/// A warm start only gets the stream going: this long (ms) after its first
+/// feedback, its ceiling and slow path lift and the stream tunes as a fresh
+/// one would. One bad start (Wi-Fi power save read as a queue) remembered
+/// otherwise held a LAN client at 0.5-2 Mbps for every stream that week.
+const WARM_RETUNE_MS: u64 = 30_000;
 /// Feedback windows a sustained rate needs before it's worth remembering.
 const SUSTAINED_MIN_WINDOWS: u32 = 40;
 /// A path that has shown it carries little (a cut for a standing queue, a
@@ -239,6 +244,9 @@ pub struct RateController {
     /// A warm start's ceiling for an idle stream's recovery: the highest rate
     /// the path has shown it carries (see [`Self::warm_start`]).
     warm_cap: Option<f64>,
+    /// When a warm start retunes, and the slow path it set (see
+    /// [`WARM_RETUNE_MS`]).
+    warm_retune: Option<(u64, u64)>,
     /// When the keyframe in flight went out (ms), and the bytes delivered
     /// (and ms) since the first arrived after it (see [`KEY_PROBE_MS`]).
     key_sent_ms: u64,
@@ -307,6 +315,7 @@ impl RateController {
             sustained: 0.0,
             sustained_n: 0,
             warm_cap: None,
+            warm_retune: None,
             key_sent_ms: 0,
             key_probe: (0, 0),
             standing_delivered: (0, 0),
@@ -515,6 +524,16 @@ impl RateController {
         (self.sent_payload, self.sent_wire) = (0, 0);
         if self.slow_until_ms == u64::MAX {
             self.slow_until_ms = now_ms + SLOW_PATH_MS;
+        }
+        if self.warm_cap.is_some() {
+            let (at, warm_slow) = *self.warm_retune.get_or_insert((now_ms + WARM_RETUNE_MS, self.slow_until_ms));
+            if now_ms >= at {
+                self.warm_cap = None;
+                // (A slow path from a cut since stays.)
+                if self.slow_until_ms == warm_slow {
+                    self.slow_until_ms = self.slow_until_ms.min(now_ms);
+                }
+            }
         }
         // Frames the client resolved. A lost feedback window leaves the count
         // short for good, so a quiet second (nothing sent, nothing arriving)
@@ -1349,6 +1368,25 @@ mod tests {
         }
         // Switched off (no warm start): the default start.
         assert_eq!(RateController::new(Limits::default()).bitrate_bps(), Limits::default().start_bps);
+    }
+
+    /// A slow memory doesn't hold the whole stream: 30 s in, an idle stream
+    /// on a clear path recovers to the resting rate as a fresh one would.
+    #[test]
+    fn a_warm_start_retunes_after_30_s() {
+        let mut r = RateController::new(Limits::default());
+        r.warm_start(600_000);
+        let mut t = 0;
+        while t * 50 < WARM_RETUNE_MS - 500 {
+            r.update(&fb(1_000, 5_500, 0, 0), 50, t * 50);
+            t += 1;
+        }
+        assert_eq!(r.bitrate_bps(), 600_000);
+        while t * 50 < WARM_RETUNE_MS + 15_000 {
+            r.update(&fb(1_000, 5_500, 0, 0), 50, t * 50);
+            t += 1;
+        }
+        assert_eq!(r.bitrate_bps(), Limits::default().start_bps, "{}", r.bitrate_bps());
     }
 
     #[test]
