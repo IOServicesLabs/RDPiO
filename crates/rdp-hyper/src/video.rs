@@ -93,6 +93,18 @@ pub struct OutFrame<'a> {
     pub probe: bool,
 }
 
+/// How many data shards a frame takes, and their size. A probe goes in
+/// [`BURST_MIN_SHARDS`] at least, smaller ones if need be: the client only
+/// times a frame that many packets long, and on a slow stream the frames are
+/// a packet or a few. (Any shard size decodes: the receiver takes a frame's
+/// from its first shard.)
+fn layout(frame: &OutFrame) -> (usize, usize) {
+    let len = frame.data.len().max(1);
+    let min = if frame.probe { BURST_MIN_SHARDS as usize } else { 1 };
+    let size = len.div_ceil(len.div_ceil(MAX_SHARD).max(min));
+    (len.div_ceil(size), size)
+}
+
 /// Cut a frame into packet bodies: all data shards, then all parity.
 /// `fec` is the parity ratio (0.1 = 10% extra packets); any value above 0
 /// gives every block at least one parity shard.
@@ -107,9 +119,7 @@ pub fn packetize(frame: &OutFrame, fec: f32) -> Vec<Vec<u8>> {
 /// parity to come). Send these first and compute [`parity`] while they're on
 /// their way: a receiver normally completes a frame from data alone.
 pub fn packetize_data(frame: &OutFrame, fec: f32) -> Vec<Vec<u8>> {
-    let len = frame.data.len().max(1);
-    let shards_needed = len.div_ceil(MAX_SHARD);
-    let shard_size = len.div_ceil(shards_needed);
+    let (shards_needed, shard_size) = layout(frame);
     let blocks = shards_needed.div_ceil(MAX_BLOCK_DATA);
     assert!(blocks <= 255, "frame too large: {} bytes", frame.data.len());
     let mut out = Vec::with_capacity(shards_needed);
@@ -227,9 +237,7 @@ impl Drop for Shards {
 /// [`Shards`] are dropped, e.g. on the sender thread): no allocation a packet,
 /// and none a frame once the buffers have grown to the largest frame.
 pub fn packetize_shards(frame: &OutFrame, fec: f32, buffers: &FrameBuffers) -> Shards {
-    let len = frame.data.len().max(1);
-    let shards_needed = len.div_ceil(MAX_SHARD);
-    let shard_size = len.div_ceil(shards_needed);
+    let (shards_needed, shard_size) = layout(frame);
     let blocks = shards_needed.div_ceil(MAX_BLOCK_DATA);
     assert!(blocks <= 255, "frame too large: {} bytes", frame.data.len());
     let size = SHARD_HEADER + shard_size;
@@ -805,6 +813,27 @@ mod tests {
         assert!((800_000..1_300_000).contains(&kbps), "{kbps}");
         deliver(&mut r, 2, true, 40_000, 30_000);
         assert_eq!(r.take_stats().link_kbps, 0, "a held-up probe isn't timed");
+    }
+
+    #[test]
+    fn a_small_probe_is_cut_fine_enough_to_time() {
+        let data = frame(1, 3_000);
+        let mut r = Reassembler::new();
+        let mut got = None;
+        for (id, probe) in [(0, false), (1, true)] {
+            let f = OutFrame { frame_id: id, data: &data, keyframe: false, ltr: false, recovery: false, capture_us: 1_000 + id as u64 * 20_000, encode_us: 0, probe };
+            let packets = packetize(&f, 0.05);
+            assert_eq!(packets.len() >= BURST_MIN_SHARDS as usize, probe, "{} packets", packets.len());
+            for (i, p) in packets.iter().enumerate() {
+                for e in r.push(p, 2_000 + id as u64 * 20_000 + i as u64 * 10) {
+                    if let Event::Frame(f) = e {
+                        got = Some(f.data.to_vec());
+                    }
+                }
+            }
+            assert_eq!(got.take().as_deref(), Some(&data[..]), "frame {id} decodes whole");
+        }
+        assert!(r.take_stats().link_kbps > 0, "the probe was timed");
     }
 
     /// Sustained loss (no FEC, every frame missing a shard): 32 frames always
