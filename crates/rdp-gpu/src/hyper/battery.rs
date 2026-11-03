@@ -272,6 +272,13 @@ pub fn may_be_nvidia(device: &ID3D11Device) -> bool {
 /// says 255, unknown: never on battery).
 pub fn on_battery() -> bool {
     use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    // (`RDPIO_POWER=battery` or `ac`: as if — for A/B runs of what
+    // follows the power source, on whatever cable the test machine has.)
+    match std::env::var("RDPIO_POWER").as_deref() {
+        Ok("battery") => return true,
+        Ok("ac") => return false,
+        _ => {}
+    }
     let mut s = SYSTEM_POWER_STATUS::default();
     unsafe { GetSystemPowerStatus(&mut s).is_ok() && s.ACLineStatus == 0 }
 }
