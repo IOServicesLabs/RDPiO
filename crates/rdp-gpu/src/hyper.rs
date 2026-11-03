@@ -222,19 +222,13 @@ pub enum PointerEvent {
     Shape { width: u16, height: u16, hot_x: u16, hot_y: u16, rgba: Vec<u8> },
 }
 
+/// A reopened duplication's first frame (the whole desktop) comes within
+/// this (see `DesktopCapture::take`).
+const REOPENED_WITHIN_MS: u32 = 100;
+
 /// How long a capture waits for the driver's first frame before it
 /// duplicates the output instead (the stream's start nudges a repaint, so a
 /// working driver has one well within this).
-/// A Desktop Duplication frame held unconverted (see `set_defer_duplication`)
-/// longer than this was forgotten by the caller: it's let go.
-const HELD_AT_MOST: Duration = Duration::from_secs(1);
-
-/// A held frame taken within this of being seen is the newest; held longer,
-/// [`take`](DesktopCapture::take) waits this long for a newer one (about a
-/// refresh of a 120-144 Hz desktop).
-const FRESH_HELD: Duration = Duration::from_millis(2);
-const NEWER_WITHIN_MS: u32 = 8;
-
 const DRIVER_GRACE: Duration = Duration::from_secs(3);
 
 /// Desktop Duplication of one monitor plus the BGRA → NV12 conversion.
@@ -283,9 +277,14 @@ pub struct DesktopCapture {
     /// Desktop Duplication looked at before it's converted too
     /// ([`set_defer_duplication`](Self::set_defer_duplication))…
     defer_dup: bool,
-    /// …the frame [`peek`](Self::peek) acquired, held unconverted (and since
-    /// when), until [`take`](Self::take) or [`forget`](Self::forget).
-    held: Option<(IDXGIResource, DXGI_OUTDUPL_FRAME_INFO, Instant)>,
+    /// …the frame [`peek`](Self::peek) acquired, held unconverted until
+    /// [`take`](Self::take), [`forget`](Self::forget) or the next look…
+    held: Option<(IDXGIResource, DXGI_OUTDUPL_FRAME_INFO)>,
+    /// …which lets it go unconverted: the screen has changed since the last
+    /// picture handed out, to what that frame showed (when it was presented,
+    /// µs). Nothing newer comes: `take` reopens the duplication, whose first
+    /// frame is the whole desktop.
+    pending: Option<u64>,
 }
 
 impl DesktopCapture {
@@ -398,6 +397,7 @@ impl DesktopCapture {
                 peeked: None,
                 defer_dup: false,
                 held: None,
+                pending: None,
             })
         }
     }
@@ -459,6 +459,7 @@ impl DesktopCapture {
     /// [`take`](Self::take) after all.
     pub fn forget(&mut self) {
         self.peeked = None;
+        self.pending = None;
         if self.held.take().is_some() {
             if let Some(dup) = &self.dup {
                 unsafe {
@@ -579,27 +580,28 @@ impl DesktopCapture {
     }
 
     /// [`peek`](Self::peek) for Desktop Duplication: acquire the next frame
-    /// and hold it. While one is held there is no newer look (acquiring lets
-    /// the held one go, and with it the picture if nothing newer comes): the
-    /// wait just passes, and [`take`](Self::take) looks for newer.
+    /// and hold it for the caller's [`take`](Self::take) — only until the
+    /// next look: a held frame keeps the compositor from updating the
+    /// duplicated desktop (measured: held to its turn, the stream's frames
+    /// went out stale and the rate controller cut on the gap). Let go
+    /// unconverted, it's [`pending`](Self::pending) until a newer one comes.
     unsafe fn peek_duplication(&mut self, timeout_ms: u32) -> WinResult<Option<u64>> {
         if self.stale {
             std::thread::sleep(Duration::from_millis(timeout_ms.min(20) as u64));
             return Ok(None);
         }
-        if let Some((_, _, since)) = &self.held {
-            // (Held this long, the caller forgot it: let it go and look again.)
-            if since.elapsed() < HELD_AT_MOST {
-                std::thread::sleep(Duration::from_millis(timeout_ms as u64));
-                return Ok(None);
+        if let Some((_, info)) = self.held.take() {
+            if let Some(dup) = &self.dup {
+                let _ = dup.ReleaseFrame();
             }
-            self.forget();
+            self.pending = Some(self.present_us(&info));
         }
         let Some((dup, info, resource)) = self.dup_acquire(timeout_ms)? else { return Ok(None) };
         match resource.filter(|_| info.LastPresentTime != 0) {
             Some(resource) => {
-                self.held = Some((resource, info, Instant::now()));
-                Ok(Some((info.LastPresentTime as f64 / self.qpc_per_us) as u64))
+                self.held = Some((resource, info));
+                self.pending = None;
+                Ok(Some(self.present_us(&info)))
             }
             None => {
                 // Only the pointer moved: nothing to hold.
@@ -610,30 +612,42 @@ impl DesktopCapture {
     }
 
     /// [`take`](Self::take) for Desktop Duplication: the held frame
-    /// converted. Held a while, the screen has likely moved on meanwhile —
-    /// but the duplication shows that only once the held frame is let go
-    /// (the compositor's next frame): so a newer one is waited for, up to
-    /// [`NEWER_WITHIN_MS`], and converted over it, into the same ring slot
-    /// (the GPU does them in order). None comes: the screen went still on
-    /// the held one, which is what goes.
+    /// converted; or, the screen having gone still on a frame let go
+    /// unconverted, the desktop as a reopened duplication first shows it.
     unsafe fn take_duplication(&mut self) -> WinResult<Option<CapturedFrame>> {
-        let Some((resource, info, since)) = self.held.take() else { return Ok(None) };
-        let Some(dup) = self.dup.clone() else { return Ok(None) };
-        let slot = self.take_frame(Some(resource), &info);
-        let _ = dup.ReleaseFrame();
-        let Some(slot) = slot? else { return Ok(None) };
-        // (Taken the moment it was seen: it's the newest.)
-        if since.elapsed() < FRESH_HELD {
-            return Ok(self.ring_out(Some(slot), &info));
-        }
-        if let Some((dup, newer, resource)) = self.dup_acquire(NEWER_WITHIN_MS)? {
-            let again = self.take_frame(resource, &newer);
+        if let Some((resource, info)) = self.held.take() {
+            let Some(dup) = self.dup.clone() else { return Ok(None) };
+            let slot = self.take_frame(Some(resource), &info);
             let _ = dup.ReleaseFrame();
-            if again?.is_some() {
-                return Ok(self.ring_out(Some(slot), &newer));
-            }
+            return Ok(self.ring_out(slot?, &info));
         }
-        Ok(self.ring_out(Some(slot), &info))
+        let Some(present_us) = self.pending.take() else { return Ok(None) };
+        self.lose_duplication();
+        let Some((dup, info, resource)) = self.dup_acquire(REOPENED_WITHIN_MS)? else {
+            // (Not yet — the secure desktop, say: next time.)
+            self.pending = Some(present_us);
+            return Ok(None);
+        };
+        // (The first frame shows the desktop whether or not it says it was
+        // presented.)
+        let mut first = info;
+        if resource.is_some() && first.LastPresentTime == 0 {
+            first.LastPresentTime = 1;
+        }
+        let slot = self.take_frame(resource, &first);
+        let _ = dup.ReleaseFrame();
+        let Some(mut frame) = self.ring_out(slot?, &info) else {
+            self.pending = Some(present_us);
+            return Ok(None);
+        };
+        if info.LastPresentTime == 0 {
+            frame.present_us = present_us;
+        }
+        Ok(Some(frame))
+    }
+
+    fn present_us(&self, info: &DXGI_OUTDUPL_FRAME_INFO) -> u64 {
+        (info.LastPresentTime as f64 / self.qpc_per_us) as u64
     }
 
     /// Put the acquired surface into the next ring slot — copied (RGB mode)
