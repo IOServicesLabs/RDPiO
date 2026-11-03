@@ -487,6 +487,8 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     // Minimized: the host is told to encode nothing (repeated, in case a
     // packet is lost); restored: a keyframe brings the picture back.
     let (mut paused, mut pause_sent) = (false, Instant::now());
+    // When the window was first seen fully covered (see COVERED_FOR).
+    let (mut covered_since, mut cover_checked) = (None::<Instant>, Instant::now());
     let mut last_input_send = Instant::now();
     let mut last_full_input_send = Instant::now();
     let mut awaiting_key = true;
@@ -836,7 +838,15 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         // this screen off, this PC locked): the host is told to encode
         // nothing; what still comes is decoded (every frame is a reference for
         // the next) but not drawn.
-        let minimized = window.output_hidden();
+        // …or buried under other windows a while (`coverpause`: looked at
+        // twice a second; uncovered, back at once).
+        if cover_checked.elapsed() >= COVER_CHECK_EVERY {
+            cover_checked = Instant::now();
+            let now = crate::host_ab::ab("coverpause", true) && window.covered();
+            covered_since = if now { covered_since.or(Some(Instant::now())) } else { None };
+        }
+        let covered = covered_since.is_some_and(|t| t.elapsed() >= COVERED_FOR);
+        let minimized = window.output_hidden() || covered;
         if let Some(v) = shared.update_note.lock().unwrap().take() {
             hint = crate::hyper_overlay::render(&[format!("rdpio {v} downloaded from the host: it installs when you close this window")]);
             hint_until = Instant::now() + Duration::from_secs(6);
@@ -1143,6 +1153,11 @@ const INPUT_MOTION_EVERY: Duration = Duration::from_millis(1);
 /// Shown frames a second at which the picture counts as moving (video, a
 /// game) and keeps the screen on; office trickling stays under it.
 const MOVING_FPS: f64 = 15.0;
+
+/// The stream's window under others for this long counts as hidden (see
+/// `Window::covered`): an alt-tab glance away and back doesn't pause it.
+const COVERED_FOR: Duration = Duration::from_secs(2);
+const COVER_CHECK_EVERY: Duration = Duration::from_millis(500);
 
 /// No video this long: the receive loop wakes less often and the feedback
 /// thins out (nothing to report on a still screen).
