@@ -72,6 +72,16 @@ pub const PARITY_FREE_BYTES: usize = 4096;
 /// is pure overhead, and the rare Wi-Fi loss is repaired from a long-term
 /// reference. (Every block still gets at least one parity shard.)
 const CLEAN_FEC: f32 = 0.02;
+/// A repair (a frame coded from a long-term reference after a loss: the one
+/// that ends the client's freeze) carries at least this much parity
+/// (`repairfec`, see [`Switches::repair_fec`]), clean path or not: it's
+/// asked for because something was just lost (often before the feedback
+/// saying so: a small one went without), and lost too, the picture stays
+/// frozen another request and round trip. A few KB, rare: a packet or two.
+/// Simulated, a game on Wi-Fi losing 1% in runs of 8: frozen 72.6 → 55.1 s
+/// in 32 min, frames never shown 7429 → 6639, packets +0.7% (see
+/// `fecsim`); at a quarter, 60.0 s and 6801.
+const REPAIR_FEC: f32 = 0.5;
 /// Drain mode: while a standing queue drains, the host encodes this many
 /// frames a second, so the backlog drains at nearly the link's whole rate
 /// instead of the sliver a cut bitrate leaves (see [`RateController::drain_fps`]).
@@ -128,6 +138,24 @@ const PROBE_EVERY_MS: u64 = 1_000;
 /// one: a slow stream's frames are a packet or a few, and without probes it
 /// stayed at the floor — every radio bump its queue, the link never shown.)
 const PROBE_MIN_BYTES: usize = 2_000;
+/// A train a frame has to be padded out to only this often (ms) while the
+/// stream carries under 1/[`PROBE_IDLE_SHARE`] of the link it has shown
+/// (`probeidle`, see [`Switches::probe_idle`]): an idle office stream's
+/// trains were most of its packets — 48 a second for a caret's 2-3 — and
+/// a reading then only says again what the last one did. (Not while the
+/// link is in doubt, and a frame half a train or more goes every second.)
+/// Simulated, an office stream on a clean LAN: padding 33% → 12% of the
+/// data packets, 13.1 → 11.2 packets a frame shown; on the laptop's uplink
+/// the rate within 2%, the same p95, nothing more lost.
+const PROBE_IDLE_EVERY_MS: u64 = 5_000;
+const PROBE_IDLE_SHARE: f64 = 20.0;
+/// With those, the link is the most of the last this many readings (over
+/// at most [`LINK_KEEP_MS`]) even when older than the window, and trains go
+/// every second again until there are as many (a cut's doubt clears them):
+/// one train a window, read low (a radio's channel access stretches it),
+/// stood alone and cut the next scroll's rate to half the other arm's.
+const LINK_KEEP_READINGS: usize = 4;
+const LINK_KEEP_MS: u64 = 30_000;
 /// With trains (`probetrain`, see [`Switches::probe_train`]) every probe
 /// goes out as at least [`crate::video::PROBE_TRAIN_PACKETS`] full packets,
 /// the frame's own parity padding it out, and the client times all of them:
@@ -232,6 +260,14 @@ pub struct Switches {
     /// there: after something took the link for 3 s it came back to 24
     /// Mbit/s on a 200 Mbit/s LAN, 29 with this.
     pub lone_frame: bool,
+    /// Repairs carry more parity (`repairfec`; see [`REPAIR_FEC`]).
+    pub repair_fec: bool,
+    /// A frame of several blocks goes a body of each in turn (`interleave`;
+    /// see [`crate::video::send_order`]).
+    pub interleave: bool,
+    /// Padded probe trains seldom while the stream is far under the link
+    /// (`probeidle`; see [`PROBE_IDLE_EVERY_MS`]).
+    pub probe_idle: bool,
 }
 
 impl Default for Switches {
@@ -251,6 +287,9 @@ impl Default for Switches {
             held_burst: true,
             own_queue: true,
             lone_frame: true,
+            repair_fec: true,
+            interleave: true,
+            probe_idle: true,
         }
     }
 }
@@ -440,6 +479,10 @@ impl RateController {
         std::mem::take(&mut self.cuts)
     }
 
+    pub fn switches(&self) -> Switches {
+        self.switches
+    }
+
     pub fn set_switches(&mut self, switches: Switches) {
         self.switches = switches;
         if !switches.standing_queue || !switches.drain {
@@ -510,15 +553,32 @@ impl RateController {
     /// (Slow pacing too: on a LAN a probe is a millisecond's burst, and only
     /// it shows the link has room again.)
     pub fn probe_due(&mut self, bytes: usize, now_ms: u64) -> bool {
+        let every = if self.probe_idle(bytes, now_ms) { PROBE_IDLE_EVERY_MS } else { PROBE_EVERY_MS };
         let due = self.lan
             && (bytes >= PROBE_MIN_BYTES || self.switches.probe_train)
             && !self.draining
             && self.standing_since_ms.is_none()
-            && self.last_probe_ms.is_none_or(|t| now_ms.saturating_sub(t) >= PROBE_EVERY_MS);
+            && self.last_probe_ms.is_none_or(|t| now_ms.saturating_sub(t) >= every);
         if due {
             self.last_probe_ms = Some(now_ms);
         }
         due
+    }
+
+    /// Whether a frame of `bytes` would be padded out to a train for a
+    /// reading not needed now (see [`PROBE_IDLE_EVERY_MS`]).
+    fn probe_idle(&self, bytes: usize, now_ms: u64) -> bool {
+        // (Mostly padding: a frame half a train or more is a scroll starting,
+        // whose first frames' reading the rate wants at once.)
+        let padded = crate::video::layout_of(bytes, true).0 < crate::video::PROBE_TRAIN_PACKETS / 2;
+        let recent = self.carried.iter().filter(|&&(t, _)| now_ms.saturating_sub(t) <= LINK_WINDOW_TRAIN_MS).map(|&(_, b)| b);
+        let carried = recent.fold(0.0, f64::max) * self.overhead;
+        self.switches.probe_idle
+            && self.switches.probe_train
+            && padded
+            && now_ms >= self.link_doubt_until_ms
+            && self.link_seen.len() >= LINK_KEEP_READINGS
+            && self.link_bps.is_some_and(|l| carried * PROBE_IDLE_SHARE < l)
     }
 
     /// Parity a probe train went out with beyond the frame's own (bytes on
@@ -626,6 +686,20 @@ impl RateController {
     /// frames carry less there ([`CLEAN_FEC`]); keyframes always carry the
     /// full ratio. The first loss brings it back for all.
     pub fn parity_for(&self, bytes: usize, keyframe: bool) -> f32 {
+        self.parity_for_frame(bytes, keyframe, false)
+    }
+
+    /// [`Self::parity_for`], and for a repair at least [`REPAIR_FEC`].
+    pub fn parity_for_frame(&self, bytes: usize, keyframe: bool, repair: bool) -> f32 {
+        let fec = self.parity_of(bytes, keyframe);
+        if repair && self.switches.repair_fec {
+            fec.max(REPAIR_FEC)
+        } else {
+            fec
+        }
+    }
+
+    fn parity_of(&self, bytes: usize, keyframe: bool) -> f32 {
         if self.clean && !keyframe && bytes <= PARITY_FREE_BYTES {
             0.0
         } else if self.clean && !keyframe && self.switches.fec_floor {
@@ -748,7 +822,11 @@ impl RateController {
             self.link_seen.push_back((now_ms, (fb.link_kbps as f64 * 1000.0).min(LINK_MAX_BPS)));
         }
         let window = if self.switches.probe_train { LINK_WINDOW_TRAIN_MS } else { LINK_WINDOW_MS };
-        while self.link_seen.front().is_some_and(|&(t, _)| now_ms.saturating_sub(t) > window) {
+        let keep = if self.switches.probe_idle && self.switches.probe_train { LINK_KEEP_READINGS } else { 0 };
+        while self.link_seen.front().is_some_and(|&(t, _)| {
+            let age = now_ms.saturating_sub(t);
+            age > window && (self.link_seen.len() > keep || age > LINK_KEEP_MS)
+        }) {
             self.link_seen.pop_front();
         }
         if let Some(most) = self.link_seen.iter().map(|&(_, b)| b).reduce(f64::max) {
@@ -1815,6 +1893,9 @@ mod tests {
                     held_burst: false,
                     own_queue: false,
                     lone_frame: false,
+                    repair_fec: false,
+                    interleave: false,
+                    probe_idle: false,
                 },
                 fps_follow: false,
                 warm_bps: None,
@@ -1873,6 +1954,8 @@ mod tests {
         /// The controller's cuts, by reason ([`CUT_NAMES`]), and when (ms).
         cuts: [u32; CUT_NAMES.len()],
         cut_at: Vec<u64>,
+        /// Probe trains' padding sent (bytes).
+        pad: u64,
     }
 
     impl Run {
@@ -2112,6 +2195,7 @@ mod tests {
                     let train = probe && r.switches.probe_train;
                     let pad = if train { crate::video::probe_padding(bytes, r.parity_for(bytes, key)) } else { 0 };
                     r.note_probe_padding(pad);
+                    run.pad += pad as u64;
                     let on_wire = on_wire + pad;
                     let cap = r.pace_cap_bps().filter(|_| !probe);
                     let pace = if probe { f64::INFINITY } else { cap.map_or(bps as f64 * 2.5, |c| c as f64) };
@@ -2510,6 +2594,71 @@ mod tests {
         assert!(new.medians(22_000, 35_000).0 <= 20_000_000, "{:?}", new.medians(22_000, 35_000));
         assert!(new.stats(20_000, 35_000).1 <= old.stats(20_000, 35_000).1 * 1.25 + 5.0);
         assert!(new.medians(40_000, 60_000).0 >= 15_000_000, "recovers: {:?}", new.medians(40_000, 60_000));
+    }
+
+    /// Padded trains every 5 s while an office stream idles far under the
+    /// link (`probeidle`): its padding was most of what it sent. The link
+    /// is still found, the rate and latency the same; and when something
+    /// takes the link while the screen is still, the next scroll backs off
+    /// as well. 32 runs each, the uplink's moves shifted (one run's cuts
+    /// fall where its radio's bumps do: a probe 7 ms later moved one phase's
+    /// mean rate 15% over 64 runs).
+    #[test]
+    fn wifi_idle_probes_seldom() {
+        let scroll: fn(u64) -> bool = |ms| ms % 12_000 < 1_000;
+        let office = Setup {
+            wifi: true,
+            lan: true,
+            airtime: true,
+            nap: true,
+            buffer_us: Some(40_000),
+            warm_bps: Some(1_200_000),
+            active: Some(scroll),
+            ..Setup::after()
+        };
+        let off = Setup { switches: Switches { probe_idle: false, ..office.switches }, ..office };
+        const RUNS: u64 = 32;
+        for taken in [false, true] {
+            let name = if taken { "uplink taken (20 Mbit/s) 60-90 s" } else { "office on the laptop's uplink" };
+            // Per arm: padding and video bytes, frames lost, the mean target
+            // 10-120 s (kbps), the median link (Mbit/s), video p95 (ms) and
+            // p95 60-90 s.
+            let mut sum = [(0u64, 0u64, 0u32, 0f64, 0f64, 0f64, 0f64); 2];
+            for shift in 0..RUNS {
+                for (arm, setup) in [off, office].into_iter().enumerate() {
+                    let link = move |ms: u64| if taken && (60_000..90_000).contains(&ms) { 20e6 } else { ax210(ms + shift * 877) };
+                    let r = simulate(setup, 120, link);
+                    let s = &mut sum[arm];
+                    let targets: Vec<f64> = r.per_s.iter().filter(|x| x.0 >= 10_000).map(|x| x.1 as f64).collect();
+                    s.0 += r.pad;
+                    s.1 += r.shown.iter().map(|f| f.2 as u64).sum::<u64>() - r.pad;
+                    s.2 += r.lost;
+                    s.3 += targets.iter().sum::<f64>() / targets.len() as f64 / 1e3 / RUNS as f64;
+                    s.4 += r.medians(10_000, 120_000).1 as f64 / 1e6 / RUNS as f64;
+                    s.5 += r.stats(10_000, 120_000).1 / RUNS as f64;
+                    s.6 += r.stats(60_000, 90_000).1 / RUNS as f64;
+                }
+            }
+            println!("{name} ({RUNS} runs):");
+            for (arm, s) in ["every 1 s", "probeidle"].iter().zip(&sum) {
+                println!(
+                    "  {arm:<10} padding {:>6} KB ({:>2.0}% of the video), lost {}, target {:>5.0} kbps, link {:>3.0} Mbit/s, video p95 {:>3.0} ms (60-90 s {:>3.0})",
+                    s.0 / 1000,
+                    s.0 as f64 * 100.0 / s.1 as f64,
+                    s.2,
+                    s.3,
+                    s.4,
+                    s.5,
+                    s.6
+                );
+            }
+            let [a, b] = sum;
+            assert!((b.0 as f64) < a.0 as f64 * 0.6, "{name}: padding {} -> {}", a.0, b.0);
+            assert!(b.2 <= a.2, "{name}: lost {} -> {}", a.2, b.2);
+            assert!(b.3 >= a.3 * 0.95, "{name}: target {:.0} -> {:.0}", a.3, b.3);
+            assert!(b.4 >= a.4 * 0.9, "{name}: link {:.0} -> {:.0}", a.4, b.4);
+            assert!(b.5 <= a.5 * 1.05 + 1.0 && b.6 <= a.6 * 1.05 + 1.0, "{name}: p95 {:.0} -> {:.0}, {:.0} -> {:.0} ms", a.5, b.5, a.6, b.6);
+        }
     }
 
     /// What the client reads off a probe on the laptop's uplink (300 Mbit/s

@@ -18,6 +18,7 @@
 //!   the stream's size from the bits that arrive, and when a decode backlog
 //!   goes for a fresh keyframe (the same on Windows and Android).
 //! - [`pause`]: when a paused host lets its GPU pipeline go, and takes it back.
+//! - [`ltr`]: long-term references, and when a loss is repaired from one.
 //!
 //! Platform-neutral; the capture/encode/decode ends live in `rdp-gpu` and
 //! `rdp-client`.
@@ -31,6 +32,7 @@ pub mod fec;
 pub mod input;
 pub mod lan;
 pub mod liveness;
+pub mod ltr;
 pub mod messages;
 pub mod pause;
 pub mod playout;
@@ -39,6 +41,9 @@ pub mod reliable;
 pub mod update;
 pub mod video;
 pub mod wire;
+
+#[cfg(test)]
+mod fecsim;
 
 /// Default UDP port the host agent listens on.
 pub const DEFAULT_PORT: u16 = 47998;

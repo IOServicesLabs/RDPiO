@@ -454,13 +454,41 @@ The picture on a bad path (host; each a switch, on unless said):
   AX210 laptop's ~300 Mbit/s uplink read 1-6 Mbit/s in office mode (100-380
   in game mode's big frames), and the stream sat at 0.4 Mbps, 13 fps. The
   link is the most a train showed over 4 s, never under what was delivered;
-  the padding (~0.5 Mbit/s) isn't counted as the stream's.
+  the padding (~0.5 Mbit/s) isn't counted as the stream's. While the stream
+  carries under a twentieth of the link, a frame that would be mostly
+  padding probes only every 5 s (`probeidle`), the link then the most of the
+  last 4 readings (30 s at most), and after a cut's doubt 4 readings come a
+  second apart first: an idle office stream's trains were a third of its
+  packets. Simulated on a clean LAN, 13.1 → 11.2 packets a frame shown; on
+  the laptop's uplink, padding 17% → 9% of the video, the rate within 2%,
+  p95 the same.
 
 The host's perf line names why the rate came down in each 5 s (`cuts=`:
 `probe`, `gap`, `standing`, `drain`, `loss`, `queue`, `soft`).
 - **Clean-path parity** (`fecfloor`): after 10 s without loss, big non-key
   frames carry 2% parity instead of 5% (at least one parity packet a block
   still; keyframes keep theirs).
+- **Interleaved blocks** (`interleave`): a frame of several FEC blocks (over
+  64 packets: keyframes, big scrolls) goes a packet of each block in turn,
+  data then parity, so packets lost back to back cost each block a few that
+  its parity rebuilds, not one block all of them. Simulated packet by packet
+  (`cargo test -p rdp-hyper fecsim -- --nocapture`), 1% lost in runs of 8
+  and a keyframe every 5 s: keyframes lost 71 → 23 of ~430, resume to
+  picture 56 → 27 ms, frames never shown 497 → 291, packets a frame shown
+  18.5 → 17.3; the same elsewhere.
+- **Repair parity** (`repairfec`): a repair (a frame coded from a long-term
+  reference after a loss, the one that ends the client's freeze) carries at
+  least half its size in parity, clean path or not: lost too, the picture
+  stays frozen another request and round trip. Simulated, a game on Wi-Fi
+  losing 1% in runs of 8: frozen 72.6 → 55.1 s in 32 min, frames never
+  shown 7429 → 6639, packets +0.7%; office 1657 → 1554 ms.
+- **Repairs that worked** (`repairok`): a third repair within a second
+  brings a keyframe — unless the client has since decoded a kept frame newer
+  than the last repair, which shows it took. The rule is for repairs that
+  don't; on Wi-Fi losing a frame or two a second, each repaired, it sent a
+  300 KB keyframe every second or so (`rdp_hyper::ltr`). Simulated, a game
+  losing 1% in runs of 8: keyframes 386 → 67 in 32 min, bytes a frame -1.1%,
+  frozen 55.1 → 52.3 s.
 - **Slow pacing** (`slowpace=1`, off by default): on a slow or queued link
   frames are paced at 1.2x the target instead of 2.5x, so they wait on the
   host rather than in front of the audio in the relay. Simulated: audio p95
@@ -479,7 +507,7 @@ frame may take up to 0.2 bits a pixel, at most 100 ms of the link, instead
 of two frames' worth), `presetfollow=1`, `introfresh=1` (the last two off
 by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
 `gapcut`, `probetrain`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
-`growcap`, `softslow`, `fecfloor`,
+`growcap`, `softslow`, `fecfloor`, `interleave`, `probeidle`, `repairfec`, `repairok`,
 `gamesharpen` (game mode re-encodes a still screen sharper too, as office
 mode does, under 0.05 bits a pixel a frame: 1440p60 under ~11 Mbps),
 `pausehold` (a minimized client's stream holds its rate instead of drifting
