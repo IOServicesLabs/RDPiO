@@ -444,6 +444,8 @@ of two frames' worth), `presetfollow=1`, `introfresh=1` (the last two off
 by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
 `gapcut`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
 `growcap`, `softslow`, `fecfloor`,
+`gamesharpen` (game mode re-encodes a still screen sharper too, as office
+mode does, under 0.05 bits a pixel a frame: 1440p60 under ~11 Mbps),
 `pausehold` (a minimized client's stream holds its rate instead of drifting
 up to resting, which restore then slammed to the floor),
 `slowpace=1` (off by default), `audiorate`, `opusfec`, `audiofirst` (read as a sender starts),
