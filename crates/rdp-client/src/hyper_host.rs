@@ -722,7 +722,11 @@ impl GpuClockFloor {
         let floor = floor.min(max);
         match unsafe { lock(device, floor, max) } {
             0 => {
-                tracing::info!(floor_mhz = floor, max_mhz = max, "GPU clocks held up while streaming");
+                // (Held and let go with each idle spell: told once.)
+                static TOLD: AtomicBool = AtomicBool::new(false);
+                if !TOLD.swap(true, Ordering::Relaxed) {
+                    tracing::info!(floor_mhz = floor, max_mhz = max, "GPU clocks held up while streaming");
+                }
                 Some(Self)
             }
             code => {
@@ -1300,7 +1304,12 @@ fn stream_inner(
                 tracing::info!(battery, "GPU clock floor {}", if battery { "let go: on battery" } else { "allowed again" });
             }
         }
-        let floor = (route_audio || SELFTEST_CLOCKS.load(Ordering::Relaxed)) && !paused && !battery;
+        // (Not on an idle desktop either, `floorbusy`: nothing typed for 2 s,
+        // only a caret or a clock changing — the next input holds it again,
+        // before the picture it brings is encoded. The floor exists for
+        // encode latency, not for frames nobody's waiting on.)
+        let idle_floor = shared.idle.load(Ordering::Relaxed) && crate::host_ab::ab("floorbusy", true);
+        let floor = (route_audio || SELFTEST_CLOCKS.load(Ordering::Relaxed)) && !paused && !battery && !idle_floor;
         if floor && clocks.is_none() {
             clocks = GpuClockFloor::hold();
         } else if !floor {
