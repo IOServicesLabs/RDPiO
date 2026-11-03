@@ -256,6 +256,7 @@ impl VirtualDisplay {
         // host's own monitor is the fallback. Waiting is for the monitor to
         // appear; once it's there, a layout Windows refuses is refused again.
         let deadline = Instant::now() + Duration::from_secs(5);
+        let (switching_deadline, retry_switching) = (Instant::now() + SWITCHING_WAIT, crate::host_ab::ab("displayretry", true));
         let mut refused_since: Option<Instant> = None;
         loop {
             match activate_only(edid) {
@@ -263,6 +264,19 @@ impl VirtualDisplay {
                     guard.device_name = name;
                     guard.layout_changed = true;
                     break;
+                }
+                // The desktop switching: Windows takes a layout only from a
+                // thread on the input desktop, which this one may no longer
+                // be. Follow it and try again in 250 ms steps, past the usual
+                // deadline (`displayretry`): the fallback, the host's own
+                // monitor streamed mid-switch, ended in "Catastrophic failure"
+                // each time it was logged.
+                Err(Activation::Switching(e)) if retry_switching => {
+                    if Instant::now() > switching_deadline {
+                        return Err(format!("the virtual monitor didn't come up: {e}"));
+                    }
+                    rdp_gpu::hyper::attach_input_desktop();
+                    std::thread::sleep(Duration::from_millis(250));
                 }
                 Err(e) if Instant::now() > deadline => return Err(format!("the virtual monitor didn't come up: {e}")),
                 // (A monitor that only just arrived can be refused for a
@@ -273,7 +287,7 @@ impl VirtualDisplay {
                     }
                     std::thread::sleep(Duration::from_millis(250));
                 }
-                Err(Activation::NotYet(_)) => std::thread::sleep(Duration::from_millis(150)),
+                Err(Activation::NotYet(_) | Activation::Switching(_)) => std::thread::sleep(Duration::from_millis(150)),
             }
         }
         // Exactly the client's mode (ours prefers it already; the other one
@@ -318,7 +332,16 @@ impl Drop for VirtualMonitor {
     fn drop(&mut self) {
         use windows::Win32::Devices::Display::{SetDisplayConfig, SDC_APPLY, SDC_USE_DATABASE_CURRENT};
         if self.layout_changed {
-            let r = unsafe { SetDisplayConfig(None, None, SDC_APPLY | SDC_USE_DATABASE_CURRENT) };
+            let mut r = unsafe { SetDisplayConfig(None, None, SDC_APPLY | SDC_USE_DATABASE_CURRENT) };
+            // ERROR_ACCESS_DENIED: the desktop switching (the console locking
+            // as the stream ends), as in `show` — the host's own screens stay
+            // dark until this goes through (`displayretry`).
+            let until = Instant::now() + SWITCHING_RESTORE_WAIT;
+            while r == 5 && Instant::now() < until && crate::host_ab::ab("displayretry", true) {
+                rdp_gpu::hyper::attach_input_desktop();
+                std::thread::sleep(Duration::from_millis(250));
+                r = unsafe { SetDisplayConfig(None, None, SDC_APPLY | SDC_USE_DATABASE_CURRENT) };
+            }
             tracing::info!(code = r, "host display layout restored");
         }
         match &self.cleanup {
@@ -508,6 +531,15 @@ fn interface_path() -> Option<String> {
     }
 }
 
+/// How long [`VirtualDisplay::show`] waits out a desktop switch (the lock
+/// screen, a session change) before the host's own monitor is streamed
+/// instead: past the usual 5 s, and well inside the 15 s a client gives the
+/// host to start the stream.
+const SWITCHING_WAIT: Duration = Duration::from_secs(8);
+
+/// …and how long the host's layout coming back as a stream ends does.
+const SWITCHING_RESTORE_WAIT: Duration = Duration::from_secs(2);
+
 /// Why the virtual monitor isn't the active display (yet).
 #[derive(Debug)]
 enum Activation {
@@ -515,12 +547,15 @@ enum Activation {
     NotYet(String),
     /// Windows refused the layout.
     Refused(String),
+    /// The console is switching desktops (the lock screen coming or going,
+    /// a session change): worth waiting for, on the input desktop.
+    Switching(String),
 }
 
 impl std::fmt::Display for Activation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Activation::NotYet(e) | Activation::Refused(e) => f.write_str(e),
+            Activation::NotYet(e) | Activation::Refused(e) | Activation::Switching(e) => f.write_str(e),
         }
     }
 }
@@ -553,7 +588,7 @@ fn activate_only(edid: (u16, u16)) -> Result<String, Activation> {
             // ERROR_ACCESS_DENIED: the console is switching desktops (locking,
             // say, as the host's restart does), not a layout Windows refuses.
             if r == 5 && first == 5 {
-                return Err(Activation::NotYet(format!("SetDisplayConfig {first} / {r} (the desktop is switching)")));
+                return Err(Activation::Switching(format!("SetDisplayConfig {first} / {r} (the desktop is switching)")));
             }
             if r != 0 {
                 return Err(Activation::Refused(format!("SetDisplayConfig {first} / {r}")));

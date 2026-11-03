@@ -474,6 +474,20 @@ up to resting, which restore then slammed to the floor),
 `%PUBLIC%` file. The Android app's are `debug.rdpio.inputdup` and
 `debug.rdpio.fastreconnect` (see android.md).
 
+Host power switches (same file, on by default):
+
+- `clockbatt`: no GPU clock floor on battery (power source looked at every
+  3 s); the floor cost ~6 W on a laptop for an encode that took 3-4 ms anyway.
+- `pausequiet`: the client's window minimized 5 s, Wi-Fi streaming mode, the
+  1 ms timer, MMCSS and the REALTIME GPU class let go until it's back; a
+  paused stream sends nothing, yet those kept the laptop out of idle.
+- `pausepoll`: while paused, the capture loop sleeps until woken (window
+  back, keyframe, goodbye) or 500 ms, and the receive socket waits 100 ms
+  not 10: ~120 of a paused stream's ~250 wake-ups a second were these.
+- `displayretry`: `SetDisplayConfig` 5 (the desktop switching) is retried on
+  the input desktop for up to 8 s (2 s for the layout's restore) before the
+  host's own monitor is streamed; that fallback always ended in an error.
+
 ## Latency notes
 
 - The host switches its monitor to the fastest refresh rate that's a whole
