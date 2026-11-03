@@ -1797,7 +1797,9 @@ fn stream_inner(
                 fec_pct = (fec * 100.0) as u32,
                 trickle_pct = trickle_frames * 100 / frames.max(1),
                 audio_pps = format!("{:.0}", crate::hyper_audio::take_sent() as f64 / secs),
-                gpu_mhz = gpu_clocks().map(|(g, v)| format!("{g}/{v}")).unwrap_or_default(),
+                // (Only while the floor's held, on mains power: asked every 5 s
+                // otherwise, NVML keeps an Optimus GPU from powering off.)
+                gpu_mhz = clocks.as_ref().and_then(|_| gpu_clocks()).map(|(g, v)| format!("{g}/{v}")).unwrap_or_default(),
                 "hyper host"
             );
             (frames, bytes, encode_us_total, acquire_us_total) = (0, 0, 0, 0);
