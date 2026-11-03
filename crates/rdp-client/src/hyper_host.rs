@@ -3164,8 +3164,22 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
         use windows::Win32::Foundation::HMODULE;
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
         use windows::Win32::Graphics::Direct3D11::*;
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
         let (mut d, mut c) = (None, None);
-        D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(),
+        // `--client-igpu`: decode on the integrated GPU (Intel's), as a
+        // client on battery does — otherwise this test's own client keeps a
+        // hybrid laptop's discrete GPU awake, and a host that let it sleep
+        // (paused, or on battery) couldn't show it.
+        let igpu: Option<IDXGIAdapter> = std::env::args().any(|a| a == "--client-igpu").then(|| {
+            let f: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+            (0..8).filter_map(|i| f.EnumAdapters1(i).ok()).find(|a| {
+                a.GetDesc1().is_ok_and(|d| String::from_utf16_lossy(&d.Description).contains("Intel"))
+            }).and_then(|a| windows::core::Interface::cast(&a).ok())
+        }).flatten();
+        println!("selftest client decodes on {}", if igpu.is_some() { "the integrated GPU" } else { "the default GPU" });
+        let driver = if igpu.is_some() { D3D_DRIVER_TYPE_UNKNOWN } else { D3D_DRIVER_TYPE_HARDWARE };
+        D3D11CreateDevice(igpu.as_ref(), driver, HMODULE::default(),
             D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT, None,
             D3D11_SDK_VERSION, Some(&mut d), None, Some(&mut c))?;
         (d.unwrap(), c.unwrap())
@@ -3200,6 +3214,15 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .and_then(|v| v.split_once('x').and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))));
     let mut stream_size = (monitor_w(), monitor_h());
+    // `--pause-at S --pause-for S`: the client's window minimized S seconds
+    // in and restored S later (`Control::Paused`), as a real client's is
+    // most of the time: what the host costs paused (this process's CPU),
+    // and how soon a picture comes back after it.
+    let secs_arg = |name: &str| std::env::args().skip_while(|a| a != name).nth(1).and_then(|v| v.parse::<f64>().ok());
+    let pause = secs_arg("--pause-at").zip(secs_arg("--pause-for")).map(|(a, f)| (Duration::from_secs_f64(a), Duration::from_secs_f64(f)));
+    // 0: not yet paused, 1: paused (since, CPU then), 2: restored (when).
+    let (mut pause_stage, mut paused_at, mut paused_cpu_us, mut restored_at) = (0u8, Instant::now(), 0u64, None::<Instant>);
+    let (mut paused_ms, mut resume_ms, mut frames_paused) = (0f64, None::<f64>, 0u32);
     let (mut view_told, mut since_resize) = (view.is_none(), None::<(Instant, u32, u64)>);
     while start.elapsed() < Duration::from_secs(secs) {
         if !view_told && start.elapsed() > Duration::from_secs(secs) / 3 {
@@ -3217,9 +3240,24 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
         for a in reliable.due_acks() {
             let _ = client.send(&csend.seal(Kind::Reliable, &a));
         }
+        if let Some((at, len)) = pause {
+            let t = start.elapsed();
+            if pause_stage == 0 && t >= at {
+                let _ = client.send(&csend.seal(Kind::Control, &Control::Paused { paused: true }.to_bytes()));
+                (pause_stage, paused_at, paused_cpu_us) = (1, Instant::now(), selftest_cpu_us());
+                println!("selftest: paused after {frames} frames");
+            } else if pause_stage == 1 && t >= at + len {
+                paused_ms = paused_at.elapsed().as_secs_f64() * 1e3;
+                paused_cpu_us = selftest_cpu_us().saturating_sub(paused_cpu_us);
+                let _ = client.send(&csend.seal(Kind::Control, &Control::Paused { paused: false }.to_bytes()));
+                (pause_stage, restored_at) = (2, Some(Instant::now()));
+            }
+        }
         // Feedback on a timer, like the real client (it also keeps the host
-        // from deciding the client went quiet while video pauses).
-        if last_fb.elapsed() > Duration::from_millis(50) {
+        // from deciding the client went quiet while video pauses): every
+        // 50 ms, every 250 ms paused (a minimized client's idle pace).
+        let fb_every = Duration::from_millis(if pause_stage == 1 { 250 } else { 50 });
+        if last_fb.elapsed() > fb_every {
             let s = reasm.take_stats();
             let fb = rdp_hyper::control::Feedback {
                 shards: s.shards,
@@ -3315,6 +3353,12 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
                         ltr_decoded = Some(f.frame_id);
                     }
                     if !out.is_empty() {
+                        if pause_stage == 1 {
+                            frames_paused += 1;
+                        }
+                        if let (2, Some(at), None) = (pause_stage, restored_at, resume_ms) {
+                            resume_ms = Some(at.elapsed().as_secs_f64() * 1e3);
+                        }
                         frames += 1;
                         keyframes += f.keyframe as u32;
                         lat.push((qpc_us() - f.capture_us) as f64 / 1000.0);
@@ -3342,6 +3386,19 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
         p(1.0),
         frozen.as_secs_f64() * 1e3
     );
+    if pause.is_some() {
+        // (Machine-readable for A/B runs: `selftest.<name>=<value>`.)
+        println!(
+            "paused {:.0} ms: {frames_paused} frames came meanwhile, {:.0} ms of CPU ({:.2}% of a core); first picture back after {}
+             selftest.paused_ms={paused_ms:.0} selftest.paused_cpu_ms={:.1} selftest.resume_ms={:.1}",
+            paused_ms,
+            paused_cpu_us as f64 / 1e3,
+            paused_cpu_us as f64 / 1e3 / paused_ms.max(1.0) * 100.0,
+            resume_ms.map_or("never".into(), |m| format!("{m:.0} ms")),
+            paused_cpu_us as f64 / 1e3,
+            resume_ms.unwrap_or(-1.0),
+        );
+    }
     if let Some((at, f0, b0)) = since_resize {
         let s = at.elapsed().as_secs_f64();
         println!("after the resize: {} frames decoded at {}x{}, {:.1} Mbps", frames - f0, stream_size.0, stream_size.1, (bytes - b0) as f64 * 8.0 / s / 1e6);
@@ -3349,6 +3406,21 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
         println!("the stream never followed the window");
     }
     Ok(())
+}
+
+/// This process's CPU time so far (µs, kernel + user): the selftest's host
+/// and client both, so what a paused host costs shows as what it adds.
+fn selftest_cpu_us() -> u64 {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let (mut a, mut b, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    let ft = |f: FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) / 10;
+    unsafe {
+        if GetProcessTimes(GetCurrentProcess(), &mut a, &mut b, &mut kernel, &mut user).is_err() {
+            return 0;
+        }
+    }
+    ft(kernel) + ft(user)
 }
 
 /// The selftest starts decoding at the primary monitor's size.
