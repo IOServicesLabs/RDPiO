@@ -474,6 +474,10 @@ struct Shared {
     paced: AtomicU32,
     /// The client's window is minimized: encode nothing.
     paused: AtomicBool,
+    /// Nothing on the screen has changed, and no input has come, for
+    /// [`IDLE_AFTER`]: the capture and receive threads wait longer between
+    /// looks (`idlewait`; see [`IDLE_LOOK`]).
+    idle: AtomicBool,
     /// The client wants office mode (crisp text) rather than game mode.
     office: AtomicBool,
     /// …with the encoder's fast preset.
@@ -771,6 +775,15 @@ impl Drop for GpuClockFloor {
 /// this often; the window coming back wakes it at once (see `Shared::wake`).
 const PAUSED_LOOK: Duration = Duration::from_millis(500);
 
+/// A desktop left alone (no change on screen, no input) this long is idle…
+const IDLE_AFTER: Duration = Duration::from_secs(2);
+
+/// …and the capture and receive threads then wake this often (instead of
+/// every 30 and 10 ms, ~130 wake-ups a second of a screen nobody's using).
+/// A change on screen or a packet still ends either wait at once; only a
+/// keyframe or repair asked for on the still screen may wait up to this.
+const IDLE_LOOK: Duration = Duration::from_millis(100);
+
 /// The receive thread's socket wait while streaming: it also sends the
 /// trailing input ack (within ~10 ms) and refreshes held touches.
 const RX_ACTIVE: Duration = Duration::from_millis(10);
@@ -987,6 +1000,7 @@ fn stream_inner(
         pace_us: AtomicU64::new(0),
         paced: AtomicU32::new(0),
         paused: AtomicBool::new(false),
+        idle: AtomicBool::new(false),
         office: AtomicBool::new(opts.office),
         fast_text: AtomicBool::new(opts.fast_text),
         recover: AtomicBool::new(false),
@@ -1147,6 +1161,7 @@ fn stream_inner(
     let (mut frame_rate, mut enc_fps, mut drain_logged) = (rdp_hyper::rate::FrameRate::default(), fps, None);
     let (mut switches_read, mut rate_saved) = (Instant::now(), Instant::now());
     let mut fps_follow = crate::host_ab::ab("fpsfollow", true);
+    let mut idle_wait = crate::host_ab::ab("idlewait", true);
     // Office mode may go on down to 10 fps (`FrameRate::follow_office`).
     let mut office_fps = crate::host_ab::ab("officefps", true);
     // A failed encoder or a lost GPU (driver reset, device removed) costs a
@@ -1441,6 +1456,7 @@ fn stream_inner(
             rdp_hyper::video::set_probe_trains(switches.probe_train);
             shared.rate.lock().unwrap().set_switches(switches);
             fps_follow = crate::host_ab::ab("fpsfollow", true);
+            idle_wait = crate::host_ab::ab("idlewait", true);
             office_fps = crate::host_ab::ab("officefps", true);
             game_sharpen = crate::host_ab::ab("gamesharpen", true);
         }
@@ -1477,6 +1493,17 @@ fn stream_inner(
         if let Some(d) = drain {
             pace_us = pace_us.max(1_000_000 / d.max(1) as u64);
         }
+        // Idle (see IDLE_AFTER): nothing waiting to go, nothing captured or
+        // typed for a while.
+        let idle = idle_wait
+            && skipped.is_none()
+            && !(office && sharpen_left > 0)
+            && since_input_us > IDLE_AFTER.as_micros() as u64
+            && last_present_us.is_none_or(|p| qpc_us().saturating_sub(p) > IDLE_AFTER.as_micros() as u64);
+        if idle != shared.idle.load(Ordering::Relaxed) {
+            shared.idle.store(idle, Ordering::Relaxed);
+            tracing::debug!(idle, "the desktop is {}", if idle { "idle: longer waits" } else { "in use again" });
+        }
         // While a skipped frame waits, wait for a newer one only until its turn.
         let until_us = |t: u64| t.saturating_sub(qpc_us()).div_ceil(1000).min(10) as u32;
         let wait_ms = match &skipped {
@@ -1485,6 +1512,7 @@ fn stream_inner(
             // A screen that changes wakes the wait at once; the timeout only
             // bounds the status and an answer to a keyframe request on a still
             // one — after a second without input, less often.
+            None if idle => IDLE_LOOK.as_millis() as u32,
             None if since_input_us > 1_000_000 => 30,
             None => 10,
         };
@@ -2361,9 +2389,12 @@ fn receive_loop(
             last_ack = Instant::now();
             shared.send_status(&socket);
         }
-        // Longer waits while paused, with no ack owed (see RX_PAUSED).
+        // Longer waits while paused, with no ack owed (see RX_PAUSED); idle
+        // with no fingers resting, too (see IDLE_LOOK).
         let want = if input.applied() == acked && shared.paused.load(Ordering::Relaxed) && crate::host_ab::ab("pausepoll", true) {
             RX_PAUSED
+        } else if input.applied() == acked && shared.idle.load(Ordering::Relaxed) && !crate::hyper_touch::resting() {
+            IDLE_LOOK
         } else {
             RX_ACTIVE
         };
@@ -3233,6 +3264,12 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     // 0: not yet paused, 1: paused (since, CPU then), 2: restored (when).
     let (mut pause_stage, mut paused_at, mut paused_cpu_us, mut restored_at) = (0u8, Instant::now(), 0u64, None::<Instant>);
     let (mut paused_ms, mut resume_ms, mut frames_paused) = (0f64, None::<f64>, 0u32);
+    // `--still-at S --still-for S`: the desktop goes still S seconds in, for
+    // S, with the client's window open: what an idle desktop costs (this
+    // process's CPU meanwhile).
+    let still_win = secs_arg("--still-at").zip(secs_arg("--still-for")).map(|(a, f)| (Duration::from_secs_f64(a), Duration::from_secs_f64(f)));
+    let (mut still_stage, mut still_from, mut still_cpu_us, mut still_ms) = (0u8, Instant::now(), 0u64, 0f64);
+    let mut idle_reads = false;
     let (mut view_told, mut since_resize) = (view.is_none(), None::<(Instant, u32, u64)>);
     while start.elapsed() < Duration::from_secs(secs) {
         if !view_told && start.elapsed() > Duration::from_secs(secs) / 3 {
@@ -3264,6 +3301,27 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = client.send(&csend.seal(Kind::Control, &Control::Paused { paused: false }.to_bytes()));
                 (pause_stage, restored_at) = (2, Some(Instant::now()));
             }
+        }
+        if let Some((at, len)) = still_win {
+            let t = start.elapsed();
+            if still_stage == 0 && t >= at {
+                still.store(true, Ordering::Relaxed);
+                (still_stage, still_from, still_cpu_us) = (1, Instant::now(), selftest_cpu_us());
+                println!("selftest: still after {frames} frames");
+            } else if still_stage == 1 && t >= at + len {
+                still_ms = still_from.elapsed().as_secs_f64() * 1e3;
+                still_cpu_us = selftest_cpu_us().saturating_sub(still_cpu_us);
+                still.store(false, Ordering::Relaxed);
+                still_stage = 2;
+            }
+        }
+        // This client waits on its socket in 1 ms steps for latency; with
+        // nothing coming (a still or paused stream), in 20 ms ones, so its own
+        // wake-ups don't hide what the host's cost.
+        let quiet_client = pause_stage == 1 || still_stage == 1;
+        if quiet_client != idle_reads {
+            idle_reads = quiet_client;
+            client.set_read_timeout(Some(Duration::from_millis(if quiet_client { 20 } else { 1 })))?;
         }
         // Feedback on a timer, like the real client (it also keeps the host
         // from deciding the client went quiet while video pauses): every
@@ -3409,6 +3467,16 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
             resume_ms.map_or("never".into(), |m| format!("{m:.0} ms")),
             paused_cpu_us as f64 / 1e3,
             resume_ms.unwrap_or(-1.0),
+        );
+    }
+    if still_win.is_some() {
+        println!(
+            "still {:.0} ms: {:.0} ms of CPU ({:.2}% of a core)
+             selftest.still_ms={still_ms:.0} selftest.still_cpu_ms={:.1}",
+            still_ms,
+            still_cpu_us as f64 / 1e3,
+            still_cpu_us as f64 / 1e3 / still_ms.max(1.0) * 100.0,
+            still_cpu_us as f64 / 1e3,
         );
     }
     if let Some((at, f0, b0)) = since_resize {

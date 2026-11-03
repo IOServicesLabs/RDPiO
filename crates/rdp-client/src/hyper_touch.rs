@@ -174,6 +174,12 @@ pub fn keep_alive() {
     }
 }
 
+/// Fingers rest on the client's screen (`keep_alive` is due every
+/// `HOLD_REFRESH`).
+pub fn resting() -> bool {
+    !TOUCH.lock().unwrap().contacts.is_empty()
+}
+
 /// Lift stream `owner`'s fingers (its client left mid-touch), without a tap.
 pub fn release_all(owner: u64) {
     let mut t = TOUCH.lock().unwrap();
