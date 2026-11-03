@@ -52,6 +52,7 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
 
+pub mod battery;
 pub mod driver_frames;
 pub mod nvenc;
 
@@ -1939,7 +1940,9 @@ impl HwEncoder {
         // AV1 always goes to NVENC directly where it opens: the Media
         // Foundation route has no quality setting for it to win on.
         let av1 = video_codec == crate::h264::Codec::Av1;
-        if (av1 || tuning.quality < MF_QUALITY) && std::env::var("RDPIO_NVENC").map_or(true, |v| v != "0") {
+        // (Not on another vendor's GPU — the integrated one, on battery — where
+        // NVENC can only fail, and loading NVIDIA's runtime there is no help.)
+        if (av1 || tuning.quality < MF_QUALITY) && std::env::var("RDPIO_NVENC").map_or(true, |v| v != "0") && battery::may_be_nvidia(device) {
             // Opened with the default link tuning (the host changes it with
             // set_link_tuning): the preset following the starting bitrate,
             // the largest frame capped, a gradual refresh available.
@@ -2419,6 +2422,16 @@ fn spawn_event_pump(events: IMFMediaEventGenerator) -> WinResult<mpsc::Receiver<
 }
 
 unsafe fn pick_hardware_encoder(adapter_luid: Option<i64>, codec: crate::h264::Codec) -> WinResult<IMFActivate> {
+    // Off the fastest GPU (the host on a hybrid laptop's integrated one, on
+    // battery), that GPU's own encoder, asked for by GPU: the plain list
+    // below carries no GPU on its entries, so its first — the fastest GPU's —
+    // was taken, and NVIDIA's encoder handed an Intel device fails at once
+    // (E_UNEXPECTED). On the fastest GPU, the plain list as it always was.
+    if let Some(luid) = adapter_luid.filter(|&l| battery::fastest_luid().is_some_and(|f| f != l)) {
+        if let Some(a) = battery::encoder_activates(codec, Some(luid)).into_iter().next() {
+            return Ok(a);
+        }
+    }
     let in_info = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
     let out_info = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: codec.subtype() };
     let mut activates: *mut Option<IMFActivate> = core::ptr::null_mut();
