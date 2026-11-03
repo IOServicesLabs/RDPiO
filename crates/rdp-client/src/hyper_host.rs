@@ -2867,6 +2867,8 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     let still_win = secs_arg("--still-at").zip(secs_arg("--still-for")).map(|(a, f)| (Duration::from_secs_f64(a), Duration::from_secs_f64(f)));
     let (mut still_stage, mut still_from, mut still_cpu_us, mut still_ms) = (0u8, Instant::now(), 0u64, 0f64);
     let mut idle_reads = false;
+    // Packets that came while still (each wakes the client's radio and CPU).
+    let mut still_pkts = 0u32;
     let (mut view_told, mut since_resize) = (view.is_none(), None::<(Instant, u32, u64)>);
     while start.elapsed() < Duration::from_secs(secs) {
         if !view_told && start.elapsed() > Duration::from_secs(secs) / 3 {
@@ -2955,6 +2957,9 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
             last_ask = Instant::now();
         }
         let Ok(n) = client.recv(&mut buf) else { continue };
+        if still_stage == 1 {
+            still_pkts += 1;
+        }
         let Ok((kind, body)) = crecv.open(&buf[..n]) else { continue };
         if kind == Kind::Reliable {
             let (ack, msgs) = reliable.on_packet(&body);
@@ -3076,11 +3081,12 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     if still_win.is_some() {
         println!(
             "still {:.0} ms: {:.0} ms of CPU ({:.2}% of a core)
-             selftest.still_ms={still_ms:.0} selftest.still_cpu_ms={:.1}",
+             selftest.still_ms={still_ms:.0} selftest.still_cpu_ms={:.1} selftest.still_pkts_s={:.1}",
             still_ms,
             still_cpu_us as f64 / 1e3,
             still_cpu_us as f64 / 1e3 / still_ms.max(1.0) * 100.0,
             still_cpu_us as f64 / 1e3,
+            still_pkts as f64 / (still_ms / 1e3).max(0.001),
         );
     }
     if let Some((at, f0, b0)) = since_resize {
