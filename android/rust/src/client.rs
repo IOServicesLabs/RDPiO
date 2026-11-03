@@ -730,7 +730,8 @@ impl Client {
                                 }
                             }
                             Some(Control::Reconnect) => {
-                                // (Its console moved to another session, or its service is restarting.)
+                                // (Its console moved to another session, its service is restarting,
+                                // or the stream moves to its other GPU: plugged in or out.)
                                 log::info!("the PC asked for a reconnect; reconnecting now");
                                 live.lost.store(true, Ordering::Relaxed);
                                 live.stop.store(true, Ordering::Relaxed);

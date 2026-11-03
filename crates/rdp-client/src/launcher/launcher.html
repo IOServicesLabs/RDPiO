@@ -1370,7 +1370,12 @@ function renderHost() {
     ["fast_refresh", "Fastest refresh rate while streaming", "The monitor runs at its fastest rate that suits the stream (240 Hz for 120 fps), so each frame is ready sooner."],
     ["keep_monitors", "Keep my other monitors on", "Off: this PC's other monitors go dark while it streams, so nothing opens where the device can't see it."],
   ];
-  $("#host-stream").innerHTML = streamRows.map(([k, t, d]) => `<label class="switch"><div class="txt">${esc(t)}<span>${esc(d)}</span></div><span class="toggle"><input type="checkbox" data-hs="${k}" ${hs[k] ? "checked" : ""} ${hostBusy ? "disabled" : ""}><i></i></span></label>`).join("");
+  // Host GPU: only on a laptop with an integrated GPU beside a faster one
+  // (elsewhere there's nothing to choose between).
+  const gpuNote = { auto: "Integrated on battery, so the other GPU can power off; the fastest plugged in. A stream switches about 10 s after you plug in or out (a few seconds' pause).", fastest: "Always the fastest GPU.", power_saving: "Always the integrated GPU, plugged in too: H.264, at most 60 fps." }[hs.host_gpu || "auto"];
+  const gpuRow = s.integrated_gpu ? `<div class="switch"><div class="txt">Host GPU<span>${esc(gpuNote)} Integrated here: ${esc(s.integrated_gpu)}.</span></div>
+    <div class="seg" id="host-gpu">${[["auto", "Auto"], ["fastest", "Fastest"], ["power_saving", "Power saving"]].map(([v, t]) => `<button data-v="${v}" aria-pressed="${(hs.host_gpu || "auto") === v}" ${hostBusy ? "disabled" : ""}>${t}</button>`).join("")}</div></div>` : "";
+  $("#host-stream").innerHTML = streamRows.map(([k, t, d]) => `<label class="switch"><div class="txt">${esc(t)}<span>${esc(d)}</span></div><span class="toggle"><input type="checkbox" data-hs="${k}" ${hs[k] ? "checked" : ""} ${hostBusy ? "disabled" : ""}><i></i></span></label>`).join("") + gpuRow;
   const updRows = [
     ["auto_update", "Keep Hyper up to date", "The Hyper service installs new rdpio releases from GitHub by itself, between streams, and passes them on to the devices that connect."],
     ["nightly", "Nightly builds", "Every change as soon as it's built, instead of releases."],
@@ -1390,6 +1395,11 @@ for (const id of ["#host-stream", "#host-updates"]) $(id).addEventListener("chan
   const k = e.target.dataset.hs; if (!k) return;
   hostBusy = "settings"; renderHost();
   call("host_action", { action: "settings", settings: { [k]: e.target.checked } }).catch(err => { hostBusy = null; renderHost(); fail(err); });
+});
+$("#host-stream").addEventListener("click", e => {
+  const b = e.target.closest("#host-gpu button"); if (!b || hostBusy || b.getAttribute("aria-pressed") === "true") return;
+  hostBusy = "settings"; renderHost();
+  call("host_action", { action: "settings", settings: { host_gpu: b.dataset.v } }).catch(err => { hostBusy = null; renderHost(); fail(err); });
 });
 $("#host-display").addEventListener("click", e => {
   const b = e.target.closest("[data-host]"); if (b) runHost(b.dataset.host);

@@ -64,6 +64,11 @@ pub(crate) enum StreamEnd {
     /// The service is stopping (an update, a restart): put back and locked
     /// like a goodbye, but the client is told to reconnect, not that it's over.
     Stopping,
+    /// The power source changed (Host GPU: Auto): the client is told to sign
+    /// in again at once, and its new sign-in puts the stream on the other GPU
+    /// with the codec and rate that GPU takes (see host_battery). Nothing is
+    /// put back or locked meanwhile.
+    GpuMove,
 }
 
 /// While a stream runs, what the host changed is written here, so a crashed
@@ -1018,6 +1023,13 @@ fn stream_inner(
             tracing::info!("Hyper service stopping; ending the stream (the client reconnects)");
             return Ok(StreamEnd::Stopping);
         }
+        // Unplugged or plugged in, and it held (Host GPU: Auto): the client
+        // signs in again and lands on the other GPU. A reconnect rather than
+        // a move in place: the codec changes with the GPU (H.264 on Intel's),
+        // and no client can switch decoders mid-stream. Polled once a second.
+        if crate::host_battery::move_due().is_some() {
+            return Ok(StreamEnd::GpuMove);
+        }
         // Office or game mode, as the client asks (Ctrl+Shift+O): a new
         // encoder (frame budget, preset) and frame rate, and the host's text
         // smoothing to match.
@@ -1498,10 +1510,11 @@ fn stream_inner(
     drop(frame_tx); // the sender finishes the frame in hand, then ends
     let _ = sender.join();
     // Goodbye only for a real end: a client that went quiet may come back,
-    // and one whose console moved reconnects to the agent there.
+    // and one whose console moved (or whose stream changes GPU) reconnects —
+    // every client since Reconnect existed does so at once (~250 ms).
     let farewell = match result {
         Ok(StreamEnd::Bye) => Some(Control::Bye),
-        Ok(StreamEnd::Moved | StreamEnd::Stopping) => Some(Control::Reconnect),
+        Ok(StreamEnd::Moved | StreamEnd::Stopping | StreamEnd::GpuMove) => Some(Control::Reconnect),
         _ => None,
     };
     if let Some(f) = farewell {

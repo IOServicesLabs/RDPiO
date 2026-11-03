@@ -1738,13 +1738,19 @@ fn host_action(st: &mut State, req: &Value) -> Result<Value, String> {
         "password" => vec!["--hyper-set-password".into()],
         "display_install" => vec!["--hyper-display-install".into()],
         "display_uninstall" => vec!["--hyper-display-uninstall".into()],
-        // `{settings: {name: bool}}`: only the known names, as 0/1.
+        // `{settings: {name: bool}}`: only the known names, as 0/1 — and
+        // `host_gpu`, one of its three names (nothing else reaches the
+        // elevated command line).
         "settings" => {
             let given = req.get("settings").and_then(Value::as_object).ok_or("no settings")?;
-            let spec: Vec<String> = ["virtual_display", "match_resolution", "fast_refresh", "keep_monitors", "auto_update", "nightly"]
+            let mut spec: Vec<String> = ["virtual_display", "match_resolution", "fast_refresh", "keep_monitors", "auto_update", "nightly"]
                 .iter()
                 .filter_map(|k| given.get(*k).and_then(Value::as_bool).map(|on| format!("{k}={}", on as u8)))
                 .collect();
+            if let Some(gpu) = given.get("host_gpu").and_then(Value::as_str) {
+                crate::hyper_direct::HostGpu::from_name(gpu).ok_or("no such host GPU choice")?;
+                spec.push(format!("host_gpu={gpu}"));
+            }
             if spec.is_empty() {
                 return Err("no settings".into());
             }
