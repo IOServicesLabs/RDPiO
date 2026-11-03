@@ -268,6 +268,13 @@ pub struct Switches {
     /// Padded probe trains seldom while the stream is far under the link
     /// (`probeidle`; see [`PROBE_IDLE_EVERY_MS`]).
     pub probe_idle: bool,
+    /// On the LAN, delay bumps alone never cut under [`LAN_FLOOR_BPS`] (or
+    /// half what the link has shown, if less) (`lanfloor`): only lost
+    /// frames or a standing queue go lower, and only for a while. A Wi-Fi
+    /// LAN's bumps are the radios', not the stream's: cut for each, a
+    /// 1440p office stream over a ~90 Mbit/s link sat at 1-3 Mbit/s,
+    /// smeared, for hours.
+    pub lan_floor: bool,
 }
 
 impl Default for Switches {
@@ -290,6 +297,7 @@ impl Default for Switches {
             repair_fec: true,
             interleave: true,
             probe_idle: true,
+            lan_floor: true,
         }
     }
 }
@@ -367,6 +375,11 @@ pub struct RateController {
     warm_retune: Option<(u64, u64)>,
     /// The client is on the host's own network (see [`RateController::set_lan`]).
     lan: bool,
+    /// Until when the LAN floor yields to a lost frame or a standing queue
+    /// (see [`Switches::lan_floor`]).
+    floor_yield_until_ms: u64,
+    /// The last yield's length (see [`LAN_FLOOR_YIELD_MS`]).
+    floor_yield_ms: u64,
     /// What the link has shown it carries (wire bits per second).
     link_bps: Option<f64>,
     /// Its measurements over the last [`LINK_WINDOW_MS`]: (when, bits per second).
@@ -414,6 +427,16 @@ const CUT_LOSS: usize = 4;
 const CUT_QUEUE: usize = 5;
 const CUT_SOFT: usize = 6;
 
+/// See [`Switches::lan_floor`]: about the least a 1440p screen looks clean at.
+const LAN_FLOOR_BPS: f64 = 20_000_000.0;
+/// How long a lost frame or a standing queue holds the rate free of the LAN
+/// floor: this at first, twice as long each time it happens again within
+/// [`LAN_FLOOR_CALM_MS`] of the last yield ending (a LAN link that really
+/// is slow), up to the most.
+const LAN_FLOOR_YIELD_MS: u64 = 5_000;
+const LAN_FLOOR_YIELD_MAX_MS: u64 = 120_000;
+const LAN_FLOOR_CALM_MS: u64 = 30_000;
+
 impl RateController {
     pub fn new(limits: Limits) -> Self {
         Self {
@@ -456,6 +479,8 @@ impl RateController {
             warm_cap: None,
             warm_retune: None,
             lan: false,
+            floor_yield_until_ms: 0,
+            floor_yield_ms: 0,
             link_bps: None,
             link_seen: Default::default(),
             link_doubt_until_ms: 0,
@@ -546,6 +571,26 @@ impl RateController {
     /// (Not over Tailscale: a relay hands packets over in bunches.)
     pub fn set_lan(&mut self, lan: bool) {
         self.lan = lan;
+    }
+
+    /// A lost frame or a standing queue: the LAN floor stands aside a while.
+    fn floor_yield(&mut self, now_ms: u64) {
+        let again = self.floor_yield_ms > 0 && now_ms < self.floor_yield_until_ms + LAN_FLOOR_CALM_MS;
+        if now_ms < self.floor_yield_until_ms {
+            return; // (already yielding)
+        }
+        self.floor_yield_ms = if again { (self.floor_yield_ms * 2).min(LAN_FLOOR_YIELD_MAX_MS) } else { LAN_FLOOR_YIELD_MS };
+        self.floor_yield_until_ms = now_ms + self.floor_yield_ms;
+    }
+
+    /// The rate delay bumps alone don't cut under (encoder bits per second;
+    /// 0: none). See [`Switches::lan_floor`].
+    fn lan_floor(&self, now_ms: u64) -> f64 {
+        if !(self.lan && self.switches.lan_floor) || now_ms < self.floor_yield_until_ms {
+            return 0.0;
+        }
+        let shown = self.link_bps.map_or(f64::INFINITY, |l| l / self.overhead * 0.5);
+        LAN_FLOOR_BPS.min(shown).min(self.limits.max_bps as f64)
     }
 
     /// Whether a frame of `bytes` should go out unpaced, as a probe of the
@@ -941,8 +986,9 @@ impl RateController {
         // Mbps, and each bump after that was its queue.)
         let held = |(ratio, got): (f64, f64)| self.lan && self.link_bps.is_some_and(|l| l / self.overhead > 2.0 * got / ratio.max(0.01));
         if let Some((_, link)) = gap.filter(|&g| self.switches.gap_cut && g.0 < GAP_CUT && !probing && !held(g)) {
-            if link * 0.85 < self.bitrate {
-                self.bitrate = (link * 0.85).max(self.limits.min_bps as f64);
+            let floor = self.lan_floor(now_ms);
+            if link * 0.85 < self.bitrate && self.bitrate > floor {
+                self.bitrate = (link * 0.85).max(self.limits.min_bps as f64).max(floor);
                 self.hold_until_ms = now_ms + HOLD_MS;
                 self.last_cut_ms = Some(now_ms);
                 self.slow_until_ms = now_ms + SLOW_PATH_MS;
@@ -1015,6 +1061,7 @@ impl RateController {
             if let Some(link) = link_bps {
                 if link * 0.85 < self.bitrate {
                     self.cuts[CUT_DRAIN] += 1;
+                    self.floor_yield(now_ms);
                 }
                 self.bitrate = self.bitrate.min(link * 0.85).max(self.limits.min_bps as f64);
             }
@@ -1026,6 +1073,7 @@ impl RateController {
             self.last_cut_ms = Some(now_ms);
             self.slow_until_ms = now_ms + SLOW_PATH_MS;
             self.cuts[CUT_STANDING] += 1;
+            self.floor_yield(now_ms);
             self.doubt_link(link, now_ms);
             self.bulk = BULK_MIN;
             self.bitrate = self.bitrate.clamp(self.limits.min_bps as f64, self.limits.max_bps as f64);
@@ -1070,6 +1118,12 @@ impl RateController {
             // floor: it has to drain.
             if queue_us <= QUEUE_SOFT_US {
                 self.bitrate = self.bitrate.max(delivered * 0.85).min(self.bitrate / f);
+            }
+            if why == CUT_LOSS {
+                self.floor_yield(now_ms);
+            } else {
+                // A delay bump on the LAN: not under the floor.
+                self.bitrate = self.bitrate.max(self.lan_floor(now_ms).min(self.bitrate / f));
             }
             self.hold_until_ms = now_ms + HOLD_MS;
             self.last_cut_ms = Some(now_ms);
@@ -1122,6 +1176,8 @@ impl RateController {
                 self.bitrate = (self.bitrate * if warm { WARM_RAMP } else { 1.02 }).min(resting).min(ceiling);
             }
         }
+        // Under the LAN floor with nothing lost or standing lately: back to it.
+        self.bitrate = self.bitrate.max(self.lan_floor(now_ms));
         self.bitrate = self.bitrate.clamp(self.limits.min_bps as f64, self.limits.max_bps as f64);
         if busy && fb.frames > 0 {
             self.note_sustained();
@@ -1896,6 +1952,7 @@ mod tests {
                     repair_fec: false,
                     interleave: false,
                     probe_idle: false,
+                    lan_floor: false,
                 },
                 fps_follow: false,
                 warm_bps: None,
@@ -2548,6 +2605,7 @@ mod tests {
             buffer_us: Some(40_000),
             warm_bps: Some(1_200_000),
             active: Some(scroll),
+            switches: Switches { lan_floor: false, ..Switches::default() },
             ..Setup::after()
         };
         let phases = [(0, 10_000), (10_000, 60_000), (60_000, 120_000)];
@@ -2566,7 +2624,14 @@ mod tests {
     /// loses nothing.
     #[test]
     fn wifi_game_converges_without_loss() {
-        let game = Setup { wifi: true, lan: true, airtime: true, buffer_us: Some(40_000), ..Setup::after() };
+        let game = Setup {
+            wifi: true,
+            lan: true,
+            airtime: true,
+            buffer_us: Some(40_000),
+            switches: Switches { lan_floor: false, ..Switches::default() },
+            ..Setup::after()
+        };
         let (old, new) = both("game wifi", game, 60, ax210, &[(0, 10_000), (10_000, 60_000)]);
         let ((ot, _), (nt, nl)) = (old.medians(10_000, 60_000), new.medians(10_000, 60_000));
         assert!(nt >= 15_000_000 && nt > ot * 2, "{ot} -> {nt}");
@@ -2840,13 +2905,20 @@ mod tests {
     /// Runs every case with a switch (`on`) and without, prints both, and
     /// returns them.
     fn doze_ab(switch: &str, off: fn(&mut Switches)) -> Vec<(Case, Tally, Tally)> {
+        // (Each without the LAN floor, which hides what the others do: see
+        // `the_lan_floor_holds_a_dozing_lan_clean` for it.)
+        let with = Switches { lan_floor: false, ..Switches::default() };
+        doze_ab_from(switch, with, off)
+    }
+
+    fn doze_ab_from(switch: &str, with: Switches, off: fn(&mut Switches)) -> Vec<(Case, Tally, Tally)> {
         println!("{switch}: target median / mean, link, delivered (Mbit/s); video p95, picture age p95, audio p95 (ms)");
-        let mut without = Switches::default();
+        let mut without = with;
         off(&mut without);
         doze_cases()
             .into_iter()
             .map(|c| {
-                let (on, no) = (Tally::of(&c, Switches::default()), Tally::of(&c, without));
+                let (on, no) = (Tally::of(&c, with), Tally::of(&c, without));
                 no.print(c.name, "off");
                 on.print(c.name, "on");
                 (c, on, no)
@@ -2921,5 +2993,26 @@ mod tests {
         let (on, no) = doze_case(&r, "office, 200M dozing, 2M 3 s");
         assert!(on.med > no.med * 1.15 && on.age < no.age, "{} / {} vs {} / {}", on.med, on.age, no.med, no.age);
         assert!(on.cuts[CUT_QUEUE] < no.cuts[CUT_QUEUE], "{:?} vs {:?}", on.cuts, no.cuts);
+    }
+
+    /// `lanfloor`: on a dozing LAN, delay bumps alone don't cut the stream
+    /// under 20 Mbit/s; a LAN link that really drops still gets cut.
+    #[test]
+    fn the_lan_floor_holds_a_dozing_lan_clean() {
+        let r = doze_ab_from("lanfloor", Switches::default(), |s| s.lan_floor = false);
+        for (c, on, no) in &r {
+            if !c.slow && c.drop_ms.is_none() {
+                assert!(on.med >= no.med * 0.95, "{}: {} vs {}", c.name, on.med, no.med);
+            }
+            assert!(on.lost - on.at_drop <= no.lost - no.at_drop + 2, "{}: lost {} vs {}", c.name, on.lost, no.lost);
+        }
+        // (The simulated LAN mostly recovers without it; where it doesn't —
+        // a LAN that dropped to 20 Mbit/s, bumps cutting it to 6 — it holds
+        // half what the link showed. Cost: on a LAN really down to 3 Mbit/s
+        // it streams at 2.4, not 0.5, ~35 ms later.)
+        let (on, no) = doze_case(&r, "office, 200M dozing, warm 0.7M");
+        assert!(on.med >= 15.0 && on.med > no.med * 1.1, "{} vs {}", on.med, no.med);
+        let (on, no) = doze_case(&r, "game, ax210 to 20M (bumps)");
+        assert!(on.med > no.med * 1.5, "{} vs {}", on.med, no.med);
     }
 }

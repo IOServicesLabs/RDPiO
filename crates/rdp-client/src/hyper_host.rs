@@ -783,6 +783,12 @@ impl Drop for GpuClockFloor {
 /// this often; the window coming back wakes it at once (see `Shared::wake`).
 const PAUSED_LOOK: Duration = Duration::from_millis(500);
 
+/// Input this recent means someone is at the stream: a client saying its
+/// window is hidden then is wrong (a covered/hidden check misreading the
+/// desktop), and pausing froze the picture under the user's hands for
+/// minutes.
+const INPUT_SHOWS_FOR: Duration = Duration::from_secs(5);
+
 /// A desktop left alone (no input) this long is idle…
 const IDLE_AFTER: Duration = Duration::from_secs(2);
 
@@ -2086,6 +2092,7 @@ fn rate_switches() -> rdp_hyper::rate::Switches {
         lone_frame: ab("loneframe", true),
         interleave: ab("interleave", true),
         probe_idle: ab("probeidle", true),
+        lan_floor: ab("lanfloor", true),
         repair_fec: ab("repairfec", true),
     }
 }
@@ -2391,6 +2398,13 @@ fn receive_loop(
         match kind {
             Kind::Input => {
                 shared.last_input_us.store(qpc_us(), Ordering::Relaxed);
+                // Someone is using the stream, so someone sees it, whatever
+                // the client last said (`inputwake`; see `INPUT_SHOWS_FOR`).
+                if shared.paused.load(Ordering::Relaxed) && crate::host_ab::ab("inputwake", true) {
+                    shared.paused.store(false, Ordering::Relaxed);
+                    tracing::info!("input from a client marked hidden: streaming again");
+                    shared.wake();
+                }
                 let events = input.receive(&body);
                 // Follow the input desktop (lock screen, UAC) — only possible
                 // as SYSTEM; harmless otherwise.
@@ -2430,6 +2444,9 @@ fn receive_loop(
                     shared.wake();
                 }
                 Some(Control::Paused { paused }) => {
+                    // (Not while its input says someone is there.)
+                    let used = qpc_us().saturating_sub(shared.last_input_us.load(Ordering::Relaxed)) < INPUT_SHOWS_FOR.as_micros() as u64;
+                    let paused = paused && !(used && crate::host_ab::ab("inputwake", true));
                     if shared.paused.swap(paused, Ordering::Relaxed) != paused {
                         tracing::info!(paused, "client window minimized/restored");
                     }
