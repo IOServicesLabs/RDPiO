@@ -457,6 +457,9 @@ Host power switches (same file, on by default):
 - `pausepoll`: while paused, the capture loop sleeps until woken (window
   back, keyframe, goodbye) or 500 ms, and the receive socket waits 100 ms
   not 10: ~120 of a paused stream's ~250 wake-ups a second were these.
+- `displayretry`: `SetDisplayConfig` 5 (the desktop switching) is retried on
+  the input desktop for up to 8 s (2 s for the layout's restore) before the
+  host's own monitor is streamed; that fallback always ended in an error.
 
 ## Latency notes
 
