@@ -442,7 +442,7 @@ read live): `pathinfo`, `inputdup` (Windows client), `fastreconnect`,
 by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
 `gapcut`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
 `growcap`, `softslow`, `fecfloor`,
-`slowpace=1` (off by default), `audiorate`, `opusfec`, `audiofirst` (read as a sender starts),
+`slowpace=1` (off by default), `battigpu` (read as a stream starts; see On battery), `audiorate`, `opusfec`, `audiofirst` (read as a sender starts),
 `catchup` — the last three also on a Windows client, from its own
 `%PUBLIC%` file. The Android app's are `debug.rdpio.inputdup` and
 `debug.rdpio.fastreconnect` (see android.md).
@@ -520,6 +520,88 @@ by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
   adds ≈ 2 ms. Packet pacing is adaptive: tight on a clean path, spread out
   only when loss shows a Wi-Fi radio or router can't take bursts.
 - HDR desktops are captured too (Windows converts them to SDR for the stream).
+
+## On battery: the host on the integrated GPU
+
+A hybrid laptop host (Razer Blade 15: Intel UHD 630 + RTX 2070 Max-Q) streaming
+office work on battery drew 35-42 W, 25-32 W of it the NVIDIA GPU alone while
+its encoder was 1-7% busy: the virtual monitor is rendered on it, captured on
+it and encoded on it, so it never powers off. With it off the laptop should
+draw ~10-14 W.
+
+**What changes on battery** (host switch `battigpu`, on by default; it acts
+only when Windows says the AC line is off *and* the laptop has an integrated
+GPU with a hardware H.264 encoder; plugged in, nothing changes):
+
+- *Render adapter.* The virtual monitor is added with the integrated GPU as
+  its render adapter (`IddCxAdapterSetRenderAdapter`, already in the driver)
+  instead of the fastest GPU (`hyper_direct.rs`, `host_battery.rs`).
+- *Capture.* Follows by itself: the capture opens on the adapter the
+  monitor's output is on, and the driver shares its frames from there.
+- *Encoder.* Follows the capture's device: NVENC isn't tried on a non-NVIDIA
+  device, and Media Foundation's encoder is asked for *by GPU*
+  (`MFTEnum2` with `MFT_ENUM_ADAPTER_LUID`). The plain list carries no GPU
+  on its entries, so before this the fastest GPU's encoder was taken — and
+  NVIDIA's encoder handed an Intel device fails with E_UNEXPECTED, which is
+  how every stream on the Intel GPU ended at once before the monitor was
+  moved to the fastest GPU. On the fastest GPU the plain list is used as
+  before.
+- *Codec and rate.* H.264, at most 60 fps (the offer says so; a client
+  without H.264 stays on the fastest GPU).
+- *A trial first.* Once per agent, the integrated encoder codes three 1080p
+  frames of text before a stream is put on it; a failure (or a frame over
+  50 ms) keeps every stream on the fastest GPU. The choice and why are logged
+  at each sign-in ("on battery: the virtual monitor renders and encodes on the
+  integrated GPU" / "on battery, but staying on the fastest GPU").
+
+**Measured** on the UHD 630 through the host's own encoder (`cargo run
+--release -p rdp-gpu --example igpu_probe`; synthetic scrolling text, 1 ms
+timer), per frame, p50:
+
+| | 2560x1440 | 1920x1080 |
+|---|---|---|
+| Quick Sync H.264, fast | 8.0 ms (BGRA in: 8.5) | 6-7 ms |
+| Quick Sync H.264, office quality | 9-17 ms | 7-9 ms |
+| Intel HEVC, fast | fails on the first frame (E_FAIL) | fails |
+| Intel HEVC, office quality | 54 ms | 34-37 ms |
+| NVENC HEVC (for comparison) | 3.6 ms | |
+
+So H.264 only, and 1440p60 holds (8 ms of a 16.7 ms frame): no resolution cap.
+Quick Sync refuses 240 fps outright (MF_E_INVALIDMEDIATYPE), hence the 60 fps
+cap, which also saves the frames nobody needs on battery (the stream measured
+on battery delivered 9 fps median).
+
+**A power change mid-stream** isn't followed yet: the stream keeps its GPU
+until it ends, and the next one (a reconnect included: a kept monitor is
+reused only on the same render GPU) picks again. Following it live needs a
+new virtual monitor — the driver sets the render adapter only as it adds one,
+and the adapter-wide call isn't documented to move an existing swapchain —
+so the plan is: on `GUID_ACDC_POWER_SOURCE` (or the 3 s poll the client
+uses), end the stream's pipeline, add a replacement monitor on the other GPU
+with `RDPIO_DISPLAY_FLAG_REPLACE` (0.9-1.9 s measured from add to streaming,
+plus the scale), reopen the pipeline on the new device name (codec and rate
+as the stream already has them, or a codec change the client must be told
+of), and send a keyframe. Windows on the old monitor move with it, as on a
+reconnect. Until that's built and measured, the start-of-stream choice is
+the safe half.
+
+**Risks.**
+
+- The discrete GPU powering off is expected, not yet measured: anything else
+  that touches it keeps it on. The clock floor (`GpuClockFloor`) talks to
+  the NVIDIA driver while a stream runs and must not on battery; polling
+  `nvidia-smi` to measure wakes it too (watch the battery draw instead).
+- Quick Sync shares the integrated GPU with the desktop's composition; a
+  heavy desktop on it may lengthen encodes beyond the synthetic numbers.
+- A game on the host still renders on the NVIDIA GPU; its frames are then
+  copied across to the integrated GPU's monitor (Windows does it), costing
+  latency and keeping the dGPU on — expected, and that's plugged-in use.
+- Intel's encoder differs from NVENC: no in-place bitrate changes (a big
+  move rebuilds it: ~30 ms and a keyframe), long-term references as Media
+  Foundation offers them.
+- Windows reports the integrated GPU as most frugal and not fastest; the
+  host also requires it to have under 512 MB of its own memory. A machine
+  where that guess is wrong stays on the fastest GPU (`battigpu=0` forces it).
 
 ## Updates and versions
 

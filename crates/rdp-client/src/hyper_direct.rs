@@ -1424,8 +1424,9 @@ fn take_returning() -> Option<(Vec<u8>, SocketAddr)> {
 /// host's screens and back. Switch `keepmonitor`.
 struct KeptMonitor {
     monitor: crate::virtual_display::VirtualMonitor,
-    /// Width, height, refresh rate and scale it was made for.
-    made_for: (u32, u32, u32, u32),
+    /// Width, height, refresh rate, scale and render GPU (LUID) it was
+    /// made for: a reconnect after the power source changed gets a new one.
+    made_for: (u32, u32, u32, u32, i64),
     until: Instant,
 }
 
@@ -1559,19 +1560,30 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
                 }
             }
         }
+        // On battery, the integrated GPU the stream's virtual monitor goes on
+        // (decided with the offer: it caps the codec and the refresh rate).
+        let on_battery_gpu = std::cell::Cell::new(None::<crate::host_battery::Plan>);
         let offer = |want: &auth::Want| {
             let monitor = rdp_gpu::hyper::list_monitors().ok()?.into_iter().next()?;
             // With the virtual display, exactly the client's screen (made
             // after sign-in); else the desktop, scaled down to fit it.
-            let exact = (virtual_display.is_some() && want.fit && opts.stream_size.is_none())
-                .then(|| crate::virtual_display::even_size(want.width, want.height));
+            let virtual_monitor = virtual_display.is_some() && want.fit && opts.stream_size.is_none();
+            let exact = virtual_monitor.then(|| crate::virtual_display::even_size(want.width, want.height));
+            // (Only a virtual monitor moves GPUs: the host's own stays put.)
+            let battery = virtual_monitor.then(|| crate::host_battery::plan(&want.codecs)).flatten();
             let size = exact.or_else(|| crate::hyper_host::client_stream_size(&opts, (monitor.width, monitor.height), want));
             let (width, height) = size.unwrap_or((monitor.width, monitor.height));
+            let fps = opts.max_fps.map_or(want.refresh_hz, |cap| want.refresh_hz.min(cap)).max(30);
+            let (fps, codec) = match &battery {
+                Some(_) if width <= 4096 && height <= 4096 => (fps.min(crate::host_battery::MAX_FPS), crate::host_battery::CODEC),
+                _ => (fps, rdp_gpu::hyper::choose_codec(&want.codecs, (width, height))?),
+            };
+            on_battery_gpu.set(battery.filter(|_| codec == crate::host_battery::CODEC));
             Some(Offer {
                 width,
                 height,
-                fps: opts.max_fps.map_or(want.refresh_hz, |cap| want.refresh_hz.min(cap)).max(30),
-                codec: rdp_gpu::hyper::choose_codec(&want.codecs, (width, height))?.name().into(),
+                fps,
+                codec: codec.name().into(),
                 // A touch screen's fingers become Windows touch here.
                 touch: true,
                 // Where a client through a VPN can find this PC directly.
@@ -1585,6 +1597,7 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
             })
         };
         let Some(client) = sign_in.handle(&socket, &buf[..n], from, offer) else { continue };
+        let battery_gpu = on_battery_gpu.take();
         if client.update_only {
             serve_update(&socket, client)?;
             continue;
@@ -1601,7 +1614,12 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
         let kept_monitor = kept.take();
         let (virtual_monitor, made_for) = match (&virtual_display, client.fit_to) {
             (Some(vd), Some((w, h))) if opts.stream_size.is_none() && settings.virtual_display && settings.match_resolution => {
-                let made_for = (w, h, client.fps, client.scale);
+                // Rendered on the fastest GPU (a hybrid laptop's
+                // discrete one), where the encoder is: left to Windows,
+                // it's the integrated GPU the panel hangs off. On battery,
+                // deliberately the integrated one (see host_battery).
+                let render_luid = battery_gpu.as_ref().map(|p| p.luid).or_else(rdp_gpu::gpu::chosen_adapter_luid);
+                let made_for = (w, h, client.fps, client.scale, render_luid.unwrap_or(0));
                 match kept_monitor {
                     Some(k) if k.made_for == made_for => {
                         tracing::info!(device = %k.monitor.device_name, "a quick reconnect: streaming the kept virtual monitor");
@@ -1610,10 +1628,7 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
                     other => {
                         // (A different size: the old one goes first.)
                         drop(other);
-                        // Rendered on the fastest GPU (a hybrid laptop's
-                        // discrete one), where the encoder is: left to
-                        // Windows, it's the integrated GPU the panel hangs off.
-                        let render_adapter = rdp_gpu::gpu::chosen_adapter_luid().map(|l| LUID { LowPart: l as u32, HighPart: (l >> 32) as i32 });
+                        let render_adapter = render_luid.map(|l| LUID { LowPart: l as u32, HighPart: (l >> 32) as i32 });
                         let m = vd
                             .show(w, h, client.fps, render_adapter)
                             .inspect(|m| crate::virtual_display::set_scale(&m.device_name, client.scale))

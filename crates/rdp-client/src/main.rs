@@ -1922,6 +1922,8 @@ mod hyper_host;
 #[cfg(windows)]
 mod host_ab;
 #[cfg(windows)]
+mod host_battery;
+#[cfg(windows)]
 mod hyper_rates;
 #[cfg(windows)]
 mod hyper_path;
