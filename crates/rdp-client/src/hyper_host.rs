@@ -859,6 +859,11 @@ impl Drop for GpuClassDown {
 /// cheap call, and a plug pulled mid-stream is followed within seconds.
 const POWER_CHECK_EVERY: Duration = Duration::from_secs(3);
 
+/// On battery the stream runs at most this many frames a second
+/// (`battfps`): a 120 or 144 Hz stream encodes, sends and decodes twice
+/// the frames for motion the eye barely tells apart on a laptop.
+const BATTERY_FPS: u32 = 60;
+
 /// Running on battery (as the client's own check, `hyper_client`; a desktop
 /// says "unknown", which isn't battery).
 fn on_battery() -> bool {
@@ -1154,6 +1159,8 @@ fn stream_inner(
     // on mains power only (`clockbatt`): the power source as last looked at.
     let mut clocks: Option<GpuClockFloor> = None;
     let (mut battery, mut power_checked) = (false, Instant::now() - POWER_CHECK_EVERY);
+    // The stream's top frame rate: `fps`, or less on battery (see BATTERY_FPS).
+    let mut top_fps = fps;
     // The loop lives in a closure so every exit — the client leaving, going
     // quiet, or an encoder/capture error — runs the same cleanup below:
     // threads stopped, the client told, the host's audio restored.
@@ -1266,7 +1273,13 @@ fn stream_inner(
         let paused = shared.paused.load(Ordering::Relaxed);
         if power_checked.elapsed() >= POWER_CHECK_EVERY {
             power_checked = Instant::now();
-            let now = crate::host_ab::ab("clockbatt", true) && on_battery();
+            let unplugged = on_battery();
+            let top = if unplugged && crate::host_ab::ab("battfps", true) { fps.min(BATTERY_FPS) } else { fps };
+            if top != top_fps {
+                top_fps = top;
+                tracing::info!(fps = top_fps, of = fps, "top frame rate {}", if top_fps < fps { "lowered: on battery" } else { "back" });
+            }
+            let now = crate::host_ab::ab("clockbatt", true) && unplugged;
             if now != battery {
                 battery = now;
                 tracing::info!(battery, "GPU clock floor {}", if battery { "let go: on battery" } else { "allowed again" });
@@ -1321,9 +1334,9 @@ fn stream_inner(
         let (sw, sh) = cap.stream;
         let pixels = sw as u64 * sh as u64;
         let follow = match (fps_follow, office && office_fps) {
-            (false, _) => fps,
-            (true, true) => frame_rate.follow_office(bps_now, pixels, fps, now_ms),
-            (true, false) => frame_rate.follow(bps_now, pixels, fps, now_ms),
+            (false, _) => top_fps,
+            (true, true) => frame_rate.follow_office(bps_now, pixels, top_fps, now_ms),
+            (true, false) => frame_rate.follow(bps_now, pixels, top_fps, now_ms),
         };
         if follow != enc_fps {
             tracing::info!(fps = follow, of = fps, kbps = bps_now / 1000, "the frame rate follows the bitrate");
