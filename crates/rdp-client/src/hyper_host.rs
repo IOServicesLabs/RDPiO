@@ -3277,6 +3277,7 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     // 0: not yet paused, 1: paused (since, CPU then), 2: restored (when).
     let (mut pause_stage, mut paused_at, mut paused_cpu_us, mut restored_at) = (0u8, Instant::now(), 0u64, None::<Instant>);
     let (mut paused_ms, mut resume_ms, mut frames_paused) = (0f64, None::<f64>, 0u32);
+    let mut last_restore_ask = 0u128;
     // `--still-at S --still-for S`: the desktop goes still S seconds in, for
     // S, with the client's window open: what an idle desktop costs (this
     // process's CPU meanwhile).
@@ -3313,6 +3314,13 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
                 still.store(false, Ordering::Relaxed);
                 let _ = client.send(&csend.seal(Kind::Control, &Control::Paused { paused: false }.to_bytes()));
                 (pause_stage, restored_at) = (2, Some(Instant::now()));
+            } else if let (2, Some(at), None) = (pause_stage, restored_at, resume_ms) {
+                // No picture yet: say it again every 250 ms (a real client
+                // asks for a keyframe, which also ends the pause).
+                if at.elapsed().as_millis() / 250 > last_restore_ask {
+                    last_restore_ask = at.elapsed().as_millis() / 250;
+                    let _ = client.send(&csend.seal(Kind::Control, &Control::Paused { paused: false }.to_bytes()));
+                }
             }
         }
         if let Some((at, len)) = still_win {
