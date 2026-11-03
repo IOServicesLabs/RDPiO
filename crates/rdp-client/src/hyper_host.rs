@@ -543,6 +543,10 @@ const TRICKLE_INTERVAL_US: u64 = 83_333;
 const TRICKLE_DEEP_AFTER_US: u64 = 2_000_000;
 /// 5 fps: still ahead of a caret's half-second blink.
 const TRICKLE_DEEP_INTERVAL_US: u64 = 200_000;
+/// …on battery, 3 fps (`battrickle`): a caret's half-second blink still
+/// shows each time, the clock's minute too; the next input brings the full
+/// rate back at once as ever.
+const TRICKLE_DEEP_BATTERY_US: u64 = 333_333;
 /// An encoded frame this small changed little (at any resolution: a big
 /// change costs tens of kilobytes).
 const SMALL_FRAME: usize = 4096;
@@ -760,6 +764,15 @@ const IDLE_AFTER: Duration = Duration::from_secs(2);
 /// A change on screen or a packet still ends either wait at once; only a
 /// keyframe or repair asked for on the still screen may wait up to this.
 const IDLE_LOOK: Duration = Duration::from_millis(100);
+
+/// With no picture going out, the status (size, input ack: the client's sign
+/// of life) every 250 ms — every second on an idle desktop (`idlestatus`):
+/// still well inside the client's 1.5 s before it starts probing
+/// (`liveness::PROBE_AFTER`), and three packets a second fewer to wake both
+/// radios.
+fn status_every(idle: bool) -> Duration {
+    Duration::from_millis(if idle && crate::host_ab::ab("idlestatus", true) { 1000 } else { 250 })
+}
 
 /// The receive thread's socket wait while streaming: it also sends the
 /// trailing input ack (within ~10 ms) and refreshes held touches.
@@ -1160,6 +1173,8 @@ fn stream_inner(
     let (mut battery, mut power_checked) = (false, Instant::now() - POWER_CHECK_EVERY);
     // The stream's top frame rate: `fps`, or less on battery (see BATTERY_FPS).
     let mut top_fps = fps;
+    // On battery, a still office desktop trickles slower (`battrickle`).
+    let mut battery_trickle = false;
     // The loop lives in a closure so every exit — the client leaving, going
     // quiet, or an encoder/capture error — runs the same cleanup below:
     // threads stopped, the client told, the host's audio restored.
@@ -1273,6 +1288,7 @@ fn stream_inner(
         if power_checked.elapsed() >= POWER_CHECK_EVERY {
             power_checked = Instant::now();
             let unplugged = on_battery();
+            battery_trickle = unplugged && crate::host_ab::ab("battrickle", true);
             let top = if unplugged && crate::host_ab::ab("battfps", true) { fps.min(BATTERY_FPS) } else { fps };
             if top != top_fps {
                 top_fps = top;
@@ -1309,6 +1325,10 @@ fn stream_inner(
         }
         let since_input_us = qpc_us().saturating_sub(shared.last_input_us.load(Ordering::Relaxed));
         let (mut pace_us, resumed) = trickle.pace(office, since_input_us, interval_us);
+        if trickle.on && since_input_us > TRICKLE_DEEP_AFTER_US && battery_trickle {
+            // (On battery: see TRICKLE_DEEP_BATTERY_US.)
+            pace_us = pace_us.max(TRICKLE_DEEP_BATTERY_US);
+        }
         if resumed {
             // Input (or a big change): the next picture goes at once.
             credit = credit.max(1.0);
@@ -1653,7 +1673,7 @@ fn stream_inner(
                 return Err("the packet sender stopped".into());
             }
         }
-        if last_status.elapsed() > Duration::from_millis(250) {
+        if last_status.elapsed() > status_every(shared.idle.load(Ordering::Relaxed)) {
             shared.send_status(&socket);
             last_status = Instant::now();
         }
@@ -2234,7 +2254,13 @@ fn receive_loop(
         // with no fingers resting, too (see IDLE_LOOK).
         let want = if input.applied() == acked && shared.paused.load(Ordering::Relaxed) && crate::host_ab::ab("pausepoll", true) {
             RX_PAUSED
-        } else if input.applied() == acked && shared.idle.load(Ordering::Relaxed) && !crate::hyper_touch::resting() {
+        } else if input.applied() == acked
+            && (shared.idle.load(Ordering::Relaxed) || crate::host_ab::ab("rxwait", true))
+            && !crate::hyper_touch::resting()
+        {
+            // (The short wait is only for an owed ack, resting fingers and
+            // noticing the stream's end: none of the first two, and a packet
+            // ends the wait anyway — `rxwait`.)
             IDLE_LOOK
         } else {
             RX_ACTIVE
