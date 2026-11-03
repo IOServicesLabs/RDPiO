@@ -461,6 +461,14 @@ The host's perf line names why the rate came down in each 5 s (`cuts=`:
 - **Clean-path parity** (`fecfloor`): after 10 s without loss, big non-key
   frames carry 2% parity instead of 5% (at least one parity packet a block
   still; keyframes keep theirs).
+- **Interleaved blocks** (`interleave`): a frame of several FEC blocks (over
+  64 packets: keyframes, big scrolls) goes a packet of each block in turn,
+  data then parity, so packets lost back to back cost each block a few that
+  its parity rebuilds, not one block all of them. Simulated packet by packet
+  (`cargo test -p rdp-hyper fecsim -- --nocapture`), 1% lost in runs of 8
+  and a keyframe every 5 s: keyframes lost 96 → 24 of ~450, resume to
+  picture 65 → 27 ms, frames never shown 758 → 395, packets a frame shown
+  20.4 → 18.7; the same elsewhere.
 - **Slow pacing** (`slowpace=1`, off by default): on a slow or queued link
   frames are paced at 1.2x the target instead of 2.5x, so they wait on the
   host rather than in front of the audio in the relay. Simulated: audio p95
@@ -479,7 +487,7 @@ frame may take up to 0.2 bits a pixel, at most 100 ms of the link, instead
 of two frames' worth), `presetfollow=1`, `introfresh=1` (the last two off
 by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
 `gapcut`, `probetrain`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
-`growcap`, `softslow`, `fecfloor`,
+`growcap`, `softslow`, `fecfloor`, `interleave`,
 `gamesharpen` (game mode re-encodes a still screen sharper too, as office
 mode does, under 0.05 bits a pixel a frame: 1440p60 under ~11 Mbps),
 `pausehold` (a minimized client's stream holds its rate instead of drifting

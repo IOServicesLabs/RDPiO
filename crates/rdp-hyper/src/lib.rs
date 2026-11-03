@@ -40,5 +40,8 @@ pub mod update;
 pub mod video;
 pub mod wire;
 
+#[cfg(test)]
+mod fecsim;
+
 /// Default UDP port the host agent listens on.
 pub const DEFAULT_PORT: u16 = 47998;

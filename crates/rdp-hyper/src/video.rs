@@ -123,7 +123,7 @@ fn layout(frame: &OutFrame) -> (usize, usize) {
     layout_of(frame.data.len(), frame.probe)
 }
 
-fn layout_of(len: usize, probe: bool) -> (usize, usize) {
+pub(crate) fn layout_of(len: usize, probe: bool) -> (usize, usize) {
     let len = len.max(1);
     if probe && trains() {
         return (len.div_ceil(MAX_SHARD), MAX_SHARD);
@@ -136,7 +136,7 @@ fn layout_of(len: usize, probe: bool) -> (usize, usize) {
 /// Parity shards for block `b` of `k` data shards (of `shards` in all):
 /// `fec` of them, and on a probe's last block as many more as make the
 /// train [`PROBE_TRAIN_PACKETS`] long.
-fn parity_count(k: usize, b: usize, shards: usize, fec: f32, probe: bool) -> usize {
+pub(crate) fn parity_count(k: usize, b: usize, shards: usize, fec: f32, probe: bool) -> usize {
     let m = if fec <= 0.0 { 0 } else { ((k as f32 * fec).ceil() as usize).clamp(1, MAX_BLOCK_PARITY) };
     let last = b + 1 == shards.div_ceil(MAX_BLOCK_DATA);
     let fill = if probe && last && trains() { PROBE_TRAIN_PACKETS.saturating_sub(shards + m) } else { 0 };
@@ -238,6 +238,64 @@ pub fn parity(data: &[Vec<u8>]) -> Vec<Vec<u8>> {
         }
     }
     out
+}
+
+/// The order to send one frame's bodies in (its data, or its parity, laid
+/// out block after block as [`packetize_shards`] and [`parity_shards`] lay
+/// them): a body of each block in turn (`interleave`, see
+/// [`crate::rate::Switches::interleave`]). Packets lost back to back — a
+/// Wi-Fi aggregate's retries running out, a queue overflowing — then cost
+/// each block a few, which its parity rebuilds, instead of one block all of
+/// them: simulated with 1% lost in runs of 8, 22 of 120 keyframes (300 KB,
+/// five blocks) were lost block after block, 4 in turns (see `fecsim`). A
+/// frame of one block goes as it is. The receiver takes shards in any order.
+pub fn send_order(bodies: &Shards, interleave: bool) -> SendOrder {
+    order_of((0..bodies.len()).map(|i| bodies.get(i)[4]), interleave)
+}
+
+/// [`send_order`] for bodies of these blocks, in their order.
+pub(crate) fn order_of(blocks: impl ExactSizeIterator<Item = u8> + Clone, interleave: bool) -> SendOrder {
+    let n = blocks.len();
+    let mut runs = Vec::new();
+    if interleave && blocks.clone().next() != blocks.clone().last() {
+        let mut prev = None;
+        for (i, b) in blocks.enumerate() {
+            if prev != Some(b) {
+                runs.push((i, i));
+                prev = Some(b);
+            }
+            runs.last_mut().expect("pushed").1 = i + 1;
+        }
+    }
+    SendOrder { runs, plain: 0..n, turn: 0 }
+}
+
+/// See [`send_order`]: body indices, a block's in turn with the others'.
+pub struct SendOrder {
+    /// Each block's bodies yet to go (next, end); empty: in order.
+    runs: Vec<(usize, usize)>,
+    plain: std::ops::Range<usize>,
+    turn: usize,
+}
+
+impl Iterator for SendOrder {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if self.runs.is_empty() {
+            return self.plain.next();
+        }
+        let n = self.runs.len();
+        for _ in 0..n {
+            let r = &mut self.runs[self.turn];
+            self.turn = (self.turn + 1) % n;
+            if r.0 < r.1 {
+                r.0 += 1;
+                return Some(r.0 - 1);
+            }
+        }
+        None
+    }
 }
 
 /// One frame's packet bodies, all one size, back to back in one buffer: what
@@ -881,6 +939,37 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A run of packets lost back to back: sent block after block it takes
+    /// one block past its parity; in turns, each block loses a few and the
+    /// frame is rebuilt.
+    #[test]
+    fn interleaved_blocks_survive_a_run_of_losses() {
+        let data = frame(0, 300_000);
+        let f = OutFrame { frame_id: 0, data: &data, keyframe: true, ltr: false, recovery: false, capture_us: 0, encode_us: 0, probe: false };
+        let buffers = FrameBuffers::default();
+        let shards = packetize_shards(&f, 0.05, &buffers);
+        let mut parity = Shards::default();
+        parity_shards(&shards, &mut parity);
+        assert!(shards.len() > 4 * MAX_BLOCK_DATA, "five blocks");
+        let deliver = |interleave: bool| {
+            let order: Vec<&[u8]> = send_order(&shards, interleave)
+                .map(|i| shards.get(i))
+                .chain(send_order(&parity, interleave).map(|i| parity.get(i)))
+                .collect();
+            assert_eq!(order.len(), shards.len() + parity.len(), "every body once");
+            let mut r = Reassembler::new();
+            // 12 lost back to back, a block's worth of parity and more.
+            let got: Vec<InFrame> = order.iter().enumerate().filter(|(i, _)| !(100..112).contains(i)).flat_map(|(i, p)| frames(r.push(p, i as u64))).collect();
+            got.first().map(|g| g.data == data)
+        };
+        assert_eq!(deliver(false), None, "block after block: lost");
+        assert_eq!(deliver(true), Some(true), "in turns: rebuilt");
+        // One block goes as it is.
+        let small = OutFrame { data: &data[..20_000], ..f };
+        let one = packetize_shards(&small, 0.05, &buffers);
+        assert!(send_order(&one, true).eq(0..one.len()));
     }
 
     /// A probe frame is timed for the link, first packet to last; a paced

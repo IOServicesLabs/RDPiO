@@ -1796,14 +1796,14 @@ fn stream_inner(
                 }
             }
             // The data shards now; the sender thread adds parity once they're out.
-            let (fec, pace_cap, probe) = {
+            let (fec, pace_cap, probe, interleave) = {
                 let mut r = shared.rate.lock().unwrap();
                 // (A keyframe on its way: the client's repeated requests for
                 // one are collapsed into it — see `receive_loop`.)
                 if out.keyframe {
                     r.note_keyframe(frame_id, out.data.len(), qpc_us() / 1000);
                 }
-                (r.parity_for(out.data.len(), out.keyframe), r.pace_cap_bps(), r.probe_due(out.data.len(), qpc_us() / 1000))
+                (r.parity_for(out.data.len(), out.keyframe), r.pace_cap_bps(), r.probe_due(out.data.len(), qpc_us() / 1000), r.switches().interleave)
             };
             let data = packetize_shards(
                 &OutFrame { frame_id, data: &out.data, keyframe: out.keyframe, ltr: is_ltr, recovery, capture_us, encode_us, probe },
@@ -1815,7 +1815,7 @@ fn stream_inner(
             bytes += out.data.len() as u64;
             encode_us_total += encode_us as u64;
             acquire_us_total += acquired_us.saturating_sub(capture_us);
-            if frame_tx.send(Outgoing { data, payload: out.data.len(), bps, fps: enc_fps, pace, fec, pace_cap, probe }).is_err() {
+            if frame_tx.send(Outgoing { data, payload: out.data.len(), bps, fps: enc_fps, pace, fec, pace_cap, probe, interleave }).is_err() {
                 return Err("the packet sender stopped".into());
             }
         }
@@ -2156,6 +2156,7 @@ fn rate_switches() -> rdp_hyper::rate::Switches {
         soft_slow: ab("softslow", true),
         probe_train: ab("probetrain", true),
         pause_hold: ab("pausehold", true),
+        interleave: ab("interleave", true),
     }
 }
 
@@ -2266,6 +2267,8 @@ struct Outgoing {
     /// Unpaced: the client times it for what the link carries (see
     /// `RateController::probe_due`).
     probe: bool,
+    /// Several blocks go a body of each in turn (`rdp_hyper::video::send_order`).
+    interleave: bool,
 }
 
 /// The sender thread. Each frame's packets are spread over `pace` of a frame
@@ -2325,13 +2328,13 @@ fn sender_loop(socket: UdpSocket, shared: Arc<Shared>, frames: std::sync::mpsc::
         };
         // The data shards; parity once they're out (the client usually
         // completes a frame from data alone).
-        for body in &f.data {
-            send(body, &mut batch);
+        for i in rdp_hyper::video::send_order(&f.data, f.interleave) {
+            send(f.data.get(i), &mut batch);
         }
         batch.flush(&socket);
         parity_shards(&f.data, &mut parity);
-        for body in &parity {
-            send(body, &mut batch);
+        for i in rdp_hyper::video::send_order(&parity, f.interleave) {
+            send(parity.get(i), &mut batch);
         }
         batch.flush(&socket);
         // (A probe's train padding isn't the stream's: see

@@ -205,6 +205,9 @@ pub struct Switches {
     /// A paused stream holds its rate (`pausehold`; see
     /// [`RateController::set_paused`]).
     pub pause_hold: bool,
+    /// A frame of several blocks goes a body of each in turn (`interleave`;
+    /// see [`crate::video::send_order`]).
+    pub interleave: bool,
 }
 
 impl Default for Switches {
@@ -221,6 +224,7 @@ impl Default for Switches {
             soft_slow: true,
             probe_train: true,
             pause_hold: true,
+            interleave: true,
         }
     }
 }
@@ -408,6 +412,10 @@ impl RateController {
     /// The cuts since the last call, by reason ([`CUT_NAMES`]).
     pub fn take_cuts(&mut self) -> [u32; CUT_NAMES.len()] {
         std::mem::take(&mut self.cuts)
+    }
+
+    pub fn switches(&self) -> Switches {
+        self.switches
     }
 
     pub fn set_switches(&mut self, switches: Switches) {
@@ -1761,6 +1769,7 @@ mod tests {
                     soft_slow: false,
                     probe_train: false,
                     pause_hold: false,
+                    interleave: false,
                 },
                 fps_follow: false,
                 warm_bps: None,
