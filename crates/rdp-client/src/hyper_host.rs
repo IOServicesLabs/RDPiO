@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use rdp_gpu::hyper::{list_monitors, DesktopCapture, HwEncoder};
 use rdp_hyper::control::{self, Control, Handshake, CHANNEL_NAME, PROTOCOL};
 use rdp_hyper::input::{InputEvent, InputReceiver};
+use rdp_hyper::pause::{self, PauseRelease, Released};
 use rdp_hyper::rate::{Limits, RateController};
 use rdp_hyper::video::{packetize_shards, parity_shards, FrameBuffers, OutFrame, Shards};
 use rdp_hyper::wire::{random_key, Direction, Kind, Session};
@@ -946,7 +947,7 @@ fn stream_inner(
     let remembered = crate::hyper_rates::recall(peer.ip());
     let warm = remembered.filter(|_| crate::host_ab::ab("warmstart", true)).map(|b| (b as u64 * 6 / 5).min(u32::MAX as u64) as u32);
     let open_bps = resting_bps(office, (1920, 1080)).min(max_bps);
-    let (mut cap, mut enc) = open_pipeline(device_name, opts, fps, warm.map_or(open_bps, |w| w.min(open_bps)), codec, tuning)?;
+    let (cap, enc) = open_pipeline(device_name, opts, fps, warm.map_or(open_bps, |w| w.min(open_bps)), codec, tuning)?;
     // (The encoder takes the rate for the stream's real size with its first frame.)
     let limits = Limits { min_bps: Limits::default().min_bps, start_bps: resting_bps(office, cap.stream).min(max_bps), max_bps };
     let mut rate = RateController::new(limits);
@@ -1152,6 +1153,12 @@ fn stream_inner(
     // Paused as the rate controller was last told.
     let mut rate_paused = false;
     let (mut battery, mut power_checked) = (false, Instant::now() - POWER_CHECK_EVERY);
+    // The capture and encoder: `None` while a long pause has let them go
+    // (`rdp_hyper::pause`, switch `pauserelease`), and when the client came
+    // back from one (for the time to its first picture).
+    let mut pipe = Some((cap, enc));
+    let mut pause_release = PauseRelease::default();
+    let mut resumed_at: Option<Instant> = None;
     // The loop lives in a closure so every exit — the client leaving, going
     // quiet, or an encoder/capture error — runs the same cleanup below:
     // threads stopped, the client told, the host's audio restored.
@@ -1177,6 +1184,109 @@ fn stream_inner(
             tracing::info!("Hyper service stopping; ending the stream (the client reconnects)");
             return Ok(StreamEnd::Stopping);
         }
+        // A long pause lets the GPU go: the NVENC session, the capture with
+        // its NV12 converter, ring and the driver's frames (or the
+        // duplication), and its D3D11 device. An open session held a laptop's
+        // discrete GPU at P3, 25 W, with nothing encoded (`rdp_hyper::pause`).
+        // Only this thread touches them: the sender, pacer and feedback
+        // threads see packets and atomics, never a texture, so nothing races
+        // the release. After the stop and timeouts above, so a stream that
+        // ends meanwhile ends as any other (with nothing left to let go). A
+        // mode, refresh or size change meanwhile is followed once rebuilt
+        // (below), at the cost of a second rebuild.
+        let step = pause_release.step(
+            shared.paused.load(Ordering::Relaxed),
+            shared.keyframe.load(Ordering::Relaxed),
+            crate::host_ab::ab("pauserelease", true),
+            crate::host_ab::ab("pausereleasedev", true),
+            Instant::now(),
+        );
+        match step {
+            pause::Step::Run => {}
+            pause::Step::Release(what) => {
+                let t = Instant::now();
+                // What was taken from them first (a texture keeps its device).
+                (last_tex, skipped, last_present_us) = (None, None, None);
+                captures = CaptureTimes::default();
+                match what {
+                    Released::Encoder => {
+                        if let Some((_, enc)) = pipe.as_mut() {
+                            enc.release();
+                        }
+                    }
+                    Released::Pipeline => {
+                        if let Some((mut cap, mut enc)) = pipe.take() {
+                            // The session before the device it uses from its
+                            // own threads.
+                            enc.release();
+                            drop(enc);
+                            cap.release();
+                            drop(cap);
+                        }
+                    }
+                }
+                tracing::info!(?what, ms = t.elapsed().as_millis() as u64, "pause release: paused {} s, the GPU let go", pause::RELEASE_AFTER.as_secs());
+                continue;
+            }
+            pause::Step::Wait => {
+                if last_status.elapsed() > Duration::from_millis(1000) {
+                    shared.send_status(&socket);
+                    last_status = Instant::now();
+                }
+                // (In steps, so coming back or a keyframe request rebuilds at once.)
+                for _ in 0..10 {
+                    if !shared.paused.load(Ordering::Relaxed) || shared.keyframe.load(Ordering::Relaxed) || shared.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                continue;
+            }
+            pause::Step::Rebuild(what) => {
+                let t = Instant::now();
+                let bps = shared.rate.lock().unwrap().bitrate_bps();
+                // Only the session went: a new one on the capture's device
+                // (BGRA in where the capture hands that over).
+                if let (Released::Encoder, Some((cap, enc))) = (what, pipe.as_mut()) {
+                    let (w, h) = cap.stream;
+                    match HwEncoder::new_tuned(&cap.device, cap.adapter_luid().ok(), w, h, fps, bps, cap.rgb, codec, tuning) {
+                        Ok(e) => *enc = e,
+                        Err(e) => {
+                            tracing::info!(error = %e, "pause release: no encoder on the old capture; the whole pipeline then");
+                            cap.release();
+                            pipe = None;
+                        }
+                    }
+                }
+                // Straight away (`reopen_pipeline` first waits 250 ms for a
+                // GPU back from a reset), and that way if it fails.
+                if pipe.is_none() {
+                    let view = viewed(opts, applied_view);
+                    pipe = Some(match open_pipeline(device_name, &view, fps, bps, codec, tuning) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::info!(error = %e, "pause release: pipeline not back at once; retrying");
+                            reopen_pipeline(device_name, &view, fps, bps, codec, tuning)?
+                        }
+                    });
+                }
+                (last_tex, skipped, last_present_us, credit) = (None, None, None, 1.0);
+                captures = CaptureTimes::default();
+                capture_errors = 0;
+                if let Some((cap, _)) = &pipe {
+                    resized(&shared, &socket, cap.stream, fps);
+                }
+                shared.keyframe.store(true, Ordering::Relaxed);
+                // A still desktop gives a new capture no frame: repaint at once.
+                last_nudge = Instant::now() - Duration::from_secs(1);
+                resumed_at = Some(t);
+                let ms = t.elapsed().as_millis() as u64;
+                tracing::info!(?what, ms, "pause release: rebuilt in {ms} ms");
+                continue;
+            }
+        }
+        // (Always there here: let go, the step above continued.)
+        let Some((cap, enc)) = pipe.as_mut() else { continue };
         // Office or game mode, as the client asks (Ctrl+Shift+O): a new
         // encoder (frame budget, preset) and frame rate, and the host's text
         // smoothing to match.
@@ -1200,7 +1310,7 @@ fn stream_inner(
                     native = opts.fit_to.and_then(|s| NativeResolution::apply(device_name, s));
                 }
             }
-            (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
+            (*cap, *enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
             captures = CaptureTimes::default();
             (last_tex, skipped, last_present_us, credit) = (None, None, None, 1.0);
             resized(&shared, &socket, cap.stream, fps);
@@ -1229,7 +1339,7 @@ fn stream_inner(
                 let bps = shared.rate.lock().unwrap().bitrate_bps();
                 cap.release();
                 enc.release();
-                (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
+                (*cap, *enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                 captures = CaptureTimes::default();
                 (last_tex, skipped, last_present_us, credit) = (None, None, None, 1.0);
                 resized(&shared, &socket, cap.stream, fps);
@@ -1250,7 +1360,7 @@ fn stream_inner(
                 let bps = shared.rate.lock().unwrap().bitrate_bps();
                 cap.release();
                 enc.release();
-                (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
+                (*cap, *enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                 captures = CaptureTimes::default();
                 (last_tex, skipped, last_present_us, credit) = (None, None, None, 1.0);
                 resized(&shared, &socket, cap.stream, fps);
@@ -1375,7 +1485,7 @@ fn stream_inner(
                     let bps = shared.rate.lock().unwrap().bitrate_bps();
                     cap.release();
                     enc.release();
-                    (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
+                    (*cap, *enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                     captures = CaptureTimes::default();
                     capture_errors = 0;
                     (last_tex, skipped) = (None, None);
@@ -1397,7 +1507,7 @@ fn stream_inner(
                 let bps = shared.rate.lock().unwrap().bitrate_bps();
                 cap.release();
                 enc.release();
-                (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
+                (*cap, *enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                 captures = CaptureTimes::default();
                 let (nw, nh) = cap.stream;
                 *shared.status.lock().unwrap() = (nw as u16, nh as u16, fps as u16);
@@ -1423,7 +1533,7 @@ fn stream_inner(
         // whatever changes meanwhile waits in the duplication, and the
         // keyframe that ends a pause takes the newest picture.
         if shared.paused.load(Ordering::Relaxed) && !want_key {
-            if let Some(f) = captured.and_then(|c| c.into_frame(&mut cap)) {
+            if let Some(f) = captured.and_then(|c| c.into_frame(cap)) {
                 last_tex = Some(f.nv12);
             }
             skipped = None;
@@ -1463,7 +1573,7 @@ fn stream_inner(
                     credit = (credit - 1.0).max(0.0);
                     skipped = None;
                     sharpen_left = fps;
-                    f.into_frame(&mut cap).map(|f| (f.nv12, f.present_us))
+                    f.into_frame(cap).map(|f| (f.nv12, f.present_us))
                 } else {
                     skipped = Some(f);
                     None
@@ -1474,7 +1584,7 @@ fn stream_inner(
                 Some(f) if want_key || acquired_us >= f.present_us() + pace_us => {
                     credit = 0.0;
                     sharpen_left = fps;
-                    f.into_frame(&mut cap).map(|f| (f.nv12, f.present_us))
+                    f.into_frame(cap).map(|f| (f.nv12, f.present_us))
                 }
                 Some(f) => {
                     skipped = Some(f);
@@ -1582,7 +1692,7 @@ fn stream_inner(
                 rebuild(&mut rebuilds, &e.to_string())?;
                 cap.release();
                 enc.release();
-                (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
+                (*cap, *enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                 (last_tex, skipped) = (None, None);
                 captures = CaptureTimes::default();
                 resized(&shared, &socket, cap.stream, fps);
@@ -1617,6 +1727,11 @@ fn stream_inner(
             let capture_us = captures.of(out.input, capture_us);
             let encode_us = qpc_us().saturating_sub(capture_us) as u32;
             let (is_ltr, recovery) = ltr.sent(out.input, frame_id, out.keyframe);
+            if out.keyframe {
+                if let Some(t) = resumed_at.take() {
+                    tracing::info!(ms = t.elapsed().as_millis() as u64, "pause release: first picture out after coming back");
+                }
+            }
             // The data shards now; the sender thread adds parity once they're out.
             let (fec, pace_cap, probe) = {
                 let mut r = shared.rate.lock().unwrap();

@@ -295,6 +295,21 @@ has to be on to be captured), and stays awake while streamed — as does the
 client. Minimizing the client window pauses the stream (the host encodes
 nothing, the laptop decodes nothing); restoring it resumes at once.
 
+Paused for 10 s, the host also lets its GPU go: the encoder (NVENC) session,
+the capture with its NV12 converter and frames, and the capture's D3D11
+device (switch `pauserelease`). An open encoder session held a laptop's
+discrete GPU (RTX 2070 Max-Q) at P3 with its memory at full clock, ~25 W,
+with nothing encoded — and streams spend most of their time paused. Restored
+(or a keyframe asked for), it's all rebuilt and starts with a keyframe; the
+host log says `pause release: rebuilt in N ms` and when the first picture
+went out (the aim: within 200-300 ms). `pausereleasedev=0` keeps the capture
+and its device and lets only the encoder session go — to tell with
+`nvidia-smi` which holds the GPU up. Expected: the NVENC session (its P-state
+should fall towards P8 once it's gone); a GPU still at P3 with everything let
+go is held by the virtual monitor, whose desktop it renders. Dropping the
+device costs little (every capture opens its own anyway), and a live device,
+idle or not, keeps a hybrid laptop's GPU in use, so it can't power off.
+
 If the host's GPU driver resets or its encoder fails, the stream rebuilds
 itself within a second or two; if the client's GPU resets, the client starts a
 fresh renderer and rejoins. Neither ends the session.
@@ -471,7 +486,7 @@ mode does, under 0.05 bits a pixel a frame: 1440p60 under ~11 Mbps),
 up to resting, which restore then slammed to the floor),
 `slowpace=1` (off by default), `audiorate`, `opusfec`, `audiofirst` (read as a sender starts),
 `catchup` — the last three also on a Windows client, from its own
-`%PUBLIC%` file. The Android app's are `debug.rdpio.inputdup` and
+`%PUBLIC%` file — `pauserelease` and `pausereleasedev` (see below). The Android app's are `debug.rdpio.inputdup` and
 `debug.rdpio.fastreconnect` (see android.md).
 
 Host power switches (same file, on by default):

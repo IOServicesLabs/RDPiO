@@ -17,6 +17,7 @@
 //! - [`autores`] + [`backlog`]: the clients' shared judgement of the link —
 //!   the stream's size from the bits that arrive, and when a decode backlog
 //!   goes for a fresh keyframe (the same on Windows and Android).
+//! - [`pause`]: when a paused host lets its GPU pipeline go, and takes it back.
 //!
 //! Platform-neutral; the capture/encode/decode ends live in `rdp-gpu` and
 //! `rdp-client`.
@@ -31,6 +32,7 @@ pub mod input;
 pub mod lan;
 pub mod liveness;
 pub mod messages;
+pub mod pause;
 pub mod playout;
 pub mod rate;
 pub mod reliable;
