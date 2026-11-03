@@ -228,6 +228,12 @@ pub enum PointerEvent {
 /// longer than this was forgotten by the caller: it's let go.
 const HELD_AT_MOST: Duration = Duration::from_secs(1);
 
+/// A held frame taken within this of being seen is the newest; held longer,
+/// [`take`](DesktopCapture::take) waits this long for a newer one (about a
+/// refresh of a 120-144 Hz desktop).
+const FRESH_HELD: Duration = Duration::from_millis(2);
+const NEWER_WITHIN_MS: u32 = 8;
+
 const DRIVER_GRACE: Duration = Duration::from_secs(3);
 
 /// Desktop Duplication of one monitor plus the BGRA → NV12 conversion.
@@ -603,15 +609,23 @@ impl DesktopCapture {
     }
 
     /// [`take`](Self::take) for Desktop Duplication: the held frame
-    /// converted, then a newer one if any came meanwhile (converted over it,
-    /// into the same ring slot — the GPU does them in order).
+    /// converted. Held a while, the screen has likely moved on meanwhile —
+    /// but the duplication shows that only once the held frame is let go
+    /// (the compositor's next frame): so a newer one is waited for, up to
+    /// [`NEWER_WITHIN_MS`], and converted over it, into the same ring slot
+    /// (the GPU does them in order). None comes: the screen went still on
+    /// the held one, which is what goes.
     unsafe fn take_duplication(&mut self) -> WinResult<Option<CapturedFrame>> {
-        let Some((resource, info, _)) = self.held.take() else { return Ok(None) };
+        let Some((resource, info, since)) = self.held.take() else { return Ok(None) };
         let Some(dup) = self.dup.clone() else { return Ok(None) };
         let slot = self.take_frame(Some(resource), &info);
         let _ = dup.ReleaseFrame();
         let Some(slot) = slot? else { return Ok(None) };
-        if let Some((dup, newer, resource)) = self.dup_acquire(0)? {
+        // (Taken the moment it was seen: it's the newest.)
+        if since.elapsed() < FRESH_HELD {
+            return Ok(self.ring_out(Some(slot), &info));
+        }
+        if let Some((dup, newer, resource)) = self.dup_acquire(NEWER_WITHIN_MS)? {
             let again = self.take_frame(resource, &newer);
             let _ = dup.ReleaseFrame();
             if again?.is_some() {
