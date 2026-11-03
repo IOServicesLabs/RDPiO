@@ -205,12 +205,23 @@ pub struct Switches {
     /// A paused stream holds its rate (`pausehold`; see
     /// [`RateController::set_paused`]).
     pub pause_hold: bool,
+    /// A queue still there a window later counts as the stream's only if
+    /// that window's fastest frame was late too (`heldburst`; see `ours` in
+    /// [`RateController::update`]). Wi-Fi power save holds a dozing
+    /// client's frames at the access point until the next beacon (~100 ms)
+    /// and lets them go at once: the window they land in averages 30-60 ms
+    /// late, the one after it too, but its last frame before the beacon
+    /// came promptly. A queue lasting has even its fastest frame late.
+    /// Simulated on a 200 Mbit/s LAN dozing one beacon interval in three,
+    /// the stream sat at 21 Mbit/s (164 queue cuts over 4 x 50 s), 35 with
+    /// it (111); warm started from a bad stream's 0.7, at 11 instead of 35.
+    pub held_burst: bool,
     /// A queue over twice what the stream's last 100 ms of bytes would take
     /// on the link, its window's fastest frame prompt (under 10 ms), isn't
     /// the stream's (`ownq`). Its bytes count as able to make a queue from
     /// a tenth of the link up, and a beacon's burst was 30-60 ms whatever
     /// was sent: on a 200 Mbit/s LAN in power save that held the stream at
-    /// 14 Mbit/s, 21 with this (and a queue on a link something else took
+    /// 17 Mbit/s, 35 with this (and a queue on a link something else took
     /// has its fastest frame late too: still cut).
     pub own_queue: bool,
     /// A window with one frame, under a beacon interval late, doesn't make
@@ -218,8 +229,8 @@ pub struct Switches {
     /// dozing between frames, each held 0-100 ms, and one such frame has no
     /// faster one to show it was held. Cut for those, an office stream
     /// went to 10 fps, its radio dozed through every frame, and it stayed
-    /// there: after something took the link for 3 s it came back to 4
-    /// Mbit/s on a 200 Mbit/s LAN at 20 fps, 11 at 44 fps with this.
+    /// there: after something took the link for 3 s it came back to 24
+    /// Mbit/s on a 200 Mbit/s LAN, 29 with this.
     pub lone_frame: bool,
 }
 
@@ -237,6 +248,7 @@ impl Default for Switches {
             soft_slow: true,
             probe_train: true,
             pause_hold: true,
+            held_burst: true,
             own_queue: true,
             lone_frame: true,
         }
@@ -785,8 +797,9 @@ impl RateController {
         // was late too, see [`Switches::held_burst`], and it had more than
         // one frame or one later than a beacon interval, see
         // [`Switches::lone_frame`].)
+        let burst = self.switches.held_burst && queue_min_us < (queue_us / 2).max(QUEUE_SOFT_US);
         let lone = self.switches.lone_frame && fb.frames < 2 && queue_us <= STANDING_US;
-        let lasting = fb.frames > 0 && queue_us > QUEUE_HARD_US && self.last_queue_us > QUEUE_HARD_US && !lone;
+        let lasting = fb.frames > 0 && queue_us > QUEUE_HARD_US && self.last_queue_us > QUEUE_HARD_US && !burst && !lone;
         let ours = self.link_bps.is_none_or(|l| own_us(l) >= QUEUE_SOFT_US as f64 && !too_big(l)) || lasting;
 
         // Bulk yields first: it halves at the first sign of queueing or a
@@ -1799,6 +1812,7 @@ mod tests {
                     soft_slow: false,
                     probe_train: false,
                     pause_hold: false,
+                    held_burst: false,
                     own_queue: false,
                     lone_frame: false,
                 },
@@ -2722,6 +2736,19 @@ mod tests {
     fn doze_case<'a>(results: &'a [(Case, Tally, Tally)], name: &str) -> (&'a Tally, &'a Tally) {
         let (_, on, no) = results.iter().find(|r| r.0.name == name).unwrap();
         (on, no)
+    }
+
+    /// `heldburst`: a dozing radio's beacon burst lasting two windows isn't
+    /// the stream's queue.
+    #[test]
+    fn a_dozing_radios_burst_is_not_a_lasting_queue() {
+        let r = doze_ab("heldburst", |s| s.held_burst = false);
+        doze_no_worse(&r);
+        for name in ["game, 200M dozing", "game, ax210 dozing", "office, 200M dozing, warm 0.7M", "game, 200M dozing, warm 0.7M"] {
+            let (on, no) = doze_case(&r, name);
+            assert!(on.med > no.med * 1.5, "{name}: {} vs {}", on.med, no.med);
+            assert!(on.cuts[CUT_QUEUE] < no.cuts[CUT_QUEUE], "{name}: {:?} vs {:?}", on.cuts, no.cuts);
+        }
     }
 
     /// `ownq`: a queue the stream's bytes couldn't have made isn't its own.
