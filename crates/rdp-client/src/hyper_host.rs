@@ -2860,6 +2860,12 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     // 0: not yet paused, 1: paused (since, CPU then), 2: restored (when).
     let (mut pause_stage, mut paused_at, mut paused_cpu_us, mut restored_at) = (0u8, Instant::now(), 0u64, None::<Instant>);
     let (mut paused_ms, mut resume_ms, mut frames_paused) = (0f64, None::<f64>, 0u32);
+    // `--still-at S --still-for S`: the desktop goes still S seconds in, for
+    // S, with the client's window open: what an idle desktop costs (this
+    // process's CPU meanwhile).
+    let still_win = secs_arg("--still-at").zip(secs_arg("--still-for")).map(|(a, f)| (Duration::from_secs_f64(a), Duration::from_secs_f64(f)));
+    let (mut still_stage, mut still_from, mut still_cpu_us, mut still_ms) = (0u8, Instant::now(), 0u64, 0f64);
+    let mut idle_reads = false;
     let (mut view_told, mut since_resize) = (view.is_none(), None::<(Instant, u32, u64)>);
     while start.elapsed() < Duration::from_secs(secs) {
         if !view_told && start.elapsed() > Duration::from_secs(secs) / 3 {
@@ -2891,6 +2897,27 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = client.send(&csend.seal(Kind::Control, &Control::Paused { paused: false }.to_bytes()));
                 (pause_stage, restored_at) = (2, Some(Instant::now()));
             }
+        }
+        if let Some((at, len)) = still_win {
+            let t = start.elapsed();
+            if still_stage == 0 && t >= at {
+                still.store(true, Ordering::Relaxed);
+                (still_stage, still_from, still_cpu_us) = (1, Instant::now(), selftest_cpu_us());
+                println!("selftest: still after {frames} frames");
+            } else if still_stage == 1 && t >= at + len {
+                still_ms = still_from.elapsed().as_secs_f64() * 1e3;
+                still_cpu_us = selftest_cpu_us().saturating_sub(still_cpu_us);
+                still.store(false, Ordering::Relaxed);
+                still_stage = 2;
+            }
+        }
+        // This client waits on its socket in 1 ms steps for latency; with
+        // nothing coming (a still or paused stream), in 20 ms ones, so its own
+        // wake-ups don't hide what the host's cost.
+        let quiet_client = pause_stage == 1 || still_stage == 1;
+        if quiet_client != idle_reads {
+            idle_reads = quiet_client;
+            client.set_read_timeout(Some(Duration::from_millis(if quiet_client { 20 } else { 1 })))?;
         }
         // Feedback on a timer, like the real client (it also keeps the host
         // from deciding the client went quiet while video pauses): every
@@ -3036,6 +3063,16 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
             resume_ms.map_or("never".into(), |m| format!("{m:.0} ms")),
             paused_cpu_us as f64 / 1e3,
             resume_ms.unwrap_or(-1.0),
+        );
+    }
+    if still_win.is_some() {
+        println!(
+            "still {:.0} ms: {:.0} ms of CPU ({:.2}% of a core)
+             selftest.still_ms={still_ms:.0} selftest.still_cpu_ms={:.1}",
+            still_ms,
+            still_cpu_us as f64 / 1e3,
+            still_cpu_us as f64 / 1e3 / still_ms.max(1.0) * 100.0,
+            still_cpu_us as f64 / 1e3,
         );
     }
     if let Some((at, f0, b0)) = since_resize {
