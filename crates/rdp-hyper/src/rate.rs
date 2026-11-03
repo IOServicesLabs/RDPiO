@@ -72,6 +72,16 @@ pub const PARITY_FREE_BYTES: usize = 4096;
 /// is pure overhead, and the rare Wi-Fi loss is repaired from a long-term
 /// reference. (Every block still gets at least one parity shard.)
 const CLEAN_FEC: f32 = 0.02;
+/// A repair (a frame coded from a long-term reference after a loss: the one
+/// that ends the client's freeze) carries at least this much parity
+/// (`repairfec`, see [`Switches::repair_fec`]), clean path or not: it's
+/// asked for because something was just lost (often before the feedback
+/// saying so: a small one went without), and lost too, the picture stays
+/// frozen another request and round trip. A few KB, rare: a packet or two.
+/// Simulated, a game on Wi-Fi losing 1% in runs of 8: frozen 72.6 → 55.1 s
+/// in 32 min, frames never shown 7429 → 6639, packets +0.7% (see
+/// `fecsim`); at a quarter, 60.0 s and 6801.
+const REPAIR_FEC: f32 = 0.5;
 /// Drain mode: while a standing queue drains, the host encodes this many
 /// frames a second, so the backlog drains at nearly the link's whole rate
 /// instead of the sliver a cut bitrate leaves (see [`RateController::drain_fps`]).
@@ -223,6 +233,8 @@ pub struct Switches {
     /// A paused stream holds its rate (`pausehold`; see
     /// [`RateController::set_paused`]).
     pub pause_hold: bool,
+    /// Repairs carry more parity (`repairfec`; see [`REPAIR_FEC`]).
+    pub repair_fec: bool,
     /// A frame of several blocks goes a body of each in turn (`interleave`;
     /// see [`crate::video::send_order`]).
     pub interleave: bool,
@@ -245,6 +257,7 @@ impl Default for Switches {
             soft_slow: true,
             probe_train: true,
             pause_hold: true,
+            repair_fec: true,
             interleave: true,
             probe_idle: true,
         }
@@ -643,6 +656,20 @@ impl RateController {
     /// frames carry less there ([`CLEAN_FEC`]); keyframes always carry the
     /// full ratio. The first loss brings it back for all.
     pub fn parity_for(&self, bytes: usize, keyframe: bool) -> f32 {
+        self.parity_for_frame(bytes, keyframe, false)
+    }
+
+    /// [`Self::parity_for`], and for a repair at least [`REPAIR_FEC`].
+    pub fn parity_for_frame(&self, bytes: usize, keyframe: bool, repair: bool) -> f32 {
+        let fec = self.parity_of(bytes, keyframe);
+        if repair && self.switches.repair_fec {
+            fec.max(REPAIR_FEC)
+        } else {
+            fec
+        }
+    }
+
+    fn parity_of(&self, bytes: usize, keyframe: bool) -> f32 {
         if self.clean && !keyframe && bytes <= PARITY_FREE_BYTES {
             0.0
         } else if self.clean && !keyframe && self.switches.fec_floor {
@@ -1812,6 +1839,7 @@ mod tests {
                     soft_slow: false,
                     probe_train: false,
                     pause_hold: false,
+                    repair_fec: false,
                     interleave: false,
                     probe_idle: false,
                 },

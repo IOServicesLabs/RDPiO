@@ -17,7 +17,10 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 
+use std::time::{Duration, Instant};
+
 use crate::control::Feedback;
+use crate::ltr::{Ltr, LtrPlan};
 use crate::rate::{Limits, RateController, Switches};
 use crate::video::{layout_of, order_of, parity_count, MAX_BLOCK_DATA, SHARD_HEADER};
 use crate::wire::OVERHEAD;
@@ -88,6 +91,8 @@ impl Path {
         lan: true,
         warm_bps: None,
     };
+    /// One packet in 10 000 lost: a LAN that's clean but for the odd one.
+    pub const NEAR_CLEAN: Path = Path { name: "LAN 0.01%", loss: 0.0001, ..Self::CLEAN_LAN };
     /// 1% of packets lost at random.
     pub const WIFI_RANDOM: Path = Path { name: "Wi-Fi 1% random", loss: 0.01, ..Self::CLEAN_LAN };
     /// 1% of packets lost in runs of 8 on average.
@@ -137,7 +142,7 @@ pub(crate) enum Kind {
 
 /// The parity ratio a frame of `bytes` and `kind` goes with.
 pub(crate) fn parity(r: &RateController, bytes: usize, kind: Kind) -> f32 {
-    r.parity_for(bytes, kind == Kind::Key)
+    r.parity_for_frame(bytes, kind == Kind::Key, kind == Kind::Repair)
 }
 
 struct Frame {
@@ -273,11 +278,30 @@ impl Tally {
     }
 }
 
+/// The host's switches for a run.
+#[derive(Clone, Copy)]
+pub(crate) struct Arm {
+    pub switches: Switches,
+}
+
+impl Default for Arm {
+    fn default() -> Self {
+        Self { switches: Switches::default() }
+    }
+}
+
+impl From<Switches> for Arm {
+    fn from(switches: Switches) -> Self {
+        Self { switches, ..Self::default() }
+    }
+}
+
 /// `seeds` runs of `secs` each, summed.
-pub(crate) fn run(switches: Switches, load: Load, path: Path, secs: u64, seeds: u64) -> Tally {
+pub(crate) fn run(arm: impl Into<Arm>, load: Load, path: Path, secs: u64, seeds: u64) -> Tally {
+    let arm = arm.into();
     let mut t = Tally::default();
     for seed in 0..seeds {
-        t.add(simulate(switches, load, path, secs, seed));
+        t.add(simulate(arm, load, path, secs, seed));
     }
     t
 }
@@ -317,10 +341,10 @@ impl Office {
     }
 }
 
-fn simulate(switches: Switches, load: Load, path: Path, secs: u64, seed: u64) -> Tally {
+fn simulate(arm: Arm, load: Load, path: Path, secs: u64, seed: u64) -> Tally {
     let mut tally = Tally::default();
     let mut r = RateController::new(Limits::default());
-    r.set_switches(switches);
+    r.set_switches(arm.switches);
     r.set_lan(path.lan);
     if let Some(w) = path.warm_bps {
         r.warm_start(w);
@@ -368,9 +392,9 @@ fn simulate(switches: Switches, load: Load, path: Path, secs: u64, seed: u64) ->
     let mut next_capture = 0u64;
     let mut last_encoded: Option<u64> = None;
     // Long-term references: (frame, the client has it), two by turns.
-    let mut slots: [Option<(usize, bool)>; 2] = [None; 2];
-    let (mut next_slot, mut last_mark) = (0usize, None::<u64>);
-    let mut repairs: VecDeque<u64> = VecDeque::new();
+    let t0 = Instant::now();
+    let at = |t: u64| t0 + Duration::from_micros(t);
+    let mut ltr = Ltr::new(0);
     let mut was_paused = false;
     let mut resumed_at: Option<u64> = None;
 
@@ -394,11 +418,7 @@ fn simulate(switches: Switches, load: Load, path: Path, secs: u64, seed: u64) ->
             match to_host.pop_front().unwrap().1 {
                 Msg::Feedback(fb) => {
                     if let Some(id) = fb.ltr_frame {
-                        for s in slots.iter_mut().flatten() {
-                            if s.0 == id as usize {
-                                s.1 = true;
-                            }
-                        }
+                        ltr.acked(id);
                     }
                     r.update(&fb, 50, now_ms);
                 }
@@ -426,7 +446,7 @@ fn simulate(switches: Switches, load: Load, path: Path, secs: u64, seed: u64) ->
                 // The pipeline was let go: a new encoder, a keyframe.
                 want_key = true;
                 recover = false;
-                slots = [None; 2];
+                ltr = Ltr::new(0);
                 resumed_at = Some(t);
                 chain = false;
                 ltr_have = None;
@@ -444,44 +464,36 @@ fn simulate(switches: Switches, load: Load, path: Path, secs: u64, seed: u64) ->
             let interval = r.drain_fps(now_ms).map_or(0, |d| 1_000_000 / d as u64);
             let due = last_encoded.is_none_or(|l| t + 2_000 >= l + interval);
             let bps = r.bitrate_bps();
-            let pick = if paused {
-                None
-            } else if want_key {
-                Some((Kind::Key, ((bps as f64 * 0.12 / 8.0) as usize).clamp(40_000, 300_000)))
-            } else if recover {
-                repairs.retain(|&a| t < a + 1_000_000);
-                let newest = slots.iter().flatten().filter(|s| s.1).map(|s| s.0).max();
-                if newest.is_some() && repairs.len() < 3 {
-                    repairs.push_back(t);
-                    Some((Kind::Repair, (2 * content.unwrap_or(0)).max(4_000)))
-                } else {
-                    repairs.clear();
-                    Some((Kind::Key, ((bps as f64 * 0.12 / 8.0) as usize).clamp(40_000, 300_000)))
-                }
-            } else {
-                content.filter(|_| due).map(|b| (Kind::Delta, b))
-            };
-            if let Some((kind, bytes)) = pick {
+            let encode = !paused && (want_key || recover || content.is_some() && due);
+            let pick = encode.then(|| {
+                let key_bytes = ((bps as f64 * 0.12 / 8.0) as usize).clamp(40_000, 300_000);
+                let id = frames.len();
+                let plan = ltr.plan(id as u64, recover, want_key, at(t));
+                let kind = match plan {
+                    _ if want_key => Kind::Key,
+                    LtrPlan::Keyframe => Kind::Key,
+                    LtrPlan::Encode { from: Some(_), .. } => Kind::Repair,
+                    LtrPlan::Encode { .. } => Kind::Delta,
+                };
+                let bytes = match kind {
+                    Kind::Key => key_bytes,
+                    Kind::Repair => (2 * content.unwrap_or(0)).max(4_000),
+                    Kind::Delta => content.unwrap_or(1_000),
+                };
+                (kind, bytes, ltr.sent(id as u64, id as u32, kind == Kind::Key).0)
+            });
+            if let Some((kind, bytes, kept)) = pick {
                 (want_key, recover) = (false, false);
                 last_encoded = Some(t);
                 let id = frames.len();
-                let mut ltr = false;
+                let ltr_frame = kept;
                 match kind {
                     Kind::Key => {
-                        slots = [None; 2];
-                        repairs.clear();
                         r.note_keyframe(id as u32, bytes, now_ms);
                         tally.keyframes += 1;
                     }
                     Kind::Repair => tally.repairs += 1,
-                    Kind::Delta => {
-                        if last_mark.is_none_or(|m| t >= m + 250_000) {
-                            slots[next_slot] = Some((id, false));
-                            next_slot = (next_slot + 1) % 2;
-                            last_mark = Some(t);
-                            ltr = true;
-                        }
-                    }
+                    Kind::Delta => {}
                 }
                 let fec = parity(&r, bytes, kind);
                 let probe = r.probe_due(bytes, now_ms);
@@ -539,7 +551,7 @@ fn simulate(switches: Switches, load: Load, path: Path, secs: u64, seed: u64) ->
                 frames.push(Frame {
                     capture_us: t,
                     kind,
-                    ltr,
+                    ltr: ltr_frame,
                     probe,
                     blocks,
                     outstanding: packets,
@@ -692,14 +704,18 @@ mod tests {
     const SEEDS: u64 = 16;
 
     /// Every load on every path, as both arms see them: (load, path, off, on).
-    fn ab(name: &str, off: Switches, on: Switches, cases: &[(Load, Path)]) -> Vec<(Load, Path, Tally, Tally)> {
-        println!("== {name} ==");
+    fn ab(name: &str, off: impl Into<Arm>, on: impl Into<Arm>, cases: &[(Load, Path)]) -> Vec<(Load, Path, Tally, Tally)> {
+        ab_for(name, off.into(), on.into(), cases, SECS)
+    }
+
+    fn ab_for(name: &str, off: Arm, on: Arm, cases: &[(Load, Path)], secs: u64) -> Vec<(Load, Path, Tally, Tally)> {
+        println!("== {name} ({SEEDS} x {secs} s) ==");
         cases
             .iter()
             .map(|&(load, path)| {
                 println!("{load:?} on {}:", path.name);
                 Tally::header();
-                let (a, b) = (run(off, load, path, SECS, SEEDS), run(on, load, path, SECS, SEEDS));
+                let (a, b) = (run(off, load, path, secs, SEEDS), run(on, load, path, secs, SEEDS));
                 a.row("off");
                 b.row("on");
                 (load, path, a, b)
@@ -710,21 +726,22 @@ mod tests {
     /// Nothing worse: no more frames unshown (lost, or behind a loss until
     /// the repair), no more packets or bytes a frame shown, no longer to a
     /// picture (a resume or a repair), no slower. Within noise: 1%, 1 ms,
-    /// frames lost 2% and unshown 1%, and a frame either way (an arm that
-    /// differs in one frame's packets differs from then on in which frames
-    /// the path's losses hit: a different repair, a different rate).
+    /// frames lost 2% and unshown 1%, and a frame (or its 17 ms frozen)
+    /// either way (an arm that differs in one frame's packets differs from
+    /// then on in which frames the path's losses hit: a different repair, a
+    /// different rate).
     fn no_worse(load: Load, path: Path, off: &Tally, on: &Tally) {
         let what = format!("{load:?} on {}", path.name);
         assert!(on.lost <= off.lost + off.lost / 50 + 1, "{what}: frames lost {} → {}", off.lost, on.lost);
         assert!(on.unshown() <= off.unshown() + off.unshown() / 100 + 1, "{what}: unshown {} → {}", off.unshown(), on.unshown());
         assert!(on.pkts_per_shown() <= off.pkts_per_shown() * 1.01, "{what}: packets a frame {:.2} → {:.2}", off.pkts_per_shown(), on.pkts_per_shown());
         assert!(on.bytes_per_shown() <= off.bytes_per_shown() * 1.01, "{what}: bytes a frame {:.0} → {:.0}", off.bytes_per_shown(), on.bytes_per_shown());
-        assert!(on.freeze_ms() <= off.freeze_ms() * 1.01 + 1.0, "{what}: frozen {:.0} → {:.0} ms", off.freeze_ms(), on.freeze_ms());
+        assert!(on.freeze_ms() <= off.freeze_ms() * 1.01 + FRAME_US as f64 / 1000.0, "{what}: frozen {:.0} → {:.0} ms", off.freeze_ms(), on.freeze_ms());
         assert!(on.resume_mean() <= off.resume_mean() + 1.0, "{what}: to a picture {:.0} → {:.0} ms", off.resume_mean(), on.resume_mean());
         assert!(on.latency_p95() <= off.latency_p95() + 1.0, "{what}: p95 {:.1} → {:.1} ms", off.latency_p95(), on.latency_p95());
     }
 
-    const PATHS: [Path; 5] = [Path::CLEAN_LAN, Path::WIFI_RANDOM, Path::WIFI_BURSTY, Path::WIFI_FADES, Path::SLOW];
+    const PATHS: [Path; 6] = [Path::CLEAN_LAN, Path::NEAR_CLEAN, Path::WIFI_RANDOM, Path::WIFI_BURSTY, Path::WIFI_FADES, Path::SLOW];
 
     /// A frame of several blocks in turns: a run of losses costs each block
     /// a few. Keyframes (300 KB, five blocks) are what it's for.
@@ -738,7 +755,7 @@ mod tests {
         for (load, path, a, b) in &runs {
             no_worse(*load, *path, a, b);
         }
-        let (_, _, a, b) = &runs[2];
+        let (_, _, a, b) = &runs[3];
         assert!(b.lost_keys * 2 <= a.lost_keys, "keyframes lost {} → {}", a.lost_keys, b.lost_keys);
         assert!(b.resume_mean() < a.resume_mean() * 0.7, "to a picture {:.0} → {:.0} ms", a.resume_mean(), b.resume_mean());
     }
@@ -760,11 +777,31 @@ mod tests {
         assert!(b.pkts_per_shown() < a.pkts_per_shown() * 0.9, "office, clean LAN: {:.2} → {:.2}", a.pkts_per_shown(), b.pkts_per_shown());
     }
 
+    /// A repair carries a quarter its size in parity at least: lost, the
+    /// picture stays frozen another request and round trip.
+    #[test]
+    fn fecsim_repair_fec() {
+        let on = Arm::default();
+        let off = Arm { switches: Switches { repair_fec: false, ..on.switches } };
+        let mut cases: Vec<(Load, Path)> = PATHS.iter().map(|&p| (Load::Game, p)).collect();
+        cases.extend(PATHS.iter().map(|&p| (Load::Office, p)));
+        cases.extend([(Load::Glances, Path::WIFI_BURSTY), (Load::Glances, Path::WIFI_FADES)]);
+        let runs = ab("repairfec", off, on, &cases);
+        for (load, path, a, b) in &runs {
+            no_worse(*load, *path, a, b);
+        }
+        for load in [Load::Game, Load::Office] {
+            let (_, _, a, b) = runs.iter().find(|r| r.0 == load && r.1.name == Path::WIFI_BURSTY.name).unwrap();
+            assert!(b.freeze_ms() < a.freeze_ms() * 0.95, "{load:?}, bursty: frozen {:.0} → {:.0} ms", a.freeze_ms(), b.freeze_ms());
+        }
+    }
+
     /// The baseline: what every path and load costs today.
     #[test]
     fn fecsim_baseline() {
         for (load, path) in [
             (Load::Office, Path::CLEAN_LAN),
+            (Load::Office, Path::NEAR_CLEAN),
             (Load::Office, Path::WIFI_RANDOM),
             (Load::Office, Path::WIFI_BURSTY),
             (Load::Office, Path::WIFI_FADES),
@@ -778,7 +815,7 @@ mod tests {
         ] {
             println!("{load:?} on {}:", path.name);
             Tally::header();
-            run(Switches::default(), load, path, SECS, SEEDS).row("default");
+            run(Arm::default(), load, path, SECS, SEEDS).row("default");
         }
     }
 }
