@@ -278,7 +278,10 @@ closing the window locks the host immediately.
 
 Clipboard and file copies only use what the stream leaves free: they slow
 down the moment the link starts queueing, and the pointer never waits behind
-them (it has its own lane).
+them (it has its own lane). On a direct-mode host the agent runs as SYSTEM,
+and Windows hides a file copy's list from SYSTEM (even impersonating the
+user): it asks a short-lived `rdpio --hyper-clipboard-files` running as the
+signed-in user for the copied paths, and reads the files with the user's rights.
 
 A host whose display has gone to sleep is woken when a client connects (it
 has to be on to be captured), and stays awake while streamed — as does the

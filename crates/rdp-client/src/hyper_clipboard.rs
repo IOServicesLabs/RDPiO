@@ -495,10 +495,10 @@ fn is_device_name(name: &str) -> bool {
 /// isn't that copy's — the newer change has its own notification.
 fn send_files(link: Arc<ReliableLink>, seq: u32) {
     let transfer = TRANSFER.fetch_add(1, Ordering::SeqCst) + 1;
-    tracing::info!(transfer, "files copied here; reading their names");
     let _ = std::thread::Builder::new().name("hyper-files".into()).spawn(move || {
         crate::net_tune::eco_thread();
         let Some(roots) = copied_paths(seq) else { return };
+        tracing::info!(transfer, paths = roots.len(), "files copied here");
         // Only files the user signed in here could read themselves (the list
         // is read as ourselves: the clipboard isn't the user's to guard, and
         // as SYSTEM impersonating them, Explorer's list never came).
@@ -512,6 +512,9 @@ fn send_files(link: Arc<ReliableLink>, seq: u32) {
 /// (it renders the list on request, and can still be busy publishing a big
 /// copy); `None`, logged, if they never come or a newer change came first.
 fn copied_paths(seq: u32) -> Option<Vec<PathBuf>> {
+    if running_as_system() {
+        return paths_from_user(seq);
+    }
     for _ in 0..10 {
         let roots = unsafe { crate::clipboard::copied_paths() };
         if unsafe { GetClipboardSequenceNumber() } != seq {
@@ -526,6 +529,65 @@ fn copied_paths(seq: u32) -> Option<Vec<PathBuf>> {
     }
     tracing::warn!("files were copied, but the clipboard never gave their names");
     None
+}
+
+/// What [`print_copied_paths`] exits with.
+const PATHS_LISTED: u32 = 0;
+const PATHS_NONE: u32 = 1;
+const PATHS_MOVED_ON: u32 = 2;
+const PATHS_NEVER_CAME: u32 = 3;
+
+/// The paths copied in clipboard change `seq`, from a helper running as the
+/// signed-in user. As SYSTEM (the direct-mode agent) Windows shows us a file
+/// copy's clipboard as one opaque `DataObject`: no `CF_HDROP`, not even while
+/// impersonating the user — so every copy of files on a host went unsent,
+/// without a word. Only the user's own processes see the list.
+fn paths_from_user(seq: u32) -> Option<Vec<PathBuf>> {
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    let mut session = 0u32;
+    unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) }.ok()?;
+    match crate::hyper_direct::output_as_user(session, &format!("--hyper-clipboard-files {seq}")) {
+        Ok(Some((PATHS_LISTED, out))) => {
+            let roots: Vec<PathBuf> = String::from_utf8_lossy(&out).lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect();
+            (!roots.is_empty()).then_some(roots)
+        }
+        // Something other than files was copied, or a newer change came.
+        Ok(Some((PATHS_NONE | PATHS_MOVED_ON, _))) => None,
+        Ok(other) => {
+            tracing::warn!(exit = ?other.map(|o| o.0), "files were copied, but the clipboard never gave their names");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "can't read the signed-in user's clipboard for copied files");
+            None
+        }
+    }
+}
+
+/// `--hyper-clipboard-files <seq>`, as the signed-in user (see
+/// [`paths_from_user`]): print the paths copied in clipboard change `seq`,
+/// one a line, waiting a little for Explorer to hand them over. The exit
+/// code says how it went.
+pub fn print_copied_paths(seq: u32) -> i32 {
+    use std::io::Write;
+    for _ in 0..10 {
+        if unsafe { GetClipboardSequenceNumber() } != seq {
+            return PATHS_MOVED_ON as i32;
+        }
+        if unsafe { IsClipboardFormatAvailable(CF_HDROP) }.is_err() {
+            return PATHS_NONE as i32;
+        }
+        if let Some(roots) = unsafe { crate::clipboard::copied_paths() }.filter(|r| !r.is_empty()) {
+            let mut out = std::io::stdout().lock();
+            for r in roots {
+                let _ = writeln!(out, "{}", r.display());
+            }
+            return if out.flush().is_ok() { PATHS_LISTED as i32 } else { PATHS_NEVER_CAME as i32 };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    PATHS_NEVER_CAME as i32
 }
 
 fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
@@ -615,6 +677,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if GetClipboardSequenceNumber() == seq {
                         link.send(&m);
                     }
+                } else if running_as_system() {
+                    // Nothing we can read: as SYSTEM, that's how a copy of
+                    // files looks (see `paths_from_user`). The user's helper
+                    // says whether it was one.
+                    send_files(link, seq);
                 }
             }
         }

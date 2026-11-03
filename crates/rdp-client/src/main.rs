@@ -124,6 +124,13 @@ fn main() {
         let percent = std::env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(0);
         std::process::exit(if virtual_display::set_scale_here(&name, percent) { 0 } else { 1 });
     }
+    // The Hyper agent (SYSTEM) asking the signed-in user's own process for
+    // the files copied on this PC: Windows hides them from SYSTEM.
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("--hyper-clipboard-files") {
+        let seq = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        std::process::exit(hyper_clipboard::print_copied_paths(seq));
+    }
     #[cfg(windows)]
     if std::env::args().nth(1).as_deref() == Some("--hyper-lock-session") {
         unsafe {
