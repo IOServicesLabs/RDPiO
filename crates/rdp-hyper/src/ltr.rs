@@ -11,7 +11,8 @@
 //! client has said so (one being refilled counts for nothing until then: the
 //! client may still hold the old picture there). A loss is answered with a
 //! frame coded from the newest confirmed one only; with none, or a third
-//! repair within a second, a keyframe.
+//! repair within a second, a keyframe — a repair the client has since shown
+//! worked (`repairok`, see [`Ltr::new`]) not counting.
 
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,10 @@ pub struct Ltr {
     /// The picture coded as a repair.
     repairing: Option<u64>,
     repairs: Vec<Instant>,
+    /// The newest repair sent (its frame), and whether one the client has
+    /// since shown worked clears the count (`repairok`).
+    repaired: Option<u32>,
+    repair_ok: bool,
 }
 
 pub enum LtrPlan {
@@ -43,8 +48,25 @@ impl Ltr {
     const EVERY: Duration = Duration::from_millis(250);
     const REPAIRS_PER_SEC: usize = 3;
 
-    pub fn new(encoder: u64) -> Self {
-        Self { encoder, slots: [None; SLOTS], next_slot: 0, last_mark: None, marking: Vec::new(), repairing: None, repairs: Vec::new() }
+    /// `repair_ok`: a kept frame newer than a repair, decoded, shows the
+    /// repair worked, and it no longer counts toward the keyframe a third
+    /// one in a second brings. The rule is for repairs that don't take; on
+    /// Wi-Fi losing a frame or two a second, each repaired, it sent a 300 KB
+    /// keyframe every second or so — itself the frame likeliest lost
+    /// (simulated, a game on 1% loss in runs of 8: 386 keyframes in 32
+    /// minutes, 67 with it; see `fecsim`).
+    pub fn new(encoder: u64, repair_ok: bool) -> Self {
+        Self {
+            encoder,
+            slots: [None; SLOTS],
+            next_slot: 0,
+            last_mark: None,
+            marking: Vec::new(),
+            repairing: None,
+            repairs: Vec::new(),
+            repaired: None,
+            repair_ok,
+        }
     }
 
     /// Before picture `input` goes in: what the encoder should do with it.
@@ -92,6 +114,7 @@ impl Ltr {
             // A keyframe clears every reference, the client's too.
             self.slots = [None; SLOTS];
             self.repairs.clear();
+            self.repaired = None;
         }
         let kept = self.marking.iter().position(|&(i, _)| i == input).map(|p| self.marking.remove(p).1);
         self.marking.retain(|&(i, _)| i > input);
@@ -99,6 +122,9 @@ impl Ltr {
         let repair = self.repairing == Some(input);
         if repair || self.repairing.is_some_and(|i| i < input) {
             self.repairing = None;
+        }
+        if repair && !keyframe {
+            self.repaired = Some(frame_id);
         }
         (kept, repair && !keyframe)
     }
@@ -109,6 +135,11 @@ impl Ltr {
             if *id == frame_id {
                 *acked = true;
             }
+        }
+        // (Kept after the repair and decoded: the picture's whole again.)
+        if self.repair_ok && self.repaired.is_some_and(|r| newer(frame_id, r)) {
+            self.repairs.clear();
+            self.repaired = None;
         }
     }
 }
@@ -126,7 +157,7 @@ mod tests {
     fn a_loss_is_repaired_from_a_reference_the_client_has() {
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
-        let mut l = Ltr::new(1);
+        let mut l = Ltr::new(1, true);
         let plain = |p: LtrPlan| matches!(p, LtrPlan::Encode { mark: None, from: None });
         // The first picture after a keyframe: no reference yet, a keyframe.
         assert!(matches!(l.plan(0, true, false, at(0)), LtrPlan::Keyframe));
@@ -149,17 +180,18 @@ mod tests {
         assert_eq!(l.sent(5, 105, false), (true, false));
         assert!(matches!(l.plan(6, true, false, at(310)), LtrPlan::Encode { from: Some(1), .. }));
         l.sent(6, 106, false);
-        // Confirmed: the newer slot 1.
+        // Confirmed: the newer slot 1 (and 105 is older than repair 106:
+        // that one hasn't shown it worked).
         l.acked(105);
         assert!(matches!(l.plan(7, true, false, at(320)), LtrPlan::Encode { from: Some(2), .. }));
         l.sent(7, 107, false);
-        // A third repair within the second: a keyframe instead.
+        // A third repair within the second, none shown to work: a keyframe.
         assert!(matches!(l.plan(8, true, false, at(330)), LtrPlan::Keyframe));
         l.sent(8, 108, true);
         // The keyframe cleared everything.
         assert!(matches!(l.plan(9, true, false, at(2000)), LtrPlan::Keyframe));
         // Refilling slot 0 drops what it held until confirmed again.
-        let mut l = Ltr::new(1);
+        let mut l = Ltr::new(1, true);
         l.plan(1, false, false, at(0));
         l.sent(1, 11, false);
         l.acked(11);
@@ -168,5 +200,37 @@ mod tests {
         l.plan(3, false, false, at(600)); // slot 0 again
         l.sent(3, 13, false);
         assert!(matches!(l.plan(4, true, false, at(610)), LtrPlan::Keyframe), "11 was replaced; 12, 13 unconfirmed");
+    }
+
+    /// Four losses within a second, each repair taken: the fourth is
+    /// repaired too (`repairok`); switched off, it's a keyframe, as before.
+    #[test]
+    fn repairs_that_worked_dont_bring_a_keyframe() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        for ok in [true, false] {
+            let mut l = Ltr::new(1, ok);
+            let (mut input, mut id, mut ms) = (0u64, 0u32, 0u64);
+            let mut step = |l: &mut Ltr, recover: bool| {
+                let plan = l.plan(input, recover, false, at(ms));
+                let key = matches!(plan, LtrPlan::Keyframe);
+                let (kept, _) = l.sent(input, id, key);
+                if kept {
+                    l.acked(id);
+                }
+                (input, id, ms) = (input + 1, id + 1, ms + 50);
+                plan
+            };
+            step(&mut l, false);
+            let mut keyframes = 0;
+            // A loss every 250 ms, each repaired, a kept frame decoded after.
+            for _ in 0..4 {
+                keyframes += matches!(step(&mut l, true), LtrPlan::Keyframe) as u32;
+                for _ in 0..4 {
+                    step(&mut l, false);
+                }
+            }
+            assert_eq!(keyframes, if ok { 0 } else { 1 }, "repairok {ok}");
+        }
     }
 }

@@ -482,6 +482,13 @@ The host's perf line names why the rate came down in each 5 s (`cuts=`:
   stays frozen another request and round trip. Simulated, a game on Wi-Fi
   losing 1% in runs of 8: frozen 72.6 → 55.1 s in 32 min, frames never
   shown 7429 → 6639, packets +0.7%; office 1657 → 1554 ms.
+- **Repairs that worked** (`repairok`): a third repair within a second
+  brings a keyframe — unless the client has since decoded a kept frame newer
+  than the last repair, which shows it took. The rule is for repairs that
+  don't; on Wi-Fi losing a frame or two a second, each repaired, it sent a
+  300 KB keyframe every second or so (`rdp_hyper::ltr`). Simulated, a game
+  losing 1% in runs of 8: keyframes 386 → 67 in 32 min, bytes a frame -1.1%,
+  frozen 55.1 → 52.3 s.
 - **Slow pacing** (`slowpace=1`, off by default): on a slow or queued link
   frames are paced at 1.2x the target instead of 2.5x, so they wait on the
   host rather than in front of the audio in the relay. Simulated: audio p95
@@ -500,7 +507,7 @@ frame may take up to 0.2 bits a pixel, at most 100 ms of the link, instead
 of two frames' worth), `presetfollow=1`, `introfresh=1` (the last two off
 by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
 `gapcut`, `probetrain`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
-`growcap`, `softslow`, `fecfloor`, `interleave`, `probeidle`, `repairfec`,
+`growcap`, `softslow`, `fecfloor`, `interleave`, `probeidle`, `repairfec`, `repairok`,
 `gamesharpen` (game mode re-encodes a still screen sharper too, as office
 mode does, under 0.05 bits a pixel a frame: 1440p60 under ~11 Mbps),
 `pausehold` (a minimized client's stream holds its rate instead of drifting

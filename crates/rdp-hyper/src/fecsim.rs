@@ -278,15 +278,17 @@ impl Tally {
     }
 }
 
-/// The host's switches for a run.
+/// The host's switches for a run: the rate controller's, and `repairok`
+/// (see [`Ltr::new`]).
 #[derive(Clone, Copy)]
 pub(crate) struct Arm {
     pub switches: Switches,
+    pub repair_ok: bool,
 }
 
 impl Default for Arm {
     fn default() -> Self {
-        Self { switches: Switches::default() }
+        Self { switches: Switches::default(), repair_ok: true }
     }
 }
 
@@ -394,7 +396,7 @@ fn simulate(arm: Arm, load: Load, path: Path, secs: u64, seed: u64) -> Tally {
     // Long-term references: (frame, the client has it), two by turns.
     let t0 = Instant::now();
     let at = |t: u64| t0 + Duration::from_micros(t);
-    let mut ltr = Ltr::new(0);
+    let mut ltr = Ltr::new(0, arm.repair_ok);
     let mut was_paused = false;
     let mut resumed_at: Option<u64> = None;
 
@@ -446,7 +448,7 @@ fn simulate(arm: Arm, load: Load, path: Path, secs: u64, seed: u64) -> Tally {
                 // The pipeline was let go: a new encoder, a keyframe.
                 want_key = true;
                 recover = false;
-                ltr = Ltr::new(0);
+                ltr = Ltr::new(0, arm.repair_ok);
                 resumed_at = Some(t);
                 chain = false;
                 ltr_have = None;
@@ -781,8 +783,8 @@ mod tests {
     /// picture stays frozen another request and round trip.
     #[test]
     fn fecsim_repair_fec() {
-        let on = Arm::default();
-        let off = Arm { switches: Switches { repair_fec: false, ..on.switches } };
+        let on = Arm { repair_ok: false, ..Arm::default() };
+        let off = Arm { switches: Switches { repair_fec: false, ..on.switches }, ..on };
         let mut cases: Vec<(Load, Path)> = PATHS.iter().map(|&p| (Load::Game, p)).collect();
         cases.extend(PATHS.iter().map(|&p| (Load::Office, p)));
         cases.extend([(Load::Glances, Path::WIFI_BURSTY), (Load::Glances, Path::WIFI_FADES)]);
@@ -794,6 +796,25 @@ mod tests {
             let (_, _, a, b) = runs.iter().find(|r| r.0 == load && r.1.name == Path::WIFI_BURSTY.name).unwrap();
             assert!(b.freeze_ms() < a.freeze_ms() * 0.95, "{load:?}, bursty: frozen {:.0} → {:.0} ms", a.freeze_ms(), b.freeze_ms());
         }
+    }
+
+    /// A repair the client has shown worked doesn't count toward the
+    /// keyframe a third in a second brings (`repairok`): Wi-Fi that loses a
+    /// frame or two a second got a 300 KB keyframe for every few.
+    #[test]
+    fn fecsim_repair_ok() {
+        let on = Arm::default();
+        let off = Arm { repair_ok: false, ..on };
+        let mut cases: Vec<(Load, Path)> = PATHS.iter().map(|&p| (Load::Game, p)).collect();
+        cases.extend(PATHS.iter().map(|&p| (Load::Office, p)));
+        cases.extend([(Load::Glances, Path::WIFI_BURSTY), (Load::Glances, Path::WIFI_FADES)]);
+        let runs = ab("repairok", off, on, &cases);
+        for (load, path, a, b) in &runs {
+            no_worse(*load, *path, a, b);
+        }
+        let (_, _, a, b) = runs.iter().find(|r| r.0 == Load::Game && r.1.name == Path::WIFI_BURSTY.name).unwrap();
+        assert!(b.keyframes * 3 < a.keyframes, "game, bursty: keyframes {} → {}", a.keyframes, b.keyframes);
+        assert!(b.bytes_per_shown() < a.bytes_per_shown() * 0.995, "game, bursty: bytes a frame {:.0} → {:.0}", a.bytes_per_shown(), b.bytes_per_shown());
     }
 
     /// The baseline: what every path and load costs today.

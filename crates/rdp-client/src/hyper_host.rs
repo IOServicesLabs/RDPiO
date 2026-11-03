@@ -1159,7 +1159,7 @@ fn stream_inner(
     let mut last_encoded_us = 0u64;
     // Trickling (see TRICKLE_AFTER_INPUT_US), and frames sent so (for the log).
     let (mut trickle, mut trickle_frames) = (Trickle::default(), 0u32);
-    let mut ltr = Ltr::new(0);
+    let mut ltr = Ltr::new(0, crate::host_ab::ab("repairok", true));
     // The frame rate follows the bitrate (`fpsfollow`), and the rate it
     // follows to now; drain mode as last logged; when the switches were last
     // read, and the path's rate last remembered.
@@ -1723,7 +1723,7 @@ fn stream_inner(
         // the newest the client has (else a keyframe). After the bitrate
         // (a rebuilt encoder has none of the old one's).
         if ltr.encoder != enc.id {
-            ltr = Ltr::new(enc.id);
+            ltr = Ltr::new(enc.id, crate::host_ab::ab("repairok", true));
         }
         let acked = shared.ltr_acked.load(Ordering::Relaxed);
         if acked != u32::MAX {
