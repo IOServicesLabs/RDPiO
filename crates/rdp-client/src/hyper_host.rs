@@ -2768,6 +2768,11 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     // Motion source, on its own thread so presenting never stalls the receiver.
     let painting = Arc::new(AtomicBool::new(true));
     let paint_flag = painting.clone();
+    // Still while the client's minimized (`--pause-at`): a desktop nobody's
+    // using, and the painter's own presents (~250 a second) aren't counted as
+    // what a paused host costs.
+    let still = Arc::new(AtomicBool::new(false));
+    let still_flag = still.clone();
     let painter = std::thread::spawn(move || {
         crate::window::SHOW_INACTIVE.store(true, Ordering::Relaxed);
         // `--small-motion`: a speck of motion (a clock, a caret), not a scene.
@@ -2776,6 +2781,11 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
         let Ok(mut renderer) = rdp_gpu::Renderer::new(window.hwnd_raw(), pw, ph, rdp_gpu::Backend::D3D11) else { return };
         let mut color = 0u32;
         while paint_flag.load(Ordering::Relaxed) {
+            if still_flag.load(Ordering::Relaxed) {
+                let _ = window.pump();
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             color = color.wrapping_add(1);
             let c = (color % 64) as f32 / 63.0;
             let _ = window.pump();
@@ -2871,11 +2881,13 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
             let t = start.elapsed();
             if pause_stage == 0 && t >= at {
                 let _ = client.send(&csend.seal(Kind::Control, &Control::Paused { paused: true }.to_bytes()));
+                still.store(true, Ordering::Relaxed);
                 (pause_stage, paused_at, paused_cpu_us) = (1, Instant::now(), selftest_cpu_us());
                 println!("selftest: paused after {frames} frames");
             } else if pause_stage == 1 && t >= at + len {
                 paused_ms = paused_at.elapsed().as_secs_f64() * 1e3;
                 paused_cpu_us = selftest_cpu_us().saturating_sub(paused_cpu_us);
+                still.store(false, Ordering::Relaxed);
                 let _ = client.send(&csend.seal(Kind::Control, &Control::Paused { paused: false }.to_bytes()));
                 (pause_stage, restored_at) = (2, Some(Instant::now()));
             }
