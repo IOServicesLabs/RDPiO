@@ -451,6 +451,9 @@ Host power switches (same file, on by default):
 
 - `clockbatt`: no GPU clock floor on battery (power source looked at every
   3 s); the floor cost ~6 W on a laptop for an encode that took 3-4 ms anyway.
+- `pausequiet`: the client's window minimized 5 s, Wi-Fi streaming mode, the
+  1 ms timer, MMCSS and the REALTIME GPU class let go until it's back; a
+  paused stream sends nothing, yet those kept the laptop out of idle.
 
 ## Latency notes
 

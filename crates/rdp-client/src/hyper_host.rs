@@ -725,6 +725,88 @@ impl Drop for GpuClockFloor {
     }
 }
 
+/// The client's window minimized this long: the stream goes quiet (see
+/// [`Latency`]). A glance at another window and back costs nothing.
+const PAUSE_QUIET_AFTER: Duration = Duration::from_secs(5);
+
+/// What a stream holds for latency's sake — and lets go once the client's
+/// window has stayed minimized [`PAUSE_QUIET_AFTER`] (switch `pausequiet`):
+/// nothing is encoded or sent then (93% of a measured laptop's streaming
+/// hours), yet each kept it out of its idle states. The Wi-Fi radio awake
+/// and on its channel (streaming mode, no background scans); the system
+/// timer at 1 ms; the capture thread in MMCSS's "Games" class; and, held
+/// apart in [`GpuClassDown`], the process's GPU scheduling class at
+/// REALTIME. All taken again at once as the window comes back, before its
+/// first frame. One of the two is held at a time, so nothing is put back
+/// twice, and whichever is held as the stream ends goes with it. Made and
+/// dropped on the capture thread (the MMCSS handle is the thread's).
+struct Latency {
+    _wifi: Option<crate::net_tune::WifiLowLatency>,
+    _boost: Option<crate::net_tune::ThreadBoost>,
+    _timer: crate::net_tune::FineTimer,
+}
+
+impl Latency {
+    fn hold() -> Self {
+        Self {
+            _wifi: crate::net_tune::WifiLowLatency::enable(),
+            _boost: crate::net_tune::ThreadBoost::games(),
+            _timer: crate::net_tune::FineTimer::new(),
+        }
+    }
+}
+
+type KmtGetClass = unsafe extern "system" fn(windows::Win32::Foundation::HANDLE, *mut i32) -> i32;
+type KmtSetClass = unsafe extern "system" fn(windows::Win32::Foundation::HANDLE, i32) -> i32;
+
+/// gdi32's D3DKMT{Get,Set}ProcessSchedulingPriorityClass (no public binding).
+fn kmt_class() -> Option<(KmtGetClass, KmtSetClass)> {
+    static F: std::sync::OnceLock<Option<(KmtGetClass, KmtSetClass)>> = std::sync::OnceLock::new();
+    *F.get_or_init(|| unsafe {
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        let gdi = LoadLibraryW(windows::core::w!("gdi32.dll")).ok()?;
+        let get = GetProcAddress(gdi, windows::core::s!("D3DKMTGetProcessSchedulingPriorityClass"))?;
+        let set = GetProcAddress(gdi, windows::core::s!("D3DKMTSetProcessSchedulingPriorityClass"))?;
+        Some((std::mem::transmute::<_, KmtGetClass>(get), std::mem::transmute::<_, KmtSetClass>(set)))
+    })
+}
+
+/// The process's GPU scheduling class at NORMAL while a paused stream is
+/// quiet (see [`Latency`]), and back to what it was on drop: REALTIME for the
+/// service's agent (HIGH otherwise), as the capture set it (`rdp_gpu::hyper`'s
+/// `raise_gpu_priority`). The CPU's priority class is never raised (it stays
+/// NORMAL); the stream's raised CPU scheduling is its threads', of which the
+/// capture thread's MMCSS class goes with `Latency`. (`None` inside: nothing
+/// was lowered.)
+struct GpuClassDown(Option<i32>);
+
+impl GpuClassDown {
+    /// D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL.
+    const NORMAL: i32 = 2;
+
+    fn lower() -> Self {
+        let Some((get, set)) = kmt_class() else { return Self(None) };
+        unsafe {
+            let process = windows::Win32::System::Threading::GetCurrentProcess();
+            let mut was = 0i32;
+            if get(process, &mut was) != 0 || was <= Self::NORMAL {
+                return Self(None);
+            }
+            Self((set(process, Self::NORMAL) == 0).then_some(was))
+        }
+    }
+}
+
+impl Drop for GpuClassDown {
+    fn drop(&mut self) {
+        if let (Some(was), Some((_, set))) = (self.0, kmt_class()) {
+            unsafe {
+                set(windows::Win32::System::Threading::GetCurrentProcess(), was);
+            }
+        }
+    }
+}
+
 /// How often a stream looks at the power source (see [`GpuClockFloor`]): a
 /// cheap call, and a plug pulled mid-stream is followed within seconds.
 const POWER_CHECK_EVERY: Duration = Duration::from_secs(3);
@@ -786,17 +868,17 @@ fn stream_inner(
     } else {
         crate::hyper_audio::HostRouting::none()
     };
-    // A Wi-Fi host shouldn't nap or scan mid-stream either, and its packets
-    // go out marked as audio/video.
-    let _wifi = crate::net_tune::WifiLowLatency::enable();
+    // A Wi-Fi host shouldn't nap or scan mid-stream either, this thread
+    // (it captures and encodes) is scheduled like the game it streams, and
+    // Media Foundation's waits (the encoder's too) are at 1 ms, not 15.6 ms —
+    // while the client looks (see `Latency`). Its packets go out marked as
+    // audio/video.
+    let mut latency = Some(Latency::hold());
+    let mut quiet: Option<GpuClassDown> = None;
     let _qos = crate::net_tune::QosFlow::tag(&socket, Some(peer));
-    // This thread captures and encodes: scheduled like the game it streams.
     // The display stays on (a sleeping one gives no frames to capture) — and
     // one already asleep is woken.
-    let _boost = crate::net_tune::ThreadBoost::games();
     let _awake = crate::net_tune::KeepAwake::new();
-    // Media Foundation's waits (the encoder's too) at 1 ms, not 15.6 ms.
-    let _timer = crate::net_tune::FineTimer::new();
     wake_display();
     let max_bps = opts.max_mbps.max(2) * 1_000_000;
     let (mut office, mut fast_text) = (opts.office, opts.fast_text);
@@ -1007,6 +1089,8 @@ fn stream_inner(
     let mut last_nudge = Instant::now();
     // The client's window as the stream last followed it, and when.
     let (mut applied_view, mut view_followed) = (None, Instant::now() - VIEW_REBUILD_EVERY);
+    // Since when the client's window has been minimized (see `Latency`).
+    let mut paused_at: Option<Instant> = None;
     // GPU clocks held up while a real stream runs unpaused (see GpuClockFloor),
     // on mains power only (`clockbatt`): the power source as last looked at.
     let mut clocks: Option<GpuClockFloor> = None;
@@ -1136,6 +1220,22 @@ fn stream_inner(
             clocks = None;
         }
         let want_key = shared.keyframe.swap(false, Ordering::Relaxed);
+        // Minimized a while: quiet (see `Latency`). Back the moment the window
+        // is (or a keyframe is asked for), before this pass encodes anything.
+        paused_at = if paused { paused_at.or_else(|| Some(Instant::now())) } else { None };
+        let go_quiet = paused
+            && !want_key
+            && paused_at.is_some_and(|t| t.elapsed() >= PAUSE_QUIET_AFTER)
+            && crate::host_ab::ab("pausequiet", true);
+        if go_quiet && quiet.is_none() {
+            drop(latency.take());
+            quiet = Some(GpuClassDown::lower());
+            tracing::info!("paused a while: Wi-Fi streaming mode, the 1 ms timer and the stream's priorities let go");
+        } else if !go_quiet && quiet.is_some() {
+            quiet = None;
+            latency = Some(Latency::hold());
+            tracing::info!("Wi-Fi streaming mode, the 1 ms timer and the stream's priorities back");
+        }
         let since_input_us = qpc_us().saturating_sub(shared.last_input_us.load(Ordering::Relaxed));
         let (mut pace_us, resumed) = trickle.pace(office, since_input_us, interval_us);
         if resumed {
