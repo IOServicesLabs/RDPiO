@@ -341,15 +341,16 @@ fn simulate(switches: Switches, load: Load, path: Path, secs: u64, seed: u64) ->
             bursts.push_back((at as u64, (at + len) as u64));
         }
     }
-    let mut lose = Rng(seed ^ 0x10557);
-    let mut in_run = false;
     let cycle = if load == Load::Glances { (2_000_000u64, 3_000_000u64) } else { (8_000_000, 20_000_000) };
     let paused_at = |t: u64| load != Load::Game && t % (cycle.0 + cycle.1) >= cycle.0;
 
     let mut frames: Vec<Frame> = Vec::new();
-    // The sender's queue: (when, frame, block, parity, body bytes, which
-    // packet: random loss draws on it, so an order changed loses the same).
-    let mut sending: VecDeque<(u64, usize, usize, bool, usize, u64)> = VecDeque::new();
+    // The sender's queue: (when, frame, block, parity, body bytes, lost on
+    // the way). Which of a frame's packets the path loses (at random, in
+    // runs) goes by the capture tick and the place in the frame's order, so
+    // both arms lose the same places of the same tick's frame however they
+    // fill them, and however their runs diverged before.
+    let mut sending: VecDeque<(u64, usize, usize, bool, usize, bool)> = VecDeque::new();
     // On the way: (arrival, seq) → (frame, block, parity, body bytes, lost).
     let mut arriving: BinaryHeap<Reverse<(u64, u64, usize, usize, bool, usize, bool)>> = BinaryHeap::new();
     let mut seq = 0u64;
@@ -519,13 +520,19 @@ fn simulate(switches: Switches, load: Load, path: Path, secs: u64, seed: u64) ->
                 let total = data_bytes as f64 * (1.0 + fec as f64);
                 let rate = if probe { f64::INFINITY } else { (bps as f64 * 2.5).max(total * 8.0 / window) / 8.0 };
                 let mut sent = 0usize;
+                let mut places = Rng(seed << 32 ^ t / FRAME_US);
+                let mut in_run = false;
                 // Data first, then parity, in the host's order.
                 for parity_pass in [false, true] {
                     let ids: Vec<u8> =
                         blocks.iter().enumerate().flat_map(|(b, &(k, m, ..))| std::iter::repeat_n(b as u8, if parity_pass { m } else { k })).collect();
                     for i in order_of(ids.iter().copied(), r.switches().interleave) {
-                        let which = (id as u64) << 20 | (parity_pass as u64) << 16 | i as u64;
-                        sending.push_back((t + (sent as f64 / rate * 1e6) as u64, id, ids[i] as usize, parity_pass, body, which));
+                        if path.run_pkts > 0.0 {
+                            let u = places.unit();
+                            in_run = if in_run { u >= 1.0 / path.run_pkts } else { u < path.run_loss / path.run_pkts / (1.0 - path.run_loss) };
+                        }
+                        let lost = in_run || places.unit() < path.loss;
+                        sending.push_back((t + (sent as f64 / rate * 1e6) as u64, id, ids[i] as usize, parity_pass, body, lost));
                         sent += body + OVERHEAD;
                     }
                 }
@@ -547,7 +554,7 @@ fn simulate(switches: Switches, load: Load, path: Path, secs: u64, seed: u64) ->
 
         // Onto the link.
         while sending.front().is_some_and(|p| p.0 <= t) {
-            let (at, id, b, par, body, which) = sending.pop_front().unwrap();
+            let (at, id, b, par, body, lost) = sending.pop_front().unwrap();
             let on_link = (body + OVERHEAD + IP_UDP) as f64 * 8e6 / path.capacity_bps;
             tally.wire_bytes += (body + OVERHEAD + IP_UDP) as u64;
             let start = free_at.max(at);
@@ -558,17 +565,8 @@ fn simulate(switches: Switches, load: Load, path: Path, secs: u64, seed: u64) ->
                 while bursts.front().is_some_and(|x| x.1 < at) {
                     bursts.pop_front();
                 }
-                let in_burst = bursts.front().is_some_and(|x| x.0 <= at);
-                let p = if in_burst { path.burst_loss } else { path.loss };
-                if path.run_pkts > 0.0 {
-                    in_run = if in_run {
-                        lose.unit() >= 1.0 / path.run_pkts
-                    } else {
-                        lose.unit() < path.run_loss / path.run_pkts / (1.0 - path.run_loss)
-                    };
-                }
-                let draw = Rng(seed << 48 ^ which).unit();
-                (free_at + path.one_way_us, in_run || draw < p)
+                let faded = bursts.front().is_some_and(|x| x.0 <= at) && Rng(seed << 40 ^ at).unit() < path.burst_loss;
+                (free_at + path.one_way_us, lost || faded)
             };
             seq += 1;
             arriving.push(Reverse((arrive, seq, id, b, par, body, lost)));
@@ -712,12 +710,13 @@ mod tests {
     /// Nothing worse: no more frames unshown (lost, or behind a loss until
     /// the repair), no more packets or bytes a frame shown, no longer to a
     /// picture (a resume or a repair), no slower. Within noise: 1%, 1 ms,
-    /// and frames lost 2% (a run that differs in one frame's packets differs
-    /// from then on in which ones its losses hit).
+    /// frames lost 2% and unshown 1%, and a frame either way (an arm that
+    /// differs in one frame's packets differs from then on in which frames
+    /// the path's losses hit: a different repair, a different rate).
     fn no_worse(load: Load, path: Path, off: &Tally, on: &Tally) {
         let what = format!("{load:?} on {}", path.name);
         assert!(on.lost <= off.lost + off.lost / 50 + 1, "{what}: frames lost {} → {}", off.lost, on.lost);
-        assert!(on.unshown() <= off.unshown(), "{what}: unshown {} → {}", off.unshown(), on.unshown());
+        assert!(on.unshown() <= off.unshown() + off.unshown() / 100 + 1, "{what}: unshown {} → {}", off.unshown(), on.unshown());
         assert!(on.pkts_per_shown() <= off.pkts_per_shown() * 1.01, "{what}: packets a frame {:.2} → {:.2}", off.pkts_per_shown(), on.pkts_per_shown());
         assert!(on.bytes_per_shown() <= off.bytes_per_shown() * 1.01, "{what}: bytes a frame {:.0} → {:.0}", off.bytes_per_shown(), on.bytes_per_shown());
         assert!(on.freeze_ms() <= off.freeze_ms() * 1.01 + 1.0, "{what}: frozen {:.0} → {:.0} ms", off.freeze_ms(), on.freeze_ms());

@@ -466,9 +466,9 @@ The host's perf line names why the rate came down in each 5 s (`cuts=`:
   data then parity, so packets lost back to back cost each block a few that
   its parity rebuilds, not one block all of them. Simulated packet by packet
   (`cargo test -p rdp-hyper fecsim -- --nocapture`), 1% lost in runs of 8
-  and a keyframe every 5 s: keyframes lost 96 → 24 of ~450, resume to
-  picture 65 → 27 ms, frames never shown 758 → 395, packets a frame shown
-  20.4 → 18.7; the same elsewhere.
+  and a keyframe every 5 s: keyframes lost 71 → 23 of ~430, resume to
+  picture 56 → 27 ms, frames never shown 497 → 291, packets a frame shown
+  18.5 → 17.3; the same elsewhere.
 - **Slow pacing** (`slowpace=1`, off by default): on a slow or queued link
   frames are paced at 1.2x the target instead of 2.5x, so they wait on the
   host rather than in front of the audio in the relay. Simulated: audio p95

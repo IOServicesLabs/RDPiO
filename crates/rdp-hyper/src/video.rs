@@ -246,9 +246,10 @@ pub fn parity(data: &[Vec<u8>]) -> Vec<Vec<u8>> {
 /// [`crate::rate::Switches::interleave`]). Packets lost back to back — a
 /// Wi-Fi aggregate's retries running out, a queue overflowing — then cost
 /// each block a few, which its parity rebuilds, instead of one block all of
-/// them: simulated with 1% lost in runs of 8, 22 of 120 keyframes (300 KB,
-/// five blocks) were lost block after block, 4 in turns (see `fecsim`). A
-/// frame of one block goes as it is. The receiver takes shards in any order.
+/// them: simulated with 1% lost in runs of 8 and a keyframe (300 KB, five
+/// blocks) every 5 s, 71 of 461 keyframes were lost block after block, 23
+/// in turns (see `fecsim`). A frame of one block goes as it is. The
+/// receiver takes shards in any order.
 pub fn send_order(bodies: &Shards, interleave: bool) -> SendOrder {
     order_of((0..bodies.len()).map(|i| bodies.get(i)[4]), interleave)
 }
