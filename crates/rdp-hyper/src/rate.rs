@@ -205,6 +205,14 @@ pub struct Switches {
     /// A paused stream holds its rate (`pausehold`; see
     /// [`RateController::set_paused`]).
     pub pause_hold: bool,
+    /// A queue over twice what the stream's last 100 ms of bytes would take
+    /// on the link, its window's fastest frame prompt (under 10 ms), isn't
+    /// the stream's (`ownq`). Its bytes count as able to make a queue from
+    /// a tenth of the link up, and a beacon's burst was 30-60 ms whatever
+    /// was sent: on a 200 Mbit/s LAN in power save that held the stream at
+    /// 14 Mbit/s, 21 with this (and a queue on a link something else took
+    /// has its fastest frame late too: still cut).
+    pub own_queue: bool,
     /// A window with one frame, under a beacon interval late, doesn't make
     /// a queue last (`loneframe`): a stream under ~25 fps has the radio
     /// dozing between frames, each held 0-100 ms, and one such frame has no
@@ -229,6 +237,7 @@ impl Default for Switches {
             soft_slow: true,
             probe_train: true,
             pause_hold: true,
+            own_queue: true,
             lone_frame: true,
         }
     }
@@ -767,13 +776,18 @@ impl RateController {
         // (A radio's bump is one frame's; a queue still there a window later
         // is the stream's, whatever the link showed: something else took it.)
         let recent: u64 = self.gap.iter().rev().take(2).map(|e| e.1).sum();
+        // (And not one over twice what those bytes would take on the link,
+        // its fastest frame prompt: that's a radio's hold let go, whatever
+        // the stream sends — see [`Switches::own_queue`].)
+        let own_us = |l: f64| recent as f64 * 8.0 / l * 1e6;
+        let too_big = |l: f64| self.switches.own_queue && queue_us as f64 > 2.0 * own_us(l) && queue_min_us < QUEUE_SOFT_US;
         // (A queue lasting is the stream's only if the window's fastest frame
         // was late too, see [`Switches::held_burst`], and it had more than
         // one frame or one later than a beacon interval, see
         // [`Switches::lone_frame`].)
         let lone = self.switches.lone_frame && fb.frames < 2 && queue_us <= STANDING_US;
         let lasting = fb.frames > 0 && queue_us > QUEUE_HARD_US && self.last_queue_us > QUEUE_HARD_US && !lone;
-        let ours = self.link_bps.is_none_or(|l| recent as f64 * 8.0 / l * 1e6 >= QUEUE_SOFT_US as f64) || lasting;
+        let ours = self.link_bps.is_none_or(|l| own_us(l) >= QUEUE_SOFT_US as f64 && !too_big(l)) || lasting;
 
         // Bulk yields first: it halves at the first sign of queueing or a
         // lost frame, and grows only while something is waiting to go.
@@ -1785,6 +1799,7 @@ mod tests {
                     soft_slow: false,
                     probe_train: false,
                     pause_hold: false,
+                    own_queue: false,
                     lone_frame: false,
                 },
                 fps_follow: false,
@@ -2709,6 +2724,17 @@ mod tests {
         (on, no)
     }
 
+    /// `ownq`: a queue the stream's bytes couldn't have made isn't its own.
+    #[test]
+    fn a_queue_bigger_than_the_streams_bytes_is_not_its_own() {
+        let r = doze_ab("ownq", |s| s.own_queue = false);
+        doze_no_worse(&r);
+        for name in ["game, 200M dozing", "game, ax210 dozing", "office, 200M dozing, warm 0.7M", "game, 200M dozing, warm 0.7M"] {
+            let (on, no) = doze_case(&r, name);
+            assert!(on.med > no.med * 1.3, "{name}: {} vs {}", on.med, no.med);
+            assert!(on.cuts[CUT_QUEUE] < no.cuts[CUT_QUEUE], "{name}: {:?} vs {:?}", on.cuts, no.cuts);
+        }
+    }
 
     /// `loneframe`: under ~20 fps a lone frame the radio held doesn't make a
     /// lasting queue.
