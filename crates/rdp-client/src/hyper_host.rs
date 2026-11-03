@@ -1118,7 +1118,10 @@ fn stream_inner(
         // The rate controller's switches (A/B, %PUBLIC%\rdpio-hyper-switches.txt).
         if switches_read.elapsed() >= Duration::from_secs(1) {
             switches_read = Instant::now();
-            shared.rate.lock().unwrap().set_switches(rate_switches());
+            let switches = rate_switches();
+            // (The packets too: off, probes go as before trains.)
+            rdp_hyper::video::set_probe_trains(switches.probe_train);
+            shared.rate.lock().unwrap().set_switches(switches);
             fps_follow = crate::host_ab::ab("fpsfollow", true);
             office_fps = crate::host_ab::ab("officefps", true);
         }

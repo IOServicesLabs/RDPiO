@@ -102,6 +102,20 @@ pub struct OutFrame<'a> {
 /// (it repairs the frame, too).
 pub const PROBE_TRAIN_PACKETS: usize = 48;
 
+/// Probes go as trains (the default); off (the host's `probetrain=0`, for
+/// A/B against it): as before, the frame alone in [`BURST_MIN_SHARDS`] data
+/// shards at least, smaller ones if need be.
+static PROBE_TRAINS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// See [`PROBE_TRAINS`].
+pub fn set_probe_trains(on: bool) {
+    PROBE_TRAINS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn trains() -> bool {
+    PROBE_TRAINS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How many data shards a frame takes, and their size. A probe's are full
 /// size (the train's packets are, see [`PROBE_TRAIN_PACKETS`]). (Any shard
 /// size decodes: the receiver takes a frame's from its first shard.)
@@ -111,10 +125,11 @@ fn layout(frame: &OutFrame) -> (usize, usize) {
 
 fn layout_of(len: usize, probe: bool) -> (usize, usize) {
     let len = len.max(1);
-    if probe {
+    if probe && trains() {
         return (len.div_ceil(MAX_SHARD), MAX_SHARD);
     }
-    let size = len.div_ceil(len.div_ceil(MAX_SHARD));
+    let min = if probe { BURST_MIN_SHARDS as usize } else { 1 };
+    let size = len.div_ceil(len.div_ceil(MAX_SHARD).max(min));
     (len.div_ceil(size), size)
 }
 
@@ -124,7 +139,7 @@ fn layout_of(len: usize, probe: bool) -> (usize, usize) {
 fn parity_count(k: usize, b: usize, shards: usize, fec: f32, probe: bool) -> usize {
     let m = if fec <= 0.0 { 0 } else { ((k as f32 * fec).ceil() as usize).clamp(1, MAX_BLOCK_PARITY) };
     let last = b + 1 == shards.div_ceil(MAX_BLOCK_DATA);
-    let fill = if probe && last { PROBE_TRAIN_PACKETS.saturating_sub(shards + m) } else { 0 };
+    let fill = if probe && last && trains() { PROBE_TRAIN_PACKETS.saturating_sub(shards + m) } else { 0 };
     (m + fill).min(MAX_BLOCK_PARITY)
 }
 
@@ -144,6 +159,9 @@ fn body_bytes(len: usize, fec: f32, probe: bool) -> usize {
 /// usual: its train's padding (see
 /// [`crate::rate::RateController::note_probe_padding`]).
 pub fn probe_padding(len: usize, fec: f32) -> usize {
+    if !trains() {
+        return 0;
+    }
     body_bytes(len, fec, true).saturating_sub(body_bytes(len, fec, false))
 }
 
