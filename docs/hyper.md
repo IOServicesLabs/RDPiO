@@ -447,6 +447,11 @@ by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
 `%PUBLIC%` file. The Android app's are `debug.rdpio.inputdup` and
 `debug.rdpio.fastreconnect` (see android.md).
 
+Host power switches (same file, on by default):
+
+- `clockbatt`: no GPU clock floor on battery (power source looked at every
+  3 s); the floor cost ~6 W on a laptop for an encode that took 3-4 ms anyway.
+
 ## Latency notes
 
 - The host switches its monitor to the fastest refresh rate that's a whole

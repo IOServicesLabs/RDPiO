@@ -665,7 +665,10 @@ fn gpu_clocks() -> Option<(u32, u32)> {
 /// service's SYSTEM agent; others are told no, once); the clocks are let go
 /// on drop, and after a crash by the next agent (`recover_after_crash`), as
 /// a lock otherwise lasts until a restart. `RDPIO_GPU_CLOCK_FLOOR=MHz` sets
-/// the floor (0: none).
+/// the floor (0: none). Not on battery (switch `clockbatt`): a laptop's GPU
+/// held at 1500 MHz drew ~6 W more (RTX 2070 Max-Q, 31-32 W of a 42 W
+/// laptop), for an encode that took 3-4 ms anyway and a frame rate the rate
+/// controller set, not the encoder.
 pub(crate) struct GpuClockFloor;
 
 /// The selftest holds the clocks too (run as administrator), to measure what
@@ -720,6 +723,19 @@ impl Drop for GpuClockFloor {
         Self::release();
         tracing::debug!("GPU clocks let go");
     }
+}
+
+/// How often a stream looks at the power source (see [`GpuClockFloor`]): a
+/// cheap call, and a plug pulled mid-stream is followed within seconds.
+const POWER_CHECK_EVERY: Duration = Duration::from_secs(3);
+
+/// Running on battery (as the client's own check, `hyper_client`; a desktop
+/// says "unknown", which isn't battery).
+fn on_battery() -> bool {
+    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    let mut s = SYSTEM_POWER_STATUS::default();
+    // (ACLineStatus: 0 offline, 1 online, 255 unknown — a desktop.)
+    unsafe { GetSystemPowerStatus(&mut s).is_ok() && s.ACLineStatus == 0 }
 }
 
 pub(crate) fn stream(
@@ -991,8 +1007,10 @@ fn stream_inner(
     let mut last_nudge = Instant::now();
     // The client's window as the stream last followed it, and when.
     let (mut applied_view, mut view_followed) = (None, Instant::now() - VIEW_REBUILD_EVERY);
-    // GPU clocks held up while a real stream runs unpaused (see GpuClockFloor).
+    // GPU clocks held up while a real stream runs unpaused (see GpuClockFloor),
+    // on mains power only (`clockbatt`): the power source as last looked at.
     let mut clocks: Option<GpuClockFloor> = None;
+    let (mut battery, mut power_checked) = (false, Instant::now() - POWER_CHECK_EVERY);
     // The loop lives in a closure so every exit — the client leaving, going
     // quiet, or an encoder/capture error — runs the same cleanup below:
     // threads stopped, the client told, the host's audio restored.
@@ -1103,9 +1121,18 @@ fn stream_inner(
             }
         }
         let paused = shared.paused.load(Ordering::Relaxed);
-        if (route_audio || SELFTEST_CLOCKS.load(Ordering::Relaxed)) && !paused && clocks.is_none() {
+        if power_checked.elapsed() >= POWER_CHECK_EVERY {
+            power_checked = Instant::now();
+            let now = crate::host_ab::ab("clockbatt", true) && on_battery();
+            if now != battery {
+                battery = now;
+                tracing::info!(battery, "GPU clock floor {}", if battery { "let go: on battery" } else { "allowed again" });
+            }
+        }
+        let floor = (route_audio || SELFTEST_CLOCKS.load(Ordering::Relaxed)) && !paused && !battery;
+        if floor && clocks.is_none() {
             clocks = GpuClockFloor::hold();
-        } else if paused {
+        } else if !floor {
             clocks = None;
         }
         let want_key = shared.keyframe.swap(false, Ordering::Relaxed);
