@@ -474,9 +474,8 @@ struct Shared {
     paced: AtomicU32,
     /// The client's window is minimized: encode nothing.
     paused: AtomicBool,
-    /// Nothing on the screen has changed, and no input has come, for
-    /// [`IDLE_AFTER`]: the capture and receive threads wait longer between
-    /// looks (`idlewait`; see [`IDLE_LOOK`]).
+    /// No input has come for [`IDLE_AFTER`]: the capture and receive threads
+    /// wait longer between looks (`idlewait`; see [`IDLE_LOOK`]).
     idle: AtomicBool,
     /// The client wants office mode (crisp text) rather than game mode.
     office: AtomicBool,
@@ -775,7 +774,7 @@ impl Drop for GpuClockFloor {
 /// this often; the window coming back wakes it at once (see `Shared::wake`).
 const PAUSED_LOOK: Duration = Duration::from_millis(500);
 
-/// A desktop left alone (no change on screen, no input) this long is idle…
+/// A desktop left alone (no input) this long is idle…
 const IDLE_AFTER: Duration = Duration::from_secs(2);
 
 /// …and the capture and receive threads then wake this often (instead of
@@ -1507,13 +1506,13 @@ fn stream_inner(
         if let Some(d) = drain {
             pace_us = pace_us.max(1_000_000 / d.max(1) as u64);
         }
-        // Idle (see IDLE_AFTER): nothing waiting to go, nothing captured or
-        // typed for a while.
+        // Idle (see IDLE_AFTER): nothing waiting to go, nothing typed for a
+        // while. (A caret blinking, a clock ticking still counts: each change
+        // ends the wait at once anyway.)
         let idle = idle_wait
             && skipped.is_none()
             && !(office && sharpen_left > 0)
-            && since_input_us > IDLE_AFTER.as_micros() as u64
-            && last_present_us.is_none_or(|p| qpc_us().saturating_sub(p) > IDLE_AFTER.as_micros() as u64);
+            && since_input_us > IDLE_AFTER.as_micros() as u64;
         if idle != shared.idle.load(Ordering::Relaxed) {
             shared.idle.store(idle, Ordering::Relaxed);
             tracing::debug!(idle, "the desktop is {}", if idle { "idle: longer waits" } else { "in use again" });
