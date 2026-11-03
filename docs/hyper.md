@@ -236,6 +236,13 @@ what it shows, 1:1.
   resolution and upscales the rest (`--upscale`).
 - A desktop of another shape than the screen (16:9 on a 3:2 Surface) keeps
   its shape, with black bars. The mouse maps to the picture.
+- **Auto resolution**, as in the Android app (`rdp_hyper::autores`): when the
+  link falls behind and the bits per pixel run short (~1 Mbps to a 2560x1440
+  window), the Windows client asks for 75/50% of the window (33% in office
+  mode) and upscales it with FSR+RCAS (office mode: bicubic; `--upscale`
+  overrides both); it goes
+  back up after 10 s clear. `--hyper-scale auto|100|75|50|33` pins it, and so
+  does an explicit `--render-scale`.
 
 `--hyper-size` on the host overrides all of this.
 
@@ -449,7 +456,9 @@ a cold start's latency 10-30 s in went from ~20 s to ~0.1 s (29 keyframes
 to 1); warm started, the first picture comes at 0.4 s instead of 2.7 s.
 
 Host switches (`%PUBLIC%\rdpio-hyper-switches.txt`, `name=0` turns one off,
-read live): `pathinfo`, `inputdup` (Windows client), `fastreconnect`,
+read live): `pathinfo`, `inputdup` and `burstok` (Windows client; the
+latter keeps a draining decode backlog instead of dropping it for a keyframe,
+as Android does: `rdp_hyper::backlog`), `fastreconnect`,
 `keepmonitor`, `vbvcap`, `presetfollow=1`, `introfresh=1` (the last two off
 by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
 `gapcut`, `probetrain`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
