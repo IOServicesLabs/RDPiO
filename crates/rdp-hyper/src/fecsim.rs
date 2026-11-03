@@ -743,6 +743,23 @@ mod tests {
         assert!(b.resume_mean() < a.resume_mean() * 0.7, "to a picture {:.0} → {:.0} ms", a.resume_mean(), b.resume_mean());
     }
 
+    /// Padded probe trains every 5 s instead of every second while the
+    /// stream carries a twentieth of the link or less: an idle office
+    /// stream's packets were mostly trains.
+    #[test]
+    fn fecsim_probe_idle() {
+        let on = Switches::default();
+        let off = Switches { probe_idle: false, ..on };
+        let mut cases: Vec<(Load, Path)> = PATHS.iter().map(|&p| (Load::Office, p)).collect();
+        cases.extend([(Load::Glances, Path::CLEAN_LAN), (Load::Glances, Path::WIFI_BURSTY), (Load::Game, Path::CLEAN_LAN)]);
+        let runs = ab("probeidle", off, on, &cases);
+        for (load, path, a, b) in &runs {
+            no_worse(*load, *path, a, b);
+        }
+        let (_, _, a, b) = &runs[0];
+        assert!(b.pkts_per_shown() < a.pkts_per_shown() * 0.9, "office, clean LAN: {:.2} → {:.2}", a.pkts_per_shown(), b.pkts_per_shown());
+    }
+
     /// The baseline: what every path and load costs today.
     #[test]
     fn fecsim_baseline() {

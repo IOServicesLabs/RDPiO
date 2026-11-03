@@ -2157,6 +2157,7 @@ fn rate_switches() -> rdp_hyper::rate::Switches {
         probe_train: ab("probetrain", true),
         pause_hold: ab("pausehold", true),
         interleave: ab("interleave", true),
+        probe_idle: ab("probeidle", true),
     }
 }
 

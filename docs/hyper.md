@@ -454,7 +454,14 @@ The picture on a bad path (host; each a switch, on unless said):
   AX210 laptop's ~300 Mbit/s uplink read 1-6 Mbit/s in office mode (100-380
   in game mode's big frames), and the stream sat at 0.4 Mbps, 13 fps. The
   link is the most a train showed over 4 s, never under what was delivered;
-  the padding (~0.5 Mbit/s) isn't counted as the stream's.
+  the padding (~0.5 Mbit/s) isn't counted as the stream's. While the stream
+  carries under a twentieth of the link, a frame that would be mostly
+  padding probes only every 5 s (`probeidle`), the link then the most of the
+  last 4 readings (30 s at most), and after a cut's doubt 4 readings come a
+  second apart first: an idle office stream's trains were a third of its
+  packets. Simulated on a clean LAN, 13.1 → 11.2 packets a frame shown; on
+  the laptop's uplink, padding 17% → 9% of the video, the rate within 2%,
+  p95 the same.
 
 The host's perf line names why the rate came down in each 5 s (`cuts=`:
 `probe`, `gap`, `standing`, `drain`, `loss`, `queue`, `soft`).
@@ -487,7 +494,7 @@ frame may take up to 0.2 bits a pixel, at most 100 ms of the link, instead
 of two frames' worth), `presetfollow=1`, `introfresh=1` (the last two off
 by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
 `gapcut`, `probetrain`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
-`growcap`, `softslow`, `fecfloor`, `interleave`,
+`growcap`, `softslow`, `fecfloor`, `interleave`, `probeidle`,
 `gamesharpen` (game mode re-encodes a still screen sharper too, as office
 mode does, under 0.05 bits a pixel a frame: 1440p60 under ~11 Mbps),
 `pausehold` (a minimized client's stream holds its rate instead of drifting
