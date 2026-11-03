@@ -993,6 +993,8 @@ fn stream_inner(
     let (mut applied_view, mut view_followed) = (None, Instant::now() - VIEW_REBUILD_EVERY);
     // GPU clocks held up while a real stream runs unpaused (see GpuClockFloor).
     let mut clocks: Option<GpuClockFloor> = None;
+    // Paused as the rate controller was last told.
+    let mut rate_paused = false;
     // The loop lives in a closure so every exit — the client leaving, going
     // quiet, or an encoder/capture error — runs the same cleanup below:
     // threads stopped, the client told, the host's audio restored.
@@ -1107,6 +1109,11 @@ fn stream_inner(
             clocks = GpuClockFloor::hold();
         } else if paused {
             clocks = None;
+        }
+        // The rate holds while nothing is sent (see RateController::set_paused).
+        if paused != rate_paused {
+            rate_paused = paused;
+            shared.rate.lock().unwrap().set_paused(paused);
         }
         let want_key = shared.keyframe.swap(false, Ordering::Relaxed);
         let since_input_us = qpc_us().saturating_sub(shared.last_input_us.load(Ordering::Relaxed));
@@ -1747,6 +1754,7 @@ fn rate_switches() -> rdp_hyper::rate::Switches {
         slow_pace: ab("slowpace", false),
         grow_cap: ab("growcap", true),
         soft_slow: ab("softslow", true),
+        pause_hold: ab("pausehold", true),
     }
 }
 

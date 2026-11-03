@@ -442,6 +442,8 @@ read live): `pathinfo`, `inputdup` (Windows client), `fastreconnect`,
 by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
 `gapcut`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
 `growcap`, `softslow`, `fecfloor`,
+`pausehold` (a minimized client's stream holds its rate instead of drifting
+up to resting, which restore then slammed to the floor),
 `slowpace=1` (off by default), `audiorate`, `opusfec`, `audiofirst` (read as a sender starts),
 `catchup` — the last three also on a Windows client, from its own
 `%PUBLIC%` file. The Android app's are `debug.rdpio.inputdup` and

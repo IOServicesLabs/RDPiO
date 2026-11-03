@@ -185,6 +185,9 @@ pub struct Switches {
     /// no queue on the client). Its real backlogs stand, and the standing
     /// rule cuts those.
     pub soft_slow: bool,
+    /// A paused stream holds its rate (`pausehold`; see
+    /// [`RateController::set_paused`]).
+    pub pause_hold: bool,
 }
 
 impl Default for Switches {
@@ -199,6 +202,7 @@ impl Default for Switches {
             slow_pace: false,
             grow_cap: true,
             soft_slow: true,
+            pause_hold: true,
         }
     }
 }
@@ -305,6 +309,9 @@ pub struct RateController {
     carried: std::collections::VecDeque<(u64, f64)>,
     /// Cuts since the last [`Self::take_cuts`], by reason (see [`CUT_NAMES`]).
     cuts: [u32; CUT_NAMES.len()],
+    /// The client can't see the stream and nothing is sent (see
+    /// [`Self::set_paused`]).
+    paused: bool,
 }
 
 /// The reasons the rate is cut, as the host's perf line names them.
@@ -372,6 +379,7 @@ impl RateController {
             slow_until_ms: 0,
             carried: Default::default(),
             cuts: Default::default(),
+            paused: false,
         }
     }
 
@@ -459,6 +467,20 @@ impl RateController {
             self.last_probe_ms = Some(now_ms);
         }
         due
+    }
+
+    /// The client's window is minimized: the host sends nothing until it's
+    /// back. Its feedback still comes, every window empty and calm — which
+    /// the idle recovery reads as a still screen on a clean path, and grew
+    /// the rate back to resting (53 Mbps) over the minutes it was down. On
+    /// restore the keyframe and first frames were sized for that, and the
+    /// probe, standing and queue cuts slammed it to the 0.5 Mbps floor in
+    /// about 2 s (65 times in one host log). Paused, the rate holds where it
+    /// was (`pausehold`): nothing was learned about the path meanwhile.
+    /// (Only on the host's word: a still screen also sends nothing for long
+    /// stretches, and recovering there is what the next page of text needs.)
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
     }
 
     /// What the link has shown it carries (bits per second), if measured.
@@ -931,6 +953,7 @@ impl RateController {
                 }
             } else if !busy
                 && calm
+                && !(self.paused && self.switches.pause_hold)
                 && self.bitrate < resting
                 && self.last_cut_ms.is_none_or(|t| now_ms.saturating_sub(t) >= RECOVER_AFTER_MS)
             {
@@ -1235,6 +1258,36 @@ mod tests {
             r.update(&fb(3_000, 5_500, 0, 0), 50, t * 50);
         }
         assert_eq!(r.bitrate_bps(), 30_000_000);
+    }
+
+    /// Minimized after a cut: nothing sent, feedback windows empty. The rate
+    /// holds there (`pausehold`), where before it drifted back to resting;
+    /// a still screen sending nothing, not paused, still recovers.
+    #[test]
+    fn a_paused_stream_holds_its_rate() {
+        let quiet = Feedback { shards: 0, frames: 0, bytes: 0, delay_min_us: 0, delay_avg_us: 0, ..fb(0, 0, 0, 0) };
+        let run = |paused: bool, switches: Switches| {
+            let mut r = RateController::new(Limits::default());
+            r.set_switches(switches);
+            r.set_resting(53_000_000);
+            for t in 0..4 {
+                r.update(&fb(3_000, 5_000, 1, 0), 50, t * 50);
+            }
+            let cut = r.bitrate_bps();
+            r.set_paused(paused);
+            // A minute down.
+            for t in 4..1_200 {
+                r.update(&quiet, 50, t * 50);
+            }
+            (cut, r.bitrate_bps())
+        };
+        let (cut, held) = run(true, Switches::default());
+        assert!(cut < 10_000_000, "{cut}");
+        assert_eq!(held, cut, "paused: held");
+        let (_, drifted) = run(true, Switches { pause_hold: false, ..Switches::default() });
+        assert_eq!(drifted, 53_000_000, "switched off: back to resting, as before");
+        let (_, still) = run(false, Switches::default());
+        assert_eq!(still, 53_000_000, "a still screen, not paused: recovers");
     }
 
     /// The Razer hosting over Wi-Fi to Wi-Fi on a LAN: the stream's first
@@ -1654,6 +1707,7 @@ mod tests {
                     slow_pace: false,
                     grow_cap: false,
                     soft_slow: false,
+                    pause_hold: false,
                 },
                 fps_follow: false,
                 warm_bps: None,
