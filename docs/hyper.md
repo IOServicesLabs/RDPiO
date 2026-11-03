@@ -421,6 +421,15 @@ The picture on a bad path (host; each a switch, on unless said):
   at 700 kbps sat at 0.5-4.5 Mbps (each scroll a smear) and now holds ~47
   (`a_slow_lan_stream_still_finds_the_link`). `link_mbps` in the perf line.
   Not over Tailscale: a relay hands packets over in bunches.
+- **Probe trains** (`probetrain`): a probe goes out as a train of at least
+  48 full-size packets, the frame's data then parity, and the client times
+  the whole train (parity after the frame completed too), with its office
+  receive nap off meanwhile. A few small packets timed first to last showed
+  the radio's channel access and the client's 1-2 ms nap, not the link: an
+  AX210 laptop's ~300 Mbit/s uplink read 1-6 Mbit/s in office mode (100-380
+  in game mode's big frames), and the stream sat at 0.4 Mbps, 13 fps. The
+  link is the most a train showed over 4 s, never under what was delivered;
+  the padding (~0.5 Mbit/s) isn't counted as the stream's.
 
 The host's perf line names why the rate came down in each 5 s (`cuts=`:
 `probe`, `gap`, `standing`, `drain`, `loss`, `queue`, `soft`).
@@ -440,7 +449,7 @@ Host switches (`%PUBLIC%\rdpio-hyper-switches.txt`, `name=0` turns one off,
 read live): `pathinfo`, `inputdup` (Windows client), `fastreconnect`,
 `keepmonitor`, `vbvcap`, `presetfollow=1`, `introfresh=1` (the last two off
 by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
-`gapcut`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
+`gapcut`, `probetrain`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
 `growcap`, `softslow`, `fecfloor`,
 `slowpace=1` (off by default), `audiorate`, `opusfec`, `audiofirst` (read as a sender starts),
 `catchup` — the last three also on a Windows client, from its own

@@ -1747,6 +1747,7 @@ fn rate_switches() -> rdp_hyper::rate::Switches {
         slow_pace: ab("slowpace", false),
         grow_cap: ab("growcap", true),
         soft_slow: ab("softslow", true),
+        probe_train: ab("probetrain", true),
     }
 }
 
@@ -1925,7 +1926,13 @@ fn sender_loop(socket: UdpSocket, shared: Arc<Shared>, frames: std::sync::mpsc::
             send(body, &mut batch);
         }
         batch.flush(&socket);
-        shared.rate.lock().unwrap().note_sent(f.payload, bodies);
+        // (A probe's train padding isn't the stream's: see
+        // `RateController::note_probe_padding`.)
+        let pad = if f.probe { rdp_hyper::video::probe_padding(f.payload, f.fec).min(bodies) } else { 0 };
+        let mut rate = shared.rate.lock().unwrap();
+        rate.note_sent(f.payload, bodies - pad);
+        rate.note_probe_padding(pad);
+        drop(rate);
         shared.pace_us.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
         shared.paced.fetch_add(1, Ordering::Relaxed);
     }

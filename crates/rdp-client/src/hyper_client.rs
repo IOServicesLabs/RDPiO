@@ -1313,7 +1313,9 @@ fn receive_loop(
     let nap = std::env::var_os("RDPIO_NO_RX_NAP").is_none();
     let mut got = false;
     while !shared.stop.load(Ordering::Relaxed) {
-        if got && nap && crate::window::office_mode() {
+        // (Not through a probe train: the nap would be timed as the link —
+        // 1-2 ms on a few KB read a 300 Mbit/s Wi-Fi link as 1-6.)
+        if got && nap && crate::window::office_mode() && !reassembler.train_open() {
             std::thread::sleep(Duration::from_millis(1));
         }
         let datagrams = receiver.recv(&socket);

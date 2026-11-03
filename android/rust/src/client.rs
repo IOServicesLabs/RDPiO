@@ -669,8 +669,9 @@ impl Client {
             // shards then come several to a call instead of one wake-up each
             // (through a VPN they trickle in one by one). The receive thread's
             // CPU, 24 Mbit/s over Tailscale: 11% of a core -> 4%, for up to a
-            // millisecond on a frame. (`debug.rdpio.rxnap=0`: no nap.)
-            if got && office && rx.pending() == 0 && crate::tune::ab("rxnap", true) {
+            // millisecond on a frame. (`debug.rdpio.rxnap=0`: no nap.) Not
+            // through a probe train: the nap would be timed as the link.
+            if got && office && rx.pending() == 0 && !reassembler.train_open() && crate::tune::ab("rxnap", true) {
                 std::thread::sleep(Duration::from_millis(1));
             }
             got = false;

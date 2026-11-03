@@ -93,16 +93,58 @@ pub struct OutFrame<'a> {
     pub probe: bool,
 }
 
-/// How many data shards a frame takes, and their size. A probe goes in
-/// [`BURST_MIN_SHARDS`] at least, smaller ones if need be: the client only
-/// times a frame that many packets long, and on a slow stream the frames are
-/// a packet or a few. (Any shard size decodes: the receiver takes a frame's
-/// from its first shard.)
+/// A probe goes out as a train of at least this many full-size packets: its
+/// data shards, then parity enough to make up the rest. The client times
+/// the whole train, first packet to last (see [`Stats::link_kbps`]). A few
+/// small packets' spread is a Wi-Fi radio's channel access and the client's
+/// own wake-up, not the link: 2 KB in 8 packets read an AX210's 300 Mbit/s
+/// uplink as 1-6. 28 KB a second is 0.23 Mbit/s, and the padding is parity
+/// (it repairs the frame, too).
+pub const PROBE_TRAIN_PACKETS: usize = 48;
+
+/// How many data shards a frame takes, and their size. A probe's are full
+/// size (the train's packets are, see [`PROBE_TRAIN_PACKETS`]). (Any shard
+/// size decodes: the receiver takes a frame's from its first shard.)
 fn layout(frame: &OutFrame) -> (usize, usize) {
-    let len = frame.data.len().max(1);
-    let min = if frame.probe { BURST_MIN_SHARDS as usize } else { 1 };
-    let size = len.div_ceil(len.div_ceil(MAX_SHARD).max(min));
+    layout_of(frame.data.len(), frame.probe)
+}
+
+fn layout_of(len: usize, probe: bool) -> (usize, usize) {
+    let len = len.max(1);
+    if probe {
+        return (len.div_ceil(MAX_SHARD), MAX_SHARD);
+    }
+    let size = len.div_ceil(len.div_ceil(MAX_SHARD));
     (len.div_ceil(size), size)
+}
+
+/// Parity shards for block `b` of `k` data shards (of `shards` in all):
+/// `fec` of them, and on a probe's last block as many more as make the
+/// train [`PROBE_TRAIN_PACKETS`] long.
+fn parity_count(k: usize, b: usize, shards: usize, fec: f32, probe: bool) -> usize {
+    let m = if fec <= 0.0 { 0 } else { ((k as f32 * fec).ceil() as usize).clamp(1, MAX_BLOCK_PARITY) };
+    let last = b + 1 == shards.div_ceil(MAX_BLOCK_DATA);
+    let fill = if probe && last { PROBE_TRAIN_PACKETS.saturating_sub(shards + m) } else { 0 };
+    (m + fill).min(MAX_BLOCK_PARITY)
+}
+
+/// Packet body bytes a frame of `len` takes, parity included.
+fn body_bytes(len: usize, fec: f32, probe: bool) -> usize {
+    let (shards, size) = layout_of(len, probe);
+    let blocks = shards.div_ceil(MAX_BLOCK_DATA);
+    (0..blocks)
+        .map(|b| {
+            let k = (shards - b * MAX_BLOCK_DATA).min(MAX_BLOCK_DATA);
+            (k + parity_count(k, b, shards, fec, probe)) * (SHARD_HEADER + size)
+        })
+        .sum()
+}
+
+/// The body bytes a probe of `len` takes beyond the same frame sent as
+/// usual: its train's padding (see
+/// [`crate::rate::RateController::note_probe_padding`]).
+pub fn probe_padding(len: usize, fec: f32) -> usize {
+    body_bytes(len, fec, true).saturating_sub(body_bytes(len, fec, false))
 }
 
 /// Cut a frame into packet bodies: all data shards, then all parity.
@@ -126,11 +168,7 @@ pub fn packetize_data(frame: &OutFrame, fec: f32) -> Vec<Vec<u8>> {
     for b in 0..blocks {
         let first = b * MAX_BLOCK_DATA;
         let k = (shards_needed - first).min(MAX_BLOCK_DATA);
-        let m = if fec <= 0.0 {
-            0
-        } else {
-            ((k as f32 * fec).ceil() as usize).clamp(1, MAX_BLOCK_PARITY)
-        };
+        let m = parity_count(k, b, shards_needed, fec, frame.probe);
         for i in 0..k {
             let mut body = Vec::with_capacity(SHARD_HEADER + shard_size);
             ShardHeader {
@@ -249,11 +287,7 @@ pub fn packetize_shards(frame: &OutFrame, fec: f32, buffers: &FrameBuffers) -> S
     for b in 0..blocks {
         let first = b * MAX_BLOCK_DATA;
         let k = (shards_needed - first).min(MAX_BLOCK_DATA);
-        let m = if fec <= 0.0 {
-            0
-        } else {
-            ((k as f32 * fec).ceil() as usize).clamp(1, MAX_BLOCK_PARITY)
-        };
+        let m = parity_count(k, b, shards_needed, fec, frame.probe);
         for i in 0..k {
             ShardHeader {
                 frame_id: frame.frame_id,
@@ -335,11 +369,12 @@ pub struct Stats {
     pub frames: u32,
     pub frames_lost: u32,
     pub bytes: u64,
-    /// How fast a probe frame (one the host sent unpaced, see
-    /// [`OutFrame::probe`]) came in, its first packet to its last (kbit/s;
-    /// the fastest, if several; 0: none): what the link carries — the host
-    /// put it all on the wire at once, and a slower link spreads it. (Not a
-    /// paced frame: that times the pacer.)
+    /// How fast a probe train (a frame the host sent unpaced, see
+    /// [`OutFrame::probe`] and [`PROBE_TRAIN_PACKETS`]) came in, its first
+    /// packet to its last, parity after the frame completed included
+    /// (kbit/s; the fastest, if several; 0: none): what the link carries —
+    /// the host put it all on the wire at once, and a slower link spreads
+    /// it. (Not a paced frame: that times the pacer.)
     pub link_kbps: u32,
 }
 
@@ -381,11 +416,28 @@ impl DelayFloor {
     }
 }
 
-/// A frame of at least this many packets is timed for [`Stats::link_kbps`]…
+/// A train of at least this many packets is timed for [`Stats::link_kbps`]
+/// (an older host's probes: 8 data shards)…
 const BURST_MIN_SHARDS: u32 = 8;
 /// …as taking this long (µs) at least: packets handed over in one batch
-/// arrive microseconds apart whatever the link (a whole frame "at 4 Gbit/s").
+/// arrive microseconds apart whatever the link (a whole frame "at 4 Gbit/s")…
 const BURST_MIN_US: u64 = 150;
+/// …and this long a packet (µs: a full one at 1.2 Gbit/s), so a train the
+/// receiver read in one coalesced batch doesn't read as gigabits.
+const TRAIN_PACKET_MIN_US: u64 = 8;
+
+/// A probe train arriving: its frame, first and last arrival (µs), the
+/// bytes after the first packet, packets, and whether it came promptly
+/// (see [`DelayFloor`]).
+#[derive(Debug, Clone, Copy)]
+struct Train {
+    frame_id: u32,
+    first_us: u64,
+    last_us: u64,
+    bytes: u64,
+    packets: u32,
+    prompt: bool,
+}
 
 struct Block {
     k: usize,
@@ -411,10 +463,6 @@ struct Assembly {
     capture_us: u64,
     encode_us: u32,
     first_rx_us: u64,
-    /// The newest shard's arrival, the shards in and their bytes since the first.
-    last_rx_us: u64,
-    rx_shards: u32,
-    rx_bytes: u64,
     /// The frame's data, `frame_len` bytes, filled in shard by shard.
     data: Vec<u8>,
 }
@@ -441,6 +489,8 @@ pub struct Reassembler {
     stats: Stats,
     /// Which frames came on time, for [`Stats::link_kbps`].
     floor: DelayFloor,
+    /// The probe train arriving, if any.
+    train: Option<Train>,
     /// Shard buffers (parity, and data for a rebuild), reused for the next
     /// ones (not an allocation and a free per packet).
     pool: Vec<Vec<u8>>,
@@ -458,6 +508,7 @@ impl Default for Reassembler {
             next: None,
             stats: Stats::default(),
             floor: DelayFloor::default(),
+            train: None,
             pool: Vec::new(),
             scratch: Vec::new(),
             buffers: FrameBuffers::default(),
@@ -549,7 +600,26 @@ impl Reassembler {
 
     /// Counters since the last call.
     pub fn take_stats(&mut self) -> Stats {
+        self.finish_train();
         std::mem::take(&mut self.stats)
+    }
+
+    /// A probe train is arriving (or the last packet was one's): the
+    /// client's receive loop doesn't nap then, or the nap would be timed
+    /// as the link (in office mode it read 1-2 ms on every train).
+    pub fn train_open(&self) -> bool {
+        self.train.is_some()
+    }
+
+    /// The train arriving, timed into [`Stats::link_kbps`] if it came
+    /// promptly and long enough to tell.
+    fn finish_train(&mut self) {
+        let Some(t) = self.train.take() else { return };
+        if t.packets >= BURST_MIN_SHARDS && t.prompt {
+            let spread = t.last_us.saturating_sub(t.first_us).max(BURST_MIN_US).max(t.packets as u64 * TRAIN_PACKET_MIN_US);
+            let kbps = (t.bytes * 8 * 1000 / spread).min(u32::MAX as u64) as u32;
+            self.stats.link_kbps = self.stats.link_kbps.max(kbps);
+        }
     }
 
     /// Frames being assembled.
@@ -574,6 +644,22 @@ impl Reassembler {
         // compares them with everything it sent. (Not in `shards`, the loss
         // estimate's denominator: late parity would dilute it.)
         self.stats.bytes += body.len() as u64;
+        // A probe train is timed whole, parity arriving after its frame
+        // completed too (before the check below drops that).
+        if h.flags & FLAG_PROBE != 0 {
+            match &mut self.train {
+                Some(t) if t.frame_id == h.frame_id => {
+                    (t.last_us, t.bytes, t.packets) = (now_us, t.bytes + body.len() as u64, t.packets + 1);
+                }
+                _ => {
+                    self.finish_train();
+                    let prompt = self.floor.prompt(now_us as i64 - (h.capture_us + h.encode_us as u64) as i64, now_us);
+                    self.train = Some(Train { frame_id: h.frame_id, first_us: now_us, last_us: now_us, bytes: 0, packets: 1, prompt });
+                }
+            }
+        } else if self.train.is_some_and(|t| t.frame_id != h.frame_id) {
+            self.finish_train();
+        }
         if self.base.is_some_and(|b| h.frame_id.wrapping_sub(b) > u32::MAX / 2) {
             return Vec::new(); // older than what we've already delivered
         }
@@ -614,9 +700,6 @@ impl Reassembler {
                 capture_us: h.capture_us,
                 encode_us: h.encode_us,
                 first_rx_us: now_us,
-                last_rx_us: now_us,
-                rx_shards: 0,
-                rx_bytes: 0,
                 data,
             });
         }
@@ -624,10 +707,6 @@ impl Reassembler {
         if payload.len() != a.shard_size || a.blocks.len() != h.blocks as usize {
             return events; // inconsistent with this frame's other shards
         }
-        if a.rx_shards > 0 {
-            a.rx_bytes += body.len() as u64;
-        }
-        (a.rx_shards, a.last_rx_us) = (a.rx_shards + 1, now_us);
         let stage = self.stage;
         let span = a.span(h.block as usize, h.shard as usize);
         let block = a.blocks[h.block as usize].get_or_insert_with(|| Block {
@@ -744,12 +823,7 @@ impl Reassembler {
         }
         (self.next, self.base) = (Some(frame_id.wrapping_add(1)), Some(frame_id.wrapping_add(1)));
         let (flags, capture_us, encode_us, first_rx_us) = (a.flags, a.capture_us, a.encode_us, a.first_rx_us);
-        let spread = a.last_rx_us.saturating_sub(first_rx_us);
-        let prompt = self.floor.prompt(first_rx_us as i64 - (capture_us + encode_us as u64) as i64, first_rx_us);
-        if flags & FLAG_PROBE != 0 && a.rx_shards >= BURST_MIN_SHARDS && prompt {
-            let kbps = (a.rx_bytes * 8 * 1000 / spread.max(BURST_MIN_US)).min(u32::MAX as u64) as u32;
-            self.stats.link_kbps = self.stats.link_kbps.max(kbps);
-        }
+        self.floor.prompt(first_rx_us as i64 - (capture_us + encode_us as u64) as i64, first_rx_us);
         let data = Self::scrap(&mut self.pool, a);
         self.stats.frames += 1;
         events.push(Event::Frame(InFrame {
@@ -813,6 +887,33 @@ mod tests {
         assert!((800_000..1_300_000).contains(&kbps), "{kbps}");
         deliver(&mut r, 2, true, 40_000, 30_000);
         assert_eq!(r.take_stats().link_kbps, 0, "a held-up probe isn't timed");
+    }
+
+    /// A probe of a 1 KB frame goes as a train of full packets, its parity
+    /// padding it out; the client times all of it (parity after the frame
+    /// completed too), and the padding is what the host leaves out of its
+    /// sent bytes.
+    #[test]
+    fn a_probe_train_is_timed_whole() {
+        let data = frame(7, 1_000);
+        let f = OutFrame { frame_id: 0, data: &data, keyframe: false, ltr: false, recovery: false, capture_us: 1_000, encode_us: 0, probe: true };
+        let packets = packetize(&f, 0.05);
+        assert_eq!(packets.len(), PROBE_TRAIN_PACKETS);
+        assert!(packets.iter().all(|p| p.len() == MAX_BODY));
+        let plain = packetize(&OutFrame { probe: false, ..f }, 0.05);
+        let bytes = |ps: &[Vec<u8>]| ps.iter().map(Vec::len).sum::<usize>();
+        assert_eq!(probe_padding(1_000, 0.05), bytes(&packets) - bytes(&plain));
+        // 50 µs a packet: 1172 bytes at ~190 Mbit/s.
+        let mut r = Reassembler::new();
+        let mut done = 0;
+        for (i, p) in packets.iter().enumerate() {
+            done += r.push(p, 2_000 + i as u64 * 50).iter().filter(|e| matches!(e, Event::Frame(f) if f.data == data)).count();
+            assert!(r.train_open());
+        }
+        assert_eq!(done, 1, "the frame decodes (from its first packet)");
+        let kbps = r.take_stats().link_kbps;
+        assert!((180_000..200_000).contains(&kbps), "{kbps}");
+        assert!(!r.train_open());
     }
 
     #[test]
