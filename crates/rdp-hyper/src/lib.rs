@@ -14,6 +14,7 @@
 //! - [`input`]: client input that survives loss without stuck keys.
 //! - [`rate`]: delay- and loss-driven bitrate and FEC control.
 //! - [`audio`] + [`playout`]: Opus packets, and the jitter buffer that plays them.
+//! - [`pause`]: when a paused host lets its GPU pipeline go, and takes it back.
 //!
 //! Platform-neutral; the capture/encode/decode ends live in `rdp-gpu` and
 //! `rdp-client`.
@@ -26,6 +27,7 @@ pub mod input;
 pub mod lan;
 pub mod liveness;
 pub mod messages;
+pub mod pause;
 pub mod playout;
 pub mod rate;
 pub mod reliable;
