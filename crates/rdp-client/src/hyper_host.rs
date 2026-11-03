@@ -491,6 +491,9 @@ struct Shared {
     /// and that it changed since the stream last followed it.
     view: Mutex<Option<(u32, u32)>>,
     view_changed: AtomicBool,
+    /// Ends the capture loop's paused wait at once (see [`Shared::wake`]).
+    woken: Mutex<bool>,
+    wake: std::sync::Condvar,
 }
 
 /// A captured frame: converted already (Desktop Duplication), or only seen —
@@ -579,6 +582,23 @@ impl Trickle {
 }
 
 impl Shared {
+    /// The receive thread heard something that ends a pause — the window
+    /// back, a keyframe or repair asked for, goodbye: the capture loop's
+    /// paused wait ([`wait_wake`](Self::wait_wake)) ends now, not at its
+    /// next look.
+    fn wake(&self) {
+        *self.woken.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+
+    /// Until [`wake`](Self::wake) (or one that came since the last wait), or
+    /// `timeout`.
+    fn wait_wake(&self, timeout: Duration) {
+        let woken = self.woken.lock().unwrap();
+        let (mut woken, _) = self.wake.wait_timeout_while(woken, timeout, |w| !*w).unwrap();
+        *woken = false;
+    }
+
     fn send(&self, socket: &UdpSocket, kind: Kind, body: &[u8]) {
         let peer = *self.peer.lock().unwrap();
         // Sealed under the lock, sent outside it: a normal-priority thread
@@ -724,6 +744,21 @@ impl Drop for GpuClockFloor {
         tracing::debug!("GPU clocks let go");
     }
 }
+
+/// A paused stream looks at the screen (and tells the client its status)
+/// this often; the window coming back wakes it at once (see `Shared::wake`).
+const PAUSED_LOOK: Duration = Duration::from_millis(500);
+
+/// The receive thread's socket wait while streaming: it also sends the
+/// trailing input ack (within ~10 ms) and refreshes held touches.
+const RX_ACTIVE: Duration = Duration::from_millis(10);
+
+/// …and while the client's window is minimized (`pausepoll`). Each timeout is
+/// a wake-up and a socket call (Windows counts it as "I/O other": ~100 a
+/// second of the ~192 measured while paused). A packet ends the wait at
+/// once, so the window coming back isn't held up; only the stream's end may
+/// wait up to this for the thread.
+const RX_PAUSED: Duration = Duration::from_millis(100);
 
 /// The client's window minimized this long: the stream goes quiet (see
 /// [`Latency`]). A glance at another window and back costs nothing.
@@ -934,6 +969,8 @@ fn stream_inner(
         camera: Mutex::new(None),
         view: Mutex::new(None),
         view_changed: AtomicBool::new(false),
+        woken: Mutex::new(false),
+        wake: std::sync::Condvar::new(),
     });
     // Frames leave from their own thread: pacing one overlaps capturing and
     // encoding the next, and the capture loop never waits on the network.
@@ -1363,12 +1400,24 @@ fn stream_inner(
                 shared.send_status(&socket);
                 last_status = Instant::now();
             }
-            // (In steps, so a keyframe request ends the pause at once.)
-            for _ in 0..10 {
-                if !shared.paused.load(Ordering::Relaxed) || shared.keyframe.load(Ordering::Relaxed) || shared.stop.load(Ordering::Relaxed) {
-                    break;
+            // Until the next look — or at once when the window comes back, a
+            // keyframe is asked for or the client leaves: woken by the receive
+            // thread (`pausepoll`; else in 50 ms steps, 20 wake-ups a second
+            // of a paused stream's ~250).
+            let resume = || {
+                !shared.paused.load(Ordering::Relaxed) || shared.keyframe.load(Ordering::Relaxed) || shared.stop.load(Ordering::Relaxed)
+            };
+            if crate::host_ab::ab("pausepoll", true) {
+                if !resume() {
+                    shared.wait_wake(PAUSED_LOOK);
                 }
-                std::thread::sleep(Duration::from_millis(50));
+            } else {
+                for _ in 0..10 {
+                    if resume() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
             continue;
         }
@@ -2107,7 +2156,8 @@ fn receive_loop(
     clipboard: Option<Arc<crate::hyper_clipboard::ClipboardSync>>,
     audio_shape: Arc<crate::hyper_audio::AudioShape>,
 ) {
-    let _ = socket.set_read_timeout(Some(Duration::from_millis(10)));
+    let mut timeout = RX_ACTIVE;
+    let _ = socket.set_read_timeout(Some(timeout));
     // Input lands here: a game holding the CPU mustn't delay it.
     crate::net_tune::raise_thread();
     let mut input = InputReceiver::new();
@@ -2130,6 +2180,16 @@ fn receive_loop(
             acked = input.applied();
             last_ack = Instant::now();
             shared.send_status(&socket);
+        }
+        // Longer waits while paused, with no ack owed (see RX_PAUSED).
+        let want = if input.applied() == acked && shared.paused.load(Ordering::Relaxed) && crate::host_ab::ab("pausepoll", true) {
+            RX_PAUSED
+        } else {
+            RX_ACTIVE
+        };
+        if want != timeout {
+            timeout = want;
+            let _ = socket.set_read_timeout(Some(timeout));
         }
         let Ok((n, from)) = socket.recv_from(&mut buf) else { continue };
         // The client signing in again (it took this stream for dead).
@@ -2179,16 +2239,21 @@ fn receive_loop(
                         shared.keyframe.store(true, Ordering::Relaxed);
                     }
                     shared.paused.store(false, Ordering::Relaxed);
+                    shared.wake();
                 }
                 Some(Control::Recover) => {
                     if !shared.rate.lock().unwrap().collapse_keyframe_request(qpc_us() / 1000) {
                         shared.recover.store(true, Ordering::Relaxed);
                     }
                     shared.paused.store(false, Ordering::Relaxed);
+                    shared.wake();
                 }
                 Some(Control::Paused { paused }) => {
                     if shared.paused.swap(paused, Ordering::Relaxed) != paused {
                         tracing::info!(paused, "client window minimized/restored");
+                    }
+                    if !paused {
+                        shared.wake();
                     }
                 }
                 Some(Control::Mode { office, fast_text }) => {
@@ -2251,6 +2316,7 @@ fn receive_loop(
                 Some(Control::Bye) => {
                     tracing::info!("client said goodbye");
                     shared.stop.store(true, Ordering::Relaxed);
+                    shared.wake();
                 }
                 _ => {}
             },

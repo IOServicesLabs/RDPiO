@@ -454,6 +454,9 @@ Host power switches (same file, on by default):
 - `pausequiet`: the client's window minimized 5 s, Wi-Fi streaming mode, the
   1 ms timer, MMCSS and the REALTIME GPU class let go until it's back; a
   paused stream sends nothing, yet those kept the laptop out of idle.
+- `pausepoll`: while paused, the capture loop sleeps until woken (window
+  back, keyframe, goodbye) or 500 ms, and the receive socket waits 100 ms
+  not 10: ~120 of a paused stream's ~250 wake-ups a second were these.
 
 ## Latency notes
 
