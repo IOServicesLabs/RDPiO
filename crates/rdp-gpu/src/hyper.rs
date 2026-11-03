@@ -1198,7 +1198,8 @@ const FULL_BUFFER_BPS: u64 = 30_000_000;
 /// 2-3 s to deliver one such frame (keyframes of 240-380 KB). So the time a
 /// frame may take shrinks with the bitrate: 8 ms per Mbps (240 ms at 30 Mbps),
 /// never under 100 ms (12.5 Mbps and below) nor two frames' worth, and never
-/// over the tuning's own (game's two frames stay as they are). Measured
+/// over the tuning's own (game's two frames stay as they are; but see
+/// [`frame_cap_for`] at low bits per pixel). Measured
 /// (`hardware::bad_link`, HEVC 2250x1590, desktop-like): at 8 Mbps the first
 /// keyframe 188 -> 96 KB (193 -> 99 ms of the link), the largest P picture
 /// 32 -> 26 KB, luma -0.3 dB; at 3 Mbps keyframes 76 -> 60 KB; at 1 Mbps the
@@ -1223,6 +1224,41 @@ fn frame_cap_floor_ms() -> u64 {
     *FLOOR.get_or_init(|| std::env::var("RDPIO_NVENC_CAP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100))
 }
 
+/// Bits per pixel the largest frame may have at a low rate with `lowbppcap`
+/// (see [`frame_cap_for`]): ~92 KB at 2560x1440. (A keyframe of dense text
+/// at 2250x1590 bottoms out at ~45 KB, 0.1: the quantizer runs out there.)
+const LOW_RATE_FRAME_BPP: f64 = 0.2;
+
+/// [`frame_cap`], and with `lowbppcap` at least a picture's worth at low
+/// bits per pixel. Game mode's buffer is two frames, to keep each frame's time
+/// on the link flat (and frame_cap leaves it so). But at a few Mbps two
+/// frames of a 2560x1440 picture are 8-20 KB: every frame, and a keyframe or
+/// a scene cut above all, comes out at the coarsest quantizer (and over
+/// even so: frame_cap's 33 ms floor sent 2.2 Mbps at 1 Mbps) and stays that
+/// blocky for as long as the screen is still. So a frame may take
+/// [`LOW_RATE_FRAME_BPP`] of the picture, but never more than
+/// [`frame_cap_floor_ms`] (100 ms) of the stream's own rate — the floor the
+/// office cap keeps too. The latency trade: such a frame holds the link up to
+/// 100 ms instead of two frames' 33, and the next frames wait behind it (the
+/// encoder pays the bits back from them: the bitrate holds). Nothing changes
+/// where two frames already give that much: from ~22 Mbps at 1440p60, at the
+/// 20 fps the frame rate follows down to (two frames are 100 ms there), nor
+/// in office mode (its own cap is never less).
+///
+/// `encoded_fps`: the frames a second really encoded. The host scales the
+/// encoder's rate up by the ones it skips; the stream's is that scaled back.
+fn frame_cap_for(bitrate: u32, fps: u32, frames: u32, link: LinkTuning, pixels: u64, encoded_fps: u32) -> u32 {
+    let cap = frame_cap(bitrate, fps, frames, link.vbv_cap);
+    if !link.low_bpp_cap {
+        return cap;
+    }
+    let fps = fps.max(1);
+    let stream_bps = bitrate as u64 * encoded_fps.clamp(1, fps) as u64 / fps as u64;
+    let longest = stream_bps / 8 * frame_cap_floor_ms() / 1000;
+    let picture = (pixels as f64 * LOW_RATE_FRAME_BPP / 8.0) as u64;
+    (cap as u64).max(longest.min(picture)).min(u32::MAX as u64) as u32
+}
+
 /// How the encoder behaves on slow links: each part one of the host's A/B
 /// switches. Changed at any time with [`HwEncoder::set_link_tuning`] (NVENC
 /// directly; Media Foundation ignores it). Defaults from measurements
@@ -1237,11 +1273,14 @@ pub struct LinkTuning {
     /// `introfresh`: [`HwEncoder::request_recovery`] may repair a loss with a
     /// gradual refresh instead of a keyframe.
     pub intra_refresh: bool,
+    /// `lowbppcap`: at low bits per pixel a frame may take up to 100 ms of
+    /// the link, not just two frames' worth ([`frame_cap_for`]).
+    pub low_bpp_cap: bool,
 }
 
 impl Default for LinkTuning {
     fn default() -> Self {
-        Self { vbv_cap: true, preset_follow: false, intra_refresh: false }
+        Self { vbv_cap: true, preset_follow: false, intra_refresh: false, low_bpp_cap: true }
     }
 }
 
@@ -1818,6 +1857,10 @@ struct Nvenc {
     preset_refused: bool,
     /// The last keyframe's size (bytes; 0: none yet).
     last_key_bytes: usize,
+    /// The picture's size (pixels), and the frames a second the host really
+    /// encodes (see [`HwEncoder::set_encoded_fps`]).
+    pixels: u64,
+    encoded_fps: u32,
 }
 
 /// NVENC's preset: P1, the fastest. Measured on a screen of new office text
@@ -1832,6 +1875,11 @@ fn nvenc_preset() -> u32 {
 }
 
 impl Nvenc {
+    /// The largest frame at `bitrate` ([`frame_cap_for`]).
+    fn cap(&self, bitrate: u32) -> u32 {
+        frame_cap_for(bitrate, self.fps, self.tuning.buffer_frames, self.link, self.pixels, self.encoded_fps)
+    }
+
     /// The preset for `bps` (switch `presetfollow`), changed in place where
     /// it should change — NVENC takes a new preset through
     /// NvEncReconfigureEncoder without a new session or a keyframe.
@@ -1901,7 +1949,8 @@ impl HwEncoder {
             // AV1 keeps long-term references only through API 13.0 (a driver
             // from 570); without them its losses take a keyframe.
             let slots = ltr_slots();
-            let vbv = frame_cap(bitrate, fps, tuning.buffer_frames, link.vbv_cap);
+            let pixels = width as u64 * height as u64;
+            let vbv = frame_cap_for(bitrate, fps, tuning.buffer_frames, link, pixels, fps);
             let opts = |intra_refresh| nvenc::Options { preset, ltr_frames: slots, argb: rgb, intra_refresh };
             // A gradual refresh if the driver takes one beside the references;
             // else without (losses then take a keyframe or a reference).
@@ -1931,6 +1980,8 @@ impl HwEncoder {
                             preset,
                             preset_refused: false,
                             last_key_bytes: 0,
+                            pixels,
+                            encoded_fps: fps.max(1),
                         }),
                         name,
                         bitrate,
@@ -1954,11 +2005,12 @@ impl HwEncoder {
                 (self.bitrate, self.id, self.ltr) = (mf.bitrate, mf.id, mf.ltr);
             }
             Inner::Nv(nv) => {
+                let cap = nv.cap(bps);
                 let Some(s) = nv.session.as_mut() else { return };
                 if nv.refused.is_some_and(|(r, t)| t.elapsed() < Duration::from_secs(5) && (r as i64 - bps as i64).unsigned_abs() < r as u64 / 10) {
                     return;
                 }
-                match s.set_bitrate(bps, frame_cap(bps, nv.fps, nv.tuning.buffer_frames, nv.link.vbv_cap)) {
+                match s.set_bitrate(bps, cap) {
                     Ok(()) => {
                         self.bitrate = bps;
                         nv.refused = None;
@@ -1980,18 +2032,43 @@ impl HwEncoder {
         if nv.link == link {
             return;
         }
-        let cap_changed = nv.link.vbv_cap != link.vbv_cap;
+        let cap_changed = nv.link.vbv_cap != link.vbv_cap || nv.link.low_bpp_cap != link.low_bpp_cap;
         tracing::info!(?link, "encoder link tuning");
         nv.link = link;
         if cap_changed {
             // The largest frame again, for the same bitrate.
+            let cap = nv.cap(self.bitrate);
             if let Some(s) = nv.session.as_mut() {
-                if let Err(e) = s.set_bitrate(self.bitrate, frame_cap(self.bitrate, nv.fps, nv.tuning.buffer_frames, link.vbv_cap)) {
+                if let Err(e) = s.set_bitrate(self.bitrate, cap) {
                     tracing::warn!(error = %e, "NVENC kept its frame cap");
                 }
             }
         }
         nv.follow_preset(self.bitrate);
+    }
+
+    /// The frames a second the host really encodes (the frame rate following
+    /// the bitrate; its rate is scaled up to match): what the stream's own
+    /// rate is, for the largest frame at low bits per pixel
+    /// ([`frame_cap_for`]). Cheap when unchanged, so it can be called every
+    /// frame.
+    pub fn set_encoded_fps(&mut self, fps: u32) {
+        let bitrate = self.bitrate;
+        let Inner::Nv(nv) = &mut self.inner else { return };
+        let fps = fps.clamp(1, nv.fps);
+        if nv.encoded_fps == fps {
+            return;
+        }
+        let before = nv.cap(bitrate);
+        nv.encoded_fps = fps;
+        let cap = nv.cap(bitrate);
+        if cap != before {
+            if let Some(s) = nv.session.as_mut() {
+                if let Err(e) = s.set_bitrate(bitrate, cap) {
+                    tracing::warn!(error = %e, "NVENC kept its frame cap");
+                }
+            }
+        }
     }
 
     /// The NVENC preset in use (0: Media Foundation's encoder).
@@ -2015,7 +2092,7 @@ impl HwEncoder {
         let key = if nv.last_key_bytes > 0 {
             nv.last_key_bytes as u64
         } else {
-            frame_cap(self.bitrate, nv.fps, nv.tuning.buffer_frames, nv.link.vbv_cap) as u64
+            nv.cap(self.bitrate) as u64
         };
         key * 8 * 1000 > self.bitrate.max(1) as u64 * GRADUAL_OVER.as_millis() as u64
     }
@@ -2725,6 +2802,27 @@ mod tests {
     }
 
     #[test]
+    fn a_low_rate_game_frame_may_take_100_ms() {
+        let px = 2560 * 1440;
+        let on = LinkTuning::default();
+        let off = LinkTuning { low_bpp_cap: false, ..on };
+        let game = |bps, link, encoded| frame_cap_for(bps, 60, 2, link, px, encoded);
+        // Off: two frames.
+        assert_eq!(game(4_000_000, off, 60), hrd_bytes(4_000_000, 60, 2));
+        // 4 Mbps at 60 fps: 100 ms of it (50 KB), not 33 (17 KB).
+        assert_eq!(game(4_000_000, on, 60), 50_000);
+        // 8 Mbps: 0.2 bits a pixel (92 KB) comes before 100 ms (100 KB).
+        assert_eq!(game(8_000_000, on, 60), (px as f64 * LOW_RATE_FRAME_BPP / 8.0) as u32);
+        // 30 Mbps: two frames give more than that already.
+        assert_eq!(game(30_000_000, on, 60), hrd_bytes(30_000_000, 60, 2));
+        // 1 Mbps at 20 fps of 60 (the encoder's rate scaled 3x): two frames
+        // are 100 ms of the stream already.
+        assert_eq!(game(3_000_000, on, 20), hrd_bytes(3_000_000, 60, 2));
+        // Office: its own cap, never less.
+        assert_eq!(frame_cap_for(8_000_000, 60, 15, on, px, 60), frame_cap(8_000_000, 60, 15, true));
+    }
+
+    #[test]
     fn preset_follows_with_hysteresis() {
         assert_eq!(preset_for(5_000_000, 1, 1), SLOW_LINK_PRESET);
         assert_eq!(preset_for(8_000_000, SLOW_LINK_PRESET, 1), SLOW_LINK_PRESET);
@@ -3335,7 +3433,7 @@ mod hardware {
                         std::env::set_var("RDPIO_NVENC_REFRESH", refresh.to_string());
                         let tuning = Tuning { buffer_frames: (fps / 4).max(2), quality: 0 };
                         let mut enc = HwEncoder::new_tuned(&device, None, w, h, fps, bps, false, Codec::Hevc, tuning).unwrap();
-                        enc.set_link_tuning(LinkTuning { vbv_cap: cap, preset_follow: false, intra_refresh: gradual });
+                        enc.set_link_tuning(LinkTuning { vbv_cap: cap, preset_follow: false, intra_refresh: gradual, low_bpp_cap: false });
                         assert_eq!(enc.preset(), preset);
                         let mut dec = crate::h264::H264GpuDecoder::with_codec(w, h, &device, &context, Codec::Hevc).unwrap();
                         let (mut enc_ms, mut psnrs, mut sizes, mut keys, mut errors) = (Vec::new(), vec![f64::NAN; n], Vec::new(), Vec::new(), 0);

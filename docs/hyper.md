@@ -438,7 +438,9 @@ to 1); warm started, the first picture comes at 0.4 s instead of 2.7 s.
 
 Host switches (`%PUBLIC%\rdpio-hyper-switches.txt`, `name=0` turns one off,
 read live): `pathinfo`, `inputdup` (Windows client), `fastreconnect`,
-`keepmonitor`, `vbvcap`, `presetfollow=1`, `introfresh=1` (the last two off
+`keepmonitor`, `vbvcap`, `lowbppcap` (at low bits per pixel a game-mode
+frame may take up to 0.2 bits a pixel, at most 100 ms of the link, instead
+of two frames' worth), `presetfollow=1`, `introfresh=1` (the last two off
 by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
 `gapcut`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
 `growcap`, `softslow`, `fecfloor`,

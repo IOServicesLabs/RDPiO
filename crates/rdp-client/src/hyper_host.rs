@@ -1325,12 +1325,16 @@ fn stream_inner(
         };
         // The encoder's slow-link switches (rdp_gpu::hyper::LinkTuning; a
         // no-op unless one changed): the largest frame following the bitrate,
-        // a slower preset at low bitrates, losses repaired gradually.
+        // a slower preset at low bitrates, losses repaired gradually, game
+        // mode's frames up to 100 ms of the link at low bits per pixel.
         enc.set_link_tuning(rdp_gpu::hyper::LinkTuning {
             vbv_cap: crate::host_ab::ab("vbvcap", true),
             preset_follow: crate::host_ab::ab("presetfollow", false),
             intra_refresh: crate::host_ab::ab("introfresh", false),
+            low_bpp_cap: crate::host_ab::ab("lowbppcap", true),
         });
+        // (The frames it really gets: the stream's own rate, for that cap.)
+        enc.set_encoded_fps(enc_fps);
         // Encoding fewer frames than it was opened for (the frame rate
         // following the bitrate), the encoder gets the rate scaled up to
         // match: its budget a frame is its rate over its frame rate, so each
