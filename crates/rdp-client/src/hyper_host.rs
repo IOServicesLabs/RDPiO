@@ -2176,6 +2176,9 @@ fn rate_switches() -> rdp_hyper::rate::Switches {
         soft_slow: ab("softslow", true),
         probe_train: ab("probetrain", true),
         pause_hold: ab("pausehold", true),
+        held_burst: ab("heldburst", true),
+        own_queue: ab("ownq", true),
+        lone_frame: ab("loneframe", true),
     }
 }
 

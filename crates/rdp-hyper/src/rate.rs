@@ -205,6 +205,33 @@ pub struct Switches {
     /// A paused stream holds its rate (`pausehold`; see
     /// [`RateController::set_paused`]).
     pub pause_hold: bool,
+    /// A queue still there a window later counts as the stream's only if
+    /// that window's fastest frame was late too (`heldburst`; see `ours` in
+    /// [`RateController::update`]). Wi-Fi power save holds a dozing
+    /// client's frames at the access point until the next beacon (~100 ms)
+    /// and lets them go at once: the window they land in averages 30-60 ms
+    /// late, the one after it too, but its last frame before the beacon
+    /// came promptly. A queue lasting has even its fastest frame late.
+    /// Simulated on a 200 Mbit/s LAN dozing one beacon interval in three,
+    /// the stream sat at 21 Mbit/s (164 queue cuts over 4 x 50 s), 35 with
+    /// it (111); warm started from a bad stream's 0.7, at 11 instead of 35.
+    pub held_burst: bool,
+    /// A queue over twice what the stream's last 100 ms of bytes would take
+    /// on the link, its window's fastest frame prompt (under 10 ms), isn't
+    /// the stream's (`ownq`). Its bytes count as able to make a queue from
+    /// a tenth of the link up, and a beacon's burst was 30-60 ms whatever
+    /// was sent: on a 200 Mbit/s LAN in power save that held the stream at
+    /// 17 Mbit/s, 35 with this (and a queue on a link something else took
+    /// has its fastest frame late too: still cut).
+    pub own_queue: bool,
+    /// A window with one frame, under a beacon interval late, doesn't make
+    /// a queue last (`loneframe`): a stream under ~25 fps has the radio
+    /// dozing between frames, each held 0-100 ms, and one such frame has no
+    /// faster one to show it was held. Cut for those, an office stream
+    /// went to 10 fps, its radio dozed through every frame, and it stayed
+    /// there: after something took the link for 3 s it came back to 24
+    /// Mbit/s on a 200 Mbit/s LAN, 29 with this.
+    pub lone_frame: bool,
 }
 
 impl Default for Switches {
@@ -221,6 +248,9 @@ impl Default for Switches {
             soft_slow: true,
             probe_train: true,
             pause_hold: true,
+            held_burst: true,
+            own_queue: true,
+            lone_frame: true,
         }
     }
 }
@@ -758,8 +788,19 @@ impl RateController {
         // (A radio's bump is one frame's; a queue still there a window later
         // is the stream's, whatever the link showed: something else took it.)
         let recent: u64 = self.gap.iter().rev().take(2).map(|e| e.1).sum();
-        let ours = self.link_bps.is_none_or(|l| recent as f64 * 8.0 / l * 1e6 >= QUEUE_SOFT_US as f64)
-            || (fb.frames > 0 && queue_us > QUEUE_HARD_US && self.last_queue_us > QUEUE_HARD_US);
+        // (And not one over twice what those bytes would take on the link,
+        // its fastest frame prompt: that's a radio's hold let go, whatever
+        // the stream sends — see [`Switches::own_queue`].)
+        let own_us = |l: f64| recent as f64 * 8.0 / l * 1e6;
+        let too_big = |l: f64| self.switches.own_queue && queue_us as f64 > 2.0 * own_us(l) && queue_min_us < QUEUE_SOFT_US;
+        // (A queue lasting is the stream's only if the window's fastest frame
+        // was late too, see [`Switches::held_burst`], and it had more than
+        // one frame or one later than a beacon interval, see
+        // [`Switches::lone_frame`].)
+        let burst = self.switches.held_burst && queue_min_us < (queue_us / 2).max(QUEUE_SOFT_US);
+        let lone = self.switches.lone_frame && fb.frames < 2 && queue_us <= STANDING_US;
+        let lasting = fb.frames > 0 && queue_us > QUEUE_HARD_US && self.last_queue_us > QUEUE_HARD_US && !burst && !lone;
+        let ours = self.link_bps.is_none_or(|l| own_us(l) >= QUEUE_SOFT_US as f64 && !too_big(l)) || lasting;
 
         // Bulk yields first: it halves at the first sign of queueing or a
         // lost frame, and grows only while something is waiting to go.
@@ -1743,6 +1784,16 @@ mod tests {
         /// The radio drops what would wait longer than this (µs) in its
         /// queue (a lost frame); `None`: it queues and never drops.
         buffer_us: Option<u64>,
+        /// The client's radio in power save (a laptop on battery), dozing
+        /// through one wake interval in this many: see [`doze_hold`]…
+        doze: Option<u64>,
+        /// …waking every this many beacons (its listen interval).
+        listen: u64,
+        /// Picks the radio's bumps and dozes (0: as ever).
+        seed: u64,
+        /// The frame rate follows the bitrate as office mode's does (down to
+        /// 10 fps; see [`FrameRate::follow_office`]).
+        office: bool,
     }
 
     impl Setup {
@@ -1761,6 +1812,9 @@ mod tests {
                     soft_slow: false,
                     probe_train: false,
                     pause_hold: false,
+                    held_burst: false,
+                    own_queue: false,
+                    lone_frame: false,
                 },
                 fps_follow: false,
                 warm_bps: None,
@@ -1772,6 +1826,10 @@ mod tests {
                 airtime: false,
                 nap: false,
                 buffer_us: None,
+                doze: None,
+                listen: 1,
+                seed: 0,
+                office: false,
             }
         }
 
@@ -1788,6 +1846,10 @@ mod tests {
                 airtime: false,
                 nap: false,
                 buffer_us: None,
+                doze: None,
+                listen: 1,
+                seed: 0,
+                office: false,
             }
         }
     }
@@ -1805,8 +1867,12 @@ mod tests {
         /// Each second: when (ms), the target and the link the controller
         /// saw (bits per second).
         per_s: Vec<(u64, u32, u32)>,
-        /// Frames the radio dropped.
+        /// Frames the radio dropped, and when (ms).
         lost: u32,
+        lost_at: Vec<u64>,
+        /// The controller's cuts, by reason ([`CUT_NAMES`]), and when (ms).
+        cuts: [u32; CUT_NAMES.len()],
+        cut_at: Vec<u64>,
     }
 
     impl Run {
@@ -1915,6 +1981,27 @@ mod tests {
     /// See [`wifi_train_us`].
     const WIFI_HEAD: usize = 4;
 
+    /// A beacon interval (µs): 100 TU.
+    const BEACON_US: u64 = 102_400;
+    /// A radio in power save dozes after this long with nothing received (µs).
+    const DOZE_IDLE_US: u64 = 40_000;
+
+    /// When a frame reaching the access point at `first` (µs) reaches a
+    /// client whose radio is in power save, last woken by a frame at
+    /// `last_rx`: a dozing radio's traffic waits at the access point for the
+    /// next beacon, and comes in a burst. It dozes once nothing came for
+    /// [`DOZE_IDLE_US`] (a stream under ~25 fps, every frame), and through one
+    /// beacon interval in `every` anyway (a laptop on battery: Windows' power
+    /// saving on the Razer, whatever is sent). So a frame waits 0-100 ms now
+    /// and then, the fastest of a window's frames comes promptly (the last
+    /// one before the beacon), and the link carries all of it at once.
+    fn doze_hold(first: u64, last_rx: u64, every: u64, listen: u64, seed: u64) -> u64 {
+        let wake = BEACON_US * listen;
+        let k = first / wake;
+        let dozing = draw(k, 7 + seed) % every == 0 || first >= last_rx + DOZE_IDLE_US;
+        if dozing { (k + 1) * wake } else { first }
+    }
+
     /// A keyframe's size at a bitrate: the log's 240-380 KB at 20 Mbps, down
     /// to a floor (even the coarsest keyframe of a whole screen is tens of KB).
     fn sim_keyframe_bytes(bps: u32) -> usize {
@@ -1968,7 +2055,11 @@ mod tests {
             }
             while feedback.front().is_some_and(|(a, _)| *a <= t) {
                 let (_, f) = feedback.pop_front().unwrap();
+                let before: u32 = r.cuts.iter().sum();
                 r.update(&f, 50, now_ms);
+                if r.cuts.iter().sum::<u32>() > before {
+                    run.cut_at.push(now_ms);
+                }
             }
             if setup.key_every_ms.is_some_and(|e| now_ms > 0 && now_ms % e == 0 && t % 1000 == 0) {
                 want_key = true;
@@ -1986,7 +2077,11 @@ mod tests {
                         println!("        cuts so far: {:?}", CUT_NAMES.iter().zip(c).filter(|p| p.1 > 0).collect::<Vec<_>>());
                     }
                 }
-                let fps = if setup.fps_follow { fr.follow(bps, SIM_PIXELS, SIM_FPS, now_ms) } else { SIM_FPS };
+                let fps = match (setup.fps_follow, setup.office) {
+                    (false, _) => SIM_FPS,
+                    (true, false) => fr.follow(bps, SIM_PIXELS, SIM_FPS, now_ms),
+                    (true, true) => fr.follow_office(bps, SIM_PIXELS, SIM_FPS, now_ms),
+                };
                 let mut interval = 1_000_000 / fps as u64;
                 if let Some(d) = r.drain_fps(now_ms) {
                     interval = interval.max(1_000_000 / d as u64);
@@ -2035,12 +2130,17 @@ mod tests {
                     let dropped = setup.buffer_us.is_some_and(|b| start.saturating_sub(host_start) > b);
                     if dropped {
                         run.lost += 1;
+                        run.lost_at.push(now_ms);
                         lost.push_back(t + one_way);
                     } else {
                     free_at = (start + (on_wire as f64 * 8e6 / capacity(now_ms)) as u64).max(pacer_free);
-                    let bump = if setup.wifi && setup.bumps { wifi_bump(t) } else { 0 };
-                    let first = (start + one_way + bump).max(last_arrival);
-                    let arrive = (free_at + one_way + bump).max(first);
+                    let bump = if setup.wifi && setup.bumps { wifi_bump(t.wrapping_add(setup.seed * 7_919)) } else { 0 };
+                    // (A dozing radio's frames wait from when they reach the
+                    // access point; at the beacon all that's waiting comes.)
+                    let ap = start + one_way + bump;
+                    let held = setup.doze.map_or(0, |every| doze_hold(ap, last_arrival, every, setup.listen, setup.seed) - ap);
+                    let first = (ap + held).max(last_arrival);
+                    let arrive = (free_at + one_way + bump + held).max(first);
                     last_arrival = arrive;
                     // How the client times it (kbit/s): an older host's probe
                     // in 8 packets at least, a train in full ones; their bytes
@@ -2124,6 +2224,7 @@ mod tests {
                 (win, delay_sum, window_start) = (Feedback::default(), 0, t);
             }
         }
+        run.cuts = r.cuts;
         run
     }
 
@@ -2402,7 +2503,10 @@ mod tests {
         let settle = |r: &Run| r.settled(20_000, 150.0).unwrap().saturating_sub(20_000);
         println!("  late by >150 ms until +{} ms -> +{} ms", settle(&old), settle(&new));
         assert!(settle(&new) <= settle(&old) + 500, "{} vs {}", settle(&new), settle(&old));
-        assert!(new.lost <= old.lost + 2, "{} vs {}", new.lost, old.lost);
+        // (What's on its way when the link drops is lost before any feedback
+        // can tell: more of it for a stream that had more of the link.)
+        let after = |r: &Run| r.lost_at.iter().filter(|&&t| t >= 20_100).count();
+        assert!(after(&new) <= after(&old) + 2, "{} vs {}", new.lost, old.lost);
         assert!(new.medians(22_000, 35_000).0 <= 20_000_000, "{:?}", new.medians(22_000, 35_000));
         assert!(new.stats(20_000, 35_000).1 <= old.stats(20_000, 35_000).1 * 1.25 + 5.0);
         assert!(new.medians(40_000, 60_000).0 >= 15_000_000, "recovers: {:?}", new.medians(40_000, 60_000));
@@ -2431,5 +2535,242 @@ mod tests {
         assert!(small.1 < 15, "{small:?}");
         assert!((100..400).contains(&game.1), "{game:?}");
         assert!(train.1 > 10 * small.1 && train.2 < 400, "{train:?}");
+    }
+
+    // ---- Power save on a fast Wi-Fi LAN --------------------------------------
+
+    impl Run {
+        /// The 95th percentile over time of how old the newest picture the
+        /// client has is (ms, from its capture): lag, frame rate and delay as
+        /// the user sees them together. (Counted per frame, a run of frames
+        /// behind one the radio held weighs six times as much at 60 fps as at
+        /// 10.)
+        fn age_p95(&self, from_ms: u64, to_ms: u64) -> f64 {
+            let mut newest = f64::NEG_INFINITY;
+            let mut shown = self.shown.iter().peekable();
+            let mut ages = Vec::new();
+            for t in 0..to_ms {
+                while let Some(s) = shown.next_if(|s| s.0 <= t) {
+                    newest = newest.max(s.0 as f64 - s.1);
+                }
+                if t >= from_ms {
+                    ages.push(t as f64 - newest);
+                }
+            }
+            ages.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ages.get(ages.len() * 95 / 100).copied().unwrap_or(f64::NAN)
+        }
+    }
+
+    /// A scenario for the power-save switches: a setup on a link, measured
+    /// over `span` (ms), run with `seeds` different radios (bumps and dozes).
+    #[derive(Clone, Copy)]
+    struct Case {
+        name: &'static str,
+        setup: Setup,
+        link: fn(u64) -> f64,
+        secs: u64,
+        span: (u64, u64),
+        seeds: u64,
+        /// A truly slow or queued path: it must be cut as fast as ever.
+        slow: bool,
+        /// The link drops at once at the first time (ms), and is down until the
+        /// second: the frames lost meanwhile (those on their way when it
+        /// dropped, more of them for a stream that had the link's room, and
+        /// the probes') are counted apart.
+        drop_ms: Option<(u64, u64)>,
+    }
+
+    /// One arm on one case, over its seeds: the target's median and mean,
+    /// the link the controller saw, what was delivered (Mbit/s) at how many
+    /// frames a second, video's p95, the picture's age at p95 (see
+    /// [`Run::age_p95`]) and audio's p95 (ms) — averaged; frames lost, those
+    /// of them in the 300 ms after a drop, and the cuts by reason — summed.
+    #[derive(Default, Clone, Copy)]
+    struct Tally {
+        med: f64,
+        mean: f64,
+        link: f64,
+        delivered: f64,
+        fps: f64,
+        p95: f64,
+        age: f64,
+        audio: f64,
+        lost: u32,
+        at_drop: u32,
+        react: f64,
+        settle: f64,
+        cuts: [u32; CUT_NAMES.len()],
+    }
+
+    impl Tally {
+        fn of(c: &Case, switches: Switches) -> Self {
+            let mut t = Tally::default();
+            let (a, b) = c.span;
+            for seed in 0..c.seeds {
+                let r = simulate(Setup { switches, seed, ..c.setup }, c.secs, c.link);
+                let w: Vec<f64> = r.per_s.iter().filter(|s| s.0 >= a && s.0 < b).map(|s| s.1 as f64 / 1e6).collect();
+                let (_, p95, fps, _) = r.stats(a, b);
+                let (med, link) = r.medians(a, b);
+                t.med += med as f64 / 1e6;
+                t.mean += w.iter().sum::<f64>() / w.len().max(1) as f64;
+                t.link += link as f64 / 1e6;
+                t.delivered += r.window(a, b).iter().map(|s| s.2 as f64).sum::<f64>() * 8.0 / (b - a) as f64 / 1e3;
+                t.fps += fps;
+                t.p95 += p95;
+                t.age += r.age_p95(a, b);
+                t.audio += r.audio_p95(a, b);
+                t.lost += r.lost;
+                t.at_drop += c.drop_ms.map_or(0, |(d, e)| r.lost_at.iter().filter(|&&l| (d..e).contains(&l)).count() as u32);
+                t.settle += c.drop_ms.map_or(0, |(d, _)| r.settled(d, 400.0).unwrap() - d) as f64;
+                t.react += c.drop_ms.map_or(0, |(d, _)| r.cut_at.iter().find(|&&t| t >= d).map_or(c.secs * 1000, |&t| t) - d) as f64;
+                for (sum, n) in t.cuts.iter_mut().zip(r.cuts) {
+                    *sum += n;
+                }
+            }
+            let n = c.seeds as f64;
+            for v in [&mut t.med, &mut t.mean, &mut t.link, &mut t.delivered, &mut t.fps, &mut t.p95, &mut t.age, &mut t.audio, &mut t.settle, &mut t.react] {
+                *v /= n;
+            }
+            t
+        }
+
+        fn print(&self, case: &str, arm: &str) {
+            let cuts: Vec<String> = CUT_NAMES.iter().zip(self.cuts).filter(|c| c.1 > 0).map(|(n, c)| format!("{n}:{c}")).collect();
+            println!(
+                "  {case:<30} {arm:<3} | target {:>5.1} / {:>5.1} | link {:>4.0} | delivered {:>5.1} at {:>4.1} fps | p95 {:>4.0} age {:>4.0} audio {:>4.0} | lost {:>3} | drop: {:>3} lost meanwhile, cut after {:>3.0}, late until {:>4.0} ms | {}",
+                self.med,
+                self.mean,
+                self.link,
+                self.delivered,
+                self.fps,
+                self.p95,
+                self.age,
+                self.audio,
+                self.lost,
+                self.at_drop,
+                self.react,
+                self.settle,
+                cuts.join(" ")
+            );
+        }
+    }
+
+    /// The cases each power-save switch is tried on.
+    fn doze_cases() -> Vec<Case> {
+        let scroll: fn(u64) -> bool = |ms| ms % 6_000 < 1_500;
+        let lan = Setup { wifi: true, lan: true, airtime: true, buffer_us: Some(40_000), ..Setup::after() };
+        // (The radio's own bumps are its dozes here.)
+        let dozing = Setup { doze: Some(3), bumps: false, ..lan };
+        let office = Setup { active: Some(scroll), office: true, ..dozing };
+        let case = |name, setup, link, secs, span| Case { name, setup, link, secs, span, seeds: 4, slow: false, drop_ms: None };
+        let blip: fn(u64) -> f64 = |ms| if (10_000..13_000).contains(&ms) { 2e6 } else { 200e6 };
+        let to_3m: fn(u64) -> f64 = |ms| if ms < 20_000 { 200e6 } else { 3e6 };
+        let to_20m: fn(u64) -> f64 = |ms| if (20_000..35_000).contains(&ms) { 20e6 } else { ax210(ms) };
+        vec![
+            case("game, 200M dozing", dozing, |_| 200e6, 60, (10_000, 60_000)),
+            case("game, ax210 dozing", dozing, ax210, 60, (10_000, 60_000)),
+            // The host's log: a bad stream's rate remembered, office mode.
+            case("office, 200M dozing, warm 0.7M", Setup { warm_bps: Some(700_000), ..office }, |_| 200e6, 60, (10_000, 60_000)),
+            case("game, 200M dozing, warm 0.7M", Setup { warm_bps: Some(700_000), ..dozing }, |_| 200e6, 60, (10_000, 60_000)),
+            case("office, listen 3, warm 0.7M", Setup { warm_bps: Some(700_000), listen: 3, ..office }, |_| 200e6, 60, (10_000, 60_000)),
+            // Something takes the link for 3 s, and what's left after.
+            Case { drop_ms: Some((10_000, 13_000)), ..case("office, 200M dozing, 2M 3 s", office, blip, 90, (15_000, 90_000)) },
+            Case { drop_ms: Some((10_000, 13_000)), ..case("game, 200M dozing, 2M 3 s", dozing, blip, 90, (15_000, 90_000)) },
+            // Truly slow: 3 Mbit/s queueing up to 2 s, on the dozing LAN
+            // and over the relay; and the dozing LAN dropping to that.
+            Case { slow: true, ..case("game, 3M dozing, deep", Setup { buffer_us: Some(2_000_000), ..dozing }, |_| 3e6, 60, (10_000, 60_000)) },
+            Case { slow: true, seeds: 1, ..case("game, 3M relay, deep", Setup::after(), |_| 3e6, 60, (10_000, 60_000)) },
+            Case { slow: true, drop_ms: Some((20_000, 21_000)), ..case("game, 200M dozing to 3M, deep", Setup { buffer_us: Some(2_000_000), ..dozing }, to_3m, 50, (25_000, 50_000)) },
+            // The cases before power save (see `wifi_game_converges_without_loss`).
+            Case { seeds: 1, ..case("game, ax210 (bumps)", lan, ax210, 60, (10_000, 60_000)) },
+            Case { slow: true, drop_ms: Some((20_000, 21_000)), ..case("game, ax210 to 20M (bumps)", lan, to_20m, 60, (22_000, 35_000)) },
+        ]
+    }
+
+    /// Runs every case with a switch (`on`) and without, prints both, and
+    /// returns them.
+    fn doze_ab(switch: &str, off: fn(&mut Switches)) -> Vec<(Case, Tally, Tally)> {
+        println!("{switch}: target median / mean, link, delivered (Mbit/s); video p95, picture age p95, audio p95 (ms)");
+        let mut without = Switches::default();
+        off(&mut without);
+        doze_cases()
+            .into_iter()
+            .map(|c| {
+                let (on, no) = (Tally::of(&c, Switches::default()), Tally::of(&c, without));
+                no.print(c.name, "off");
+                on.print(c.name, "on");
+                (c, on, no)
+            })
+            .collect()
+    }
+
+    /// Nothing worse with the switch: pictures no later and audio no more
+    /// delayed (5 ms for noise), no more frames lost (but while a dropped
+    /// link is down, see [`Case::drop_ms`]), a drop cut as fast (250 ms for
+    /// noise) and drained nearly as fast, and a slow path held no higher.
+    /// (A stream that had more of the link before it dropped has more in a
+    /// deep queue to drain at 3 Mbit/s after: 200M dozing to 3M was late
+    /// for 2.9 s after the drop with `ownq` or `heldburst`, 2.5 without
+    /// either, though cut sooner — so 500 ms for that.)
+    fn doze_no_worse(results: &[(Case, Tally, Tally)]) {
+        for (c, on, no) in results {
+            let n = c.name;
+            assert!(on.p95 <= no.p95 + 5.0, "{n}: p95 {} vs {}", on.p95, no.p95);
+            assert!(on.age <= no.age + 5.0, "{n}: age {} vs {}", on.age, no.age);
+            assert!(on.audio <= no.audio + 5.0, "{n}: audio {} vs {}", on.audio, no.audio);
+            assert!(on.lost - on.at_drop <= no.lost - no.at_drop, "{n}: lost {} ({}) vs {} ({})", on.lost, on.at_drop, no.lost, no.at_drop);
+            if c.drop_ms.is_some() {
+                assert!(on.react <= no.react + 250.0, "{n}: cut after {} vs {}", on.react, no.react);
+                assert!(on.settle <= no.settle + 500.0, "{n}: late until {} vs {}", on.settle, no.settle);
+            }
+            if c.slow {
+                assert!(on.mean <= no.mean * 1.1 + 0.1, "{n}: mean {} vs {}", on.mean, no.mean);
+            } else {
+                assert!(on.med >= no.med * 0.95 && on.mean >= no.mean * 0.95, "{n}: {} / {} vs {} / {}", on.med, on.mean, no.med, no.mean);
+            }
+        }
+    }
+
+    /// A case's (switch on, off).
+    fn doze_case<'a>(results: &'a [(Case, Tally, Tally)], name: &str) -> (&'a Tally, &'a Tally) {
+        let (_, on, no) = results.iter().find(|r| r.0.name == name).unwrap();
+        (on, no)
+    }
+
+    /// `heldburst`: a dozing radio's beacon burst lasting two windows isn't
+    /// the stream's queue.
+    #[test]
+    fn a_dozing_radios_burst_is_not_a_lasting_queue() {
+        let r = doze_ab("heldburst", |s| s.held_burst = false);
+        doze_no_worse(&r);
+        for name in ["game, 200M dozing", "game, ax210 dozing", "office, 200M dozing, warm 0.7M", "game, 200M dozing, warm 0.7M"] {
+            let (on, no) = doze_case(&r, name);
+            assert!(on.med > no.med * 1.5, "{name}: {} vs {}", on.med, no.med);
+            assert!(on.cuts[CUT_QUEUE] < no.cuts[CUT_QUEUE], "{name}: {:?} vs {:?}", on.cuts, no.cuts);
+        }
+    }
+
+    /// `ownq`: a queue the stream's bytes couldn't have made isn't its own.
+    #[test]
+    fn a_queue_bigger_than_the_streams_bytes_is_not_its_own() {
+        let r = doze_ab("ownq", |s| s.own_queue = false);
+        doze_no_worse(&r);
+        for name in ["game, 200M dozing", "game, ax210 dozing", "office, 200M dozing, warm 0.7M", "game, 200M dozing, warm 0.7M"] {
+            let (on, no) = doze_case(&r, name);
+            assert!(on.med > no.med * 1.3, "{name}: {} vs {}", on.med, no.med);
+            assert!(on.cuts[CUT_QUEUE] < no.cuts[CUT_QUEUE], "{name}: {:?} vs {:?}", on.cuts, no.cuts);
+        }
+    }
+
+    /// `loneframe`: under ~20 fps a lone frame the radio held doesn't make a
+    /// lasting queue.
+    #[test]
+    fn a_lone_held_frame_is_not_a_lasting_queue() {
+        let r = doze_ab("loneframe", |s| s.lone_frame = false);
+        doze_no_worse(&r);
+        let (on, no) = doze_case(&r, "office, 200M dozing, 2M 3 s");
+        assert!(on.med > no.med * 1.15 && on.age < no.age, "{} / {} vs {} / {}", on.med, on.age, no.med, no.age);
+        assert!(on.cuts[CUT_QUEUE] < no.cuts[CUT_QUEUE], "{:?} vs {:?}", on.cuts, no.cuts);
     }
 }
