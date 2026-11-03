@@ -2921,8 +2921,8 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
         }
         // Feedback on a timer, like the real client (it also keeps the host
         // from deciding the client went quiet while video pauses): every
-        // 50 ms, every 250 ms paused (a minimized client's idle pace).
-        let fb_every = Duration::from_millis(if pause_stage == 1 { 250 } else { 50 });
+        // 50 ms, every 250 ms paused or still (no video: the real one's idle pace).
+        let fb_every = Duration::from_millis(if quiet_client { 250 } else { 50 });
         if last_fb.elapsed() > fb_every {
             let s = reasm.take_stats();
             let fb = rdp_hyper::control::Feedback {
