@@ -551,6 +551,22 @@ fn sharpen_frames(change_bytes: usize, fps: u32) -> u32 {
     ((change_bytes / SHARPEN_BYTES_PER_FRAME) as u32).clamp(2, fps.max(2))
 }
 
+/// Game mode sharpens a still picture too (`gamesharpen`), under this many
+/// bits per pixel a frame (2560x1440 at 60 fps: under ~11 Mbps; 1080p60,
+/// ~6). There a frame coded during motion is blocky, and stays so for as long
+/// as the screen is still — the Windows client's default mode, often at 1-5
+/// Mbps. Over it the picture is near done already: refining it would cost
+/// encoder time, and a game's still moments are short — the next real frame
+/// could wait behind a refresh being encoded.
+const GAME_SHARPEN_BPP: f64 = 0.05;
+
+/// Whether a still picture is re-encoded sharper: always in office mode; in
+/// game mode (`game` = switch `gamesharpen`) only when short of bits (see
+/// [`GAME_SHARPEN_BPP`]), at `bps` over `pixels` and `fps` frames a second.
+fn sharpens(office: bool, game: bool, bps: u32, pixels: u64, fps: u32) -> bool {
+    office || (game && (bps as f64) < GAME_SHARPEN_BPP * pixels as f64 * fps.max(1) as f64)
+}
+
 /// Whether to trickle (see [`TRICKLE_AFTER_INPUT_US`]).
 #[derive(Default)]
 struct Trickle {
@@ -969,8 +985,10 @@ fn stream_inner(
     // (up to a second's frames), each time sharper: the encoder spends the
     // frame budget refining it. Measured on a screen of new text with the
     // fast preset: luma 33 dB, then 45 at half a second and 52 at one —
-    // past the quality preset's 42, which costs ~8 ms on every frame.
+    // past the quality preset's 42, which costs ~8 ms on every frame. Game
+    // mode too, at low bits per pixel (`gamesharpen`; see GAME_SHARPEN_BPP).
     let mut sharpen_left = 0u32;
+    let mut game_sharpen = crate::host_ab::ab("gamesharpen", true);
     let mut last_encoded_us = 0u64;
     // Trickling (see TRICKLE_AFTER_INPUT_US), and frames sent so (for the log).
     let (mut trickle, mut trickle_frames) = (Trickle::default(), 0u32);
@@ -993,6 +1011,8 @@ fn stream_inner(
     let (mut applied_view, mut view_followed) = (None, Instant::now() - VIEW_REBUILD_EVERY);
     // GPU clocks held up while a real stream runs unpaused (see GpuClockFloor).
     let mut clocks: Option<GpuClockFloor> = None;
+    // Paused as the rate controller was last told.
+    let mut rate_paused = false;
     // The loop lives in a closure so every exit — the client leaving, going
     // quiet, or an encoder/capture error — runs the same cleanup below:
     // threads stopped, the client told, the host's audio restored.
@@ -1108,6 +1128,11 @@ fn stream_inner(
         } else if paused {
             clocks = None;
         }
+        // The rate holds while nothing is sent (see RateController::set_paused).
+        if paused != rate_paused {
+            rate_paused = paused;
+            shared.rate.lock().unwrap().set_paused(paused);
+        }
         let want_key = shared.keyframe.swap(false, Ordering::Relaxed);
         let since_input_us = qpc_us().saturating_sub(shared.last_input_us.load(Ordering::Relaxed));
         let (mut pace_us, resumed) = trickle.pace(office, since_input_us, interval_us);
@@ -1124,6 +1149,7 @@ fn stream_inner(
             shared.rate.lock().unwrap().set_switches(switches);
             fps_follow = crate::host_ab::ab("fpsfollow", true);
             office_fps = crate::host_ab::ab("officefps", true);
+            game_sharpen = crate::host_ab::ab("gamesharpen", true);
         }
         // Fewer frames when the bitrate can't make them sharp (the encoder's
         // rate is scaled to match, below), and only a few while a standing
@@ -1146,6 +1172,8 @@ fn stream_inner(
             enc_fps = follow;
         }
         pace_us = pace_us.max(1_000_000 / enc_fps.max(1) as u64);
+        // A still picture re-encoded sharper (see sharpen_left).
+        let sharpen = sharpens(office, game_sharpen, bps_now, pixels, enc_fps);
         if drain.is_some() != drain_logged.is_some() {
             match drain {
                 Some(d) => tracing::info!(fps = d, kbps = bps_now / 1000, "drain mode: a queue stands on the path (or a keyframe crawls over it)"),
@@ -1160,7 +1188,7 @@ fn stream_inner(
         let until_us = |t: u64| t.saturating_sub(qpc_us()).div_ceil(1000).min(10) as u32;
         let wait_ms = match &skipped {
             Some(f) => until_us(f.present_us() + pace_us),
-            None if office && sharpen_left > 0 && last_tex.is_some() => until_us(last_encoded_us + pace_us),
+            None if sharpen && sharpen_left > 0 && last_tex.is_some() => until_us(last_encoded_us + pace_us),
             // A screen that changes wakes the wait at once; the timeout only
             // bounds the status and an answer to a keyframe request on a still
             // one — after a second without input, less often.
@@ -1283,7 +1311,7 @@ fn stream_inner(
                 // coded from a reference the client has.
                 None if shared.recover.load(Ordering::Relaxed) && last_tex.is_some() => Some((last_tex.clone().unwrap(), qpc_us())),
                 // Still: the last picture again, sharper.
-                None if office && sharpen_left > 0 && last_tex.is_some() && acquired_us >= last_encoded_us + pace_us => {
+                None if sharpen && sharpen_left > 0 && last_tex.is_some() && acquired_us >= last_encoded_us + pace_us => {
                     sharpen_left -= 1;
                     refresh = true;
                     Some((last_tex.clone().unwrap(), qpc_us()))
@@ -1321,12 +1349,16 @@ fn stream_inner(
         };
         // The encoder's slow-link switches (rdp_gpu::hyper::LinkTuning; a
         // no-op unless one changed): the largest frame following the bitrate,
-        // a slower preset at low bitrates, losses repaired gradually.
+        // a slower preset at low bitrates, losses repaired gradually, game
+        // mode's frames up to 100 ms of the link at low bits per pixel.
         enc.set_link_tuning(rdp_gpu::hyper::LinkTuning {
             vbv_cap: crate::host_ab::ab("vbvcap", true),
             preset_follow: crate::host_ab::ab("presetfollow", false),
             intra_refresh: crate::host_ab::ab("introfresh", false),
+            low_bpp_cap: crate::host_ab::ab("lowbppcap", true),
         });
+        // (The frames it really gets: the stream's own rate, for that cap.)
+        enc.set_encoded_fps(enc_fps);
         // Encoding fewer frames than it was opened for (the frame rate
         // following the bitrate), the encoder gets the rate scaled up to
         // match: its budget a frame is its rate over its frame rate, so each
@@ -1751,6 +1783,7 @@ fn rate_switches() -> rdp_hyper::rate::Switches {
         grow_cap: ab("growcap", true),
         soft_slow: ab("softslow", true),
         probe_train: ab("probetrain", true),
+        pause_hold: ab("pausehold", true),
     }
 }
 
@@ -3214,6 +3247,16 @@ mod tests {
         assert_eq!(sharpen_frames(8 * 1024, 60), 8);
         assert_eq!(sharpen_frames(500_000, 60), 60, "a new page: a second's frames");
         assert_eq!(sharpen_frames(500_000, 1), 2);
+    }
+
+    #[test]
+    fn game_mode_sharpens_only_short_of_bits() {
+        let px = 2560 * 1440;
+        assert!(sharpens(true, false, 50_000_000, px, 60), "office: always");
+        assert!(sharpens(false, true, 5_000_000, px, 60), "1440p60 at 5 Mbps");
+        assert!(!sharpens(false, true, 20_000_000, px, 60), "1440p60 at 20 Mbps: sharp already");
+        assert!(sharpens(false, true, 1_000_000, px, 20), "1 Mbps at 20 fps");
+        assert!(!sharpens(false, false, 1_000_000, px, 20), "switched off");
     }
 
     /// Holds the GPU's clocks up and lets them go (as administrator; told no

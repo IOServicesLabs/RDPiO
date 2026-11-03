@@ -459,10 +459,16 @@ Host switches (`%PUBLIC%\rdpio-hyper-switches.txt`, `name=0` turns one off,
 read live): `pathinfo`, `inputdup` and `burstok` (Windows client; the
 latter keeps a draining decode backlog instead of dropping it for a keyframe,
 as Android does: `rdp_hyper::backlog`), `fastreconnect`,
-`keepmonitor`, `vbvcap`, `presetfollow=1`, `introfresh=1` (the last two off
+`keepmonitor`, `vbvcap`, `lowbppcap` (at low bits per pixel a game-mode
+frame may take up to 0.2 bits a pixel, at most 100 ms of the link, instead
+of two frames' worth), `presetfollow=1`, `introfresh=1` (the last two off
 by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
 `gapcut`, `probetrain`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
 `growcap`, `softslow`, `fecfloor`,
+`gamesharpen` (game mode re-encodes a still screen sharper too, as office
+mode does, under 0.05 bits a pixel a frame: 1440p60 under ~11 Mbps),
+`pausehold` (a minimized client's stream holds its rate instead of drifting
+up to resting, which restore then slammed to the floor),
 `slowpace=1` (off by default), `audiorate`, `opusfec`, `audiofirst` (read as a sender starts),
 `catchup` — the last three also on a Windows client, from its own
 `%PUBLIC%` file. The Android app's are `debug.rdpio.inputdup` and
