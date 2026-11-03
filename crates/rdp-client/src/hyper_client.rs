@@ -47,6 +47,8 @@ pub struct Link {
 
 /// This process downloaded an update (installed when it ends).
 static DOWNLOADED: AtomicBool = AtomicBool::new(false);
+/// The stream ended because the host said Reconnect (not a lost link).
+static HOST_ASKED: AtomicBool = AtomicBool::new(false);
 
 static LINK: Mutex<Option<Link>> = Mutex::new(None);
 /// `--hyper-vsync`: present on vblank instead of immediately (tearing).
@@ -1542,10 +1544,13 @@ fn receive_loop(
                             }
                         }
                         // The host's console moved to another session (a
-                        // sign-in, a user switch): sign in again at once, not
-                        // after seconds of silence.
+                        // sign-in, a user switch), its service restarts, or
+                        // the stream moves to its other GPU (plugged in or
+                        // out): sign in again at once, not after seconds of
+                        // silence.
                         Some(Control::Reconnect) if !shared.stop.load(Ordering::Relaxed) => {
-                            tracing::info!("the host's console moved to another session; reconnecting now");
+                            tracing::info!("the host asked for a reconnect (another session, a restart or another GPU); reconnecting now");
+                            HOST_ASKED.store(true, Ordering::Relaxed);
                             shared.lost.store(true, Ordering::Relaxed);
                             shared.stop.store(true, Ordering::Relaxed);
                             crate::window::signal_frame();
@@ -2166,11 +2171,16 @@ pub fn run_direct(
         }
         // The network dropped: sign in again (the host keeps the session
         // unlocked for a short grace period, so this resumes where we were).
-        window.set_title("RDPiO — Hyper: connection lost, reconnecting…");
+        // Or the host asked for it (Reconnect): nothing was lost, so not
+        // "connection lost" for the seconds a GPU move takes.
+        let (title, line) = if HOST_ASKED.swap(false, Ordering::Relaxed) {
+            ("RDPiO — Hyper: reconnecting…", "Reconnecting...")
+        } else {
+            ("RDPiO — Hyper: connection lost, reconnecting…", "Connection lost: reconnecting...")
+        };
+        window.set_title(title);
         // On screen too: a fullscreen window has no title bar to read it in.
-        if let Some((nw, nh, px)) =
-            crate::hyper_overlay::render(&["Connection lost: reconnecting...".to_string(), "Ctrl+Shift+Q   quit".to_string()])
-        {
+        if let Some((nw, nh, px)) = crate::hyper_overlay::render(&[line.to_string(), "Ctrl+Shift+Q   quit".to_string()]) {
             renderer.update_rect(16, 16, nw, nh, &px);
             let _ = renderer.present_frame();
         }

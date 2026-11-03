@@ -1670,7 +1670,8 @@ HYPER ACCELERATOR (low-latency game streaming beside RDP)
                            explicit --render-scale pins it too.
     --hyper-host-settings <name=0|1,...>
                            Host (elevated): virtual_display, match_resolution,
-                           fast_refresh, keep_monitors.
+                           fast_refresh, keep_monitors; and
+                           host_gpu=auto|fastest|power_saving.
     --hyper-vsync          Present frames on vblank. Default: immediately (the
                            lowest latency; no visible tearing on G-Sync /
                            FreeSync displays).

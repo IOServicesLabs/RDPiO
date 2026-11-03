@@ -484,7 +484,7 @@ by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
 mode does, under 0.05 bits a pixel a frame: 1440p60 under ~11 Mbps),
 `pausehold` (a minimized client's stream holds its rate instead of drifting
 up to resting, which restore then slammed to the floor),
-`slowpace=1` (off by default), `battigpu` (read as a stream starts; see On battery), `audiorate`, `opusfec`, `audiofirst` (read as a sender starts),
+`slowpace=1` (off by default), `battigpu` (read as a stream starts and as a stream would move; `0` forces the fastest GPU whatever Host GPU says; see On battery), `audiorate`, `opusfec`, `audiofirst` (read as a sender starts),
 `catchup` — the last three also on a Windows client, from its own
 `%PUBLIC%` file — `pauserelease` and `pausereleasedev` (see below). The Android app's are `debug.rdpio.inputdup` and
 `debug.rdpio.fastreconnect` (see android.md).
@@ -585,9 +585,23 @@ its encoder was 1-7% busy: the virtual monitor is rendered on it, captured on
 it and encoded on it, so it never powers off. With it off the laptop should
 draw ~10-14 W.
 
-**What changes on battery** (host switch `battigpu`, on by default; it acts
-only when Windows says the AC line is off *and* the laptop has an integrated
-GPU with a hardware H.264 encoder; plugged in, nothing changes):
+**Host GPU** (the launcher's This PC page, shown only on a laptop with an
+integrated GPU beside a faster one; `"host_gpu"` in `hyper-host.json`, or
+`--hyper-host-settings host_gpu=auto|fastest|power_saving`):
+
+- *Auto* (the default): the integrated GPU on battery, the fastest plugged
+  in — and a running stream follows the cable (below).
+- *Fastest*: always the fastest GPU, as before there was a choice.
+- *Power saving*: always the integrated GPU, plugged in too, wherever its
+  encoder passes the trial (else the fastest, logged).
+
+On a machine with one GPU (or two discrete ones) it has no effect: there's
+nothing the discrete GPU could hand over to. The switch `battigpu=0` in
+`%PUBLIC%dpio-hyper-switches.txt` overrides all three: the fastest GPU,
+and nothing moves mid-stream.
+
+**What changes on the integrated GPU** (it's used only when the laptop has
+one with a hardware H.264 encoder; plugged in under Auto, nothing changes):
 
 - *Render adapter.* The virtual monitor is added with the integrated GPU as
   its render adapter (`IddCxAdapterSetRenderAdapter`, already in the driver)
@@ -607,8 +621,9 @@ GPU with a hardware H.264 encoder; plugged in, nothing changes):
 - *A trial first.* Once per agent, the integrated encoder codes three 1080p
   frames of text before a stream is put on it; a failure (or a frame over
   50 ms) keeps every stream on the fastest GPU. The choice and why are logged
-  at each sign-in ("on battery: the virtual monitor renders and encodes on the
-  integrated GPU" / "on battery, but staying on the fastest GPU").
+  at each sign-in ("the virtual monitor renders and encodes on the
+  integrated GPU" / "the integrated GPU is wanted, but staying on the
+  fastest GPU", with the setting and the power source).
 
 **Measured** on the UHD 630 through the host's own encoder (`cargo run
 --release -p rdp-gpu --example igpu_probe`; synthetic scrolling text, 1 ms
@@ -627,19 +642,49 @@ Quick Sync refuses 240 fps outright (MF_E_INVALIDMEDIATYPE), hence the 60 fps
 cap, which also saves the frames nobody needs on battery (the stream measured
 on battery delivered 9 fps median).
 
-**A power change mid-stream** isn't followed yet: the stream keeps its GPU
-until it ends, and the next one (a reconnect included: a kept monitor is
-reused only on the same render GPU) picks again. Following it live needs a
-new virtual monitor — the driver sets the render adapter only as it adds one,
-and the adapter-wide call isn't documented to move an existing swapchain —
-so the plan is: on `GUID_ACDC_POWER_SOURCE` (or the 3 s poll the client
-uses), end the stream's pipeline, add a replacement monitor on the other GPU
-with `RDPIO_DISPLAY_FLAG_REPLACE` (0.9-1.9 s measured from add to streaming,
-plus the scale), reopen the pipeline on the new device name (codec and rate
-as the stream already has them, or a codec change the client must be told
-of), and send a keyframe. Windows on the old monitor move with it, as on a
-reconnect. Until that's built and measured, the start-of-stream choice is
-the safe half.
+**A power change mid-stream** (Auto only) moves the stream by reconnecting
+it. The stream's loop looks at the power source once a second
+(`host_battery::move_due`); once the new source has held for 10 s — a cable
+wiggled or a dock dropping for a moment doesn't bounce the stream — the host
+logs "the power source changed and held: moving the stream to the other
+GPU", ends the stream with `Control::Reconnect` (as for a service restart)
+and keeps the console unlocked for the client's new sign-in, which decides
+the GPU, codec and rate again: unplugged, H.264 at up to 60 fps on the
+integrated GPU; plugged in, the fastest GPU's codec (HEVC/AV1) and the
+client's full rate. One move a stream: the watch is gone once it fires and
+the new stream starts a fresh 10 s. A move to the integrated GPU happens only
+where the new sign-in would land there (the client decodes H.264, the stream
+fits 4096 a side, the encoder passes its trial), else the stream stays and
+says why — no reconnect every 10 s for nothing.
+
+Why a reconnect, not a move in place: the driver sets the render adapter only
+as it adds a monitor, so either way the virtual monitor is replaced and the
+pipeline reopened; but the codec changes with the GPU too (Intel's HEVC
+fails, NVIDIA's H.264 is the lesser choice there), and the protocol agrees a
+codec only at sign-in — neither client can switch decoders mid-stream, and an
+in-place change would need a new message every client understands. Every
+client already reconnects at once on `Reconnect` (250 ms, then sign-in), and
+the sign-in path is the one every stream takes. The Windows client shows
+"Reconnecting..." meanwhile (not "connection lost").
+
+The gap the user sees, estimated from the logged steps (not yet timed end to
+end on battery): the client's 250 ms wait and sign-in (a few round trips),
+the old virtual monitor removed (~0.8 s, the host's layout put back on the
+way), the new one added on the other GPU and streaming (~1.1 s; 0.9-1.9 s
+logged) and scaled (~0.4 s), the pipeline opened and a keyframe (~0.1 s):
+about 2.5-3 s of frozen picture, windows on the virtual monitor moving to the
+host's own screens and back as on a reconnect at a new size. The first move
+to the integrated GPU in an agent's life also runs its encoder trial (a few
+hundred ms) before the stream ends. Adding the new monitor with
+`RDPIO_DISPLAY_FLAG_REPLACE` before the old is removed would save the removal
+and the window shuffle; not done yet, since the old monitor's removal removes
+every monitor of ours.
+
+A monitor kept for a quick reconnect (`keepmonitor`) is kept across a move
+too, but it's streamed again only when made for the same render GPU (as well
+as the size, rate and scale): so it's reused only if the power source flips
+back before the client is in, and a reconnect after a power change always
+gets a monitor on the right GPU.
 
 **Risks.**
 
@@ -658,6 +703,11 @@ the safe half.
 - Windows reports the integrated GPU as most frugal and not fastest; the
   host also requires it to have under 512 MB of its own memory. A machine
   where that guess is wrong stays on the fastest GPU (`battigpu=0` forces it).
+- A move mid-stream costs ~2.5-3 s of picture each time the cable goes in or
+  out for more than 10 s; Fastest or Power saving avoid it.
+- On the open-source Virtual Display Driver (the fallback) the render GPU
+  can't be chosen, so the integrated GPU only changes the codec and rate
+  there, and a move only reconnects.
 
 ## Updates and versions
 
