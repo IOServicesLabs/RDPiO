@@ -564,6 +564,24 @@ const TRICKLE_STREAK: u32 = 3;
 /// caret blink then costs two frames, not a second of them.
 const SHARPEN_BYTES_PER_FRAME: usize = 1024;
 
+/// On the LAN, a still picture's sharpening frames get this many times the
+/// stream's rate (`settleboost`), up to [`SETTLE_BOOST_MAX_BPS`] and half
+/// what the link has shown: text scrolled at a few Mbit/s took ~20 refresh
+/// frames — seconds at a low frame rate — to read again; a few big ones
+/// carry the same detail. (Only while still: each is the same picture, so
+/// its bytes are the detail the motion lacked, and none queue ahead of new
+/// motion.)
+const SETTLE_BOOST: u64 = 4;
+const SETTLE_BOOST_MAX_BPS: u64 = 40_000_000;
+
+/// A sharpening run's length and cost, for the log (`settled`).
+#[derive(Default)]
+struct Settle {
+    since: Option<Instant>,
+    frames: u32,
+    bytes: usize,
+}
+
 fn sharpen_frames(change_bytes: usize, fps: u32) -> u32 {
     ((change_bytes / SHARPEN_BYTES_PER_FRAME) as u32).clamp(2, fps.max(2))
 }
@@ -1180,6 +1198,11 @@ fn stream_inner(
     let mut sharpen_left = 0u32;
     let mut game_sharpen = crate::host_ab::ab("gamesharpen", true);
     let mut last_encoded_us = 0u64;
+    let mut settle = Settle::default();
+    // A big change was sent and its picture is still being sharpened, and
+    // the last frame's size (see SETTLE_BOOST).
+    let (mut moved, mut last_len) = (false, 0usize);
+    let mut settle_boost = crate::host_ab::ab("settleboost", true);
     // Trickling (see TRICKLE_AFTER_INPUT_US), and frames sent so (for the log).
     let (mut trickle, mut trickle_frames) = (Trickle::default(), 0u32);
     let mut ltr = Ltr::new(0, crate::host_ab::ab("repairok", true));
@@ -1508,6 +1531,7 @@ fn stream_inner(
             cap.set_defer_duplication(crate::host_ab::ab("ddlater", true));
             office_fps = crate::host_ab::ab("officefps", true);
             game_sharpen = crate::host_ab::ab("gamesharpen", true);
+            settle_boost = crate::host_ab::ab("settleboost", true);
         }
         // Fewer frames when the bitrate can't make them sharp (the encoder's
         // rate is scaled to match, below), and only a few while a standing
@@ -1662,6 +1686,7 @@ fn stream_inner(
             continue;
         }
         let mut refresh = false;
+        let left_before = sharpen_left;
         let frame = match captured {
             Some(f) => {
                 let present_us = f.present_us();
@@ -1750,7 +1775,21 @@ fn stream_inner(
         // frame gets the stream's rate over the frames it really gets — the
         // sharper pictures this is for. (Drain mode's skips aren't scaled:
         // they're meant to send less.)
-        let enc_bps = (bps as u64 * fps as u64 / enc_fps.clamp(1, fps.max(1)) as u64).min(u32::MAX as u64) as u32;
+        let mut enc_bps = (bps as u64 * fps as u64 / enc_fps.clamp(1, fps.max(1)) as u64).min(u32::MAX as u64) as u32;
+        // Sharpening a still picture on the LAN — refresh frames, and small
+        // changes after a big one (a caret, a spinner: each a pass too) —
+        // the boost (see SETTLE_BOOST).
+        let settling = settle_boost && moved && left_before > 0 && (refresh || last_len < SMALL_FRAME);
+        if settling {
+            // (This machine itself — the selftest — is a link without limit.)
+            let local = shared.peer.lock().unwrap().ip().is_loopback();
+            let r = shared.rate.lock().unwrap();
+            let link = if r.lan() { r.link_bps() } else { local.then_some(u32::MAX) };
+            if let Some(link) = link {
+                let most = SETTLE_BOOST_MAX_BPS.min(link as u64 / 2).max(enc_bps as u64);
+                enc_bps = (enc_bps as u64 * SETTLE_BOOST).min(most) as u32;
+            }
+        }
         if (enc_bps as i64 - enc.bitrate as i64).unsigned_abs() > enc.bitrate as u64 / 20 {
             enc.set_bitrate(enc_bps);
         }
@@ -1804,14 +1843,45 @@ fn stream_inner(
         // Nothing left to refine: a quarter second in (a big change first
         // drains the frame budget, and those frames are tiny too), a frame
         // with next to nothing in it.
-        if refresh && fps.saturating_sub(sharpen_left) >= fps / 4 && out.data.len() < 1500 {
+        let len = out.data.len();
+        // A small change while a big one sharpens is a pass of its own: it
+        // used to start the count over (two passes for a caret's blink), and
+        // a terminal's blinking caret kept scrolled text blurry for seconds —
+        // its unchanged parts never re-coded.
+        let pass = settling && !refresh && !out.keyframe;
+        if pass {
+            sharpen_left = left_before - 1;
+        }
+        if (refresh || pass) && fps.saturating_sub(sharpen_left) >= fps / 4 && len < 1500 {
             sharpen_left = 0;
+        }
+        // How long a still picture took to sharpen (a run of four or more:
+        // not a caret's blink), for the log.
+        if refresh || pass {
+            let t = *settle.since.get_or_insert_with(Instant::now);
+            (settle.frames, settle.bytes) = (settle.frames + 1, settle.bytes + out.data.len());
+            if sharpen_left == 0 {
+                moved = false;
+                if settle.frames >= 4 {
+                    tracing::info!(frames = settle.frames, kb = settle.bytes / 1024, ms = t.elapsed().as_millis() as u64, boost = settle_boost, "settled");
+                }
+                settle = Settle::default();
+            }
+        } else {
+            settle = Settle::default();
         }
         // A new picture: as much sharpening as the change was big, and small
         // ones in a row lead to trickling.
-        if !refresh && !out.keyframe {
-            sharpen_left = sharpen_frames(out.data.len(), fps);
+        if !refresh && !out.keyframe && !pass {
+            sharpen_left = sharpen_frames(len, fps);
+            // (The first small one after a big change keeps the big one's
+            // count.)
+            if settle_boost && moved && len < SMALL_FRAME {
+                sharpen_left = sharpen_left.max(left_before);
+            }
+            moved = settle_boost && (moved || len >= SMALL_FRAME);
         }
+        last_len = len;
         trickle.encoded(out.data.len(), refresh, out.keyframe);
         if trickle.on {
             trickle_frames += 1;
@@ -2103,6 +2173,43 @@ fn rate_switches() -> rdp_hyper::rate::Switches {
 /// tablet-sized text: the first frame's luma 26 → 34 dB, and 45 dB in half a
 /// second instead of a second), never more (the delay-based control still
 /// backs off where the link can't carry it).
+/// The selftest's `--text` scene: a 1280x900 window of text lines, drawn
+/// with GDI, scrolled a few pixels a frame (60 a second) for 2 s, then left
+/// still for 3, over and over (and still while `still`).
+fn selftest_scroll_text(painting: &AtomicBool, still: &AtomicBool) {
+    use windows::Win32::Graphics::Gdi::*;
+    let Ok(window) = crate::window::Window::new("rdpio Hyper selftest", 1280, 900) else { return };
+    let hwnd = windows::Win32::Foundation::HWND(window.hwnd_raw() as *mut _);
+    let words = "the quick brown fox jumps over the lazy dog 0123456789 ({[ ]}) <=> fn main() -> Result<(), Error> ";
+    let (mut offset, mut drawn) = (0i32, -1i32);
+    let began = Instant::now();
+    while painting.load(Ordering::Relaxed) {
+        let _ = window.pump();
+        if !still.load(Ordering::Relaxed) && began.elapsed().as_millis() % 5_000 < 2_000 {
+            offset += 3;
+        }
+        // (Still: nothing drawn, so nothing new to capture.)
+        if drawn == offset {
+            std::thread::sleep(Duration::from_millis(16));
+            continue;
+        }
+        drawn = offset;
+        unsafe {
+            let dc = GetDC(Some(hwnd));
+            let rect = windows::Win32::Foundation::RECT { left: 0, top: 0, right: 1280, bottom: 900 };
+            FillRect(dc, &rect, HBRUSH(GetStockObject(WHITE_BRUSH).0));
+            SetBkMode(dc, TRANSPARENT);
+            for i in 0..58 {
+                let n = i + offset / 16;
+                let line: Vec<u16> = format!("{n:5}  {}", &words[(n as usize * 7) % 40..]).encode_utf16().collect();
+                let _ = TextOutW(dc, 8, i * 16 - offset % 16, &line);
+            }
+            ReleaseDC(Some(hwnd), dc);
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+}
+
 fn resting_bps(office: bool, (w, h): (u32, u32)) -> u32 {
     if !office {
         return 20_000_000;
@@ -3167,6 +3274,13 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     let painter = std::thread::spawn(move || {
         crate::window::SHOW_INACTIVE.store(true, Ordering::Relaxed);
         // `--small-motion`: a speck of motion (a clock, a caret), not a scene.
+        // `--text`: a page of small text scrolling, as in a terminal or a
+        // browser — the detail a stream smears in motion and has to sharpen
+        // after (see SETTLE_BOOST).
+        if std::env::args().any(|a| a == "--text") {
+            selftest_scroll_text(&paint_flag, &still_flag);
+            return;
+        }
         let (pw, ph) = if std::env::args().any(|a| a == "--small-motion") { (24, 24) } else { (480, 270) };
         let Ok(window) = crate::window::Window::new("rdpio Hyper selftest", pw, ph) else { return };
         let Ok(mut renderer) = rdp_gpu::Renderer::new(window.hwnd_raw(), pw, ph, rdp_gpu::Backend::D3D11) else { return };

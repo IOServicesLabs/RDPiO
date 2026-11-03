@@ -573,6 +573,11 @@ impl RateController {
         self.lan = lan;
     }
 
+    /// Whether the client is on the host's own network (see [`Self::set_lan`]).
+    pub fn lan(&self) -> bool {
+        self.lan
+    }
+
     /// A lost frame or a standing queue: the LAN floor stands aside a while.
     fn floor_yield(&mut self, now_ms: u64) {
         let again = self.floor_yield_ms > 0 && now_ms < self.floor_yield_until_ms + LAN_FLOOR_CALM_MS;
