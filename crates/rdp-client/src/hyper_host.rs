@@ -850,6 +850,13 @@ const POWER_CHECK_EVERY: Duration = Duration::from_secs(3);
 /// says "unknown", which isn't battery).
 fn on_battery() -> bool {
     use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    // (`RDPIO_POWER=battery` or `ac`: as if — for A/B runs of what
+    // follows the power source, on whatever cable the test machine has.)
+    match std::env::var("RDPIO_POWER").as_deref() {
+        Ok("battery") => return true,
+        Ok("ac") => return false,
+        _ => {}
+    }
     let mut s = SYSTEM_POWER_STATUS::default();
     // (ACLineStatus: 0 offline, 1 online, 255 unknown — a desktop.)
     unsafe { GetSystemPowerStatus(&mut s).is_ok() && s.ACLineStatus == 0 }
