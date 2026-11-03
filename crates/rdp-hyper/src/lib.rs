@@ -14,12 +14,17 @@
 //! - [`input`]: client input that survives loss without stuck keys.
 //! - [`rate`]: delay- and loss-driven bitrate and FEC control.
 //! - [`audio`] + [`playout`]: Opus packets, and the jitter buffer that plays them.
+//! - [`autores`] + [`backlog`]: the clients' shared judgement of the link —
+//!   the stream's size from the bits that arrive, and when a decode backlog
+//!   goes for a fresh keyframe (the same on Windows and Android).
 //!
 //! Platform-neutral; the capture/encode/decode ends live in `rdp-gpu` and
 //! `rdp-client`.
 
 pub mod audio;
 pub mod auth;
+pub mod autores;
+pub mod backlog;
 pub mod control;
 pub mod fec;
 pub mod input;

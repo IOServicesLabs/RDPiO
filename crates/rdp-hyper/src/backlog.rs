@@ -11,10 +11,12 @@
 //!
 //! So: a backlog is thrown away only when it hasn't shrunk over a while
 //! (the decoder isn't draining it), or when it's huge (catching up would take
-//! longer than a keyframe). `debug.rdpio.burstok=0`: thrown away at once, as
-//! before.
+//! longer than a keyframe). `burst_ok` false (Android's
+//! `debug.rdpio.burstok=0`, the Windows client's host A/B `burstok`): thrown
+//! away at once, as before.
 //!
-//! Pure logic, tested on the PC: `rustc --test src/backlog.rs`.
+//! Pure logic, shared by the Android and Windows clients:
+//! `cargo test -p rdp-hyper`.
 
 use std::time::{Duration, Instant};
 

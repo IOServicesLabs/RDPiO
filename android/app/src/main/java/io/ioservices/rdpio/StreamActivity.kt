@@ -107,7 +107,7 @@ class StreamActivity : Activity() {
     /**
      * Auto's current pick per mode: full size at the start, then what the
      * connection carries (the core decides from the bits that arrive; see
-     * autores.rs). Not kept across sessions: a slow link's pick would hold a
+     * rdp-hyper's autores.rs). Not kept across sessions: a slow link's pick would hold a
      * LAN back.
      */
     private var autoGame = 100
