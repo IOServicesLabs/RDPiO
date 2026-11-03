@@ -1120,6 +1120,7 @@ fn stream_inner(
             switches_read = Instant::now();
             shared.rate.lock().unwrap().set_switches(rate_switches());
             fps_follow = crate::host_ab::ab("fpsfollow", true);
+            cap.set_defer_duplication(crate::host_ab::ab("ddlater", true));
             office_fps = crate::host_ab::ab("officefps", true);
         }
         // Fewer frames when the bitrate can't make them sharp (the encoder's
@@ -1228,10 +1229,13 @@ fn stream_inner(
         // whatever changes meanwhile waits in the duplication, and the
         // keyframe that ends a pause takes the newest picture.
         if shared.paused.load(Ordering::Relaxed) && !want_key {
-            if let Some(f) = captured.and_then(|c| c.into_frame(&mut cap)) {
+            // (Nothing newer, a frame skipped just before is the screen as it
+            // is now: kept too, for the keyframe that ends the pause.)
+            let newest = captured.or(skipped.take());
+            skipped = None;
+            if let Some(f) = newest.and_then(|c| c.into_frame(&mut cap)) {
                 last_tex = Some(f.nv12);
             }
-            skipped = None;
             if last_status.elapsed() > Duration::from_millis(1000) {
                 shared.send_status(&socket);
                 last_status = Instant::now();
@@ -1707,6 +1711,21 @@ fn resized(shared: &Shared, socket: &UdpSocket, (w, h): (u32, u32), fps: u32) {
 /// (it converts on its own engine — measured 8.5 ms → see log while a game
 /// loads the 3D engine); fall back to our NV12 conversion.
 fn open_pipeline(
+    device_name: &str,
+    opts: &HostOptions,
+    fps: u32,
+    bps: u32,
+    codec: rdp_gpu::h264::Codec,
+    tuning: rdp_gpu::hyper::Tuning,
+) -> Result<(DesktopCapture, HwEncoder), Box<dyn std::error::Error>> {
+    let (mut cap, enc) = open_capture_encoder(device_name, opts, fps, bps, codec, tuning)?;
+    // Desktop Duplication's frames converted only when they're sent (see
+    // `set_defer_duplication`; switch `ddlater`).
+    cap.set_defer_duplication(crate::host_ab::ab("ddlater", true));
+    Ok((cap, enc))
+}
+
+fn open_capture_encoder(
     device_name: &str,
     opts: &HostOptions,
     fps: u32,
