@@ -468,6 +468,10 @@ struct Shared {
     paced: AtomicU32,
     /// The client's window is minimized: encode nothing.
     paused: AtomicBool,
+    /// Nothing on the screen has changed, and no input has come, for
+    /// [`IDLE_AFTER`]: the capture and receive threads wait longer between
+    /// looks (`idlewait`; see [`IDLE_LOOK`]).
+    idle: AtomicBool,
     /// The client wants office mode (crisp text) rather than game mode.
     office: AtomicBool,
     /// …with the encoder's fast preset.
@@ -749,6 +753,15 @@ impl Drop for GpuClockFloor {
 /// this often; the window coming back wakes it at once (see `Shared::wake`).
 const PAUSED_LOOK: Duration = Duration::from_millis(500);
 
+/// A desktop left alone (no change on screen, no input) this long is idle…
+const IDLE_AFTER: Duration = Duration::from_secs(2);
+
+/// …and the capture and receive threads then wake this often (instead of
+/// every 30 and 10 ms, ~130 wake-ups a second of a screen nobody's using).
+/// A change on screen or a packet still ends either wait at once; only a
+/// keyframe or repair asked for on the still screen may wait up to this.
+const IDLE_LOOK: Duration = Duration::from_millis(100);
+
 /// The receive thread's socket wait while streaming: it also sends the
 /// trailing input ack (within ~10 ms) and refreshes held touches.
 const RX_ACTIVE: Duration = Duration::from_millis(10);
@@ -965,6 +978,7 @@ fn stream_inner(
         pace_us: AtomicU64::new(0),
         paced: AtomicU32::new(0),
         paused: AtomicBool::new(false),
+        idle: AtomicBool::new(false),
         office: AtomicBool::new(opts.office),
         fast_text: AtomicBool::new(opts.fast_text),
         recover: AtomicBool::new(false),
@@ -1123,6 +1137,7 @@ fn stream_inner(
     let (mut frame_rate, mut enc_fps, mut drain_logged) = (rdp_hyper::rate::FrameRate::default(), fps, None);
     let (mut switches_read, mut rate_saved) = (Instant::now(), Instant::now());
     let mut fps_follow = crate::host_ab::ab("fpsfollow", true);
+    let mut idle_wait = crate::host_ab::ab("idlewait", true);
     // Office mode may go on down to 10 fps (`FrameRate::follow_office`).
     let mut office_fps = crate::host_ab::ab("officefps", true);
     // A failed encoder or a lost GPU (driver reset, device removed) costs a
@@ -1291,6 +1306,7 @@ fn stream_inner(
             switches_read = Instant::now();
             shared.rate.lock().unwrap().set_switches(rate_switches());
             fps_follow = crate::host_ab::ab("fpsfollow", true);
+            idle_wait = crate::host_ab::ab("idlewait", true);
             office_fps = crate::host_ab::ab("officefps", true);
         }
         // Fewer frames when the bitrate can't make them sharp (the encoder's
@@ -1324,6 +1340,17 @@ fn stream_inner(
         if let Some(d) = drain {
             pace_us = pace_us.max(1_000_000 / d.max(1) as u64);
         }
+        // Idle (see IDLE_AFTER): nothing waiting to go, nothing captured or
+        // typed for a while.
+        let idle = idle_wait
+            && skipped.is_none()
+            && !(office && sharpen_left > 0)
+            && since_input_us > IDLE_AFTER.as_micros() as u64
+            && last_present_us.is_none_or(|p| qpc_us().saturating_sub(p) > IDLE_AFTER.as_micros() as u64);
+        if idle != shared.idle.load(Ordering::Relaxed) {
+            shared.idle.store(idle, Ordering::Relaxed);
+            tracing::debug!(idle, "the desktop is {}", if idle { "idle: longer waits" } else { "in use again" });
+        }
         // While a skipped frame waits, wait for a newer one only until its turn.
         let until_us = |t: u64| t.saturating_sub(qpc_us()).div_ceil(1000).min(10) as u32;
         let wait_ms = match &skipped {
@@ -1332,6 +1359,7 @@ fn stream_inner(
             // A screen that changes wakes the wait at once; the timeout only
             // bounds the status and an answer to a keyframe request on a still
             // one — after a second without input, less often.
+            None if idle => IDLE_LOOK.as_millis() as u32,
             None if since_input_us > 1_000_000 => 30,
             None => 10,
         };
@@ -2190,9 +2218,12 @@ fn receive_loop(
             last_ack = Instant::now();
             shared.send_status(&socket);
         }
-        // Longer waits while paused, with no ack owed (see RX_PAUSED).
+        // Longer waits while paused, with no ack owed (see RX_PAUSED); idle
+        // with no fingers resting, too (see IDLE_LOOK).
         let want = if input.applied() == acked && shared.paused.load(Ordering::Relaxed) && crate::host_ab::ab("pausepoll", true) {
             RX_PAUSED
+        } else if input.applied() == acked && shared.idle.load(Ordering::Relaxed) && !crate::hyper_touch::resting() {
+            IDLE_LOOK
         } else {
             RX_ACTIVE
         };
