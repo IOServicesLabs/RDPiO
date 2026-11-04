@@ -40,7 +40,9 @@ pub enum Message {
     /// Host → client, on the LAN: copies may go over TCP to this port,
     /// sealed under this key (see [`crate::bulk_tcp`]). An older client
     /// doesn't know it and keeps to the link.
-    BulkTcp { port: u16, key: [u8; crate::bulk_tcp::KEY_LEN] },
+    /// `streams`: how many connections the client opens (one each says
+    /// hello); a copy is striped over them.
+    BulkTcp { port: u16, key: [u8; crate::bulk_tcp::KEY_LEN], streams: u8 },
 }
 
 /// One copied file or folder; `name` is relative to the copy (backslashes).
@@ -91,10 +93,11 @@ impl Message {
                 o.extend_from_slice(&offset.to_le_bytes());
                 o.extend_from_slice(data);
             }
-            Self::BulkTcp { port, key } => {
+            Self::BulkTcp { port, key, streams } => {
                 o.push(7);
                 o.extend_from_slice(&port.to_le_bytes());
                 o.extend_from_slice(key);
+                o.push(*streams);
             }
         }
         o
@@ -124,7 +127,11 @@ impl Message {
                 offset: u64::from_le_bytes(b.get(9..17)?.try_into().ok()?),
                 data: b.get(17..)?.to_vec(),
             },
-            7 => Self::BulkTcp { port: u16_at(1)?, key: b.get(3..3 + crate::bulk_tcp::KEY_LEN)?.try_into().ok()? },
+            7 => Self::BulkTcp {
+                port: u16_at(1)?,
+                key: b.get(3..3 + crate::bulk_tcp::KEY_LEN)?.try_into().ok()?,
+                streams: b.get(3 + crate::bulk_tcp::KEY_LEN).copied().unwrap_or(1).clamp(1, crate::bulk_tcp::MAX_STREAMS),
+            },
             _ => return None,
         })
     }
@@ -141,7 +148,7 @@ mod tests {
             Message::CursorVisible(false),
             Message::ClipboardText("héllo ☺".into()),
             Message::ClipboardImage(vec![9; 100]),
-            Message::BulkTcp { port: 47999, key: [5; 32] },
+            Message::BulkTcp { port: 47999, key: [5; 32], streams: 4 },
             Message::ClipboardFiles {
                 transfer: 3,
                 entries: vec![FileEntry { name: "dir\\a.txt".into(), size: 5, is_dir: false }],

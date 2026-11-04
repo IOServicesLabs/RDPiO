@@ -1707,10 +1707,10 @@ fn receive_loop(
                                 }
                                 // Copies over TCP of their own, on the LAN (see
                                 // hyper_tcp; RDPIO_NO_BULK_TCP=1: over the link).
-                                Message::BulkTcp { port, key } => {
+                                Message::BulkTcp { port, key, streams } => {
                                     let host = socket.peer_addr().ok().filter(|a| crate::hyper_path::on_lan(a.ip()));
                                     if let Some(host) = host.filter(|_| std::env::var_os("RDPIO_NO_BULK_TCP").is_none()) {
-                                        crate::hyper_tcp::client_connect(host, port, key, clipboard.clone());
+                                        crate::hyper_tcp::client_connect(host, port, key, streams, clipboard.clone());
                                     }
                                 }
                                 other => {

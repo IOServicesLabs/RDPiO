@@ -1125,7 +1125,7 @@ fn stream_inner(
     // Copies over TCP of their own to a client on the LAN (`bulktcp`; see
     // hyper_tcp).
     if crate::host_ab::ab("bulktcp", true) && crate::hyper_path::on_lan(peer.ip()) {
-        crate::hyper_tcp::host_offer(opts.port, peer.ip(), &link, clipboard.clone());
+        crate::hyper_tcp::host_offer(opts.port, peer.ip(), rdp_hyper::bulk_tcp::MAX_STREAMS, &link, clipboard.clone());
     }
 
     let rx_socket = socket.try_clone()?;

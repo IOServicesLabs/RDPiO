@@ -757,9 +757,20 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
     // Over the copy stream when one is up (see hyper_tcp), else the link.
     let tcp = crate::hyper_tcp::current();
     let via = if tcp.is_some() { "tcp" } else { "link" };
+    // Striped over this many of its connections (switches tcp1 / tcp2 for
+    // A/B; all of them by default).
+    let width = tcp.as_ref().map_or(1, |t| {
+        if crate::host_ab::ab("tcp1", false) {
+            1
+        } else if crate::host_ab::ab("tcp2", false) {
+            2
+        } else {
+            t.width()
+        }
+    });
     let send = |m: Message| -> bool {
         match &tcp {
-            Some(t) => t.send(&m).is_ok(),
+            Some(t) => t.send(&m, width).is_ok(),
             None => {
                 link.send(&m);
                 true
@@ -769,11 +780,13 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
     if !send(Message::ClipboardFiles { transfer, entries: entries.clone() }) {
         return;
     }
-    tracing::info!(files = entries.len(), bytes = total, via, "sending copied files");
+    tracing::info!(files = entries.len(), bytes = total, via, width, "sending copied files");
     let began = Instant::now();
     // How the bulk lane reads the path, every few seconds of a copy.
     let mut progress = Instant::now();
     let mut queued_bytes = 0u64;
+    // Where the time goes: reading the files, and handing them over.
+    let (mut read_time, mut send_time) = (Duration::ZERO, Duration::ZERO);
     let mut report = |queued_bytes: u64| {
         if progress.elapsed() >= Duration::from_secs(2) {
             progress = Instant::now();
@@ -820,7 +833,10 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
             // Never past the size announced: the receiver drops a copy
             // whose data overruns a file (one that grew meanwhile).
             let want = (e.size - offset).min(CHUNK as u64) as u32;
-            let Some(data) = cb.read_file(i as u32, offset, want) else {
+            let t = Instant::now();
+            let read = cb.read_file(i as u32, offset, want);
+            read_time += t.elapsed();
+            let Some(data) = read else {
                 tracing::warn!(name = %e.name, "couldn't read a copied file");
                 return;
             };
@@ -828,9 +844,11 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
                 break;
             }
             let n = data.len() as u64;
+            let t = Instant::now();
             if !send(Message::FileChunk { transfer, index: i as u32, offset, data }) {
                 return;
             }
+            send_time += t.elapsed();
             offset += n;
             queued_bytes += n;
         }
@@ -852,6 +870,9 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
         ms = (secs * 1000.0) as u64,
         mbps = format!("{:.1}", total as f64 * 8.0 / secs / 1e6),
         via,
+        width,
+        read_ms = read_time.as_millis() as u64,
+        send_wait_ms = send_time.as_millis() as u64,
         "copied files all delivered"
     );
 }

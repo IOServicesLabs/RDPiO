@@ -11,14 +11,20 @@
 //! fresh key over the (sealed) link; the client connects and says hello under
 //! it. Each record is a [`Message`](crate::messages::Message)'s bytes, sealed
 //! with AES-256-GCM: `u32` little-endian length, then ciphertext and tag. The
-//! nonce is the direction and a record counter, so a replayed, reordered or
-//! reflected record fails to open.
+//! nonce is the direction, the connection's number and a record counter, so
+//! a replayed, reordered, reflected or swapped record fails to open. A copy
+//! may be striped over several connections ([`MAX_STREAMS`]); each record
+//! then starts with its sequence number in the copy stream, for the receiver
+//! to put them back in order.
 
 use std::io::{self, Read, Write};
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 
 pub const KEY_LEN: usize = 32;
+
+/// Connections a copy stream may be striped over.
+pub const MAX_STREAMS: u8 = 4;
 
 /// What the client says first: it holds the key.
 pub const HELLO: &[u8] = b"rdpio bulk hello 1";
@@ -34,9 +40,10 @@ pub enum Dir {
     ClientToHost = 2,
 }
 
-fn nonce(dir: Dir, counter: u64) -> Nonce {
+fn nonce(dir: Dir, lane: u8, counter: u64) -> Nonce {
     let mut n = [0u8; 12];
     n[0] = dir as u8;
+    n[1] = lane;
     n[4..].copy_from_slice(&counter.to_le_bytes());
     Nonce::assume_unique_for_key(n)
 }
@@ -57,13 +64,24 @@ pub fn new_key() -> [u8; KEY_LEN] {
 pub struct Sealer {
     key: LessSafeKey,
     dir: Dir,
+    lane: u8,
     counter: u64,
     buf: Vec<u8>,
 }
 
 impl Sealer {
     pub fn new(k: &[u8; KEY_LEN], dir: Dir) -> Self {
-        Self { key: key(k), dir, counter: 0, buf: Vec::new() }
+        Self::lane(k, dir, 0)
+    }
+
+    /// For connection `lane` of a striped stream.
+    pub fn lane(k: &[u8; KEY_LEN], dir: Dir, lane: u8) -> Self {
+        Self { key: key(k), dir, lane, counter: 0, buf: Vec::new() }
+    }
+
+    /// Past a record sealed elsewhere (a connection's hello).
+    pub fn skip_one(&mut self) {
+        self.counter += 1;
     }
 
     /// Seal `plain` as one record and write it.
@@ -76,7 +94,7 @@ impl Sealer {
         self.buf.extend_from_slice(plain);
         let mut body = self.buf.split_off(4);
         self.key
-            .seal_in_place_append_tag(nonce(self.dir, self.counter), Aad::empty(), &mut body)
+            .seal_in_place_append_tag(nonce(self.dir, self.lane, self.counter), Aad::empty(), &mut body)
             .map_err(|_| io::Error::other("seal"))?;
         self.counter += 1;
         self.buf.extend_from_slice(&body);
@@ -88,12 +106,23 @@ impl Sealer {
 pub struct Opener {
     key: LessSafeKey,
     dir: Dir,
+    lane: u8,
     counter: u64,
 }
 
 impl Opener {
     pub fn new(k: &[u8; KEY_LEN], dir: Dir) -> Self {
-        Self { key: key(k), dir, counter: 0 }
+        Self::lane(k, dir, 0)
+    }
+
+    /// For connection `lane` of a striped stream.
+    pub fn lane(k: &[u8; KEY_LEN], dir: Dir, lane: u8) -> Self {
+        Self { key: key(k), dir, lane, counter: 0 }
+    }
+
+    /// Past a record opened elsewhere (a connection's hello).
+    pub fn skip_one(&mut self) {
+        self.counter += 1;
     }
 
     /// The next record's plaintext; an error ends the stream (a record that
@@ -109,7 +138,7 @@ impl Opener {
         r.read_exact(&mut body)?;
         let plain = self
             .key
-            .open_in_place(nonce(self.dir, self.counter), Aad::empty(), &mut body)
+            .open_in_place(nonce(self.dir, self.lane, self.counter), Aad::empty(), &mut body)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "record didn't open"))?
             .len();
         self.counter += 1;
@@ -151,6 +180,8 @@ mod tests {
         // The second record first (a replay or a reorder).
         let first_len = 4 + 3 + TAG_LEN;
         assert!(Opener::new(&k, Dir::HostToClient).read(&mut &wire[first_len..]).is_err());
+        // Sealed for another connection.
+        assert!(Opener::lane(&k, Dir::HostToClient, 1).read(&mut &wire[..]).is_err());
         // Tampered.
         let mut bad = wire.clone();
         bad[6] ^= 1;
