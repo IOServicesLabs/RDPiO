@@ -130,8 +130,6 @@ struct Session {
     embedded: bool,
     /// …and its window, once it said so (`WM_RDPIO_EMBEDDED`).
     child: Option<isize>,
-    /// It had a window of its own once it was up (see `connect`).
-    seen_window: bool,
 }
 
 /// Where the Workspace's tab in front is (this window's client pixels), and
@@ -1240,21 +1238,18 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
     }
     let _ = st.prefs.save();
     if let Some((&pid, s)) = st.sessions.iter().find(|(_, s)| s.key == key) {
-        // Already open: its tab, or its window brought forward, instead of a
-        // second session.
-        if s.embedded {
-            return Ok(json!({ "already": true, "key": key, "embedded": true }));
+        match on_connect_again(s.embedded, !windows_of(pid).is_empty()) {
+            Again::ShowTab => return Ok(json!({ "already": true, "key": key, "embedded": true })),
+            Again::BringForward => {
+                bring_forward(pid);
+                return Ok(json!({ "already": true, "key": key }));
+            }
+            Again::Replace => {
+                tracing::warn!(pid, "Connect clicked while that session has no window (still signing in, retrying, or stuck); ending it and starting a fresh one");
+                st.sessions.remove(&pid);
+                end_session_now(pid);
+            }
         }
-        // Unless the window it had is gone while the process isn't (stuck
-        // closing, or after a resume): bringing it forward would show
-        // nothing. It's ended, and a new one starts.
-        if !s.seen_window || !windows_of(pid).is_empty() {
-            bring_forward(pid);
-            return Ok(json!({ "already": true, "key": key }));
-        }
-        tracing::warn!(pid, "that session's window is gone but its process isn't; ending it and starting a new one");
-        st.sessions.remove(&pid);
-        close_session(pid, None);
     }
     // In a tab: a window of the tab's size, never full screen.
     let mut options = options;
@@ -1308,7 +1303,7 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
     });
     st.sessions.insert(
         pid,
-        Session { key: key.clone(), name: name.clone(), started: Instant::now(), recorded: false, record, log, embedded: embed.is_some(), child: None, seen_window: false },
+        Session { key: key.clone(), name: name.clone(), started: Instant::now(), recorded: false, record, log, embedded: embed.is_some(), child: None },
     );
     // (A session in a tab is in this window: it stays.)
     if !st.keep_open && embed.is_none() {
@@ -1320,6 +1315,53 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
     }
     send(st, &json!({ "event": "state", "state": state_json(st) }));
     Ok(json!({ "started": true, "key": key }))
+}
+
+/// What a Connect click does about a session already running for the same
+/// connection.
+#[derive(Debug, PartialEq, Eq)]
+enum Again {
+    /// In a Workspace tab: that tab in front (the tab has Reconnect of its own).
+    ShowTab,
+    /// Up, in a window of its own: that window in front, not a second session.
+    BringForward,
+    /// No window: still signing in, in its first-connect retries (3, with
+    /// backoff, each of which can sit in a TCP or TLS timeout), stuck — or its
+    /// window is gone while the process isn't (after a resume). The session is
+    /// ended and a fresh one starts.
+    Replace,
+}
+
+/// A Connect click is always a fresh attempt unless there's a session to show.
+/// (This used to keep any session that had never had a window — "never taken
+/// for stuck" — and answer the click with `bring_forward` of no window at
+/// all: a failing connect whose process lingered left the button doing
+/// nothing until the launcher was closed and opened again, the only thing
+/// that forgot the session. The retry counters and backoff live in the
+/// session process, so a new process is what resets them.)
+fn on_connect_again(embedded: bool, has_window: bool) -> Again {
+    if embedded {
+        Again::ShowTab
+    } else if has_window {
+        Again::BringForward
+    } else {
+        Again::Replace
+    }
+}
+
+/// End a session that's being replaced, and wait (briefly) until it's gone:
+/// the new one takes the same log file (the old one renamed to `.prev`), which
+/// Windows won't rename while the old process still has it open. No window to
+/// ask to close: it has none.
+fn end_session_now(pid: u32) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) else { return };
+        let _ = TerminateProcess(h, 1);
+        let _ = WaitForSingleObject(h, 2000);
+        let _ = CloseHandle(h);
+    }
 }
 
 /// "host:port" typed in one box.
@@ -1528,9 +1570,6 @@ fn on_event(e: Value) {
             let pid = e.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
             // (After it ended, the `_ended` already took it out: not recorded.)
             if let Some(sess) = st.sessions.get_mut(&pid) {
-                // (A sign-in still going on after 10 s, a Cloud PC's say, has
-                // none yet: never taken for stuck.)
-                sess.seen_window |= !sess.embedded && !windows_of(pid).is_empty();
                 if !sess.recorded {
                     sess.recorded = true;
                     if let Some(r) = sess.record.take() {
@@ -1546,9 +1585,17 @@ fn on_event(e: Value) {
         }
         "_ended" => {
             let pid = e.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
-            let sess = st.sessions.remove(&pid);
+            // A session a Connect click replaced (see `on_connect_again`): its
+            // end is no news, and the page would take it for the new one's (the
+            // same key) — dropping that one's "Connecting…" toast, or marking it
+            // failed.
+            let Some(sess) = st.sessions.remove(&pid) else {
+                tracing::info!(pid, "a replaced session ended");
+                send(st, &json!({ "event": "state", "state": state_json(st) }));
+                return;
+            };
             let code = e.get("code").and_then(Value::as_i64).unwrap_or(-1);
-            let quick = sess.as_ref().is_some_and(|s| s.started.elapsed() < STARTUP);
+            let quick = sess.started.elapsed() < STARTUP;
             let failed = code != 0 && quick;
             if let Ok(m) = MruStore::load() {
                 st.mru = m;
@@ -1785,6 +1832,17 @@ fn host_action(st: &mut State, req: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every Connect click is a fresh attempt unless there's a window to show:
+    /// a session still connecting (or stuck, or retrying) is replaced, so its
+    /// retries start over in a new process.
+    #[test]
+    fn connect_again_replaces_a_session_without_a_window() {
+        assert_eq!(on_connect_again(false, false), Again::Replace);
+        assert_eq!(on_connect_again(false, true), Again::BringForward);
+        assert_eq!(on_connect_again(true, false), Again::ShowTab);
+        assert_eq!(on_connect_again(true, true), Again::ShowTab);
+    }
 
     #[test]
     fn host_and_port_split_from_one_box() {
