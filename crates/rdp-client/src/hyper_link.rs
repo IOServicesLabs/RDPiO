@@ -39,6 +39,29 @@ fn framed(lane: Lane, body: &[u8]) -> Vec<u8> {
     b
 }
 
+/// When the bulk lane last moved data, either way (ms since [`epoch`]).
+static BULK_MOVED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn epoch() -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+fn bulk_moved() {
+    BULK_MOVED_MS.store(epoch().elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
+}
+
+/// A copy (files, an image) is going either way over this process's link,
+/// or did within the last second: what holds the stream's power settings
+/// (Wi-Fi streaming mode, the 1 ms timer, thread priorities) while its
+/// window is hidden — pasting is done with the stream's window under
+/// Explorer's, and a copy then went with the radio dozing and coarse timers
+/// (100 MB: 62 Mbit/s, 273 with the stream in view).
+pub fn copying() -> bool {
+    let at = BULK_MOVED_MS.load(Ordering::Relaxed);
+    at > 0 && (epoch().elapsed().as_millis() as u64 + 1).saturating_sub(at) < 1000
+}
+
 impl ReliableLink {
     pub fn new() -> Arc<Self> {
         let mut bulk = Sender::new();
@@ -51,6 +74,9 @@ impl ReliableLink {
 
     pub fn send(&self, m: &Message) {
         let bytes = m.to_bytes();
+        if m.lane() == Lane::Bulk {
+            bulk_moved();
+        }
         self.state.lock().unwrap().tx[m.lane() as usize].send(&bytes);
         self.wake.notify_one();
     }
@@ -81,6 +107,9 @@ impl ReliableLink {
             drop(st);
             self.wake.notify_one(); // the window may have opened
             return (None, Vec::new());
+        }
+        if lane == Lane::Bulk {
+            bulk_moved();
         }
         let rx = &mut st.rx[lane as usize];
         let raw = rx.on_data(body, now);
@@ -129,6 +158,9 @@ impl ReliableLink {
                         out.extend(tx.poll(now).iter().map(|c| framed(lane, c)));
                         if tx.backlog() > 0 {
                             wait = wait.min(TICK);
+                            if lane == Lane::Bulk {
+                                bulk_moved();
+                            }
                         }
                     }
                     if out.is_empty() {

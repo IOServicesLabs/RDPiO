@@ -1537,9 +1537,11 @@ fn stream_inner(
         // Minimized a while: quiet (see `Latency`). Back the moment the window
         // is (or a keyframe is asked for), before this pass encodes anything.
         paused_at = if paused { paused_at.or_else(|| Some(Instant::now())) } else { None };
+        // (Never while a copy goes: see hyper_link::copying; `copyholds`.)
         let go_quiet = paused
             && !want_key
             && paused_at.is_some_and(|t| t.elapsed() >= PAUSE_QUIET_AFTER)
+            && !(crate::host_ab::ab("copyholds", true) && crate::hyper_link::copying())
             && crate::host_ab::ab("pausequiet", true);
         if go_quiet && quiet.is_none() {
             drop(latency.take());

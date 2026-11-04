@@ -490,6 +490,9 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     // Minimized: the host is told to encode nothing (repeated, in case a
     // packet is lost); restored: a keyframe brings the picture back.
     let (mut paused, mut pause_sent) = (false, Instant::now());
+    // RDPIO_NO_COPY_HOLDS=1: a copy doesn't hold the power settings.
+    let copy_holds = std::env::var_os("RDPIO_NO_COPY_HOLDS").is_none();
+    let mut copy_held = false;
     // When the window was first seen fully covered (see COVERED_FOR).
     let (mut covered_since, mut cover_checked) = (None::<Instant>, Instant::now());
     let mut last_input_send = Instant::now();
@@ -717,6 +720,11 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             }
         }
 
+        // (A copy going counts as activity: see hyper_link::copying.)
+        let copying = copy_holds && crate::hyper_link::copying();
+        if copying {
+            last_activity = Instant::now();
+        }
         if fine_timer.is_some() && last_activity.elapsed() > FINE_TIMER_IDLE {
             fine_timer = None;
         }
@@ -918,6 +926,21 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                 tracing::info!("stream hidden: paused, Wi-Fi and power settings handed back");
             }
             (paused, pause_sent) = (minimized, Instant::now());
+        }
+        // Hidden, a copy going: Wi-Fi, the thread and the timer held for it
+        // (pasting is done with Explorer over the stream), and let go after.
+        if paused && copying && !copy_held {
+            wifi = crate::net_tune::WifiLowLatency::enable();
+            boost = crate::net_tune::ThreadBoost::games();
+            fine_timer.get_or_insert_with(crate::net_tune::FineTimer::new);
+            copy_held = true;
+            tracing::info!("stream hidden, a copy going: Wi-Fi and power settings held for it");
+        } else if copy_held && !(paused && copying) {
+            if paused {
+                (wifi, boost, fine_timer) = (None, None, None);
+                tracing::info!("the copy done: Wi-Fi and power settings handed back");
+            }
+            copy_held = false;
         }
         // Overlays: the stats (Ctrl+Shift+S) and, for the first seconds, the
         // hotkeys — shown before the first picture too, so even a stream that
