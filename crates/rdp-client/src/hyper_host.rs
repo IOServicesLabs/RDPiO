@@ -816,26 +816,35 @@ const INPUT_SHOWS_FOR: Duration = Duration::from_secs(5);
 /// reliable sender's own congestion window — slow start, halving on loss
 /// and on queueing — finds what the path carries, as TCP's does. And the
 /// queueing it yields to is a LAN Wi-Fi's ordinary jitter no more
-/// (`bulkq`: 25 ms over the path's least round trip, was 10).
+/// (`bulkq`: 25 ms over the path's least round trip, was 10). A Wi-Fi
+/// radio's round trip spikes from 2 ms to 100+ now and then: that's read as
+/// TCP reads it (`bulkjitter`), not as a lost window or a queue each time.
+/// `bulknodelay` (off) leaves the window to losses alone, as TCP's.
 #[derive(Clone, Copy)]
 struct BulkLane {
     fast: bool,
     queue_25: bool,
+    jitter: bool,
+    no_delay: bool,
 }
 
 impl BulkLane {
     fn read() -> Self {
-        Self { fast: crate::host_ab::ab("bulkfast", true), queue_25: crate::host_ab::ab("bulkq", true) }
+        use crate::host_ab::ab;
+        Self { fast: ab("bulkfast", true), queue_25: ab("bulkq", true), jitter: ab("bulkjitter", true), no_delay: ab("bulknodelay", false) }
     }
 
     fn apply(&self, link: &crate::hyper_link::ReliableLink, bulk_bps: u64, lan: bool) {
         let fast = self.fast && lan;
         link.set_bulk_rate(if fast { None } else { Some(bulk_bps) });
-        link.set_bulk_queue_limit(if fast && self.queue_25 {
+        link.set_bulk_queue_limit(if fast && self.no_delay {
+            Duration::from_secs(10)
+        } else if fast && self.queue_25 {
             Duration::from_millis(25)
         } else {
             crate::hyper_link::BULK_QUEUE_LIMIT
         });
+        link.set_bulk_jitter_tolerant(fast && self.jitter);
     }
 }
 

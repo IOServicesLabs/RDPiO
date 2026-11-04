@@ -754,12 +754,36 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
     link.send(&Message::ClipboardFiles { transfer, entries: entries.clone() });
     tracing::info!(files = entries.len(), bytes = total, "sending copied files");
     let began = Instant::now();
+    // How the bulk lane reads the path, every few seconds of a copy.
+    let mut progress = Instant::now();
+    let mut queued_bytes = 0u64;
+    let mut report = |queued_bytes: u64| {
+        if progress.elapsed() >= Duration::from_secs(2) {
+            progress = Instant::now();
+            let s = link.bulk_stats();
+            tracing::info!(
+                transfer,
+                queued_mb = queued_bytes / 1_000_000,
+                backlog_kb = link.bulk_backlog() / 1000,
+                cwnd = s.cwnd as u32,
+                srtt_ms = format!("{:.1}", s.srtt.as_secs_f64() * 1000.0),
+                min_rtt_ms = format!("{:.1}", s.min_rtt.as_secs_f64() * 1000.0),
+                rto_ms = s.rto.as_millis() as u64,
+                paced_kbps = s.rate_bps.map(|b| b / 1000),
+                wide = s.wide,
+                cuts = format!("timeout:{} loss:{} delay:{}", s.cuts_timeout, s.cuts_loss, s.cuts_delay),
+                resent = s.resent,
+                "copy progress"
+            );
+        }
+    };
     for (i, e) in entries.iter().enumerate() {
         if e.is_dir || e.size == 0 {
             continue;
         }
         let mut offset = 0u64;
         while offset < e.size {
+            report(queued_bytes);
             if TRANSFER.load(Ordering::SeqCst) != transfer {
                 return; // superseded by a newer copy
             }
@@ -784,6 +808,7 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
             let n = data.len() as u64;
             link.send(&Message::FileChunk { transfer, index: i as u32, offset, data });
             offset += n;
+            queued_bytes += n;
         }
     }
     // (Handed to the link: on the wire once its bulk lane drains.)
@@ -793,6 +818,7 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
         if TRANSFER.load(Ordering::SeqCst) != transfer || began.elapsed() > Duration::from_secs(3600) {
             return;
         }
+        report(queued_bytes);
         std::thread::sleep(Duration::from_millis(20));
     }
     let secs = began.elapsed().as_secs_f64().max(queued.as_secs_f64()).max(0.001);

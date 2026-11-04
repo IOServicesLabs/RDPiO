@@ -157,6 +157,17 @@ impl ReliableLink {
         self.state.lock().unwrap().tx[Lane::Bulk as usize].backlog()
     }
 
+    /// How the bulk lane's sender reads the path, and what it has done.
+    pub fn bulk_stats(&self) -> rdp_hyper::reliable::SenderStats {
+        self.state.lock().unwrap().tx[Lane::Bulk as usize].stats()
+    }
+
+    /// Read a spiky (Wi-Fi) path's round trip as TCP does (see
+    /// `Sender::set_jitter_tolerant`).
+    pub fn set_bulk_jitter_tolerant(&self, on: bool) {
+        self.state.lock().unwrap().tx[Lane::Bulk as usize].set_jitter_tolerant(on);
+    }
+
     /// Wake the pump (e.g. at shutdown so it notices `stop`).
     pub fn nudge(&self) {
         self.wake.notify_all();
