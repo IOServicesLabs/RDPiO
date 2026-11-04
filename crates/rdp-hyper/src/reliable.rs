@@ -28,6 +28,17 @@ pub const MAX_CHUNK: usize = crate::wire::MAX_BODY - 16;
 /// Sequence numbers in flight at most; also the span the ack bitmap covers.
 pub const SPAN: u32 = 256;
 const BITMAP_BYTES: usize = SPAN as usize / 8;
+/// …with a peer whose acks say it takes more (see [`WIDE_SPAN`]).
+///
+/// 256 chunks of 1.2 KB is 300 KB in flight: over a Wi-Fi LAN's 10-20 ms
+/// round trip under load, 120-250 Mbit/s at most, under what the radio
+/// carries (a 250 MB copy took RDP 15 s). 4096 is 4.9 MB: gigabits.
+/// A receiver that can track this many sends a bitmap longer than
+/// [`BITMAP_BYTES`] (at least one byte more); an older one sends exactly
+/// that, and an older sender reads only that much — so either side of a
+/// mixed pair keeps to [`SPAN`].
+pub const WIDE_SPAN: u32 = 4096;
+const WIDE_BITMAP_BYTES: usize = WIDE_SPAN as usize / 8;
 const MIN_RTO: Duration = Duration::from_millis(40);
 const MAX_RTO: Duration = Duration::from_millis(1000);
 /// Before any round trip was measured.
@@ -88,6 +99,8 @@ pub struct Sender {
     /// Below this the window grows per acknowledged chunk; above it, by one
     /// chunk per window.
     ssthresh: f64,
+    /// The peer's acks can cover [`WIDE_SPAN`].
+    wide: bool,
     /// Token bucket: bytes allowed now, refilled at `rate_bps`.
     rate_bps: f64,
     tokens: f64,
@@ -112,8 +125,9 @@ impl Sender {
             srtt: None,
             min_rtt: None,
             queue_limit: QUEUE_LIMIT,
+            wide: false,
             cwnd: CWND_START,
-            ssthresh: SPAN as f64,
+            ssthresh: WIDE_SPAN as f64,
             rate_bps: f64::INFINITY,
             tokens: 0.0,
             last_refill: None,
@@ -165,11 +179,22 @@ impl Sender {
         self.srtt.map_or(INITIAL_RTO, |r| (r * 2 + Duration::from_millis(10)).clamp(MIN_RTO, MAX_RTO))
     }
 
-    /// The chunks within [`SPAN`] of the front (the only ones that may be in
-    /// flight).
+    /// How many sequence numbers may be in flight: [`SPAN`], or
+    /// [`WIDE_SPAN`] with a peer that acks that many.
+    fn span(&self) -> u32 {
+        if self.wide {
+            WIDE_SPAN
+        } else {
+            SPAN
+        }
+    }
+
+    /// The chunks within [`Self::span`] of the front (the only ones that may
+    /// be in flight).
     fn window(&mut self) -> impl Iterator<Item = &mut Chunk> {
         let front = self.queue.front().map_or(0, |c| c.seq);
-        self.queue.iter_mut().take_while(move |c| c.seq.wrapping_sub(front) < SPAN)
+        let span = self.span();
+        self.queue.iter_mut().take_while(move |c| c.seq.wrapping_sub(front) < span)
     }
 
     /// Halve the window, once per congestion episode (a loss or delay sample
@@ -246,6 +271,7 @@ impl Sender {
     /// Fold in an ack body.
     pub fn on_ack(&mut self, body: &[u8], now: Instant) {
         let Some((cum, bits)) = parse_ack(body) else { return };
+        self.wide |= bits.len() > BITMAP_BYTES;
         // Never acknowledges what wasn't sent yet (a confused peer).
         if cum.wrapping_sub(self.next_seq) as i32 >= 0 {
             return;
@@ -278,7 +304,7 @@ impl Sender {
         }
         // Selective part: index straight into the span after `cum`.
         if let Some(front) = self.queue.front().map(|c| c.seq) {
-            for i in 0..SPAN {
+            for i in 0..(bits.len() as u32 * 8).min(self.span()) {
                 if bits[(i / 8) as usize] & (1 << (i % 8)) == 0 {
                     continue;
                 }
@@ -325,7 +351,7 @@ impl Sender {
             Some(tx) => self.on_congestion(tx),
             None if newly > 0 => {
                 let grow = if self.cwnd < self.ssthresh { newly as f64 } else { newly as f64 / self.cwnd };
-                self.cwnd = (self.cwnd + grow).min(SPAN as f64);
+                self.cwnd = (self.cwnd + grow).min(self.span() as f64);
             }
             None => {}
         }
@@ -337,12 +363,14 @@ impl Sender {
     }
 }
 
-fn parse_ack(b: &[u8]) -> Option<(u32, [u8; BITMAP_BYTES])> {
+/// An ack's cumulative sequence number and selective bitmap
+/// ([`BITMAP_BYTES`], or up to [`WIDE_BITMAP_BYTES`] from a wide peer).
+fn parse_ack(b: &[u8]) -> Option<(u32, &[u8])> {
     if b.first() != Some(&TYPE_ACK) || b.len() < 5 + BITMAP_BYTES {
         return None;
     }
     let cum = u32::from_le_bytes(b[1..5].try_into().ok()?);
-    Some((cum, b[5..5 + BITMAP_BYTES].try_into().ok()?))
+    Some((cum, &b[5..b.len().min(5 + WIDE_BITMAP_BYTES)]))
 }
 
 /// Whether a reliable-channel body is an ack (for the sender) or data (for
@@ -391,7 +419,7 @@ impl Receiver {
         self.unacked += 1;
         self.first_unacked.get_or_insert(now);
         let ahead = seq.wrapping_sub(self.cum);
-        if ahead as i32 <= 0 || ahead > SPAN {
+        if ahead as i32 <= 0 || ahead > WIDE_SPAN {
             // A duplicate (our ack was probably lost) or nonsense.
             self.urgent = true;
             return out;
@@ -443,14 +471,20 @@ impl Receiver {
         self.unacked = 0;
         self.first_unacked = None;
         self.urgent = false;
-        let mut bits = [0u8; BITMAP_BYTES];
+        // As long as the chunks held call for, and one byte past an older
+        // peer's bitmap at least: that says we track [`WIDE_SPAN`].
+        let mut bits = vec![0u8; BITMAP_BYTES + 1];
         for &s in self.pending.keys() {
             let i = s.wrapping_sub(self.cum.wrapping_add(1));
-            if i < SPAN {
-                bits[(i / 8) as usize] |= 1 << (i % 8);
+            if i < WIDE_SPAN {
+                let byte = (i / 8) as usize;
+                if byte >= bits.len() {
+                    bits.resize(byte + 1, 0);
+                }
+                bits[byte] |= 1 << (i % 8);
             }
         }
-        let mut b = Vec::with_capacity(5 + BITMAP_BYTES);
+        let mut b = Vec::with_capacity(5 + bits.len());
         b.push(TYPE_ACK);
         b.extend_from_slice(&self.cum.to_le_bytes());
         b.extend_from_slice(&bits);
@@ -570,8 +604,16 @@ mod tests {
         assert_eq!(again as f64, CWND_START / 2.0, "resent {again}");
     }
 
+    /// An ack as an older receiver sends it (exactly [`BITMAP_BYTES`]).
+    fn narrow(mut ack: Vec<u8>) -> Vec<u8> {
+        ack.truncate(5 + BITMAP_BYTES);
+        ack
+    }
+
     #[test]
     fn a_growing_round_trip_shrinks_the_window() {
+        // (With an older receiver: a wide window would finish this transfer
+        // before the queue builds.)
         let mut s = Sender::new();
         let mut r = Receiver::new();
         // Enough that the transfer outlasts the test.
@@ -585,11 +627,11 @@ mod tests {
             for c in s.poll(now) {
                 r.on_data(&c, now);
                 if let Some(a) = r.ack(now) {
-                    in_air.push_back((now + rtt, a));
+                    in_air.push_back((now + rtt, narrow(a)));
                 }
             }
             if let Some(a) = r.ack(now) {
-                in_air.push_back((now + rtt, a));
+                in_air.push_back((now + rtt, narrow(a)));
             }
             while in_air.front().is_some_and(|(t, _)| *t <= now) {
                 let (_, a) = in_air.pop_front().unwrap();
@@ -620,13 +662,13 @@ mod tests {
         assert_eq!(r.ack_deadline(), None);
     }
 
-    #[test]
-    fn in_flight_stays_within_the_span_and_window() {
+    /// Seq 1 held back forever: the highest sequence number sent meanwhile,
+    /// with acks as a current receiver sends them, or an older one.
+    fn furthest_sent_past_a_hole(old_peer: bool) -> u32 {
         let mut s = Sender::new();
         let mut r = Receiver::new();
-        s.send(&vec![0u8; MAX_CHUNK * 2000]);
+        s.send(&vec![0u8; MAX_CHUNK * 6000]);
         let mut now = Instant::now();
-        // Hold back chunk 1 forever: the window can't run past SPAN of it.
         let mut max_seq = 0;
         for _ in 0..200 {
             for c in s.poll(now) {
@@ -637,11 +679,58 @@ mod tests {
                 }
             }
             if let Some(a) = r.ack(now) {
-                s.on_ack(&a, now);
+                s.on_ack(&if old_peer { narrow(a) } else { a }, now);
             }
             now += Duration::from_millis(5);
         }
-        assert!(max_seq <= SPAN, "sent seq {max_seq} while seq 1 was outstanding");
+        max_seq
+    }
+
+    #[test]
+    fn in_flight_stays_within_the_span_and_window() {
+        let wide = furthest_sent_past_a_hole(false);
+        assert!(wide > SPAN && wide <= WIDE_SPAN, "a current peer: sent seq {wide} while seq 1 was outstanding");
+        let narrow = furthest_sent_past_a_hole(true);
+        assert!(narrow <= SPAN, "an older peer: sent seq {narrow} while seq 1 was outstanding");
+    }
+
+    /// What a wide window buys: a big copy over a 15 ms round trip (a
+    /// loaded Wi-Fi LAN) goes at hundreds of Mbit/s, not the ~160 that 256
+    /// chunks in flight allow.
+    #[test]
+    fn a_wide_window_fills_a_fast_long_path() {
+        let rate = |old_peer: bool| {
+            let mut s = Sender::new();
+            let mut r = Receiver::new();
+            const CHUNKS: usize = 40_000;
+            s.send(&vec![0u8; MAX_CHUNK * CHUNKS]);
+            let rtt = Duration::from_millis(15);
+            let start = Instant::now();
+            let mut now = start;
+            let mut in_air: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
+            let mut delivered = 0;
+            while delivered < CHUNKS && now - start < Duration::from_secs(30) {
+                for c in s.poll(now) {
+                    delivered += r.on_data(&c, now).len().min(1) * CHUNKS;
+                    if let Some(a) = r.ack(now) {
+                        in_air.push_back((now + rtt, if old_peer { narrow(a) } else { a }));
+                    }
+                }
+                if let Some(a) = r.ack(now) {
+                    in_air.push_back((now + rtt, if old_peer { narrow(a) } else { a }));
+                }
+                while in_air.front().is_some_and(|(t, _)| *t <= now) {
+                    let (_, a) = in_air.pop_front().unwrap();
+                    s.on_ack(&a, now);
+                }
+                now += Duration::from_millis(1);
+            }
+            (MAX_CHUNK * CHUNKS) as f64 * 8.0 / (now - start).as_secs_f64() / 1e6
+        };
+        let (wide, narrow) = (rate(false), rate(true));
+        println!("48 MB over a 15 ms round trip: {wide:.0} Mbit/s wide, {narrow:.0} narrow");
+        assert!(narrow < 200.0, "256 in flight: {narrow:.0} Mbit/s");
+        assert!(wide > 2.0 * narrow, "wide {wide:.0} vs narrow {narrow:.0} Mbit/s");
     }
 
     #[test]

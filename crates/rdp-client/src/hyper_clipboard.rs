@@ -46,7 +46,7 @@ const MAX_DEPTH: usize = 64;
 const MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 /// File data queued on the link at most. Only a memory bound: the link paces
 /// its bulk lane itself, so the game stream comes first.
-const MAX_BACKLOG: usize = 4 * 1024 * 1024;
+const MAX_BACKLOG: usize = 16 * 1024 * 1024;
 const CHUNK: u32 = 1024 * 1024;
 
 static LINK: Mutex<Option<Arc<ReliableLink>>> = Mutex::new(None);
