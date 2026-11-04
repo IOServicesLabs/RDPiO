@@ -2195,6 +2195,7 @@ fn rate_switches() -> rdp_hyper::rate::Switches {
         interleave: ab("interleave", true),
         probe_idle: ab("probeidle", true),
         lan_floor: ab("lanfloor", true),
+        link_memory: ab("linkmemory", true),
         repair_fec: ab("repairfec", true),
     }
 }

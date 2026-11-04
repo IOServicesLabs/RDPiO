@@ -182,6 +182,9 @@ const LINK_WINDOW_TRAIN_MS: u64 = 4_000;
 /// then, and the next probe tells. (10 s: the radio's bumps meanwhile held a
 /// LAN at the floor long after the congestion was gone.)
 const LINK_DOUBT_MS: u64 = 3_000;
+/// What the link showed is remembered this long (ms) for
+/// [`Switches::link_memory`].
+const LINK_BEST_MS: u64 = 60_000;
 /// Under this share of what the link has shown, the rate grows as a warm
 /// start does ([`WARM_RAMP`]): it's far from anything the link pushes back on.
 const LINK_RAMP_BELOW: f64 = 0.1;
@@ -278,6 +281,14 @@ pub struct Switches {
     /// 1440p office stream over a ~90 Mbit/s link sat at 1-3 Mbit/s,
     /// smeared, for hours.
     pub lan_floor: bool,
+    /// On the LAN, what the link carries is the most its probes showed over
+    /// the last [`LINK_BEST_MS`] (`linkmemory`), for judging whose a queue
+    /// is and for the floor — not what the stream carried at the last cut
+    /// ([`RateController::doubt_link`]), its own rate when the radio
+    /// bumped. That fed itself: a 900 Mbit/s Wi-Fi LAN read 4-6, so every
+    /// bump was the stream's, the floor sank to half of that, and the
+    /// stream sat at 1-3 Mbit/s. (Probes err low only, so the most is safe.)
+    pub link_memory: bool,
 }
 
 impl Default for Switches {
@@ -301,6 +312,7 @@ impl Default for Switches {
             interleave: true,
             probe_idle: true,
             lan_floor: true,
+            link_memory: true,
         }
     }
 }
@@ -388,6 +400,8 @@ pub struct RateController {
     /// Its measurements over the last [`LINK_WINDOW_MS`]: (when, bits per second).
     link_seen: std::collections::VecDeque<(u64, f64)>,
     link_doubt_until_ms: u64,
+    /// Every probe reading of the last [`LINK_BEST_MS`]: (when, bits per second).
+    link_best: std::collections::VecDeque<(u64, f64)>,
     last_probe_ms: Option<u64>,
     /// A probe train's padding sent and not yet seen delivered (bytes): not
     /// the encoder using its budget (see [`RateController::note_probe_padding`]).
@@ -487,6 +501,7 @@ impl RateController {
             link_bps: None,
             link_seen: Default::default(),
             link_doubt_until_ms: 0,
+            link_best: Default::default(),
             last_probe_ms: None,
             pad_pending: 0,
             key_sent_ms: 0,
@@ -588,14 +603,30 @@ impl RateController {
             return; // (already yielding)
         }
         self.floor_yield_ms = if again { (self.floor_yield_ms * 2).min(LAN_FLOOR_YIELD_MAX_MS) } else { LAN_FLOOR_YIELD_MS };
+        if again {
+            // (Yielding again and again: the link really is down, whatever
+            // it showed before.)
+            self.link_best.clear();
+        }
         self.floor_yield_until_ms = now_ms + self.floor_yield_ms;
+    }
+
+    /// What the link carries, for judging queues and the LAN floor: the
+    /// estimate, or on the LAN the most its probes showed lately if more
+    /// (see [`Switches::link_memory`]).
+    fn link_shown(&self) -> Option<f64> {
+        let best = self.link_best.iter().map(|&(_, b)| b).reduce(f64::max).filter(|_| self.lan && self.switches.link_memory);
+        match (self.link_bps, best) {
+            (Some(l), Some(b)) => Some(l.max(b)),
+            (l, b) => l.or(b),
+        }
     }
 
     /// The least the bulk lane is cut to: on the LAN, as for the video (see
     /// [`Self::lan_floor`]), [`BULK_LAN_MIN`] or half the link.
     fn bulk_min(&self, now_ms: u64) -> f64 {
         if self.lan_floor(now_ms) > 0.0 {
-            let shown = self.link_bps.map_or(f64::INFINITY, |l| l / 2.0);
+            let shown = self.link_shown().map_or(f64::INFINITY, |l| l / 2.0);
             BULK_LAN_MIN.min(shown).max(BULK_MIN)
         } else {
             BULK_MIN
@@ -608,7 +639,7 @@ impl RateController {
         if !(self.lan && self.switches.lan_floor) || now_ms < self.floor_yield_until_ms {
             return 0.0;
         }
-        let shown = self.link_bps.map_or(f64::INFINITY, |l| l / self.overhead * 0.5);
+        let shown = self.link_shown().map_or(f64::INFINITY, |l| l / self.overhead * 0.5);
         LAN_FLOOR_BPS.min(shown).min(self.limits.max_bps as f64)
     }
 
@@ -885,6 +916,12 @@ impl RateController {
         if self.lan && fb.link_kbps > 0 && now_ms >= self.link_doubt_until_ms {
             self.link_seen.push_back((now_ms, (fb.link_kbps as f64 * 1000.0).min(LINK_MAX_BPS)));
         }
+        if self.lan && fb.link_kbps > 0 {
+            self.link_best.push_back((now_ms, (fb.link_kbps as f64 * 1000.0).min(LINK_MAX_BPS)));
+        }
+        while self.link_best.front().is_some_and(|&(t, _)| now_ms.saturating_sub(t) > LINK_BEST_MS) {
+            self.link_best.pop_front();
+        }
         let window = if self.switches.probe_train { LINK_WINDOW_TRAIN_MS } else { LINK_WINDOW_MS };
         let keep = if self.switches.probe_idle && self.switches.probe_train { LINK_KEEP_READINGS } else { 0 };
         while self.link_seen.front().is_some_and(|&(t, _)| {
@@ -942,7 +979,7 @@ impl RateController {
         let burst = self.switches.held_burst && queue_min_us < (queue_us / 2).max(QUEUE_SOFT_US);
         let lone = self.switches.lone_frame && fb.frames < 2 && queue_us <= STANDING_US;
         let lasting = fb.frames > 0 && queue_us > QUEUE_HARD_US && self.last_queue_us > QUEUE_HARD_US && !burst && !lone;
-        let ours = self.link_bps.is_none_or(|l| own_us(l) >= QUEUE_SOFT_US as f64 && !too_big(l)) || lasting;
+        let ours = self.link_shown().is_none_or(|l| own_us(l) >= QUEUE_SOFT_US as f64 && !too_big(l)) || lasting;
 
         // Bulk yields first: it halves at the first sign of queueing or a
         // lost frame, and grows only while something is waiting to go.
@@ -1094,6 +1131,9 @@ impl RateController {
             self.cuts[CUT_STANDING] += 1;
             self.floor_yield(now_ms);
             self.doubt_link(link, now_ms);
+            // (A queue standing for a second is someone else's traffic on
+            // the link, or the link slowed: what it showed is past.)
+            self.link_best.clear();
             self.bulk = self.bulk_min(now_ms);
             self.bitrate = self.bitrate.clamp(self.limits.min_bps as f64, self.limits.max_bps as f64);
             self.note_sustained();
@@ -1139,6 +1179,11 @@ impl RateController {
                 self.bitrate = self.bitrate.max(delivered * 0.85).min(self.bitrate / f);
             }
             if why == CUT_LOSS {
+                // Lost to a queue (not the radio's random loss): the link
+                // carries less than it showed; forget that.
+                if queue_us > QUEUE_SOFT_US {
+                    self.link_best.clear();
+                }
                 self.floor_yield(now_ms);
             } else {
                 // A delay bump on the LAN: not under the floor.
@@ -1972,6 +2017,7 @@ mod tests {
                     interleave: false,
                     probe_idle: false,
                     lan_floor: false,
+                    link_memory: false,
                 },
                 fps_follow: false,
                 warm_bps: None,
@@ -2624,7 +2670,7 @@ mod tests {
             buffer_us: Some(40_000),
             warm_bps: Some(1_200_000),
             active: Some(scroll),
-            switches: Switches { lan_floor: false, ..Switches::default() },
+            switches: Switches { lan_floor: false, link_memory: false, ..Switches::default() },
             ..Setup::after()
         };
         let phases = [(0, 10_000), (10_000, 60_000), (60_000, 120_000)];
@@ -2648,7 +2694,7 @@ mod tests {
             lan: true,
             airtime: true,
             buffer_us: Some(40_000),
-            switches: Switches { lan_floor: false, ..Switches::default() },
+            switches: Switches { lan_floor: false, link_memory: false, ..Switches::default() },
             ..Setup::after()
         };
         let (old, new) = both("game wifi", game, 60, ax210, &[(0, 10_000), (10_000, 60_000)]);
@@ -2698,6 +2744,7 @@ mod tests {
             buffer_us: Some(40_000),
             warm_bps: Some(1_200_000),
             active: Some(scroll),
+            switches: Switches { link_memory: false, ..Switches::default() },
             ..Setup::after()
         };
         let off = Setup { switches: Switches { probe_idle: false, ..office.switches }, ..office };
@@ -2926,7 +2973,7 @@ mod tests {
     fn doze_ab(switch: &str, off: fn(&mut Switches)) -> Vec<(Case, Tally, Tally)> {
         // (Each without the LAN floor, which hides what the others do: see
         // `the_lan_floor_holds_a_dozing_lan_clean` for it.)
-        let with = Switches { lan_floor: false, ..Switches::default() };
+        let with = Switches { lan_floor: false, link_memory: false, ..Switches::default() };
         doze_ab_from(switch, with, off)
     }
 
@@ -3012,6 +3059,19 @@ mod tests {
         let (on, no) = doze_case(&r, "office, 200M dozing, 2M 3 s");
         assert!(on.med > no.med * 1.15 && on.age < no.age, "{} / {} vs {} / {}", on.med, on.age, no.med, no.age);
         assert!(on.cuts[CUT_QUEUE] < no.cuts[CUT_QUEUE], "{:?} vs {:?}", on.cuts, no.cuts);
+    }
+
+    /// `linkmemory`: on a dozing LAN, what the link showed is remembered
+    /// over the cuts that reset the estimate to the stream's own rate.
+    #[test]
+    fn link_memory_keeps_a_dozing_lan_off_its_own_rate() {
+        let r = doze_ab_from("linkmemory", Switches::default(), |s| s.link_memory = false);
+        for (c, on, no) in &r {
+            if !c.slow && c.drop_ms.is_none() {
+                assert!(on.med >= no.med * 0.95, "{}: {} vs {}", c.name, on.med, no.med);
+            }
+            assert!(on.lost - on.at_drop <= no.lost - no.at_drop + 2, "{}: lost {} vs {}", c.name, on.lost, no.lost);
+        }
     }
 
     /// `lanfloor`: on a dozing LAN, delay bumps alone don't cut the stream

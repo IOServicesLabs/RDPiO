@@ -283,9 +283,17 @@ resolution changes, and monitor consolidation. If the network drops, the
 client reconnects by itself and the host keeps the session unlocked for 20 s;
 closing the window locks the host immediately.
 
-Clipboard and file copies only use what the stream leaves free: they slow
-down the moment the link starts queueing, and the pointer never waits behind
-them (it has its own lane). On a direct-mode host the agent runs as SYSTEM,
+File copies go as fast as the network carries them: the bar is RDP's
+(250 MB over a Wi-Fi LAN in 15 s), and anything slower is a bug. On a LAN
+path the bulk lane isn't paced by the video's rate controller (`bulkfast`):
+the reliable channel's own congestion window (slow start; halving on loss,
+and on 25 ms of queueing over the least round trip, `bulkq`) finds the
+path's rate, as TCP's does, with up to 4096 chunks (4.9 MB) in flight to a
+current peer (256 to an older one). Elsewhere (relays, the internet) copies
+use only what the stream leaves free. The pointer never waits behind them
+(it has its own lane). A copy's sender logs `copied files all delivered`
+with its time and rate. Pasted files appear at once (virtual files, as in
+RDP), and stream in as they arrive. On a direct-mode host the agent runs as SYSTEM,
 and Windows hides a file copy's list from SYSTEM (even impersonating the
 user): it asks a short-lived `rdpio --hyper-clipboard-files` running as the
 signed-in user for the copied paths, and reads the files with the user's rights.
