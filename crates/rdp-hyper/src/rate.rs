@@ -61,6 +61,9 @@ const STANDING_FLAT_US: i64 = 50_000;
 /// here, halve at the first sign of queueing and grow only while busy.
 const BULK_START: f64 = 8_000_000.0;
 const BULK_MIN: f64 = 1_000_000.0;
+/// …on the LAN (with [`Switches::lan_floor`]): its Wi-Fi's bumps halved a
+/// file copy to 1 Mbit/s too — 26 MB then took minutes, and never arrived.
+const BULK_LAN_MIN: f64 = 20_000_000.0;
 const BULK_MAX: f64 = 100_000_000.0;
 /// A path that lost nothing for this long (ms) counts as clean (see
 /// [`RateController::parity_for`]).
@@ -588,6 +591,17 @@ impl RateController {
         self.floor_yield_until_ms = now_ms + self.floor_yield_ms;
     }
 
+    /// The least the bulk lane is cut to: on the LAN, as for the video (see
+    /// [`Self::lan_floor`]), [`BULK_LAN_MIN`] or half the link.
+    fn bulk_min(&self, now_ms: u64) -> f64 {
+        if self.lan_floor(now_ms) > 0.0 {
+            let shown = self.link_bps.map_or(f64::INFINITY, |l| l / 2.0);
+            BULK_LAN_MIN.min(shown).max(BULK_MIN)
+        } else {
+            BULK_MIN
+        }
+    }
+
     /// The rate delay bumps alone don't cut under (encoder bits per second;
     /// 0: none). See [`Switches::lan_floor`].
     fn lan_floor(&self, now_ms: u64) -> f64 {
@@ -933,7 +947,7 @@ impl RateController {
         // Bulk yields first: it halves at the first sign of queueing or a
         // lost frame, and grows only while something is waiting to go.
         if fb.frames_lost > 0 || queue_us > QUEUE_SOFT_US / 2 {
-            self.bulk = (self.bulk * 0.5).max(BULK_MIN);
+            self.bulk = (self.bulk * 0.5).max(self.bulk_min(now_ms));
         } else if self.bulk_busy {
             self.bulk = (self.bulk * 1.15).min(BULK_MAX);
         }
@@ -999,7 +1013,7 @@ impl RateController {
                 self.slow_until_ms = now_ms + SLOW_PATH_MS;
                 self.cuts[CUT_GAP] += 1;
                 self.doubt_link(link, now_ms);
-                self.bulk = BULK_MIN;
+                self.bulk = self.bulk_min(now_ms);
                 // (Once: the next check needs a fresh half second.)
                 self.gap.clear();
             }
@@ -1080,7 +1094,7 @@ impl RateController {
             self.cuts[CUT_STANDING] += 1;
             self.floor_yield(now_ms);
             self.doubt_link(link, now_ms);
-            self.bulk = BULK_MIN;
+            self.bulk = self.bulk_min(now_ms);
             self.bitrate = self.bitrate.clamp(self.limits.min_bps as f64, self.limits.max_bps as f64);
             self.note_sustained();
             return;

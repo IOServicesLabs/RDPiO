@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use rdp_channels::cliprdr::ClipboardProvider;
 use rdp_hyper::messages::{FileEntry, Message};
@@ -19,7 +20,7 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::clipboard::{get_clipboard_bytes, hdrop_bytes, set_clipboard_formats, CF_DIB, CF_HDROP, CF_UNICODETEXT};
+use crate::clipboard::{get_clipboard_bytes, global_block, hdrop_bytes, set_clipboard_formats, CF_DIB, CF_HDROP, CF_UNICODETEXT};
 use crate::hyper_link::ReliableLink;
 
 /// Text and images larger than this aren't synced.
@@ -45,11 +46,66 @@ const CHUNK: u32 = 1024 * 1024;
 static LINK: Mutex<Option<Arc<ReliableLink>>> = Mutex::new(None);
 /// The newest outbound file transfer; older ones stop when it changes.
 static TRANSFER: AtomicU32 = AtomicU32::new(0);
+/// The outbound transfer still sending, and what was copied for it.
+static SENDING: Mutex<Option<(u32, Vec<PathBuf>)>> = Mutex::new(None);
 /// The clipboard sequence number our last write left. A write holds the lock
 /// until its number is recorded, and the listener holds it while it judges a
 /// change, so it never sees one of our writes unrecorded (and echoes it).
 static OUR_SEQ: Mutex<u32> = Mutex::new(0);
 static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
+
+/// Posted to the clipboard window: put a promise of files on the clipboard
+/// (see [`Promise`]).
+const WM_PROMISE_FILES: u32 = WM_APP + 1;
+/// How long a paste waits for promised files still on their way.
+const PROMISE_WAIT: Duration = Duration::from_secs(120);
+
+/// Files the peer copied, promised on our clipboard as soon as their list
+/// comes (delayed rendering: `CF_HDROP` with no data yet), and handed over
+/// when a paste asks for them — once the last byte is in. Before, nothing
+/// was on the clipboard until a copy had wholly arrived: a paste meanwhile
+/// did nothing, so the user copied again, which started the transfer over;
+/// a 26 MB copy over a slow stretch never arrived at all.
+#[derive(Default)]
+struct Promise {
+    transfer: u32,
+    /// The paste, once every file is in.
+    ready: Option<Vec<u8>>,
+    /// Given up on (refused, abandoned, superseded).
+    failed: bool,
+}
+
+static PROMISE: Mutex<Option<Promise>> = Mutex::new(None);
+static PROMISE_CHANGED: Condvar = Condvar::new();
+
+/// What became of promised `transfer`: its paste (`Some`), or nothing.
+fn settle_promise(transfer: u32, paste: Option<&[u8]>) {
+    let mut p = PROMISE.lock().unwrap();
+    if let Some(p) = p.as_mut().filter(|p| p.transfer == transfer) {
+        p.ready = paste.map(<[u8]>::to_vec);
+        p.failed = paste.is_none();
+        PROMISE_CHANGED.notify_all();
+    }
+}
+
+/// The promised paste, waiting until it's ready, has failed, or `wait` is up.
+fn await_promise(wait: Duration) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + wait;
+    let mut p = PROMISE.lock().unwrap();
+    loop {
+        match p.as_ref() {
+            Some(Promise { ready: Some(paste), .. }) => return Some(paste.clone()),
+            Some(Promise { failed: false, .. }) => {}
+            _ => return None,
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            tracing::warn!("a paste waited for copied files still on their way; gave up");
+            return None;
+        }
+        p = PROMISE_CHANGED.wait_timeout(p, left).unwrap().0;
+    }
+}
 
 /// Running clipboard sync; stops on drop.
 pub struct ClipboardSync {
@@ -71,6 +127,10 @@ struct Incoming {
     open: HashMap<u32, std::fs::File>,
     received: HashMap<u32, u64>,
     remaining: usize,
+    /// Bytes in all and so far, and when it began (for the log).
+    total: u64,
+    done: u64,
+    began: Instant,
 }
 
 impl ClipboardSync {
@@ -158,12 +218,17 @@ fn apply_now(incoming: &mut Option<Incoming>, m: Message) {
             // A new copy supersedes an unfinished one (its sender moved on).
             abandon(incoming);
             let Some(hdrop) = SessionUser::current().and_then(|user| begin_files(incoming, user, transfer, entries)) else {
+                // (Files still to come: promised meanwhile. Or refused.)
+                if incoming.as_ref().is_some_and(|i| i.transfer == transfer) {
+                    promise_files(transfer);
+                }
                 return;
             };
             vec![(CF_HDROP, hdrop)]
         }
         Message::FileChunk { transfer, index, offset, data } => {
             let Some(hdrop) = file_chunk(incoming, transfer, index, offset, &data) else { return };
+            settle_promise(transfer, Some(&hdrop));
             vec![(CF_HDROP, hdrop)]
         }
         Message::ClipboardText(t) if t.len() <= MAX_BYTES => {
@@ -302,7 +367,18 @@ fn begin_files(slot: &mut Option<Incoming>, user: SessionUser, transfer: u32, en
     let dir = user.root.join(transfer.to_string());
     let remaining = user.act(|| lay_out(&user.root, &dir, &entries, total)).flatten()?;
     tracing::info!(files = entries.len(), bytes = total, "receiving copied files");
-    let inc = Incoming { transfer, dir, user, entries, open: HashMap::new(), received: HashMap::new(), remaining };
+    let inc = Incoming {
+        transfer,
+        dir,
+        user,
+        entries,
+        open: HashMap::new(),
+        received: HashMap::new(),
+        remaining,
+        total,
+        done: 0,
+        began: Instant::now(),
+    };
     if remaining == 0 {
         return finished(inc);
     }
@@ -423,6 +499,12 @@ fn file_chunk(slot: &mut Option<Incoming>, transfer: u32, index: u32, offset: u6
     }
     let got = inc.received.entry(index).or_insert(0);
     *got += data.len() as u64;
+    // Progress: a line per tenth of the copy.
+    let before = inc.done;
+    inc.done += data.len() as u64;
+    if inc.total > 0 && before * 10 / inc.total != inc.done * 10 / inc.total {
+        tracing::info!(percent = inc.done * 100 / inc.total, secs = inc.began.elapsed().as_secs(), "receiving copied files");
+    }
     if *got < size {
         return None;
     }
@@ -437,6 +519,7 @@ fn file_chunk(slot: &mut Option<Incoming>, transfer: u32, index: u32, offset: u6
 /// Drop the unfinished inbound copy, and what it had written.
 fn abandon(slot: &mut Option<Incoming>) {
     if let Some(mut inc) = slot.take() {
+        settle_promise(inc.transfer, None);
         inc.open.clear(); // closed before they're deleted
         let _ = inc.user.act(|| std::fs::remove_dir_all(&inc.dir));
     }
@@ -494,16 +577,32 @@ fn is_device_name(name: &str) -> bool {
 /// on by the time the list is read (a paste from the peer landing), the list
 /// isn't that copy's — the newer change has its own notification.
 fn send_files(link: Arc<ReliableLink>, seq: u32) {
-    let transfer = TRANSFER.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = std::thread::Builder::new().name("hyper-files".into()).spawn(move || {
         crate::net_tune::eco_thread();
         let Some(roots) = copied_paths(seq) else { return };
+        // The same files copied again while they're still on their way (a
+        // paste that seemed to do nothing, so the user copied again): the
+        // transfer carries on rather than starting over.
+        {
+            let mut sending = SENDING.lock().unwrap();
+            if sending.as_ref().is_some_and(|(t, r)| *r == roots && *t == TRANSFER.load(Ordering::SeqCst)) {
+                tracing::info!(paths = roots.len(), "the same files copied again: still sending them");
+                return;
+            }
+            *sending = None;
+        }
+        let transfer = TRANSFER.fetch_add(1, Ordering::SeqCst) + 1;
+        *SENDING.lock().unwrap() = Some((transfer, roots.clone()));
         tracing::info!(transfer, paths = roots.len(), "files copied here");
         // Only files the user signed in here could read themselves (the list
         // is read as ourselves: the clipboard isn't the user's to guard, and
         // as SYSTEM impersonating them, Explorer's list never came).
         if let Some(user) = SessionUser::current() {
             user.act(|| send_files_now(&link, transfer, &roots));
+        }
+        let mut sending = SENDING.lock().unwrap();
+        if sending.as_ref().is_some_and(|(t, _)| *t == transfer) {
+            *sending = None;
         }
     });
 }
@@ -610,6 +709,7 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
     };
     link.send(&Message::ClipboardFiles { transfer, entries: entries.clone() });
     tracing::info!(files = entries.len(), bytes = total, "sending copied files");
+    let began = Instant::now();
     for (i, e) in entries.iter().enumerate() {
         if e.is_dir || e.size == 0 {
             continue;
@@ -642,6 +742,8 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
             offset += n;
         }
     }
+    // (Handed to the link: on the wire once its bulk lane drains.)
+    tracing::info!(transfer, bytes = total, secs = began.elapsed().as_secs(), "copied files all queued to send");
 }
 
 impl Drop for ClipboardSync {
@@ -664,7 +766,73 @@ impl Drop for ClipboardSync {
     }
 }
 
+/// Promise `transfer`'s files on the clipboard now (see [`Promise`]): the
+/// clipboard window does it, as their owner.
+fn promise_files(transfer: u32) {
+    *PROMISE.lock().unwrap() = Some(Promise { transfer, ..Default::default() });
+    let h = HWND_RAW.load(Ordering::SeqCst);
+    if h != 0 {
+        unsafe {
+            let _ = PostMessageW(Some(HWND(h as *mut _)), WM_PROMISE_FILES, WPARAM(transfer as usize), LPARAM(0));
+        }
+    }
+}
+
+/// Hand the promised files to a paste (in `WM_RENDERFORMAT` and
+/// `WM_RENDERALLFORMATS`: the clipboard is open for us).
+unsafe fn render_promise(paste: &[u8]) {
+    use windows::Win32::System::DataExchange::SetClipboardData;
+    if let Some(h) = global_block(paste) {
+        if SetClipboardData(CF_HDROP, Some(HANDLE(h.0))).is_err() {
+            let _ = windows::Win32::Foundation::GlobalFree(Some(h));
+        }
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+    if msg == WM_PROMISE_FILES {
+        // Still the one to promise (not settled or superseded meanwhile).
+        let open = PROMISE.lock().unwrap().as_ref().is_some_and(|p| p.transfer == wparam.0 as u32 && p.ready.is_none() && !p.failed);
+        if open {
+            let mut ours = OUR_SEQ.lock().unwrap();
+            let mut tries = 0;
+            // (Another app may hold it open a moment: up to 2 s.)
+            while OpenClipboard(Some(hwnd)).is_err() {
+                tries += 1;
+                if tries == 100 {
+                    tracing::warn!("couldn't open the clipboard to promise copied files");
+                    return LRESULT(0);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = EmptyClipboard();
+            let _ = SetClipboardData(CF_HDROP, None);
+            let _ = CloseClipboard();
+            *ours = GetClipboardSequenceNumber();
+            tracing::info!("copied files promised on the clipboard: a paste waits for them");
+        }
+        return LRESULT(0);
+    }
+    if msg == WM_RENDERFORMAT && wparam.0 as u32 == CF_HDROP {
+        // A paste of the promised files: hand them over once they're in.
+        if let Some(paste) = await_promise(PROMISE_WAIT) {
+            render_promise(&paste);
+        }
+        return LRESULT(0);
+    }
+    if msg == WM_RENDERALLFORMATS {
+        // Going away with a promise on the clipboard: kept only if the files
+        // are in (no waiting: the window is closing).
+        let ready = PROMISE.lock().unwrap().as_ref().and_then(|p| p.ready.clone());
+        if let Some(paste) = ready {
+            if OpenClipboard(Some(hwnd)).is_ok() {
+                render_promise(&paste);
+                let _ = CloseClipboard();
+            }
+        }
+        return LRESULT(0);
+    }
     if msg == WM_CLIPBOARDUPDATE {
         if let Some(seq) = local_change() {
             let link = LINK.lock().unwrap().clone();
@@ -841,6 +1009,68 @@ mod tests {
             .join()
             .unwrap();
         }
+    }
+
+    /// Copied files are on the clipboard as soon as their list comes, and a
+    /// paste then waits for the last byte, getting the finished copy.
+    #[test]
+    fn a_paste_waits_for_promised_files() {
+        on_private_clipboard("hyper_clipboard::tests::a_paste_waits_for_promised_files", |desktop| {
+            use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+            use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+            use windows::Win32::System::StationsAndDesktops::{SetThreadDesktop, HDESK};
+            // The clipboard window, on a thread of its own as in `start`.
+            let window = std::thread::spawn(move || unsafe {
+                SetThreadDesktop(HDESK(desktop as *mut _)).unwrap();
+                let class = w!("rdpioHyperClipboardTest");
+                RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(wndproc), lpszClassName: class, ..Default::default() });
+                let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), class, w!(""), WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, None, None).unwrap();
+                HWND_RAW.store(hwnd.0 as isize, Ordering::SeqCst);
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    DispatchMessageW(&msg);
+                }
+            });
+            while HWND_RAW.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let user = test_user("promise");
+            let root = user.root.clone();
+            let mut slot = None;
+            assert!(begin_files(&mut slot, user, 9, vec![entry("a.txt", 5, false)]).is_none(), "data still to come");
+            promise_files(9);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while unsafe { IsClipboardFormatAvailable(CF_HDROP) }.is_err() {
+                assert!(Instant::now() < deadline, "promised on the clipboard");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Someone pastes: it waits for the files…
+            let paster = std::thread::spawn(move || unsafe {
+                SetThreadDesktop(HDESK(desktop as *mut _)).unwrap();
+                let t = Instant::now();
+                OpenClipboard(None).unwrap();
+                let h = GetClipboardData(CF_HDROP).expect("the files, once in");
+                let g = windows::Win32::Foundation::HGLOBAL(h.0);
+                let bytes = std::slice::from_raw_parts(GlobalLock(g) as *const u8, GlobalSize(g)).to_vec();
+                let _ = GlobalUnlock(g);
+                let _ = CloseClipboard();
+                (t.elapsed(), bytes)
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            // …which come in a while later.
+            assert!(file_chunk(&mut slot, 9, 0, 0, b"hel").is_none());
+            let hdrop = file_chunk(&mut slot, 9, 0, 3, b"lo").expect("the paste");
+            settle_promise(9, Some(&hdrop));
+            let (waited, pasted) = paster.join().unwrap();
+            assert!(waited >= Duration::from_millis(250), "the paste waited ({waited:?})");
+            assert!(pasted.starts_with(&hdrop), "and got the finished copy");
+            assert_eq!(std::fs::read(root.join("9").join("a.txt")).unwrap(), b"hello");
+            unsafe {
+                let _ = PostMessageW(Some(HWND(HWND_RAW.load(Ordering::SeqCst) as *mut _)), WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+            window.join().unwrap();
+            let _ = std::fs::remove_dir_all(&root);
+        });
     }
 
     #[test]

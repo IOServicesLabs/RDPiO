@@ -586,7 +586,7 @@ pub(crate) fn hdrop_bytes(paths: &[PathBuf]) -> Vec<u8> {
 
 /// Allocate a `GMEM_MOVEABLE` block holding `bytes`, ready to hand to
 /// `SetClipboardData` (which takes ownership on success).
-unsafe fn global_block(bytes: &[u8]) -> Option<HGLOBAL> {
+pub(crate) unsafe fn global_block(bytes: &[u8]) -> Option<HGLOBAL> {
     let hglobal = GlobalAlloc(GMEM_MOVEABLE, bytes.len()).ok()?;
     let ptr = GlobalLock(hglobal) as *mut u8;
     if ptr.is_null() {
