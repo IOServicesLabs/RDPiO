@@ -182,6 +182,9 @@ impl ClipboardSync {
             .spawn(move || unsafe {
                 crate::net_tune::eco_thread();
                 let _ = windows::Win32::System::Ole::OleInitialize(None);
+                if running_as_system() {
+                    open_com_to_the_user();
+                }
                 let class = w!("rdpioHyperClipboard");
                 let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), lpszClassName: class, ..Default::default() };
                 RegisterClassW(&wc);
@@ -891,7 +894,7 @@ unsafe fn offer_promised(hwnd: HWND, transfer: u32) {
     if files.arrival.state.lock().unwrap().failed {
         return;
     }
-    if running_as_system() {
+    if running_as_system() && !(crate::host_ab::ab("comopen", true) && open_com_to_the_user()) {
         promise_hdrop(hwnd, files);
         return;
     }
@@ -910,6 +913,40 @@ unsafe fn offer_promised(hwnd: HWND, transfer: u32) {
     }
     *ours = GetClipboardSequenceNumber();
     tracing::info!("copied files offered on the clipboard: a paste streams them as they arrive");
+}
+
+/// As SYSTEM (the direct-mode agent): let the signed-in user's processes
+/// call into this process's COM objects — Explorer, pasting, reads the
+/// copied files' streams from ours. By default COM lets a SYSTEM process be
+/// called by SYSTEM and administrators only, so a paste had to wait for every
+/// file, blocked with no progress (a 685 MB upload: 2.5 minutes of a frozen
+/// Explorer). Local calls by SYSTEM, administrators and the interactive
+/// user, at medium integrity or above. Once per process (COM's security is
+/// set once, before anything is marshalled); false if it couldn't be.
+fn open_com_to_the_user() -> bool {
+    static OPEN: OnceLock<bool> = OnceLock::new();
+    *OPEN.get_or_init(|| unsafe {
+        use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+        use windows::Win32::Security::PSECURITY_DESCRIPTOR;
+        use windows::Win32::System::Com::{CoInitializeSecurity, EOAC_NONE, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IDENTIFY};
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        // (COM_RIGHTS_EXECUTE | EXECUTE_LOCAL; kept for the process's life.)
+        let sddl = w!("O:SYG:SYD:(A;;0x3;;;SY)(A;;0x3;;;BA)(A;;0x3;;;IU)S:(ML;;NX;;;ME)");
+        if let Err(e) = ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &mut sd, None) {
+            tracing::warn!(error = %e, "couldn't build the clipboard's COM access");
+            return false;
+        }
+        match CoInitializeSecurity(Some(sd), -1, None, None, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IDENTIFY, None, EOAC_NONE, None) {
+            Ok(()) => {
+                tracing::info!("the signed-in user may read copied files from this SYSTEM process: pastes stream");
+                true
+            }
+            Err(e) => {
+                tracing::info!(error = %e, "COM access already set: pastes of copied files wait for them");
+                false
+            }
+        }
+    })
 }
 
 /// As SYSTEM (the direct-mode agent), the files are promised as a
