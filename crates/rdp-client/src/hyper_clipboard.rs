@@ -754,8 +754,22 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
             return;
         }
     };
-    link.send(&Message::ClipboardFiles { transfer, entries: entries.clone() });
-    tracing::info!(files = entries.len(), bytes = total, "sending copied files");
+    // Over the copy stream when one is up (see hyper_tcp), else the link.
+    let tcp = crate::hyper_tcp::current();
+    let via = if tcp.is_some() { "tcp" } else { "link" };
+    let send = |m: Message| -> bool {
+        match &tcp {
+            Some(t) => t.send(&m).is_ok(),
+            None => {
+                link.send(&m);
+                true
+            }
+        }
+    };
+    if !send(Message::ClipboardFiles { transfer, entries: entries.clone() }) {
+        return;
+    }
+    tracing::info!(files = entries.len(), bytes = total, via, "sending copied files");
     let began = Instant::now();
     // How the bulk lane reads the path, every few seconds of a copy.
     let mut progress = Instant::now();
@@ -763,6 +777,11 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
     let mut report = |queued_bytes: u64| {
         if progress.elapsed() >= Duration::from_secs(2) {
             progress = Instant::now();
+            if tcp.is_some() {
+                let secs = began.elapsed().as_secs_f64().max(0.001);
+                tracing::info!(transfer, queued_mb = queued_bytes / 1_000_000, mbps = format!("{:.1}", queued_bytes as f64 * 8.0 / secs / 1e6), "copy progress (tcp)");
+                return;
+            }
             let s = link.bulk_stats();
             tracing::info!(
                 transfer,
@@ -792,7 +811,7 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
             }
             // The link paces its bulk lane; this only bounds the data
             // waiting in memory.
-            while link.bulk_backlog() > MAX_BACKLOG {
+            while tcp.is_none() && link.bulk_backlog() > MAX_BACKLOG {
                 std::thread::sleep(std::time::Duration::from_millis(5));
                 if TRANSFER.load(Ordering::SeqCst) != transfer {
                     return;
@@ -809,7 +828,9 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
                 break;
             }
             let n = data.len() as u64;
-            link.send(&Message::FileChunk { transfer, index: i as u32, offset, data });
+            if !send(Message::FileChunk { transfer, index: i as u32, offset, data }) {
+                return;
+            }
             offset += n;
             queued_bytes += n;
         }
@@ -817,7 +838,7 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
     // (Handed to the link: on the wire once its bulk lane drains.)
     tracing::info!(transfer, bytes = total, secs = began.elapsed().as_secs(), "copied files all queued to send");
     let queued = began.elapsed();
-    while link.bulk_backlog() > 0 {
+    while tcp.is_none() && link.bulk_backlog() > 0 {
         if TRANSFER.load(Ordering::SeqCst) != transfer || began.elapsed() > Duration::from_secs(3600) {
             return;
         }
@@ -830,6 +851,7 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
         bytes = total,
         ms = (secs * 1000.0) as u64,
         mbps = format!("{:.1}", total as f64 * 8.0 / secs / 1e6),
+        via,
         "copied files all delivered"
     );
 }

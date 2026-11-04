@@ -1218,6 +1218,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     pump_stop.store(true, Ordering::Relaxed);
     reliable.nudge();
     let _ = pump.join();
+    crate::hyper_tcp::end_session();
     drop(clipboard);
     result
 }
@@ -1703,6 +1704,14 @@ fn receive_loop(
                                         crate::session::CursorUpdate::Hide
                                     });
                                     crate::window::signal_frame();
+                                }
+                                // Copies over TCP of their own, on the LAN (see
+                                // hyper_tcp; RDPIO_NO_BULK_TCP=1: over the link).
+                                Message::BulkTcp { port, key } => {
+                                    let host = socket.peer_addr().ok().filter(|a| crate::hyper_path::on_lan(a.ip()));
+                                    if let Some(host) = host.filter(|_| std::env::var_os("RDPIO_NO_BULK_TCP").is_none()) {
+                                        crate::hyper_tcp::client_connect(host, port, key, clipboard.clone());
+                                    }
                                 }
                                 other => {
                                     if let Some(c) = &clipboard {

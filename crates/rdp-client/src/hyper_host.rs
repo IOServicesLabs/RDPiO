@@ -1122,6 +1122,11 @@ fn stream_inner(
         let link = link.clone();
         crate::hyper_clipboard::ClipboardSync::start(link).map(Arc::new)
     };
+    // Copies over TCP of their own to a client on the LAN (`bulktcp`; see
+    // hyper_tcp).
+    if crate::host_ab::ab("bulktcp", true) && crate::hyper_path::on_lan(peer.ip()) {
+        crate::hyper_tcp::host_offer(opts.port, peer.ip(), &link, clipboard.clone());
+    }
 
     let rx_socket = socket.try_clone()?;
     let rx_shared = shared.clone();
@@ -2054,6 +2059,7 @@ fn stream_inner(
     pump_stop.store(true, Ordering::Relaxed);
     link.nudge();
     let _ = pump.join();
+    crate::hyper_tcp::end_session();
     drop(clipboard);
     if let Some(t) = mic_watch {
         mic_changed.notify(); // (out of its wait at once)

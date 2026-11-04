@@ -47,7 +47,7 @@ fn epoch() -> Instant {
     *EPOCH.get_or_init(Instant::now)
 }
 
-fn bulk_moved() {
+pub(crate) fn bulk_moved() {
     BULK_MOVED_MS.store(epoch().elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
 }
 

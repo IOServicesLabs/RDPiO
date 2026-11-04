@@ -1960,6 +1960,8 @@ mod net_tune;
 mod udp_batch;
 #[cfg(windows)]
 mod hyper_clipboard;
+#[cfg(windows)]
+mod hyper_tcp;
 
 #[cfg(windows)]
 mod hyper_camera;

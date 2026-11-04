@@ -23,6 +23,7 @@
 //! Platform-neutral; the capture/encode/decode ends live in `rdp-gpu` and
 //! `rdp-client`.
 
+pub mod bulk_tcp;
 pub mod audio;
 pub mod auth;
 pub mod autores;
