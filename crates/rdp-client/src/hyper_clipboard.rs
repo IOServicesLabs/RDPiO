@@ -1347,6 +1347,10 @@ mod tests {
     fn on_private_clipboard(test: &str, body: fn(isize)) {
         const CHILD: &str = "RDPIO_TEST_PRIVATE_CLIPBOARD";
         if std::env::var_os(CHILD).is_none() {
+            // One at a time: an unnamed window station is named for the
+            // logon session, so children running at once share its clipboard.
+            static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+            let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([test, "--exact", "--nocapture", "--test-threads=1"])
                 .env(CHILD, "1")
