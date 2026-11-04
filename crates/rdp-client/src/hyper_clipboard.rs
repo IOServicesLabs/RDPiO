@@ -926,16 +926,11 @@ unsafe fn offer_promised(hwnd: HWND, transfer: u32) {
 fn open_com_to_the_user() -> bool {
     static OPEN: OnceLock<bool> = OnceLock::new();
     *OPEN.get_or_init(|| unsafe {
-        use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
-        use windows::Win32::Security::PSECURITY_DESCRIPTOR;
         use windows::Win32::System::Com::{CoInitializeSecurity, EOAC_NONE, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IDENTIFY};
-        let mut sd = PSECURITY_DESCRIPTOR::default();
-        // (COM_RIGHTS_EXECUTE | EXECUTE_LOCAL; kept for the process's life.)
-        let sddl = w!("O:SYG:SYD:(A;;0x3;;;SY)(A;;0x3;;;BA)(A;;0x3;;;IU)S:(ML;;NX;;;ME)");
-        if let Err(e) = ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &mut sd, None) {
-            tracing::warn!(error = %e, "couldn't build the clipboard's COM access");
+        let Some(sd) = com_access_for_the_user() else {
+            tracing::warn!("couldn't build the clipboard's COM access");
             return false;
-        }
+        };
         match CoInitializeSecurity(Some(sd), -1, None, None, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IDENTIFY, None, EOAC_NONE, None) {
             Ok(()) => {
                 tracing::info!("the signed-in user may read copied files from this SYSTEM process: pastes stream");
@@ -947,6 +942,38 @@ fn open_com_to_the_user() -> bool {
             }
         }
     })
+}
+
+/// [`open_com_to_the_user`]'s access, as the absolute security descriptor
+/// COM takes (SDDL gives a self-relative one, which it refuses: "not in the
+/// right format"). Kept for the process's life.
+unsafe fn com_access_for_the_user() -> Option<windows::Win32::Security::PSECURITY_DESCRIPTOR> {
+    use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+    use windows::Win32::Security::{IsValidSecurityDescriptor, MakeAbsoluteSD, ACL, PSECURITY_DESCRIPTOR, PSID};
+    let mut rel = PSECURITY_DESCRIPTOR::default();
+    // (COM_RIGHTS_EXECUTE | EXECUTE_LOCAL.)
+    let sddl = w!("O:SYG:SYD:(A;;0x3;;;SY)(A;;0x3;;;BA)(A;;0x3;;;IU)S:(ML;;NX;;;ME)");
+    ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &mut rel, None).ok()?;
+    // Generous buffers, u64s for alignment.
+    let buf = |n: usize| Box::leak(vec![0u64; n / 8].into_boxed_slice()).as_mut_ptr().cast::<core::ffi::c_void>();
+    let (abs, dacl, sacl, owner, group) = (buf(256), buf(1024), buf(1024), buf(256), buf(256));
+    let (mut abs_n, mut dacl_n, mut sacl_n, mut owner_n, mut group_n) = (256u32, 1024u32, 1024u32, 256u32, 256u32);
+    MakeAbsoluteSD(
+        rel,
+        Some(PSECURITY_DESCRIPTOR(abs)),
+        &mut abs_n,
+        Some(dacl.cast::<ACL>()),
+        &mut dacl_n,
+        Some(sacl.cast::<ACL>()),
+        &mut sacl_n,
+        Some(PSID(owner)),
+        &mut owner_n,
+        Some(PSID(group)),
+        &mut group_n,
+    )
+    .ok()?;
+    let sd = PSECURITY_DESCRIPTOR(abs);
+    IsValidSecurityDescriptor(sd).as_bool().then_some(sd)
 }
 
 /// As SYSTEM (the direct-mode agent), the files are promised as a
@@ -1650,6 +1677,27 @@ mod tests {
 
     /// As SYSTEM: the files are promised as a `CF_HDROP`, and a paste waits
     /// for the last byte, getting the finished copy.
+    /// COM takes the access the SYSTEM agent opens to the user (run alone:
+    /// COM's security is set once per process).
+    /// `cargo test -p rdp-client com_takes_the_users_access -- --ignored`
+    #[test]
+    #[ignore]
+    fn com_takes_the_users_access() {
+        unsafe {
+            let _ = windows::Win32::System::Ole::OleInitialize(None);
+        }
+        assert!(open_com_to_the_user());
+    }
+
+    #[test]
+    fn com_access_for_the_user_is_absolute() {
+        let sd = unsafe { com_access_for_the_user() }.expect("built");
+        let mut control = 0u16;
+        let mut rev = 0u32;
+        unsafe { windows::Win32::Security::GetSecurityDescriptorControl(sd, &mut control, &mut rev) }.unwrap();
+        assert_eq!(control & 0x8000, 0, "self-relative");
+    }
+
     #[test]
     fn a_paste_of_files_promised_as_system_waits_for_them() {
         on_private_clipboard("hyper_clipboard::tests::a_paste_of_files_promised_as_system_waits_for_them", |desktop| {
