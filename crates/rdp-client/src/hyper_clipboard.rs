@@ -850,7 +850,7 @@ unsafe fn offer_promised(hwnd: HWND, transfer: u32) {
     if files.arrival.state.lock().unwrap().failed {
         return;
     }
-    if running_as_system() && !FORCE_VIRTUAL.load(Ordering::SeqCst) {
+    if running_as_system() {
         promise_hdrop(hwnd, files);
         return;
     }
@@ -875,8 +875,6 @@ unsafe fn offer_promised(hwnd: HWND, transfer: u32) {
 /// delayed-rendered `CF_HDROP` instead, handed over once they're all in:
 /// the signed-in user's Explorer may not call into a SYSTEM process.
 static HDROP_PROMISED: Mutex<Option<Arc<PromisedFiles>>> = Mutex::new(None);
-/// Virtual files even as SYSTEM (tests: CI may run them as SYSTEM).
-static FORCE_VIRTUAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 unsafe fn promise_hdrop(hwnd: HWND, files: PromisedFiles) {
     use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
@@ -1383,6 +1381,12 @@ mod tests {
     /// the finished copy's `CF_HDROP`.
     #[test]
     fn a_paste_streams_files_as_they_arrive() {
+        // (As SYSTEM, as CI may run tests, files are promised as a CF_HDROP
+        // instead: see the next test.)
+        if running_as_system() {
+            println!("skipped: virtual files are offered only when not SYSTEM");
+            return;
+        }
         on_private_clipboard("hyper_clipboard::tests::a_paste_streams_files_as_they_arrive", |desktop| {
             use windows::Win32::System::Ole::{OleGetClipboard, OleInitialize};
             use windows::Win32::System::StationsAndDesktops::{SetThreadDesktop, HDESK};
@@ -1403,7 +1407,6 @@ mod tests {
             while HWND_RAW.load(Ordering::SeqCst) == 0 {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            FORCE_VIRTUAL.store(true, Ordering::SeqCst);
             let user = test_user("stream");
             let root = user.root.clone();
             let mut slot = None;
