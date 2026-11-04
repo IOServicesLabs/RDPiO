@@ -20,7 +20,7 @@ const TICK: Duration = Duration::from_millis(2);
 const IDLE: Duration = Duration::from_millis(250);
 /// The bulk lane backs off once the round trip grows this much: it shares
 /// the uplink with game input, which mustn't sit behind a copy's queue.
-const BULK_QUEUE_LIMIT: Duration = Duration::from_millis(10);
+pub const BULK_QUEUE_LIMIT: Duration = Duration::from_millis(10);
 
 struct Lanes {
     tx: [Sender; 2],
@@ -59,6 +59,12 @@ impl ReliableLink {
     /// lane is never paced: it only carries a few small messages.
     pub fn set_bulk_rate(&self, bps: Option<u64>) {
         self.state.lock().unwrap().tx[Lane::Bulk as usize].set_rate(bps);
+    }
+
+    /// How far over the path's least round trip the bulk lane lets its
+    /// round trip grow before it backs off.
+    pub fn set_bulk_queue_limit(&self, limit: Duration) {
+        self.state.lock().unwrap().tx[Lane::Bulk as usize].set_queue_limit(limit);
     }
 
     /// An incoming reliable-channel body: returns an ack to send back now (if

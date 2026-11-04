@@ -807,6 +807,38 @@ const PAUSED_LOOK: Duration = Duration::from_millis(500);
 /// minutes.
 const INPUT_SHOWS_FOR: Duration = Duration::from_secs(5);
 
+/// How the bulk lane (copied files, clipboard images) is paced.
+///
+/// It followed the video's rate controller (`Rate::bulk_bps`), which halves
+/// it at every rise in delay and holds it at its floor while the client's
+/// link estimate reads low: over a LAN's Wi-Fi a 250 MB copy took 25 minutes
+/// (~1.4 Mbit/s). On a LAN path it now goes unpaced (`bulkfast`): the
+/// reliable sender's own congestion window — slow start, halving on loss
+/// and on queueing — finds what the path carries, as TCP's does. And the
+/// queueing it yields to is a LAN Wi-Fi's ordinary jitter no more
+/// (`bulkq`: 25 ms over the path's least round trip, was 10).
+#[derive(Clone, Copy)]
+struct BulkLane {
+    fast: bool,
+    queue_25: bool,
+}
+
+impl BulkLane {
+    fn read() -> Self {
+        Self { fast: crate::host_ab::ab("bulkfast", true), queue_25: crate::host_ab::ab("bulkq", true) }
+    }
+
+    fn apply(&self, link: &crate::hyper_link::ReliableLink, bulk_bps: u64, lan: bool) {
+        let fast = self.fast && lan;
+        link.set_bulk_rate(if fast { None } else { Some(bulk_bps) });
+        link.set_bulk_queue_limit(if fast && self.queue_25 {
+            Duration::from_millis(25)
+        } else {
+            crate::hyper_link::BULK_QUEUE_LIMIT
+        });
+    }
+}
+
 /// A desktop left alone (no input) this long is idle…
 const IDLE_AFTER: Duration = Duration::from_secs(2);
 
@@ -2459,6 +2491,8 @@ fn receive_loop(
     let mut held = crate::hyper_client::Held::default();
     let mut mic: Option<crate::hyper_audio::AudioSink> = None;
     let mut last_feedback = Instant::now();
+    // The bulk lane's switches (see `bulk_lane`), re-read each second.
+    let mut bulk_switches = (BulkLane::read(), Instant::now());
     let mut buf = [0u8; 2048];
     while !shared.stop.load(Ordering::Relaxed) {
         crate::hyper_touch::keep_alive();
@@ -2610,13 +2644,16 @@ fn receive_loop(
                         if fb.window_us > 0 { (fb.window_us as u64 / 1000).clamp(10, 1000) } else { arrived_ms };
                     let now_ms = qpc_us() / 1000;
                     let busy = link.bulk_backlog() > 0;
-                    let bulk = {
+                    let (bulk, lan) = {
                         let mut r = shared.rate.lock().unwrap();
                         r.set_bulk_busy(busy);
                         r.update(&fb, window_ms, now_ms);
-                        r.bulk_bps()
+                        (r.bulk_bps(), r.lan())
                     };
-                    link.set_bulk_rate(Some(bulk));
+                    if bulk_switches.1.elapsed() >= Duration::from_secs(1) {
+                        bulk_switches = (BulkLane::read(), Instant::now());
+                    }
+                    bulk_switches.0.apply(&link, bulk, lan);
                 }
                 Some(Control::Bye) => {
                     tracing::info!("client said goodbye");

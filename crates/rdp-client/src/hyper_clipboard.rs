@@ -788,6 +788,21 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
     }
     // (Handed to the link: on the wire once its bulk lane drains.)
     tracing::info!(transfer, bytes = total, secs = began.elapsed().as_secs(), "copied files all queued to send");
+    let queued = began.elapsed();
+    while link.bulk_backlog() > 0 {
+        if TRANSFER.load(Ordering::SeqCst) != transfer || began.elapsed() > Duration::from_secs(3600) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let secs = began.elapsed().as_secs_f64().max(queued.as_secs_f64()).max(0.001);
+    tracing::info!(
+        transfer,
+        bytes = total,
+        ms = (secs * 1000.0) as u64,
+        mbps = format!("{:.1}", total as f64 * 8.0 / secs / 1e6),
+        "copied files all delivered"
+    );
 }
 
 impl Drop for ClipboardSync {
