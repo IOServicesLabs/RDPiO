@@ -944,6 +944,30 @@ fn open_com_to_the_user() -> bool {
     })
 }
 
+/// [`open_com_to_the_user`] first thing in the agent's process: COM's
+/// security is set once, before any interface is marshalled — set from the
+/// clipboard's thread, it came too late ("Security must be initialized
+/// before any interfaces are marshalled"). On a thread of its own in the
+/// process's multithreaded apartment, which it keeps alive (COM's settings
+/// last while COM is loaded).
+pub(crate) fn open_com_early() {
+    if !running_as_system() || !crate::host_ab::ab("comopen", true) {
+        return;
+    }
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new().name("com-access".into()).spawn(move || unsafe {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _ = done_tx.send(open_com_to_the_user());
+        loop {
+            std::thread::park();
+        }
+    });
+    if spawned.is_ok() {
+        let _ = done_rx.recv_timeout(Duration::from_secs(5));
+    }
+}
+
 /// [`open_com_to_the_user`]'s access, as the absolute security descriptor
 /// COM takes (SDDL gives a self-relative one, which it refuses: "not in the
 /// right format"). Kept for the process's life.

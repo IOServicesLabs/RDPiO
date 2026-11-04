@@ -181,6 +181,12 @@ fn main() {
     // First line of every log: which build produced it. Field reports from a
     // stale rdpio.exe are indistinguishable from current ones without this.
     tracing::info!(version = env!("CARGO_PKG_VERSION"), build = env!("RDPIO_BUILD"), "rdpio starting");
+    // The agent (SYSTEM): COM's access is set before anything marshals an
+    // interface (see hyper_clipboard::open_com_early).
+    #[cfg(windows)]
+    if std::env::args().any(|a| a == "--hyper-console-agent") {
+        hyper_clipboard::open_com_early();
+    }
     // Log the faulting module on any native crash (e.g. inside a hosted add-in),
     // so a hard crash is diagnosable instead of a silently-truncated log.
     #[cfg(windows)]
