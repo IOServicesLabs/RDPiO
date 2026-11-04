@@ -452,7 +452,18 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     let (tx, rx) = mpsc::channel::<Event>();
     let (cursor_tx, cursor_rx) = mpsc::channel::<crate::session::CursorUpdate>();
     let reliable = crate::hyper_link::ReliableLink::new();
-    reliable.set_bulk_rate(Some(CLIENT_BULK_BPS));
+    // To a host on the LAN, copies go as fast as the path carries them, as
+    // the host's do (its BulkLane): unpaced, yielding to queues of 25 ms,
+    // reading a Wi-Fi radio's spikes as TCP does. (40 Mbit/s held a 250 MB
+    // copy to 50 s at best, where RDP took 17.) RDPIO_BULK_PACED=1: as before.
+    let lan = link.socket.peer_addr().is_ok_and(|a| crate::hyper_path::on_lan(a.ip()));
+    if lan && std::env::var_os("RDPIO_BULK_PACED").is_none() {
+        reliable.set_bulk_rate(None);
+        reliable.set_bulk_queue_limit(Duration::from_millis(25));
+        reliable.set_bulk_jitter_tolerant(true);
+    } else {
+        reliable.set_bulk_rate(Some(CLIENT_BULK_BPS));
+    }
     let pump_stop = Arc::new(AtomicBool::new(false));
     let pump = {
         let s = shared.clone();
@@ -1486,11 +1497,19 @@ fn receive_loop(
     // 11% of a core -> 4%), for up to a millisecond on a frame.
     // (RDPIO_NO_RX_NAP=1: no nap.)
     let nap = std::env::var_os("RDPIO_NO_RX_NAP").is_none();
+    // Never while a copy streams in: a nap after each batch of one or two
+    // datagrams held copied files to ~600 a second, 5.5 Mbit/s over a
+    // 900 Mbit/s Wi-Fi LAN (the rest waited in the socket's buffer: the
+    // host saw 100-190 ms round trips where a ping saw 2-6). Reliable data
+    // lifts the nap for a while. (RDPIO_RX_NAP_BULK=1: nap anyway.)
+    let nap_bulk = std::env::var_os("RDPIO_RX_NAP_BULK").is_some();
+    let mut bulk_at = Instant::now() - Duration::from_secs(1);
     let mut got = false;
     while !shared.stop.load(Ordering::Relaxed) {
         // (Not through a probe train: the nap would be timed as the link —
         // 1-2 ms on a few KB read a 300 Mbit/s Wi-Fi link as 1-6.)
-        if got && nap && crate::window::office_mode() && !reassembler.train_open() {
+        let streaming_in = !nap_bulk && bulk_at.elapsed() < Duration::from_millis(250);
+        if got && nap && !streaming_in && crate::window::office_mode() && !reassembler.train_open() {
             std::thread::sleep(Duration::from_millis(1));
         }
         let datagrams = receiver.recv(&socket);
@@ -1643,6 +1662,7 @@ fn receive_loop(
                     }
                     Kind::Reliable => {
                         use rdp_hyper::messages::Message;
+                        bulk_at = Instant::now();
                         let (ack, msgs) = reliable.on_packet(&body);
                         if let Some(a) = ack {
                             shared.send(Kind::Reliable, &a);

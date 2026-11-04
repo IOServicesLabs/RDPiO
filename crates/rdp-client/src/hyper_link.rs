@@ -179,6 +179,91 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    /// Lab: 100 MB of file chunks between two links over UDP on loopback,
+    /// with the host's own pump, unpaced as on the LAN: what the channel
+    /// itself can carry, with no radio in the way.
+    /// `cargo test --release -p rdp-client loopback_copy -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn loopback_copy_speed() {
+        use std::net::UdpSocket;
+        for tolerant in [false, true] {
+            let (a, b) = (ReliableLink::new(), ReliableLink::new());
+            a.set_bulk_rate(None);
+            a.set_bulk_queue_limit(Duration::from_millis(25));
+            a.set_bulk_jitter_tolerant(tolerant);
+            let (sa, sb) = (UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap());
+            crate::hyper_client::set_socket_buffers(&sa);
+            crate::hyper_client::set_socket_buffers(&sb);
+            sa.connect(sb.local_addr().unwrap()).unwrap();
+            sb.connect(sa.local_addr().unwrap()).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let pa = {
+                let s = sa.try_clone().unwrap();
+                a.spawn_pump(move |p| drop(s.send(p)), stop.clone())
+            };
+            let pb = {
+                let s = sb.try_clone().unwrap();
+                b.spawn_pump(move |p| drop(s.send(p)), stop.clone())
+            };
+            // The host's receive thread: acks in.
+            sa.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+            sb.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+            let ra = {
+                let (s, a, stop) = (sa.try_clone().unwrap(), a.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Ok(n) = s.recv(&mut buf) {
+                            a.on_packet(&buf[..n]);
+                        }
+                    }
+                })
+            };
+            // The client's: data in, acks straight back.
+            const MB: usize = 100;
+            let got = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let rb = {
+                let (s, b, stop, got) = (sb.try_clone().unwrap(), b.clone(), stop.clone(), got.clone());
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Ok(n) = s.recv(&mut buf) {
+                            let (ack, msgs) = b.on_packet(&buf[..n]);
+                            if let Some(ack) = ack {
+                                let _ = s.send(&ack);
+                            }
+                            got.fetch_add(msgs.len(), Ordering::Relaxed);
+                        }
+                    }
+                })
+            };
+            let start = Instant::now();
+            for i in 0..MB {
+                while a.bulk_backlog() > 16 * 1024 * 1024 {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                a.send(&Message::FileChunk { transfer: 1, index: 0, offset: (i << 20) as u64, data: vec![i as u8; 1 << 20] });
+            }
+            while got.load(Ordering::Relaxed) < MB && start.elapsed() < Duration::from_secs(120) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let secs = start.elapsed().as_secs_f64();
+            eprintln!(
+                "loopback, tolerant={tolerant}: {} MB in {secs:.2} s = {:.0} Mbit/s {:?}",
+                got.load(Ordering::Relaxed),
+                (MB << 20) as f64 * 8.0 / secs / 1e6,
+                a.bulk_stats()
+            );
+            stop.store(true, Ordering::Relaxed);
+            a.nudge();
+            b.nudge();
+            for h in [pa, pb, ra, rb] {
+                h.join().unwrap();
+            }
+        }
+    }
+
     /// Two links joined by channels (lossless), each with its pump.
     #[test]
     fn lanes_deliver_independently_and_acks_flush() {
