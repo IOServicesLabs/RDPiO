@@ -861,6 +861,8 @@ unsafe fn offer_promised(hwnd: HWND, transfer: u32) {
         tries += 1;
         if tries == 100 {
             tracing::warn!(error = %e, "couldn't offer copied files on the clipboard");
+            #[cfg(test)]
+            eprintln!("couldn't offer copied files on the clipboard: {e}");
             return;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -1408,7 +1410,8 @@ mod tests {
             let (descriptor, contents, _) = virtual_formats();
             let deadline = Instant::now() + Duration::from_secs(5);
             while unsafe { IsClipboardFormatAvailable(descriptor as u32) }.is_err() {
-                assert!(Instant::now() < deadline, "offered on the clipboard");
+                let owner = unsafe { windows::Win32::System::DataExchange::GetClipboardOwner() };
+                assert!(Instant::now() < deadline, "offered on the clipboard (owner {owner:?})");
                 std::thread::sleep(Duration::from_millis(10));
             }
             // Someone pastes: the list at once, then each file as it comes.
