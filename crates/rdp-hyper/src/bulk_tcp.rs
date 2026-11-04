@@ -24,7 +24,7 @@ use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 pub const KEY_LEN: usize = 32;
 
 /// Connections a copy stream may be striped over.
-pub const MAX_STREAMS: u8 = 4;
+pub const MAX_STREAMS: u8 = 16;
 
 /// What the client says first: it holds the key.
 pub const HELLO: &[u8] = b"rdpio bulk hello 1";

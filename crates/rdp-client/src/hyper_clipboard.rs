@@ -757,16 +757,10 @@ fn send_files_now(link: &ReliableLink, transfer: u32, roots: &[PathBuf]) {
     // Over the copy stream when one is up (see hyper_tcp), else the link.
     let tcp = crate::hyper_tcp::current();
     let via = if tcp.is_some() { "tcp" } else { "link" };
-    // Striped over this many of its connections (switches tcp1 / tcp2 for
-    // A/B; all of them by default).
+    // Striped over this many of its connections (switches tcp1, tcp2, tcp4,
+    // tcp8 for A/B; all of them by default).
     let width = tcp.as_ref().map_or(1, |t| {
-        if crate::host_ab::ab("tcp1", false) {
-            1
-        } else if crate::host_ab::ab("tcp2", false) {
-            2
-        } else {
-            t.width()
-        }
+        [1, 2, 4, 8].into_iter().find(|w| crate::host_ab::ab(&format!("tcp{w}"), false)).unwrap_or(t.width()).min(t.width())
     });
     let send = |m: Message| -> bool {
         match &tcp {
