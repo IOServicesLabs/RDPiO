@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 use rdp_gpu::hyper::{list_monitors, DesktopCapture, HwEncoder};
 use rdp_hyper::control::{self, Control, Handshake, CHANNEL_NAME, PROTOCOL};
 use rdp_hyper::input::{InputEvent, InputReceiver};
+use rdp_hyper::ltr::{Ltr, LtrPlan};
+use rdp_hyper::pause::{self, PauseRelease, Released};
 use rdp_hyper::rate::{Limits, RateController};
 use rdp_hyper::video::{packetize_shards, parity_shards, FrameBuffers, OutFrame, Shards};
 use rdp_hyper::wire::{random_key, Direction, Kind, Session};
@@ -64,6 +66,11 @@ pub(crate) enum StreamEnd {
     /// The service is stopping (an update, a restart): put back and locked
     /// like a goodbye, but the client is told to reconnect, not that it's over.
     Stopping,
+    /// The power source changed (Host GPU: Auto): the client is told to sign
+    /// in again at once, and its new sign-in puts the stream on the other GPU
+    /// with the codec and rate that GPU takes (see host_battery). Nothing is
+    /// put back or locked meanwhile.
+    GpuMove,
 }
 
 /// While a stream runs, what the host changed is written here, so a crashed
@@ -468,6 +475,9 @@ struct Shared {
     paced: AtomicU32,
     /// The client's window is minimized: encode nothing.
     paused: AtomicBool,
+    /// No input has come for [`IDLE_AFTER`]: the capture and receive threads
+    /// wait longer between looks (`idlewait`; see [`IDLE_LOOK`]).
+    idle: AtomicBool,
     /// The client wants office mode (crisp text) rather than game mode.
     office: AtomicBool,
     /// …with the encoder's fast preset.
@@ -491,6 +501,9 @@ struct Shared {
     /// and that it changed since the stream last followed it.
     view: Mutex<Option<(u32, u32)>>,
     view_changed: AtomicBool,
+    /// Ends the capture loop's paused wait at once (see [`Shared::wake`]).
+    woken: Mutex<bool>,
+    wake: std::sync::Condvar,
 }
 
 /// A captured frame: converted already (Desktop Duplication), or only seen —
@@ -537,6 +550,10 @@ const TRICKLE_INTERVAL_US: u64 = 83_333;
 const TRICKLE_DEEP_AFTER_US: u64 = 2_000_000;
 /// 5 fps: still ahead of a caret's half-second blink.
 const TRICKLE_DEEP_INTERVAL_US: u64 = 200_000;
+/// …on battery, 3 fps (`battrickle`): a caret's half-second blink still
+/// shows each time, the clock's minute too; the next input brings the full
+/// rate back at once as ever.
+const TRICKLE_DEEP_BATTERY_US: u64 = 333_333;
 /// An encoded frame this small changed little (at any resolution: a big
 /// change costs tens of kilobytes).
 const SMALL_FRAME: usize = 4096;
@@ -547,8 +564,42 @@ const TRICKLE_STREAK: u32 = 3;
 /// caret blink then costs two frames, not a second of them.
 const SHARPEN_BYTES_PER_FRAME: usize = 1024;
 
+/// On the LAN, a still picture's sharpening frames get this many times the
+/// stream's rate (`settleboost`), up to [`SETTLE_BOOST_MAX_BPS`] and half
+/// what the link has shown: text scrolled at a few Mbit/s took ~20 refresh
+/// frames — seconds at a low frame rate — to read again; a few big ones
+/// carry the same detail. (Only while still: each is the same picture, so
+/// its bytes are the detail the motion lacked, and none queue ahead of new
+/// motion.)
+const SETTLE_BOOST: u64 = 4;
+const SETTLE_BOOST_MAX_BPS: u64 = 40_000_000;
+
+/// A sharpening run's length and cost, for the log (`settled`).
+#[derive(Default)]
+struct Settle {
+    since: Option<Instant>,
+    frames: u32,
+    bytes: usize,
+}
+
 fn sharpen_frames(change_bytes: usize, fps: u32) -> u32 {
     ((change_bytes / SHARPEN_BYTES_PER_FRAME) as u32).clamp(2, fps.max(2))
+}
+
+/// Game mode sharpens a still picture too (`gamesharpen`), under this many
+/// bits per pixel a frame (2560x1440 at 60 fps: under ~11 Mbps; 1080p60,
+/// ~6). There a frame coded during motion is blocky, and stays so for as long
+/// as the screen is still — the Windows client's default mode, often at 1-5
+/// Mbps. Over it the picture is near done already: refining it would cost
+/// encoder time, and a game's still moments are short — the next real frame
+/// could wait behind a refresh being encoded.
+const GAME_SHARPEN_BPP: f64 = 0.05;
+
+/// Whether a still picture is re-encoded sharper: always in office mode; in
+/// game mode (`game` = switch `gamesharpen`) only when short of bits (see
+/// [`GAME_SHARPEN_BPP`]), at `bps` over `pixels` and `fps` frames a second.
+fn sharpens(office: bool, game: bool, bps: u32, pixels: u64, fps: u32) -> bool {
+    office || (game && (bps as f64) < GAME_SHARPEN_BPP * pixels as f64 * fps.max(1) as f64)
 }
 
 /// Whether to trickle (see [`TRICKLE_AFTER_INPUT_US`]).
@@ -579,6 +630,23 @@ impl Trickle {
 }
 
 impl Shared {
+    /// The receive thread heard something that ends a pause — the window
+    /// back, a keyframe or repair asked for, goodbye: the capture loop's
+    /// paused wait ([`wait_wake`](Self::wait_wake)) ends now, not at its
+    /// next look.
+    fn wake(&self) {
+        *self.woken.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+
+    /// Until [`wake`](Self::wake) (or one that came since the last wait), or
+    /// `timeout`.
+    fn wait_wake(&self, timeout: Duration) {
+        let woken = self.woken.lock().unwrap();
+        let (mut woken, _) = self.wake.wait_timeout_while(woken, timeout, |w| !*w).unwrap();
+        *woken = false;
+    }
+
     fn send(&self, socket: &UdpSocket, kind: Kind, body: &[u8]) {
         let peer = *self.peer.lock().unwrap();
         // Sealed under the lock, sent outside it: a normal-priority thread
@@ -665,7 +733,10 @@ fn gpu_clocks() -> Option<(u32, u32)> {
 /// service's SYSTEM agent; others are told no, once); the clocks are let go
 /// on drop, and after a crash by the next agent (`recover_after_crash`), as
 /// a lock otherwise lasts until a restart. `RDPIO_GPU_CLOCK_FLOOR=MHz` sets
-/// the floor (0: none).
+/// the floor (0: none). Not on battery (switch `clockbatt`): a laptop's GPU
+/// held at 1500 MHz drew ~6 W more (RTX 2070 Max-Q, 31-32 W of a 42 W
+/// laptop), for an encode that took 3-4 ms anyway and a frame rate the rate
+/// controller set, not the encoder.
 pub(crate) struct GpuClockFloor;
 
 /// The selftest holds the clocks too (run as administrator), to measure what
@@ -692,7 +763,11 @@ impl GpuClockFloor {
         let floor = floor.min(max);
         match unsafe { lock(device, floor, max) } {
             0 => {
-                tracing::info!(floor_mhz = floor, max_mhz = max, "GPU clocks held up while streaming");
+                // (Held and let go with each idle spell: told once.)
+                static TOLD: AtomicBool = AtomicBool::new(false);
+                if !TOLD.swap(true, Ordering::Relaxed) {
+                    tracing::info!(floor_mhz = floor, max_mhz = max, "GPU clocks held up while streaming");
+                }
                 Some(Self)
             }
             code => {
@@ -720,6 +795,193 @@ impl Drop for GpuClockFloor {
         Self::release();
         tracing::debug!("GPU clocks let go");
     }
+}
+
+/// A paused stream looks at the screen (and tells the client its status)
+/// this often; the window coming back wakes it at once (see `Shared::wake`).
+const PAUSED_LOOK: Duration = Duration::from_millis(500);
+
+/// Input this recent means someone is at the stream: a client saying its
+/// window is hidden then is wrong (a covered/hidden check misreading the
+/// desktop), and pausing froze the picture under the user's hands for
+/// minutes.
+const INPUT_SHOWS_FOR: Duration = Duration::from_secs(5);
+
+/// How the bulk lane (copied files, clipboard images) is paced.
+///
+/// It followed the video's rate controller (`Rate::bulk_bps`), which halves
+/// it at every rise in delay and holds it at its floor while the client's
+/// link estimate reads low: over a LAN's Wi-Fi a 250 MB copy took 25 minutes
+/// (~1.4 Mbit/s). On a LAN path it now goes unpaced (`bulkfast`): the
+/// reliable sender's own congestion window — slow start, halving on loss
+/// and on queueing — finds what the path carries, as TCP's does. And the
+/// queueing it yields to is a LAN Wi-Fi's ordinary jitter no more
+/// (`bulkq`: 25 ms over the path's least round trip, was 10). A Wi-Fi
+/// radio's round trip spikes from 2 ms to 100+ now and then: that's read as
+/// TCP reads it (`bulkjitter`), not as a lost window or a queue each time.
+/// `bulknodelay` (off) leaves the window to losses alone, as TCP's.
+#[derive(Clone, Copy)]
+struct BulkLane {
+    fast: bool,
+    queue_25: bool,
+    jitter: bool,
+    no_delay: bool,
+}
+
+impl BulkLane {
+    fn read() -> Self {
+        use crate::host_ab::ab;
+        Self { fast: ab("bulkfast", true), queue_25: ab("bulkq", true), jitter: ab("bulkjitter", true), no_delay: ab("bulknodelay", false) }
+    }
+
+    fn apply(&self, link: &crate::hyper_link::ReliableLink, bulk_bps: u64, lan: bool) {
+        let fast = self.fast && lan;
+        link.set_bulk_rate(if fast { None } else { Some(bulk_bps) });
+        link.set_bulk_queue_limit(if fast && self.no_delay {
+            Duration::from_secs(10)
+        } else if fast && self.queue_25 {
+            Duration::from_millis(25)
+        } else {
+            crate::hyper_link::BULK_QUEUE_LIMIT
+        });
+        link.set_bulk_jitter_tolerant(fast && self.jitter);
+    }
+}
+
+/// A desktop left alone (no input) this long is idle…
+const IDLE_AFTER: Duration = Duration::from_secs(2);
+
+/// …and the capture and receive threads then wake this often (instead of
+/// every 30 and 10 ms, ~130 wake-ups a second of a screen nobody's using).
+/// A change on screen or a packet still ends either wait at once; only a
+/// keyframe or repair asked for on the still screen may wait up to this.
+const IDLE_LOOK: Duration = Duration::from_millis(100);
+
+/// With no picture going out, the status (size, input ack: the client's sign
+/// of life) every 250 ms — every second on an idle desktop (`idlestatus`):
+/// still well inside the client's 1.5 s before it starts probing
+/// (`liveness::PROBE_AFTER`), and three packets a second fewer to wake both
+/// radios.
+fn status_every(idle: bool) -> Duration {
+    Duration::from_millis(if idle && crate::host_ab::ab("idlestatus", true) { 1000 } else { 250 })
+}
+
+/// The receive thread's socket wait while streaming: it also sends the
+/// trailing input ack (within ~10 ms) and refreshes held touches.
+const RX_ACTIVE: Duration = Duration::from_millis(10);
+
+/// …and while the client's window is minimized (`pausepoll`). Each timeout is
+/// a wake-up and a socket call (Windows counts it as "I/O other": ~100 a
+/// second of the ~192 measured while paused). A packet ends the wait at
+/// once, so the window coming back isn't held up; only the stream's end may
+/// wait up to this for the thread.
+const RX_PAUSED: Duration = Duration::from_millis(100);
+
+/// The client's window minimized this long: the stream goes quiet (see
+/// [`Latency`]). A glance at another window and back costs nothing.
+const PAUSE_QUIET_AFTER: Duration = Duration::from_secs(5);
+
+/// What a stream holds for latency's sake — and lets go once the client's
+/// window has stayed minimized [`PAUSE_QUIET_AFTER`] (switch `pausequiet`):
+/// nothing is encoded or sent then (93% of a measured laptop's streaming
+/// hours), yet each kept it out of its idle states. The Wi-Fi radio awake
+/// and on its channel (streaming mode, no background scans); the system
+/// timer at 1 ms; the capture thread in MMCSS's "Games" class; and, held
+/// apart in [`GpuClassDown`], the process's GPU scheduling class at
+/// REALTIME. All taken again at once as the window comes back, before its
+/// first frame. One of the two is held at a time, so nothing is put back
+/// twice, and whichever is held as the stream ends goes with it. Made and
+/// dropped on the capture thread (the MMCSS handle is the thread's).
+struct Latency {
+    _wifi: Option<crate::net_tune::WifiLowLatency>,
+    _boost: Option<crate::net_tune::ThreadBoost>,
+    _timer: crate::net_tune::FineTimer,
+}
+
+impl Latency {
+    fn hold() -> Self {
+        Self {
+            _wifi: crate::net_tune::WifiLowLatency::enable(),
+            _boost: crate::net_tune::ThreadBoost::games(),
+            _timer: crate::net_tune::FineTimer::new(),
+        }
+    }
+}
+
+type KmtGetClass = unsafe extern "system" fn(windows::Win32::Foundation::HANDLE, *mut i32) -> i32;
+type KmtSetClass = unsafe extern "system" fn(windows::Win32::Foundation::HANDLE, i32) -> i32;
+
+/// gdi32's D3DKMT{Get,Set}ProcessSchedulingPriorityClass (no public binding).
+fn kmt_class() -> Option<(KmtGetClass, KmtSetClass)> {
+    static F: std::sync::OnceLock<Option<(KmtGetClass, KmtSetClass)>> = std::sync::OnceLock::new();
+    *F.get_or_init(|| unsafe {
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        let gdi = LoadLibraryW(windows::core::w!("gdi32.dll")).ok()?;
+        let get = GetProcAddress(gdi, windows::core::s!("D3DKMTGetProcessSchedulingPriorityClass"))?;
+        let set = GetProcAddress(gdi, windows::core::s!("D3DKMTSetProcessSchedulingPriorityClass"))?;
+        Some((std::mem::transmute::<_, KmtGetClass>(get), std::mem::transmute::<_, KmtSetClass>(set)))
+    })
+}
+
+/// The process's GPU scheduling class at NORMAL while a paused stream is
+/// quiet (see [`Latency`]), and back to what it was on drop: REALTIME for the
+/// service's agent (HIGH otherwise), as the capture set it (`rdp_gpu::hyper`'s
+/// `raise_gpu_priority`). The CPU's priority class is never raised (it stays
+/// NORMAL); the stream's raised CPU scheduling is its threads', of which the
+/// capture thread's MMCSS class goes with `Latency`. (`None` inside: nothing
+/// was lowered.)
+struct GpuClassDown(Option<i32>);
+
+impl GpuClassDown {
+    /// D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL.
+    const NORMAL: i32 = 2;
+
+    fn lower() -> Self {
+        let Some((get, set)) = kmt_class() else { return Self(None) };
+        unsafe {
+            let process = windows::Win32::System::Threading::GetCurrentProcess();
+            let mut was = 0i32;
+            if get(process, &mut was) != 0 || was <= Self::NORMAL {
+                return Self(None);
+            }
+            Self((set(process, Self::NORMAL) == 0).then_some(was))
+        }
+    }
+}
+
+impl Drop for GpuClassDown {
+    fn drop(&mut self) {
+        if let (Some(was), Some((_, set))) = (self.0, kmt_class()) {
+            unsafe {
+                set(windows::Win32::System::Threading::GetCurrentProcess(), was);
+            }
+        }
+    }
+}
+
+/// How often a stream looks at the power source (see [`GpuClockFloor`]): a
+/// cheap call, and a plug pulled mid-stream is followed within seconds.
+const POWER_CHECK_EVERY: Duration = Duration::from_secs(3);
+
+/// On battery the stream runs at most this many frames a second
+/// (`battfps`): a 120 or 144 Hz stream encodes, sends and decodes twice
+/// the frames for motion the eye barely tells apart on a laptop.
+const BATTERY_FPS: u32 = 60;
+
+/// Running on battery (as the client's own check, `hyper_client`; a desktop
+/// says "unknown", which isn't battery).
+fn on_battery() -> bool {
+    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    // (`RDPIO_POWER=battery` or `ac`: as if — for A/B runs of what
+    // follows the power source, on whatever cable the test machine has.)
+    match std::env::var("RDPIO_POWER").as_deref() {
+        Ok("battery") => return true,
+        Ok("ac") => return false,
+        _ => {}
+    }
+    let mut s = SYSTEM_POWER_STATUS::default();
+    // (ACLineStatus: 0 offline, 1 online, 255 unknown — a desktop.)
+    unsafe { GetSystemPowerStatus(&mut s).is_ok() && s.ACLineStatus == 0 }
 }
 
 pub(crate) fn stream(
@@ -770,17 +1032,17 @@ fn stream_inner(
     } else {
         crate::hyper_audio::HostRouting::none()
     };
-    // A Wi-Fi host shouldn't nap or scan mid-stream either, and its packets
-    // go out marked as audio/video.
-    let _wifi = crate::net_tune::WifiLowLatency::enable();
+    // A Wi-Fi host shouldn't nap or scan mid-stream either, this thread
+    // (it captures and encodes) is scheduled like the game it streams, and
+    // Media Foundation's waits (the encoder's too) are at 1 ms, not 15.6 ms —
+    // while the client looks (see `Latency`). Its packets go out marked as
+    // audio/video.
+    let mut latency = Some(Latency::hold());
+    let mut quiet: Option<GpuClassDown> = None;
     let _qos = crate::net_tune::QosFlow::tag(&socket, Some(peer));
-    // This thread captures and encodes: scheduled like the game it streams.
     // The display stays on (a sleeping one gives no frames to capture) — and
     // one already asleep is woken.
-    let _boost = crate::net_tune::ThreadBoost::games();
     let _awake = crate::net_tune::KeepAwake::new();
-    // Media Foundation's waits (the encoder's too) at 1 ms, not 15.6 ms.
-    let _timer = crate::net_tune::FineTimer::new();
     wake_display();
     let max_bps = opts.max_mbps.max(2) * 1_000_000;
     let (mut office, mut fast_text) = (opts.office, opts.fast_text);
@@ -797,7 +1059,7 @@ fn stream_inner(
     let remembered = crate::hyper_rates::recall(peer.ip());
     let warm = remembered.filter(|_| crate::host_ab::ab("warmstart", true)).map(|b| (b as u64 * 6 / 5).min(u32::MAX as u64) as u32);
     let open_bps = resting_bps(office, (1920, 1080)).min(max_bps);
-    let (mut cap, mut enc) = open_pipeline(device_name, opts, fps, warm.map_or(open_bps, |w| w.min(open_bps)), codec, tuning)?;
+    let (cap, enc) = open_pipeline(device_name, opts, fps, warm.map_or(open_bps, |w| w.min(open_bps)), codec, tuning)?;
     // (The encoder takes the rate for the stream's real size with its first frame.)
     let limits = Limits { min_bps: Limits::default().min_bps, start_bps: resting_bps(office, cap.stream).min(max_bps), max_bps };
     let mut rate = RateController::new(limits);
@@ -825,6 +1087,7 @@ fn stream_inner(
         pace_us: AtomicU64::new(0),
         paced: AtomicU32::new(0),
         paused: AtomicBool::new(false),
+        idle: AtomicBool::new(false),
         office: AtomicBool::new(opts.office),
         fast_text: AtomicBool::new(opts.fast_text),
         recover: AtomicBool::new(false),
@@ -836,6 +1099,8 @@ fn stream_inner(
         camera: Mutex::new(None),
         view: Mutex::new(None),
         view_changed: AtomicBool::new(false),
+        woken: Mutex::new(false),
+        wake: std::sync::Condvar::new(),
     });
     // Frames leave from their own thread: pacing one overlaps capturing and
     // encoding the next, and the capture loop never waits on the network.
@@ -857,6 +1122,11 @@ fn stream_inner(
         let link = link.clone();
         crate::hyper_clipboard::ClipboardSync::start(link).map(Arc::new)
     };
+    // Copies over TCP of their own to a client on the LAN (`bulktcp`; see
+    // hyper_tcp).
+    if crate::host_ab::ab("bulktcp", true) && crate::hyper_path::on_lan(peer.ip()) {
+        crate::hyper_tcp::host_offer(opts.port, peer.ip(), rdp_hyper::bulk_tcp::MAX_STREAMS, &link, clipboard.clone());
+    }
 
     let rx_socket = socket.try_clone()?;
     let rx_shared = shared.clone();
@@ -969,18 +1239,26 @@ fn stream_inner(
     // (up to a second's frames), each time sharper: the encoder spends the
     // frame budget refining it. Measured on a screen of new text with the
     // fast preset: luma 33 dB, then 45 at half a second and 52 at one —
-    // past the quality preset's 42, which costs ~8 ms on every frame.
+    // past the quality preset's 42, which costs ~8 ms on every frame. Game
+    // mode too, at low bits per pixel (`gamesharpen`; see GAME_SHARPEN_BPP).
     let mut sharpen_left = 0u32;
+    let mut game_sharpen = crate::host_ab::ab("gamesharpen", true);
     let mut last_encoded_us = 0u64;
+    let mut settle = Settle::default();
+    // A big change was sent and its picture is still being sharpened, and
+    // the last frame's size (see SETTLE_BOOST).
+    let (mut moved, mut last_len) = (false, 0usize);
+    let mut settle_boost = crate::host_ab::ab("settleboost", true);
     // Trickling (see TRICKLE_AFTER_INPUT_US), and frames sent so (for the log).
     let (mut trickle, mut trickle_frames) = (Trickle::default(), 0u32);
-    let mut ltr = Ltr::new(0);
+    let mut ltr = Ltr::new(0, crate::host_ab::ab("repairok", true));
     // The frame rate follows the bitrate (`fpsfollow`), and the rate it
     // follows to now; drain mode as last logged; when the switches were last
     // read, and the path's rate last remembered.
     let (mut frame_rate, mut enc_fps, mut drain_logged) = (rdp_hyper::rate::FrameRate::default(), fps, None);
     let (mut switches_read, mut rate_saved) = (Instant::now(), Instant::now());
     let mut fps_follow = crate::host_ab::ab("fpsfollow", true);
+    let mut idle_wait = crate::host_ab::ab("idlewait", true);
     // Office mode may go on down to 10 fps (`FrameRate::follow_office`).
     let mut office_fps = crate::host_ab::ab("officefps", true);
     // A failed encoder or a lost GPU (driver reset, device removed) costs a
@@ -991,8 +1269,24 @@ fn stream_inner(
     let mut last_nudge = Instant::now();
     // The client's window as the stream last followed it, and when.
     let (mut applied_view, mut view_followed) = (None, Instant::now() - VIEW_REBUILD_EVERY);
-    // GPU clocks held up while a real stream runs unpaused (see GpuClockFloor).
+    // Since when the client's window has been minimized (see `Latency`).
+    let mut paused_at: Option<Instant> = None;
+    // GPU clocks held up while a real stream runs unpaused (see GpuClockFloor),
+    // on mains power only (`clockbatt`): the power source as last looked at.
     let mut clocks: Option<GpuClockFloor> = None;
+    // Paused as the rate controller was last told.
+    let mut rate_paused = false;
+    let (mut battery, mut power_checked) = (false, Instant::now() - POWER_CHECK_EVERY);
+    // The capture and encoder: `None` while a long pause has let them go
+    // (`rdp_hyper::pause`, switch `pauserelease`), and when the client came
+    // back from one (for the time to its first picture).
+    let mut pipe = Some((cap, enc));
+    let mut pause_release = PauseRelease::default();
+    let mut resumed_at: Option<Instant> = None;
+    // The stream's top frame rate: `fps`, or less on battery (see BATTERY_FPS).
+    let mut top_fps = fps;
+    // On battery, a still office desktop trickles slower (`battrickle`).
+    let mut battery_trickle = false;
     // The loop lives in a closure so every exit — the client leaving, going
     // quiet, or an encoder/capture error — runs the same cleanup below:
     // threads stopped, the client told, the host's audio restored.
@@ -1018,6 +1312,116 @@ fn stream_inner(
             tracing::info!("Hyper service stopping; ending the stream (the client reconnects)");
             return Ok(StreamEnd::Stopping);
         }
+        // Unplugged or plugged in, and it held (Host GPU: Auto): the client
+        // signs in again and lands on the other GPU. A reconnect rather than
+        // a move in place: the codec changes with the GPU (H.264 on Intel's),
+        // and no client can switch decoders mid-stream. Polled once a second.
+        if crate::host_battery::move_due().is_some() {
+            return Ok(StreamEnd::GpuMove);
+        }
+        // A long pause lets the GPU go: the NVENC session, the capture with
+        // its NV12 converter, ring and the driver's frames (or the
+        // duplication), and its D3D11 device. An open session held a laptop's
+        // discrete GPU at P3, 25 W, with nothing encoded (`rdp_hyper::pause`).
+        // Only this thread touches them: the sender, pacer and feedback
+        // threads see packets and atomics, never a texture, so nothing races
+        // the release. After the stop and timeouts above, so a stream that
+        // ends meanwhile ends as any other (with nothing left to let go). A
+        // mode, refresh or size change meanwhile is followed once rebuilt
+        // (below), at the cost of a second rebuild.
+        let step = pause_release.step(
+            shared.paused.load(Ordering::Relaxed),
+            shared.keyframe.load(Ordering::Relaxed),
+            crate::host_ab::ab("pauserelease", true),
+            crate::host_ab::ab("pausereleasedev", true),
+            Instant::now(),
+        );
+        match step {
+            pause::Step::Run => {}
+            pause::Step::Release(what) => {
+                let t = Instant::now();
+                // What was taken from them first (a texture keeps its device).
+                (last_tex, skipped, last_present_us) = (None, None, None);
+                captures = CaptureTimes::default();
+                match what {
+                    Released::Encoder => {
+                        if let Some((_, enc)) = pipe.as_mut() {
+                            enc.release();
+                        }
+                    }
+                    Released::Pipeline => {
+                        if let Some((mut cap, mut enc)) = pipe.take() {
+                            // The session before the device it uses from its
+                            // own threads.
+                            enc.release();
+                            drop(enc);
+                            cap.release();
+                            drop(cap);
+                        }
+                    }
+                }
+                tracing::info!(?what, ms = t.elapsed().as_millis() as u64, "pause release: paused {} s, the GPU let go", pause::RELEASE_AFTER.as_secs());
+                continue;
+            }
+            pause::Step::Wait => {
+                if last_status.elapsed() > Duration::from_millis(1000) {
+                    shared.send_status(&socket);
+                    last_status = Instant::now();
+                }
+                // (In steps, so coming back or a keyframe request rebuilds at once.)
+                for _ in 0..10 {
+                    if !shared.paused.load(Ordering::Relaxed) || shared.keyframe.load(Ordering::Relaxed) || shared.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                continue;
+            }
+            pause::Step::Rebuild(what) => {
+                let t = Instant::now();
+                let bps = shared.rate.lock().unwrap().bitrate_bps();
+                // Only the session went: a new one on the capture's device
+                // (BGRA in where the capture hands that over).
+                if let (Released::Encoder, Some((cap, enc))) = (what, pipe.as_mut()) {
+                    let (w, h) = cap.stream;
+                    match HwEncoder::new_tuned(&cap.device, cap.adapter_luid().ok(), w, h, fps, bps, cap.rgb, codec, tuning) {
+                        Ok(e) => *enc = e,
+                        Err(e) => {
+                            tracing::info!(error = %e, "pause release: no encoder on the old capture; the whole pipeline then");
+                            cap.release();
+                            pipe = None;
+                        }
+                    }
+                }
+                // Straight away (`reopen_pipeline` first waits 250 ms for a
+                // GPU back from a reset), and that way if it fails.
+                if pipe.is_none() {
+                    let view = viewed(opts, applied_view);
+                    pipe = Some(match open_pipeline(device_name, &view, fps, bps, codec, tuning) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::info!(error = %e, "pause release: pipeline not back at once; retrying");
+                            reopen_pipeline(device_name, &view, fps, bps, codec, tuning)?
+                        }
+                    });
+                }
+                (last_tex, skipped, last_present_us, credit) = (None, None, None, 1.0);
+                captures = CaptureTimes::default();
+                capture_errors = 0;
+                if let Some((cap, _)) = &pipe {
+                    resized(&shared, &socket, cap.stream, fps);
+                }
+                shared.keyframe.store(true, Ordering::Relaxed);
+                // A still desktop gives a new capture no frame: repaint at once.
+                last_nudge = Instant::now() - Duration::from_secs(1);
+                resumed_at = Some(t);
+                let ms = t.elapsed().as_millis() as u64;
+                tracing::info!(?what, ms, "pause release: rebuilt in {ms} ms");
+                continue;
+            }
+        }
+        // (Always there here: let go, the step above continued.)
+        let Some((cap, enc)) = pipe.as_mut() else { continue };
         // Office or game mode, as the client asks (Ctrl+Shift+O): a new
         // encoder (frame budget, preset) and frame rate, and the host's text
         // smoothing to match.
@@ -1041,7 +1445,7 @@ fn stream_inner(
                     native = opts.fit_to.and_then(|s| NativeResolution::apply(device_name, s));
                 }
             }
-            (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
+            (*cap, *enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
             captures = CaptureTimes::default();
             (last_tex, skipped, last_present_us, credit) = (None, None, None, 1.0);
             resized(&shared, &socket, cap.stream, fps);
@@ -1070,7 +1474,7 @@ fn stream_inner(
                 let bps = shared.rate.lock().unwrap().bitrate_bps();
                 cap.release();
                 enc.release();
-                (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
+                (*cap, *enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                 captures = CaptureTimes::default();
                 (last_tex, skipped, last_present_us, credit) = (None, None, None, 1.0);
                 resized(&shared, &socket, cap.stream, fps);
@@ -1091,7 +1495,7 @@ fn stream_inner(
                 let bps = shared.rate.lock().unwrap().bitrate_bps();
                 cap.release();
                 enc.release();
-                (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
+                (*cap, *enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                 captures = CaptureTimes::default();
                 (last_tex, skipped, last_present_us, credit) = (None, None, None, 1.0);
                 resized(&shared, &socket, cap.stream, fps);
@@ -1103,14 +1507,62 @@ fn stream_inner(
             }
         }
         let paused = shared.paused.load(Ordering::Relaxed);
-        if (route_audio || SELFTEST_CLOCKS.load(Ordering::Relaxed)) && !paused && clocks.is_none() {
+        if power_checked.elapsed() >= POWER_CHECK_EVERY {
+            power_checked = Instant::now();
+            let unplugged = on_battery();
+            battery_trickle = unplugged && crate::host_ab::ab("battrickle", true);
+            let top = if unplugged && crate::host_ab::ab("battfps", true) { fps.min(BATTERY_FPS) } else { fps };
+            if top != top_fps {
+                top_fps = top;
+                tracing::info!(fps = top_fps, of = fps, "top frame rate {}", if top_fps < fps { "lowered: on battery" } else { "back" });
+            }
+            let now = crate::host_ab::ab("clockbatt", true) && unplugged;
+            if now != battery {
+                battery = now;
+                tracing::info!(battery, "GPU clock floor {}", if battery { "let go: on battery" } else { "allowed again" });
+            }
+        }
+        // (Not on an idle desktop either, `floorbusy`: nothing typed for 2 s,
+        // only a caret or a clock changing — the next input holds it again,
+        // before the picture it brings is encoded. The floor exists for
+        // encode latency, not for frames nobody's waiting on.)
+        let idle_floor = shared.idle.load(Ordering::Relaxed) && crate::host_ab::ab("floorbusy", true);
+        let floor = (route_audio || SELFTEST_CLOCKS.load(Ordering::Relaxed)) && !paused && !battery && !idle_floor;
+        if floor && clocks.is_none() {
             clocks = GpuClockFloor::hold();
-        } else if paused {
+        } else if !floor {
             clocks = None;
         }
+        // The rate holds while nothing is sent (see RateController::set_paused).
+        if paused != rate_paused {
+            rate_paused = paused;
+            shared.rate.lock().unwrap().set_paused(paused);
+        }
         let want_key = shared.keyframe.swap(false, Ordering::Relaxed);
+        // Minimized a while: quiet (see `Latency`). Back the moment the window
+        // is (or a keyframe is asked for), before this pass encodes anything.
+        paused_at = if paused { paused_at.or_else(|| Some(Instant::now())) } else { None };
+        // (Never while a copy goes: see hyper_link::copying; `copyholds`.)
+        let go_quiet = paused
+            && !want_key
+            && paused_at.is_some_and(|t| t.elapsed() >= PAUSE_QUIET_AFTER)
+            && !(crate::host_ab::ab("copyholds", true) && crate::hyper_link::copying())
+            && crate::host_ab::ab("pausequiet", true);
+        if go_quiet && quiet.is_none() {
+            drop(latency.take());
+            quiet = Some(GpuClassDown::lower());
+            tracing::info!("paused a while: Wi-Fi streaming mode, the 1 ms timer and the stream's priorities let go");
+        } else if !go_quiet && quiet.is_some() {
+            quiet = None;
+            latency = Some(Latency::hold());
+            tracing::info!("Wi-Fi streaming mode, the 1 ms timer and the stream's priorities back");
+        }
         let since_input_us = qpc_us().saturating_sub(shared.last_input_us.load(Ordering::Relaxed));
         let (mut pace_us, resumed) = trickle.pace(office, since_input_us, interval_us);
+        if trickle.on && since_input_us > TRICKLE_DEEP_AFTER_US && battery_trickle {
+            // (On battery: see TRICKLE_DEEP_BATTERY_US.)
+            pace_us = pace_us.max(TRICKLE_DEEP_BATTERY_US);
+        }
         if resumed {
             // Input (or a big change): the next picture goes at once.
             credit = credit.max(1.0);
@@ -1118,9 +1570,16 @@ fn stream_inner(
         // The rate controller's switches (A/B, %PUBLIC%\rdpio-hyper-switches.txt).
         if switches_read.elapsed() >= Duration::from_secs(1) {
             switches_read = Instant::now();
-            shared.rate.lock().unwrap().set_switches(rate_switches());
+            let switches = rate_switches();
+            // (The packets too: off, probes go as before trains.)
+            rdp_hyper::video::set_probe_trains(switches.probe_train);
+            shared.rate.lock().unwrap().set_switches(switches);
             fps_follow = crate::host_ab::ab("fpsfollow", true);
+            idle_wait = crate::host_ab::ab("idlewait", true);
+            cap.set_defer_duplication(crate::host_ab::ab("ddlater", true));
             office_fps = crate::host_ab::ab("officefps", true);
+            game_sharpen = crate::host_ab::ab("gamesharpen", true);
+            settle_boost = crate::host_ab::ab("settleboost", true);
         }
         // Fewer frames when the bitrate can't make them sharp (the encoder's
         // rate is scaled to match, below), and only a few while a standing
@@ -1134,15 +1593,17 @@ fn stream_inner(
         let (sw, sh) = cap.stream;
         let pixels = sw as u64 * sh as u64;
         let follow = match (fps_follow, office && office_fps) {
-            (false, _) => fps,
-            (true, true) => frame_rate.follow_office(bps_now, pixels, fps, now_ms),
-            (true, false) => frame_rate.follow(bps_now, pixels, fps, now_ms),
+            (false, _) => top_fps,
+            (true, true) => frame_rate.follow_office(bps_now, pixels, top_fps, now_ms),
+            (true, false) => frame_rate.follow(bps_now, pixels, top_fps, now_ms),
         };
         if follow != enc_fps {
             tracing::info!(fps = follow, of = fps, kbps = bps_now / 1000, "the frame rate follows the bitrate");
             enc_fps = follow;
         }
         pace_us = pace_us.max(1_000_000 / enc_fps.max(1) as u64);
+        // A still picture re-encoded sharper (see sharpen_left).
+        let sharpen = sharpens(office, game_sharpen, bps_now, pixels, enc_fps);
         if drain.is_some() != drain_logged.is_some() {
             match drain {
                 Some(d) => tracing::info!(fps = d, kbps = bps_now / 1000, "drain mode: a queue stands on the path (or a keyframe crawls over it)"),
@@ -1153,14 +1614,26 @@ fn stream_inner(
         if let Some(d) = drain {
             pace_us = pace_us.max(1_000_000 / d.max(1) as u64);
         }
+        // Idle (see IDLE_AFTER): nothing waiting to go, nothing typed for a
+        // while. (A caret blinking, a clock ticking still counts: each change
+        // ends the wait at once anyway.)
+        let idle = idle_wait
+            && skipped.is_none()
+            && !(office && sharpen_left > 0)
+            && since_input_us > IDLE_AFTER.as_micros() as u64;
+        if idle != shared.idle.load(Ordering::Relaxed) {
+            shared.idle.store(idle, Ordering::Relaxed);
+            tracing::debug!(idle, "the desktop is {}", if idle { "idle: longer waits" } else { "in use again" });
+        }
         // While a skipped frame waits, wait for a newer one only until its turn.
         let until_us = |t: u64| t.saturating_sub(qpc_us()).div_ceil(1000).min(10) as u32;
         let wait_ms = match &skipped {
             Some(f) => until_us(f.present_us() + pace_us),
-            None if office && sharpen_left > 0 && last_tex.is_some() => until_us(last_encoded_us + pace_us),
+            None if sharpen && sharpen_left > 0 && last_tex.is_some() => until_us(last_encoded_us + pace_us),
             // A screen that changes wakes the wait at once; the timeout only
             // bounds the status and an answer to a keyframe request on a still
             // one — after a second without input, less often.
+            None if idle => IDLE_LOOK.as_millis() as u32,
             None if since_input_us > 1_000_000 => 30,
             None => 10,
         };
@@ -1180,7 +1653,7 @@ fn stream_inner(
                     let bps = shared.rate.lock().unwrap().bitrate_bps();
                     cap.release();
                     enc.release();
-                    (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
+                    (*cap, *enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                     captures = CaptureTimes::default();
                     capture_errors = 0;
                     (last_tex, skipped) = (None, None);
@@ -1202,7 +1675,7 @@ fn stream_inner(
                 let bps = shared.rate.lock().unwrap().bitrate_bps();
                 cap.release();
                 enc.release();
-                (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
+                (*cap, *enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                 captures = CaptureTimes::default();
                 let (nw, nh) = cap.stream;
                 *shared.status.lock().unwrap() = (nw as u16, nh as u16, fps as u16);
@@ -1228,24 +1701,40 @@ fn stream_inner(
         // whatever changes meanwhile waits in the duplication, and the
         // keyframe that ends a pause takes the newest picture.
         if shared.paused.load(Ordering::Relaxed) && !want_key {
-            if let Some(f) = captured.and_then(|c| c.into_frame(&mut cap)) {
+            // (Nothing newer, a frame skipped just before is the screen as it
+            // is now: kept too, for the keyframe that ends the pause.)
+            let newest = captured.or(skipped.take());
+            skipped = None;
+            if let Some(f) = newest.and_then(|c| c.into_frame(cap)) {
                 last_tex = Some(f.nv12);
             }
-            skipped = None;
             if last_status.elapsed() > Duration::from_millis(1000) {
                 shared.send_status(&socket);
                 last_status = Instant::now();
             }
-            // (In steps, so a keyframe request ends the pause at once.)
-            for _ in 0..10 {
-                if !shared.paused.load(Ordering::Relaxed) || shared.keyframe.load(Ordering::Relaxed) || shared.stop.load(Ordering::Relaxed) {
-                    break;
+            // Until the next look — or at once when the window comes back, a
+            // keyframe is asked for or the client leaves: woken by the receive
+            // thread (`pausepoll`; else in 50 ms steps, 20 wake-ups a second
+            // of a paused stream's ~250).
+            let resume = || {
+                !shared.paused.load(Ordering::Relaxed) || shared.keyframe.load(Ordering::Relaxed) || shared.stop.load(Ordering::Relaxed)
+            };
+            if crate::host_ab::ab("pausepoll", true) {
+                if !resume() {
+                    shared.wait_wake(PAUSED_LOOK);
                 }
-                std::thread::sleep(Duration::from_millis(50));
+            } else {
+                for _ in 0..10 {
+                    if resume() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
             continue;
         }
         let mut refresh = false;
+        let left_before = sharpen_left;
         let frame = match captured {
             Some(f) => {
                 let present_us = f.present_us();
@@ -1256,7 +1745,7 @@ fn stream_inner(
                     credit = (credit - 1.0).max(0.0);
                     skipped = None;
                     sharpen_left = fps;
-                    f.into_frame(&mut cap).map(|f| (f.nv12, f.present_us))
+                    f.into_frame(cap).map(|f| (f.nv12, f.present_us))
                 } else {
                     skipped = Some(f);
                     None
@@ -1267,7 +1756,7 @@ fn stream_inner(
                 Some(f) if want_key || acquired_us >= f.present_us() + pace_us => {
                     credit = 0.0;
                     sharpen_left = fps;
-                    f.into_frame(&mut cap).map(|f| (f.nv12, f.present_us))
+                    f.into_frame(cap).map(|f| (f.nv12, f.present_us))
                 }
                 Some(f) => {
                     skipped = Some(f);
@@ -1280,7 +1769,7 @@ fn stream_inner(
                 // coded from a reference the client has.
                 None if shared.recover.load(Ordering::Relaxed) && last_tex.is_some() => Some((last_tex.clone().unwrap(), qpc_us())),
                 // Still: the last picture again, sharper.
-                None if office && sharpen_left > 0 && last_tex.is_some() && acquired_us >= last_encoded_us + pace_us => {
+                None if sharpen && sharpen_left > 0 && last_tex.is_some() && acquired_us >= last_encoded_us + pace_us => {
                     sharpen_left -= 1;
                     refresh = true;
                     Some((last_tex.clone().unwrap(), qpc_us()))
@@ -1318,19 +1807,37 @@ fn stream_inner(
         };
         // The encoder's slow-link switches (rdp_gpu::hyper::LinkTuning; a
         // no-op unless one changed): the largest frame following the bitrate,
-        // a slower preset at low bitrates, losses repaired gradually.
+        // a slower preset at low bitrates, losses repaired gradually, game
+        // mode's frames up to 100 ms of the link at low bits per pixel.
         enc.set_link_tuning(rdp_gpu::hyper::LinkTuning {
             vbv_cap: crate::host_ab::ab("vbvcap", true),
             preset_follow: crate::host_ab::ab("presetfollow", false),
             intra_refresh: crate::host_ab::ab("introfresh", false),
+            low_bpp_cap: crate::host_ab::ab("lowbppcap", true),
         });
+        // (The frames it really gets: the stream's own rate, for that cap.)
+        enc.set_encoded_fps(enc_fps);
         // Encoding fewer frames than it was opened for (the frame rate
         // following the bitrate), the encoder gets the rate scaled up to
         // match: its budget a frame is its rate over its frame rate, so each
         // frame gets the stream's rate over the frames it really gets — the
         // sharper pictures this is for. (Drain mode's skips aren't scaled:
         // they're meant to send less.)
-        let enc_bps = (bps as u64 * fps as u64 / enc_fps.clamp(1, fps.max(1)) as u64).min(u32::MAX as u64) as u32;
+        let mut enc_bps = (bps as u64 * fps as u64 / enc_fps.clamp(1, fps.max(1)) as u64).min(u32::MAX as u64) as u32;
+        // Sharpening a still picture on the LAN — refresh frames, and small
+        // changes after a big one (a caret, a spinner: each a pass too) —
+        // the boost (see SETTLE_BOOST).
+        let settling = settle_boost && moved && left_before > 0 && (refresh || last_len < SMALL_FRAME);
+        if settling {
+            // (This machine itself — the selftest — is a link without limit.)
+            let local = shared.peer.lock().unwrap().ip().is_loopback();
+            let r = shared.rate.lock().unwrap();
+            let link = if r.lan() { r.link_bps() } else { local.then_some(u32::MAX) };
+            if let Some(link) = link {
+                let most = SETTLE_BOOST_MAX_BPS.min(link as u64 / 2).max(enc_bps as u64);
+                enc_bps = (enc_bps as u64 * SETTLE_BOOST).min(most) as u32;
+            }
+        }
         if (enc_bps as i64 - enc.bitrate as i64).unsigned_abs() > enc.bitrate as u64 / 20 {
             enc.set_bitrate(enc_bps);
         }
@@ -1338,7 +1845,7 @@ fn stream_inner(
         // the newest the client has (else a keyframe). After the bitrate
         // (a rebuilt encoder has none of the old one's).
         if ltr.encoder != enc.id {
-            ltr = Ltr::new(enc.id);
+            ltr = Ltr::new(enc.id, crate::host_ab::ab("repairok", true));
         }
         let acked = shared.ltr_acked.load(Ordering::Relaxed);
         if acked != u32::MAX {
@@ -1371,7 +1878,7 @@ fn stream_inner(
                 rebuild(&mut rebuilds, &e.to_string())?;
                 cap.release();
                 enc.release();
-                (cap, enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
+                (*cap, *enc) = reopen_pipeline(device_name, &viewed(opts, applied_view), fps, bps, codec, tuning)?;
                 (last_tex, skipped) = (None, None);
                 captures = CaptureTimes::default();
                 resized(&shared, &socket, cap.stream, fps);
@@ -1384,14 +1891,45 @@ fn stream_inner(
         // Nothing left to refine: a quarter second in (a big change first
         // drains the frame budget, and those frames are tiny too), a frame
         // with next to nothing in it.
-        if refresh && fps.saturating_sub(sharpen_left) >= fps / 4 && out.data.len() < 1500 {
+        let len = out.data.len();
+        // A small change while a big one sharpens is a pass of its own: it
+        // used to start the count over (two passes for a caret's blink), and
+        // a terminal's blinking caret kept scrolled text blurry for seconds —
+        // its unchanged parts never re-coded.
+        let pass = settling && !refresh && !out.keyframe;
+        if pass {
+            sharpen_left = left_before - 1;
+        }
+        if (refresh || pass) && fps.saturating_sub(sharpen_left) >= fps / 4 && len < 1500 {
             sharpen_left = 0;
+        }
+        // How long a still picture took to sharpen (a run of four or more:
+        // not a caret's blink), for the log.
+        if refresh || pass {
+            let t = *settle.since.get_or_insert_with(Instant::now);
+            (settle.frames, settle.bytes) = (settle.frames + 1, settle.bytes + out.data.len());
+            if sharpen_left == 0 {
+                moved = false;
+                if settle.frames >= 4 {
+                    tracing::info!(frames = settle.frames, kb = settle.bytes / 1024, ms = t.elapsed().as_millis() as u64, boost = settle_boost, "settled");
+                }
+                settle = Settle::default();
+            }
+        } else {
+            settle = Settle::default();
         }
         // A new picture: as much sharpening as the change was big, and small
         // ones in a row lead to trickling.
-        if !refresh && !out.keyframe {
-            sharpen_left = sharpen_frames(out.data.len(), fps);
+        if !refresh && !out.keyframe && !pass {
+            sharpen_left = sharpen_frames(len, fps);
+            // (The first small one after a big change keeps the big one's
+            // count.)
+            if settle_boost && moved && len < SMALL_FRAME {
+                sharpen_left = sharpen_left.max(left_before);
+            }
+            moved = settle_boost && (moved || len >= SMALL_FRAME);
         }
+        last_len = len;
         trickle.encoded(out.data.len(), refresh, out.keyframe);
         if trickle.on {
             trickle_frames += 1;
@@ -1406,15 +1944,20 @@ fn stream_inner(
             let capture_us = captures.of(out.input, capture_us);
             let encode_us = qpc_us().saturating_sub(capture_us) as u32;
             let (is_ltr, recovery) = ltr.sent(out.input, frame_id, out.keyframe);
+            if out.keyframe {
+                if let Some(t) = resumed_at.take() {
+                    tracing::info!(ms = t.elapsed().as_millis() as u64, "pause release: first picture out after coming back");
+                }
+            }
             // The data shards now; the sender thread adds parity once they're out.
-            let (fec, pace_cap, probe) = {
+            let (fec, pace_cap, probe, interleave) = {
                 let mut r = shared.rate.lock().unwrap();
                 // (A keyframe on its way: the client's repeated requests for
                 // one are collapsed into it — see `receive_loop`.)
                 if out.keyframe {
                     r.note_keyframe(frame_id, out.data.len(), qpc_us() / 1000);
                 }
-                (r.parity_for(out.data.len(), out.keyframe), r.pace_cap_bps(), r.probe_due(out.data.len(), qpc_us() / 1000))
+                (r.parity_for_frame(out.data.len(), out.keyframe, recovery), r.pace_cap_bps(), r.probe_due(out.data.len(), qpc_us() / 1000), r.switches().interleave)
             };
             let data = packetize_shards(
                 &OutFrame { frame_id, data: &out.data, keyframe: out.keyframe, ltr: is_ltr, recovery, capture_us, encode_us, probe },
@@ -1426,11 +1969,11 @@ fn stream_inner(
             bytes += out.data.len() as u64;
             encode_us_total += encode_us as u64;
             acquire_us_total += acquired_us.saturating_sub(capture_us);
-            if frame_tx.send(Outgoing { data, payload: out.data.len(), bps, fps: enc_fps, pace, fec, pace_cap, probe }).is_err() {
+            if frame_tx.send(Outgoing { data, payload: out.data.len(), bps, fps: enc_fps, pace, fec, pace_cap, probe, interleave }).is_err() {
                 return Err("the packet sender stopped".into());
             }
         }
-        if last_status.elapsed() > Duration::from_millis(250) {
+        if last_status.elapsed() > status_every(shared.idle.load(Ordering::Relaxed)) {
             shared.send_status(&socket);
             last_status = Instant::now();
         }
@@ -1471,7 +2014,9 @@ fn stream_inner(
                 fec_pct = (fec * 100.0) as u32,
                 trickle_pct = trickle_frames * 100 / frames.max(1),
                 audio_pps = format!("{:.0}", crate::hyper_audio::take_sent() as f64 / secs),
-                gpu_mhz = gpu_clocks().map(|(g, v)| format!("{g}/{v}")).unwrap_or_default(),
+                // (Only while the floor's held, on mains power: asked every 5 s
+                // otherwise, NVML keeps an Optimus GPU from powering off.)
+                gpu_mhz = clocks.as_ref().and_then(|_| gpu_clocks()).map(|(g, v)| format!("{g}/{v}")).unwrap_or_default(),
                 "hyper host"
             );
             (frames, bytes, encode_us_total, acquire_us_total) = (0, 0, 0, 0);
@@ -1498,10 +2043,11 @@ fn stream_inner(
     drop(frame_tx); // the sender finishes the frame in hand, then ends
     let _ = sender.join();
     // Goodbye only for a real end: a client that went quiet may come back,
-    // and one whose console moved reconnects to the agent there.
+    // and one whose console moved (or whose stream changes GPU) reconnects —
+    // every client since Reconnect existed does so at once (~250 ms).
     let farewell = match result {
         Ok(StreamEnd::Bye) => Some(Control::Bye),
-        Ok(StreamEnd::Moved | StreamEnd::Stopping) => Some(Control::Reconnect),
+        Ok(StreamEnd::Moved | StreamEnd::Stopping | StreamEnd::GpuMove) => Some(Control::Reconnect),
         _ => None,
     };
     if let Some(f) = farewell {
@@ -1513,6 +2059,7 @@ fn stream_inner(
     pump_stop.store(true, Ordering::Relaxed);
     link.nudge();
     let _ = pump.join();
+    crate::hyper_tcp::end_session();
     drop(clipboard);
     if let Some(t) = mic_watch {
         mic_changed.notify(); // (out of its wait at once)
@@ -1589,113 +2136,8 @@ fn reopen_pipeline(
     }
 }
 
-/// Long-term reference frames, to repair a loss without a keyframe. Measured
-/// on NVENC (H.264 and HEVC, through Media Foundation): after frames were
-/// lost, a frame coded from a kept one decodes exactly on the GPU decoder
-/// clients use, at the size of a normal frame — where a keyframe is several
-/// times bigger, so on a lossy link it's the frame most likely lost again,
-/// and it spikes the bitrate.
-///
-/// Every quarter second a frame is kept, in two slots by turns. The client
-/// reports the newest kept frame it decoded; a slot counts only once the
-/// client has said so (one being refilled counts for nothing until then: the
-/// client may still hold the old picture there). A loss is answered with a
-/// frame coded from the newest confirmed one only; with none, or a third
-/// repair within a second, a keyframe.
-struct Ltr {
-    /// The encoder ([`rdp_gpu::hyper::HwEncoder::id`]) these slots are in.
-    encoder: u64,
-    /// Per slot: the frame kept there, and whether the client has it.
-    slots: [Option<(u32, bool)>; rdp_gpu::hyper::LTR_SLOTS as usize],
-    next_slot: usize,
-    last_mark: Option<Instant>,
-    /// Pictures (encoder inputs) told to be kept, with their slot.
-    marking: Vec<(u64, usize)>,
-    /// The picture coded as a repair.
-    repairing: Option<u64>,
-    repairs: Vec<Instant>,
-}
-
-enum LtrPlan {
-    /// Keep the picture in slot `mark`; code it from the references in mask
-    /// `from` only (a repair).
-    Encode { mark: Option<u32>, from: Option<u32> },
-    Keyframe,
-}
-
-impl Ltr {
-    const EVERY: Duration = Duration::from_millis(250);
-    const REPAIRS_PER_SEC: usize = 3;
-
-    fn new(encoder: u64) -> Self {
-        Self { encoder, slots: [None; 2], next_slot: 0, last_mark: None, marking: Vec::new(), repairing: None, repairs: Vec::new() }
-    }
-
-    /// Before picture `input` goes in: what the encoder should do with it.
-    /// `recover`: the client lost frames. `key`: a keyframe comes anyway
-    /// (or the encoder keeps no references).
-    fn plan(&mut self, input: u64, recover: bool, key: bool, now: Instant) -> LtrPlan {
-        if key {
-            return if recover { LtrPlan::Keyframe } else { LtrPlan::Encode { mark: None, from: None } };
-        }
-        if recover {
-            self.repairs.retain(|t| now.duration_since(*t) < Duration::from_secs(1));
-            let newest = (0..self.slots.len())
-                .filter_map(|s| match self.slots[s] {
-                    Some((id, true)) => Some((id, s)),
-                    _ => None,
-                })
-                .max_by(|a, b| if a.0.wrapping_sub(b.0) < u32::MAX / 2 { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less });
-            return match newest {
-                Some((_, slot)) if self.repairs.len() < Self::REPAIRS_PER_SEC => {
-                    self.repairs.push(now);
-                    self.repairing = Some(input);
-                    LtrPlan::Encode { mark: None, from: Some(1 << slot) }
-                }
-                _ => {
-                    self.repairs.clear();
-                    LtrPlan::Keyframe
-                }
-            };
-        }
-        if self.last_mark.is_some_and(|t| now.duration_since(t) < Self::EVERY) {
-            return LtrPlan::Encode { mark: None, from: None };
-        }
-        let slot = self.next_slot;
-        self.next_slot = (slot + 1) % self.slots.len();
-        self.slots[slot] = None;
-        self.marking.push((input, slot));
-        self.last_mark = Some(now);
-        LtrPlan::Encode { mark: Some(slot as u32), from: None }
-    }
-
-    /// Picture `input` went out as frame `frame_id`: whether it's kept, and
-    /// whether it's a repair.
-    fn sent(&mut self, input: u64, frame_id: u32, keyframe: bool) -> (bool, bool) {
-        if keyframe {
-            // A keyframe clears every reference, the client's too.
-            self.slots = [None; 2];
-            self.repairs.clear();
-        }
-        let kept = self.marking.iter().position(|&(i, _)| i == input).map(|p| self.marking.remove(p).1);
-        self.marking.retain(|&(i, _)| i > input);
-        let kept = kept.filter(|_| !keyframe).map(|slot| self.slots[slot] = Some((frame_id, false))).is_some();
-        let repair = self.repairing == Some(input);
-        if repair || self.repairing.is_some_and(|i| i < input) {
-            self.repairing = None;
-        }
-        (kept, repair && !keyframe)
-    }
-
-    /// The client decoded kept frame `frame_id`.
-    fn acked(&mut self, frame_id: u32) {
-        for (id, acked) in self.slots.iter_mut().flatten() {
-            if *id == frame_id {
-                *acked = true;
-            }
-        }
-    }
-}
+// (The encoder keeps as many long-term references as the plan has slots.)
+const _: () = assert!(rdp_hyper::ltr::SLOTS == rdp_gpu::hyper::LTR_SLOTS as usize);
 
 /// Tell the client the (possibly new) stream size.
 fn resized(shared: &Shared, socket: &UdpSocket, (w, h): (u32, u32), fps: u32) {
@@ -1707,6 +2149,21 @@ fn resized(shared: &Shared, socket: &UdpSocket, (w, h): (u32, u32), fps: u32) {
 /// (it converts on its own engine — measured 8.5 ms → see log while a game
 /// loads the 3D engine); fall back to our NV12 conversion.
 fn open_pipeline(
+    device_name: &str,
+    opts: &HostOptions,
+    fps: u32,
+    bps: u32,
+    codec: rdp_gpu::h264::Codec,
+    tuning: rdp_gpu::hyper::Tuning,
+) -> Result<(DesktopCapture, HwEncoder), Box<dyn std::error::Error>> {
+    let (mut cap, enc) = open_capture_encoder(device_name, opts, fps, bps, codec, tuning)?;
+    // Desktop Duplication's frames converted only when they're sent (see
+    // `set_defer_duplication`; switch `ddlater`).
+    cap.set_defer_duplication(crate::host_ab::ab("ddlater", true));
+    Ok((cap, enc))
+}
+
+fn open_capture_encoder(
     device_name: &str,
     opts: &HostOptions,
     fps: u32,
@@ -1747,6 +2204,16 @@ fn rate_switches() -> rdp_hyper::rate::Switches {
         slow_pace: ab("slowpace", false),
         grow_cap: ab("growcap", true),
         soft_slow: ab("softslow", true),
+        probe_train: ab("probetrain", true),
+        pause_hold: ab("pausehold", true),
+        held_burst: ab("heldburst", true),
+        own_queue: ab("ownq", true),
+        lone_frame: ab("loneframe", true),
+        interleave: ab("interleave", true),
+        probe_idle: ab("probeidle", true),
+        lan_floor: ab("lanfloor", true),
+        link_memory: ab("linkmemory", true),
+        repair_fec: ab("repairfec", true),
     }
 }
 
@@ -1756,6 +2223,43 @@ fn rate_switches() -> rdp_hyper::rate::Switches {
 /// tablet-sized text: the first frame's luma 26 → 34 dB, and 45 dB in half a
 /// second instead of a second), never more (the delay-based control still
 /// backs off where the link can't carry it).
+/// The selftest's `--text` scene: a 1280x900 window of text lines, drawn
+/// with GDI, scrolled a few pixels a frame (60 a second) for 2 s, then left
+/// still for 3, over and over (and still while `still`).
+fn selftest_scroll_text(painting: &AtomicBool, still: &AtomicBool) {
+    use windows::Win32::Graphics::Gdi::*;
+    let Ok(window) = crate::window::Window::new("rdpio Hyper selftest", 1280, 900) else { return };
+    let hwnd = windows::Win32::Foundation::HWND(window.hwnd_raw() as *mut _);
+    let words = "the quick brown fox jumps over the lazy dog 0123456789 ({[ ]}) <=> fn main() -> Result<(), Error> ";
+    let (mut offset, mut drawn) = (0i32, -1i32);
+    let began = Instant::now();
+    while painting.load(Ordering::Relaxed) {
+        let _ = window.pump();
+        if !still.load(Ordering::Relaxed) && began.elapsed().as_millis() % 5_000 < 2_000 {
+            offset += 3;
+        }
+        // (Still: nothing drawn, so nothing new to capture.)
+        if drawn == offset {
+            std::thread::sleep(Duration::from_millis(16));
+            continue;
+        }
+        drawn = offset;
+        unsafe {
+            let dc = GetDC(Some(hwnd));
+            let rect = windows::Win32::Foundation::RECT { left: 0, top: 0, right: 1280, bottom: 900 };
+            FillRect(dc, &rect, HBRUSH(GetStockObject(WHITE_BRUSH).0));
+            SetBkMode(dc, TRANSPARENT);
+            for i in 0..58 {
+                let n = i + offset / 16;
+                let line: Vec<u16> = format!("{n:5}  {}", &words[(n as usize * 7) % 40..]).encode_utf16().collect();
+                let _ = TextOutW(dc, 8, i * 16 - offset % 16, &line);
+            }
+            ReleaseDC(Some(hwnd), dc);
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+}
+
 fn resting_bps(office: bool, (w, h): (u32, u32)) -> u32 {
     if !office {
         return 20_000_000;
@@ -1857,6 +2361,8 @@ struct Outgoing {
     /// Unpaced: the client times it for what the link carries (see
     /// `RateController::probe_due`).
     probe: bool,
+    /// Several blocks go a body of each in turn (`rdp_hyper::video::send_order`).
+    interleave: bool,
 }
 
 /// The sender thread. Each frame's packets are spread over `pace` of a frame
@@ -1916,16 +2422,22 @@ fn sender_loop(socket: UdpSocket, shared: Arc<Shared>, frames: std::sync::mpsc::
         };
         // The data shards; parity once they're out (the client usually
         // completes a frame from data alone).
-        for body in &f.data {
-            send(body, &mut batch);
+        for i in rdp_hyper::video::send_order(&f.data, f.interleave) {
+            send(f.data.get(i), &mut batch);
         }
         batch.flush(&socket);
         parity_shards(&f.data, &mut parity);
-        for body in &parity {
-            send(body, &mut batch);
+        for i in rdp_hyper::video::send_order(&parity, f.interleave) {
+            send(parity.get(i), &mut batch);
         }
         batch.flush(&socket);
-        shared.rate.lock().unwrap().note_sent(f.payload, bodies);
+        // (A probe's train padding isn't the stream's: see
+        // `RateController::note_probe_padding`.)
+        let pad = if f.probe { rdp_hyper::video::probe_padding(f.payload, f.fec).min(bodies) } else { 0 };
+        let mut rate = shared.rate.lock().unwrap();
+        rate.note_sent(f.payload, bodies - pad);
+        rate.note_probe_padding(pad);
+        drop(rate);
         shared.pace_us.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
         shared.paced.fetch_add(1, Ordering::Relaxed);
     }
@@ -1980,7 +2492,8 @@ fn receive_loop(
     clipboard: Option<Arc<crate::hyper_clipboard::ClipboardSync>>,
     audio_shape: Arc<crate::hyper_audio::AudioShape>,
 ) {
-    let _ = socket.set_read_timeout(Some(Duration::from_millis(10)));
+    let mut timeout = RX_ACTIVE;
+    let _ = socket.set_read_timeout(Some(timeout));
     // Input lands here: a game holding the CPU mustn't delay it.
     crate::net_tune::raise_thread();
     let mut input = InputReceiver::new();
@@ -1996,6 +2509,8 @@ fn receive_loop(
     let mut held = crate::hyper_client::Held::default();
     let mut mic: Option<crate::hyper_audio::AudioSink> = None;
     let mut last_feedback = Instant::now();
+    // The bulk lane's switches (see `bulk_lane`), re-read each second.
+    let mut bulk_switches = (BulkLane::read(), Instant::now());
     let mut buf = [0u8; 2048];
     while !shared.stop.load(Ordering::Relaxed) {
         crate::hyper_touch::keep_alive();
@@ -2003,6 +2518,25 @@ fn receive_loop(
             acked = input.applied();
             last_ack = Instant::now();
             shared.send_status(&socket);
+        }
+        // Longer waits while paused, with no ack owed (see RX_PAUSED); idle
+        // with no fingers resting, too (see IDLE_LOOK).
+        let want = if input.applied() == acked && shared.paused.load(Ordering::Relaxed) && crate::host_ab::ab("pausepoll", true) {
+            RX_PAUSED
+        } else if input.applied() == acked
+            && (shared.idle.load(Ordering::Relaxed) || crate::host_ab::ab("rxwait", true))
+            && !crate::hyper_touch::resting()
+        {
+            // (The short wait is only for an owed ack, resting fingers and
+            // noticing the stream's end: none of the first two, and a packet
+            // ends the wait anyway — `rxwait`.)
+            IDLE_LOOK
+        } else {
+            RX_ACTIVE
+        };
+        if want != timeout {
+            timeout = want;
+            let _ = socket.set_read_timeout(Some(timeout));
         }
         let Ok((n, from)) = socket.recv_from(&mut buf) else { continue };
         // The client signing in again (it took this stream for dead).
@@ -2023,6 +2557,13 @@ fn receive_loop(
         match kind {
             Kind::Input => {
                 shared.last_input_us.store(qpc_us(), Ordering::Relaxed);
+                // Someone is using the stream, so someone sees it, whatever
+                // the client last said (`inputwake`; see `INPUT_SHOWS_FOR`).
+                if shared.paused.load(Ordering::Relaxed) && crate::host_ab::ab("inputwake", true) {
+                    shared.paused.store(false, Ordering::Relaxed);
+                    tracing::info!("input from a client marked hidden: streaming again");
+                    shared.wake();
+                }
                 let events = input.receive(&body);
                 // Follow the input desktop (lock screen, UAC) — only possible
                 // as SYSTEM; harmless otherwise.
@@ -2052,16 +2593,24 @@ fn receive_loop(
                         shared.keyframe.store(true, Ordering::Relaxed);
                     }
                     shared.paused.store(false, Ordering::Relaxed);
+                    shared.wake();
                 }
                 Some(Control::Recover) => {
                     if !shared.rate.lock().unwrap().collapse_keyframe_request(qpc_us() / 1000) {
                         shared.recover.store(true, Ordering::Relaxed);
                     }
                     shared.paused.store(false, Ordering::Relaxed);
+                    shared.wake();
                 }
                 Some(Control::Paused { paused }) => {
+                    // (Not while its input says someone is there.)
+                    let used = qpc_us().saturating_sub(shared.last_input_us.load(Ordering::Relaxed)) < INPUT_SHOWS_FOR.as_micros() as u64;
+                    let paused = paused && !(used && crate::host_ab::ab("inputwake", true));
                     if shared.paused.swap(paused, Ordering::Relaxed) != paused {
                         tracing::info!(paused, "client window minimized/restored");
+                    }
+                    if !paused {
+                        shared.wake();
                     }
                 }
                 Some(Control::Mode { office, fast_text }) => {
@@ -2113,17 +2662,21 @@ fn receive_loop(
                         if fb.window_us > 0 { (fb.window_us as u64 / 1000).clamp(10, 1000) } else { arrived_ms };
                     let now_ms = qpc_us() / 1000;
                     let busy = link.bulk_backlog() > 0;
-                    let bulk = {
+                    let (bulk, lan) = {
                         let mut r = shared.rate.lock().unwrap();
                         r.set_bulk_busy(busy);
                         r.update(&fb, window_ms, now_ms);
-                        r.bulk_bps()
+                        (r.bulk_bps(), r.lan())
                     };
-                    link.set_bulk_rate(Some(bulk));
+                    if bulk_switches.1.elapsed() >= Duration::from_secs(1) {
+                        bulk_switches = (BulkLane::read(), Instant::now());
+                    }
+                    bulk_switches.0.apply(&link, bulk, lan);
                 }
                 Some(Control::Bye) => {
                     tracing::info!("client said goodbye");
                     shared.stop.store(true, Ordering::Relaxed);
+                    shared.wake();
                 }
                 _ => {}
             },
@@ -2768,14 +3321,31 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     // Motion source, on its own thread so presenting never stalls the receiver.
     let painting = Arc::new(AtomicBool::new(true));
     let paint_flag = painting.clone();
+    // Still while the client's minimized (`--pause-at`): a desktop nobody's
+    // using, and the painter's own presents (~250 a second) aren't counted as
+    // what a paused host costs.
+    let still = Arc::new(AtomicBool::new(false));
+    let still_flag = still.clone();
     let painter = std::thread::spawn(move || {
         crate::window::SHOW_INACTIVE.store(true, Ordering::Relaxed);
         // `--small-motion`: a speck of motion (a clock, a caret), not a scene.
+        // `--text`: a page of small text scrolling, as in a terminal or a
+        // browser — the detail a stream smears in motion and has to sharpen
+        // after (see SETTLE_BOOST).
+        if std::env::args().any(|a| a == "--text") {
+            selftest_scroll_text(&paint_flag, &still_flag);
+            return;
+        }
         let (pw, ph) = if std::env::args().any(|a| a == "--small-motion") { (24, 24) } else { (480, 270) };
         let Ok(window) = crate::window::Window::new("rdpio Hyper selftest", pw, ph) else { return };
         let Ok(mut renderer) = rdp_gpu::Renderer::new(window.hwnd_raw(), pw, ph, rdp_gpu::Backend::D3D11) else { return };
         let mut color = 0u32;
         while paint_flag.load(Ordering::Relaxed) {
+            if still_flag.load(Ordering::Relaxed) {
+                let _ = window.pump();
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             color = color.wrapping_add(1);
             let c = (color % 64) as f32 / 63.0;
             let _ = window.pump();
@@ -2791,8 +3361,22 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
         use windows::Win32::Foundation::HMODULE;
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
         use windows::Win32::Graphics::Direct3D11::*;
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
         let (mut d, mut c) = (None, None);
-        D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(),
+        // `--client-igpu`: decode on the integrated GPU (Intel's), as a
+        // client on battery does — otherwise this test's own client keeps a
+        // hybrid laptop's discrete GPU awake, and a host that let it sleep
+        // (paused, or on battery) couldn't show it.
+        let igpu: Option<IDXGIAdapter> = std::env::args().any(|a| a == "--client-igpu").then(|| {
+            let f: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+            (0..8).filter_map(|i| f.EnumAdapters1(i).ok()).find(|a| {
+                a.GetDesc1().is_ok_and(|d| String::from_utf16_lossy(&d.Description).contains("Intel"))
+            }).and_then(|a| windows::core::Interface::cast(&a).ok())
+        }).flatten();
+        println!("selftest client decodes on {}", if igpu.is_some() { "the integrated GPU" } else { "the default GPU" });
+        let driver = if igpu.is_some() { D3D_DRIVER_TYPE_UNKNOWN } else { D3D_DRIVER_TYPE_HARDWARE };
+        D3D11CreateDevice(igpu.as_ref(), driver, HMODULE::default(),
             D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT, None,
             D3D11_SDK_VERSION, Some(&mut d), None, Some(&mut c))?;
         (d.unwrap(), c.unwrap())
@@ -2827,6 +3411,24 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .and_then(|v| v.split_once('x').and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))));
     let mut stream_size = (monitor_w(), monitor_h());
+    // `--pause-at S --pause-for S`: the client's window minimized S seconds
+    // in and restored S later (`Control::Paused`), as a real client's is
+    // most of the time: what the host costs paused (this process's CPU),
+    // and how soon a picture comes back after it.
+    let secs_arg = |name: &str| std::env::args().skip_while(|a| a != name).nth(1).and_then(|v| v.parse::<f64>().ok());
+    let pause = secs_arg("--pause-at").zip(secs_arg("--pause-for")).map(|(a, f)| (Duration::from_secs_f64(a), Duration::from_secs_f64(f)));
+    // 0: not yet paused, 1: paused (since, CPU then), 2: restored (when).
+    let (mut pause_stage, mut paused_at, mut paused_cpu_us, mut restored_at) = (0u8, Instant::now(), 0u64, None::<Instant>);
+    let (mut paused_ms, mut resume_ms, mut frames_paused) = (0f64, None::<f64>, 0u32);
+    let mut last_restore_ask = 0u128;
+    // `--still-at S --still-for S`: the desktop goes still S seconds in, for
+    // S, with the client's window open: what an idle desktop costs (this
+    // process's CPU meanwhile).
+    let still_win = secs_arg("--still-at").zip(secs_arg("--still-for")).map(|(a, f)| (Duration::from_secs_f64(a), Duration::from_secs_f64(f)));
+    let (mut still_stage, mut still_from, mut still_cpu_us, mut still_ms) = (0u8, Instant::now(), 0u64, 0f64);
+    let mut idle_reads = false;
+    // Packets that came while still (each wakes the client's radio and CPU).
+    let mut still_pkts = 0u32;
     let (mut view_told, mut since_resize) = (view.is_none(), None::<(Instant, u32, u64)>);
     while start.elapsed() < Duration::from_secs(secs) {
         if !view_told && start.elapsed() > Duration::from_secs(secs) / 3 {
@@ -2844,9 +3446,54 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
         for a in reliable.due_acks() {
             let _ = client.send(&csend.seal(Kind::Reliable, &a));
         }
+        if let Some((at, len)) = pause {
+            let t = start.elapsed();
+            if pause_stage == 0 && t >= at {
+                let _ = client.send(&csend.seal(Kind::Control, &Control::Paused { paused: true }.to_bytes()));
+                still.store(true, Ordering::Relaxed);
+                (pause_stage, paused_at, paused_cpu_us) = (1, Instant::now(), selftest_cpu_us());
+                println!("selftest: paused after {frames} frames");
+            } else if pause_stage == 1 && t >= at + len {
+                paused_ms = paused_at.elapsed().as_secs_f64() * 1e3;
+                paused_cpu_us = selftest_cpu_us().saturating_sub(paused_cpu_us);
+                still.store(false, Ordering::Relaxed);
+                let _ = client.send(&csend.seal(Kind::Control, &Control::Paused { paused: false }.to_bytes()));
+                (pause_stage, restored_at) = (2, Some(Instant::now()));
+            } else if let (2, Some(at), None) = (pause_stage, restored_at, resume_ms) {
+                // No picture yet: say it again every 250 ms (a real client
+                // asks for a keyframe, which also ends the pause).
+                if at.elapsed().as_millis() / 250 > last_restore_ask {
+                    last_restore_ask = at.elapsed().as_millis() / 250;
+                    let _ = client.send(&csend.seal(Kind::Control, &Control::Paused { paused: false }.to_bytes()));
+                }
+            }
+        }
+        if let Some((at, len)) = still_win {
+            let t = start.elapsed();
+            if still_stage == 0 && t >= at {
+                still.store(true, Ordering::Relaxed);
+                (still_stage, still_from, still_cpu_us) = (1, Instant::now(), selftest_cpu_us());
+                println!("selftest: still after {frames} frames");
+            } else if still_stage == 1 && t >= at + len {
+                still_ms = still_from.elapsed().as_secs_f64() * 1e3;
+                still_cpu_us = selftest_cpu_us().saturating_sub(still_cpu_us);
+                still.store(false, Ordering::Relaxed);
+                still_stage = 2;
+            }
+        }
+        // This client waits on its socket in 1 ms steps for latency; with
+        // nothing coming (a still or paused stream), in 20 ms ones, so its own
+        // wake-ups don't hide what the host's cost.
+        let quiet_client = pause_stage == 1 || still_stage == 1;
+        if quiet_client != idle_reads {
+            idle_reads = quiet_client;
+            client.set_read_timeout(Some(Duration::from_millis(if quiet_client { 20 } else { 1 })))?;
+        }
         // Feedback on a timer, like the real client (it also keeps the host
-        // from deciding the client went quiet while video pauses).
-        if last_fb.elapsed() > Duration::from_millis(50) {
+        // from deciding the client went quiet while video pauses): every
+        // 50 ms, every 250 ms paused or still (no video: the real one's idle pace).
+        let fb_every = Duration::from_millis(if quiet_client { 250 } else { 50 });
+        if last_fb.elapsed() > fb_every {
             let s = reasm.take_stats();
             let fb = rdp_hyper::control::Feedback {
                 shards: s.shards,
@@ -2870,6 +3517,9 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
             last_ask = Instant::now();
         }
         let Ok(n) = client.recv(&mut buf) else { continue };
+        if still_stage == 1 {
+            still_pkts += 1;
+        }
         let Ok((kind, body)) = crecv.open(&buf[..n]) else { continue };
         if kind == Kind::Reliable {
             let (ack, msgs) = reliable.on_packet(&body);
@@ -2942,6 +3592,12 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
                         ltr_decoded = Some(f.frame_id);
                     }
                     if !out.is_empty() {
+                        if pause_stage == 1 {
+                            frames_paused += 1;
+                        }
+                        if let (2, Some(at), None) = (pause_stage, restored_at, resume_ms) {
+                            resume_ms = Some(at.elapsed().as_secs_f64() * 1e3);
+                        }
                         frames += 1;
                         keyframes += f.keyframe as u32;
                         lat.push((qpc_us() - f.capture_us) as f64 / 1000.0);
@@ -2969,6 +3625,30 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
         p(1.0),
         frozen.as_secs_f64() * 1e3
     );
+    if pause.is_some() {
+        // (Machine-readable for A/B runs: `selftest.<name>=<value>`.)
+        println!(
+            "paused {:.0} ms: {frames_paused} frames came meanwhile, {:.0} ms of CPU ({:.2}% of a core); first picture back after {}
+             selftest.paused_ms={paused_ms:.0} selftest.paused_cpu_ms={:.1} selftest.resume_ms={:.1}",
+            paused_ms,
+            paused_cpu_us as f64 / 1e3,
+            paused_cpu_us as f64 / 1e3 / paused_ms.max(1.0) * 100.0,
+            resume_ms.map_or("never".into(), |m| format!("{m:.0} ms")),
+            paused_cpu_us as f64 / 1e3,
+            resume_ms.unwrap_or(-1.0),
+        );
+    }
+    if still_win.is_some() {
+        println!(
+            "still {:.0} ms: {:.0} ms of CPU ({:.2}% of a core)
+             selftest.still_ms={still_ms:.0} selftest.still_cpu_ms={:.1} selftest.still_pkts_s={:.1}",
+            still_ms,
+            still_cpu_us as f64 / 1e3,
+            still_cpu_us as f64 / 1e3 / still_ms.max(1.0) * 100.0,
+            still_cpu_us as f64 / 1e3,
+            still_pkts as f64 / (still_ms / 1e3).max(0.001),
+        );
+    }
     if let Some((at, f0, b0)) = since_resize {
         let s = at.elapsed().as_secs_f64();
         println!("after the resize: {} frames decoded at {}x{}, {:.1} Mbps", frames - f0, stream_size.0, stream_size.1, (bytes - b0) as f64 * 8.0 / s / 1e6);
@@ -2976,6 +3656,21 @@ pub fn selftest(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
         println!("the stream never followed the window");
     }
     Ok(())
+}
+
+/// This process's CPU time so far (µs, kernel + user): the selftest's host
+/// and client both, so what a paused host costs shows as what it adds.
+fn selftest_cpu_us() -> u64 {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let (mut a, mut b, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    let ft = |f: FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) / 10;
+    unsafe {
+        if GetProcessTimes(GetCurrentProcess(), &mut a, &mut b, &mut kernel, &mut user).is_err() {
+            return 0;
+        }
+    }
+    ft(kernel) + ft(user)
 }
 
 /// The selftest starts decoding at the primary monitor's size.
@@ -3109,54 +3804,6 @@ mod tests {
     }
 
     #[test]
-    fn a_loss_is_repaired_from_a_reference_the_client_has() {
-        let t0 = Instant::now();
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
-        let mut l = Ltr::new(1);
-        let plain = |p: LtrPlan| matches!(p, LtrPlan::Encode { mark: None, from: None });
-        // The first picture after a keyframe: no reference yet, a keyframe.
-        assert!(matches!(l.plan(0, true, false, at(0)), LtrPlan::Keyframe));
-        assert_eq!(l.sent(0, 100, true), (false, false));
-        // Picture 1 kept in slot 0 (frame 101); the next ones not, for a while.
-        assert!(matches!(l.plan(1, false, false, at(10)), LtrPlan::Encode { mark: Some(0), from: None }));
-        assert_eq!(l.sent(1, 101, false), (true, false));
-        assert!(plain(l.plan(2, false, false, at(20))));
-        l.sent(2, 102, false);
-        // Lost before the client said it has 101: a keyframe.
-        assert!(matches!(l.plan(3, true, false, at(30)), LtrPlan::Keyframe));
-        l.sent(3, 103, false);
-        // The client confirms 101: a loss is repaired from slot 0.
-        l.acked(101);
-        assert!(matches!(l.plan(4, true, false, at(40)), LtrPlan::Encode { mark: None, from: Some(1) }));
-        assert_eq!(l.sent(4, 104, false), (false, true));
-        // A quarter second on, slot 1 is filled; unconfirmed, slot 0 still
-        // repairs.
-        assert!(matches!(l.plan(5, false, false, at(300)), LtrPlan::Encode { mark: Some(1), from: None }));
-        assert_eq!(l.sent(5, 105, false), (true, false));
-        assert!(matches!(l.plan(6, true, false, at(310)), LtrPlan::Encode { from: Some(1), .. }));
-        l.sent(6, 106, false);
-        // Confirmed: the newer slot 1.
-        l.acked(105);
-        assert!(matches!(l.plan(7, true, false, at(320)), LtrPlan::Encode { from: Some(2), .. }));
-        l.sent(7, 107, false);
-        // A third repair within the second: a keyframe instead.
-        assert!(matches!(l.plan(8, true, false, at(330)), LtrPlan::Keyframe));
-        l.sent(8, 108, true);
-        // The keyframe cleared everything.
-        assert!(matches!(l.plan(9, true, false, at(2000)), LtrPlan::Keyframe));
-        // Refilling slot 0 drops what it held until confirmed again.
-        let mut l = Ltr::new(1);
-        l.plan(1, false, false, at(0));
-        l.sent(1, 11, false);
-        l.acked(11);
-        l.plan(2, false, false, at(300));
-        l.sent(2, 12, false);
-        l.plan(3, false, false, at(600)); // slot 0 again
-        l.sent(3, 13, false);
-        assert!(matches!(l.plan(4, true, false, at(610)), LtrPlan::Keyframe), "11 was replaced; 12, 13 unconfirmed");
-    }
-
-    #[test]
     fn office_text_gets_bits_by_the_screens_area() {
         assert_eq!(resting_bps(false, (3000, 2120)), 20_000_000);
         assert_eq!(resting_bps(true, (1280, 800)), 30_000_000);
@@ -3204,6 +3851,16 @@ mod tests {
         assert_eq!(sharpen_frames(8 * 1024, 60), 8);
         assert_eq!(sharpen_frames(500_000, 60), 60, "a new page: a second's frames");
         assert_eq!(sharpen_frames(500_000, 1), 2);
+    }
+
+    #[test]
+    fn game_mode_sharpens_only_short_of_bits() {
+        let px = 2560 * 1440;
+        assert!(sharpens(true, false, 50_000_000, px, 60), "office: always");
+        assert!(sharpens(false, true, 5_000_000, px, 60), "1440p60 at 5 Mbps");
+        assert!(!sharpens(false, true, 20_000_000, px, 60), "1440p60 at 20 Mbps: sharp already");
+        assert!(sharpens(false, true, 1_000_000, px, 20), "1 Mbps at 20 fps");
+        assert!(!sharpens(false, false, 1_000_000, px, 20), "switched off");
     }
 
     /// Holds the GPU's clocks up and lets them go (as administrator; told no

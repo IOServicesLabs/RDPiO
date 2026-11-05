@@ -61,6 +61,9 @@ const STANDING_FLAT_US: i64 = 50_000;
 /// here, halve at the first sign of queueing and grow only while busy.
 const BULK_START: f64 = 8_000_000.0;
 const BULK_MIN: f64 = 1_000_000.0;
+/// …on the LAN (with [`Switches::lan_floor`]): its Wi-Fi's bumps halved a
+/// file copy to 1 Mbit/s too — 26 MB then took minutes, and never arrived.
+const BULK_LAN_MIN: f64 = 20_000_000.0;
 const BULK_MAX: f64 = 100_000_000.0;
 /// A path that lost nothing for this long (ms) counts as clean (see
 /// [`RateController::parity_for`]).
@@ -72,6 +75,16 @@ pub const PARITY_FREE_BYTES: usize = 4096;
 /// is pure overhead, and the rare Wi-Fi loss is repaired from a long-term
 /// reference. (Every block still gets at least one parity shard.)
 const CLEAN_FEC: f32 = 0.02;
+/// A repair (a frame coded from a long-term reference after a loss: the one
+/// that ends the client's freeze) carries at least this much parity
+/// (`repairfec`, see [`Switches::repair_fec`]), clean path or not: it's
+/// asked for because something was just lost (often before the feedback
+/// saying so: a small one went without), and lost too, the picture stays
+/// frozen another request and round trip. A few KB, rare: a packet or two.
+/// Simulated, a game on Wi-Fi losing 1% in runs of 8: frozen 72.6 → 55.1 s
+/// in 32 min, frames never shown 7429 → 6639, packets +0.7% (see
+/// `fecsim`); at a quarter, 60.0 s and 6801.
+const REPAIR_FEC: f32 = 0.5;
 /// Drain mode: while a standing queue drains, the host encodes this many
 /// frames a second, so the backlog drains at nearly the link's whole rate
 /// instead of the sliver a cut bitrate leaves (see [`RateController::drain_fps`]).
@@ -128,16 +141,50 @@ const PROBE_EVERY_MS: u64 = 1_000;
 /// one: a slow stream's frames are a packet or a few, and without probes it
 /// stayed at the floor — every radio bump its queue, the link never shown.)
 const PROBE_MIN_BYTES: usize = 2_000;
+/// A train a frame has to be padded out to only this often (ms) while the
+/// stream carries under 1/[`PROBE_IDLE_SHARE`] of the link it has shown
+/// (`probeidle`, see [`Switches::probe_idle`]): an idle office stream's
+/// trains were most of its packets — 48 a second for a caret's 2-3 — and
+/// a reading then only says again what the last one did. (Not while the
+/// link is in doubt, and a frame half a train or more goes every second.)
+/// Simulated, an office stream on a clean LAN: padding 33% → 12% of the
+/// data packets, 13.1 → 11.2 packets a frame shown; on the laptop's uplink
+/// the rate within 2%, the same p95, nothing more lost.
+const PROBE_IDLE_EVERY_MS: u64 = 5_000;
+const PROBE_IDLE_SHARE: f64 = 20.0;
+/// With those, the link is the most of the last this many readings (over
+/// at most [`LINK_KEEP_MS`]) even when older than the window, and trains go
+/// every second again until there are as many (a cut's doubt clears them):
+/// one train a window, read low (a radio's channel access stretches it),
+/// stood alone and cut the next scroll's rate to half the other arm's.
+const LINK_KEEP_READINGS: usize = 4;
+const LINK_KEEP_MS: u64 = 30_000;
+/// With trains (`probetrain`, see [`Switches::probe_train`]) every probe
+/// goes out as at least [`crate::video::PROBE_TRAIN_PACKETS`] full packets,
+/// the frame's own parity padding it out, and the client times all of them:
+/// any frame can carry one. A few small packets timed first to last showed
+/// a Wi-Fi radio's channel access and the client's receive nap (1-2 ms in
+/// office mode), not the link: an AX210 laptop's 300 Mbit/s uplink read
+/// 1-6 Mbit/s in office mode, 100-380 in game mode's big frames.
 /// The link carries the most its probes showed over this long (ms): two
 /// probes' worth, so a link something else has taken shows within it. With
 /// none (frames too small to probe with), the last rate stands: a queue it
 /// let build is still cut (see `ours` in [`RateController::update`]).
 const LINK_WINDOW_MS: u64 = 2_000;
+/// With trains: four probes' worth. A train's reading errs low only (a
+/// radio's channel access, a receiver's wake-up stretch it, nothing
+/// shortens it below [`crate::video`]'s per-packet floor), so the most of
+/// several is the link; a link something else took still shows through
+/// the cuts' doubt ([`RateController::doubt_link`]).
+const LINK_WINDOW_TRAIN_MS: u64 = 4_000;
 /// …and isn't read for this long (ms) after the link showed it carries far
 /// less (a gap, a slow keyframe, a standing queue): the queue's drained by
 /// then, and the next probe tells. (10 s: the radio's bumps meanwhile held a
 /// LAN at the floor long after the congestion was gone.)
 const LINK_DOUBT_MS: u64 = 3_000;
+/// What the link showed is remembered this long (ms) for
+/// [`Switches::link_memory`].
+const LINK_BEST_MS: u64 = 60_000;
 /// Under this share of what the link has shown, the rate grows as a warm
 /// start does ([`WARM_RAMP`]): it's far from anything the link pushes back on.
 const LINK_RAMP_BELOW: f64 = 0.1;
@@ -185,6 +232,63 @@ pub struct Switches {
     /// no queue on the client). Its real backlogs stand, and the standing
     /// rule cuts those.
     pub soft_slow: bool,
+    /// Probes as padded trains timed whole (`probetrain`; see
+    /// [`PROBE_MIN_BYTES`]), and the link never read under what it
+    /// delivered.
+    pub probe_train: bool,
+    /// A paused stream holds its rate (`pausehold`; see
+    /// [`RateController::set_paused`]).
+    pub pause_hold: bool,
+    /// A queue still there a window later counts as the stream's only if
+    /// that window's fastest frame was late too (`heldburst`; see `ours` in
+    /// [`RateController::update`]). Wi-Fi power save holds a dozing
+    /// client's frames at the access point until the next beacon (~100 ms)
+    /// and lets them go at once: the window they land in averages 30-60 ms
+    /// late, the one after it too, but its last frame before the beacon
+    /// came promptly. A queue lasting has even its fastest frame late.
+    /// Simulated on a 200 Mbit/s LAN dozing one beacon interval in three,
+    /// the stream sat at 21 Mbit/s (164 queue cuts over 4 x 50 s), 35 with
+    /// it (111); warm started from a bad stream's 0.7, at 11 instead of 35.
+    pub held_burst: bool,
+    /// A queue over twice what the stream's last 100 ms of bytes would take
+    /// on the link, its window's fastest frame prompt (under 10 ms), isn't
+    /// the stream's (`ownq`). Its bytes count as able to make a queue from
+    /// a tenth of the link up, and a beacon's burst was 30-60 ms whatever
+    /// was sent: on a 200 Mbit/s LAN in power save that held the stream at
+    /// 17 Mbit/s, 35 with this (and a queue on a link something else took
+    /// has its fastest frame late too: still cut).
+    pub own_queue: bool,
+    /// A window with one frame, under a beacon interval late, doesn't make
+    /// a queue last (`loneframe`): a stream under ~25 fps has the radio
+    /// dozing between frames, each held 0-100 ms, and one such frame has no
+    /// faster one to show it was held. Cut for those, an office stream
+    /// went to 10 fps, its radio dozed through every frame, and it stayed
+    /// there: after something took the link for 3 s it came back to 24
+    /// Mbit/s on a 200 Mbit/s LAN, 29 with this.
+    pub lone_frame: bool,
+    /// Repairs carry more parity (`repairfec`; see [`REPAIR_FEC`]).
+    pub repair_fec: bool,
+    /// A frame of several blocks goes a body of each in turn (`interleave`;
+    /// see [`crate::video::send_order`]).
+    pub interleave: bool,
+    /// Padded probe trains seldom while the stream is far under the link
+    /// (`probeidle`; see [`PROBE_IDLE_EVERY_MS`]).
+    pub probe_idle: bool,
+    /// On the LAN, delay bumps alone never cut under [`LAN_FLOOR_BPS`] (or
+    /// half what the link has shown, if less) (`lanfloor`): only lost
+    /// frames or a standing queue go lower, and only for a while. A Wi-Fi
+    /// LAN's bumps are the radios', not the stream's: cut for each, a
+    /// 1440p office stream over a ~90 Mbit/s link sat at 1-3 Mbit/s,
+    /// smeared, for hours.
+    pub lan_floor: bool,
+    /// On the LAN, what the link carries is the most its probes showed over
+    /// the last [`LINK_BEST_MS`] (`linkmemory`), for judging whose a queue
+    /// is and for the floor — not what the stream carried at the last cut
+    /// ([`RateController::doubt_link`]), its own rate when the radio
+    /// bumped. That fed itself: a 900 Mbit/s Wi-Fi LAN read 4-6, so every
+    /// bump was the stream's, the floor sank to half of that, and the
+    /// stream sat at 1-3 Mbit/s. (Probes err low only, so the most is safe.)
+    pub link_memory: bool,
 }
 
 impl Default for Switches {
@@ -199,6 +303,16 @@ impl Default for Switches {
             slow_pace: false,
             grow_cap: true,
             soft_slow: true,
+            probe_train: true,
+            pause_hold: true,
+            held_burst: true,
+            own_queue: true,
+            lone_frame: true,
+            repair_fec: true,
+            interleave: true,
+            probe_idle: true,
+            lan_floor: true,
+            link_memory: true,
         }
     }
 }
@@ -276,12 +390,22 @@ pub struct RateController {
     warm_retune: Option<(u64, u64)>,
     /// The client is on the host's own network (see [`RateController::set_lan`]).
     lan: bool,
+    /// Until when the LAN floor yields to a lost frame or a standing queue
+    /// (see [`Switches::lan_floor`]).
+    floor_yield_until_ms: u64,
+    /// The last yield's length (see [`LAN_FLOOR_YIELD_MS`]).
+    floor_yield_ms: u64,
     /// What the link has shown it carries (wire bits per second).
     link_bps: Option<f64>,
     /// Its measurements over the last [`LINK_WINDOW_MS`]: (when, bits per second).
     link_seen: std::collections::VecDeque<(u64, f64)>,
     link_doubt_until_ms: u64,
+    /// Every probe reading of the last [`LINK_BEST_MS`]: (when, bits per second).
+    link_best: std::collections::VecDeque<(u64, f64)>,
     last_probe_ms: Option<u64>,
+    /// A probe train's padding sent and not yet seen delivered (bytes): not
+    /// the encoder using its budget (see [`RateController::note_probe_padding`]).
+    pad_pending: u64,
     /// When the keyframe in flight went out (ms), and the bytes delivered
     /// (and ms) since the first arrived after it (see [`KEY_PROBE_MS`]).
     key_sent_ms: u64,
@@ -305,6 +429,9 @@ pub struct RateController {
     carried: std::collections::VecDeque<(u64, f64)>,
     /// Cuts since the last [`Self::take_cuts`], by reason (see [`CUT_NAMES`]).
     cuts: [u32; CUT_NAMES.len()],
+    /// The client can't see the stream and nothing is sent (see
+    /// [`Self::set_paused`]).
+    paused: bool,
 }
 
 /// The reasons the rate is cut, as the host's perf line names them.
@@ -316,6 +443,16 @@ const CUT_DRAIN: usize = 3;
 const CUT_LOSS: usize = 4;
 const CUT_QUEUE: usize = 5;
 const CUT_SOFT: usize = 6;
+
+/// See [`Switches::lan_floor`]: about the least a 1440p screen looks clean at.
+const LAN_FLOOR_BPS: f64 = 20_000_000.0;
+/// How long a lost frame or a standing queue holds the rate free of the LAN
+/// floor: this at first, twice as long each time it happens again within
+/// [`LAN_FLOOR_CALM_MS`] of the last yield ending (a LAN link that really
+/// is slow), up to the most.
+const LAN_FLOOR_YIELD_MS: u64 = 5_000;
+const LAN_FLOOR_YIELD_MAX_MS: u64 = 120_000;
+const LAN_FLOOR_CALM_MS: u64 = 30_000;
 
 impl RateController {
     pub fn new(limits: Limits) -> Self {
@@ -359,10 +496,14 @@ impl RateController {
             warm_cap: None,
             warm_retune: None,
             lan: false,
+            floor_yield_until_ms: 0,
+            floor_yield_ms: 0,
             link_bps: None,
             link_seen: Default::default(),
             link_doubt_until_ms: 0,
+            link_best: Default::default(),
             last_probe_ms: None,
+            pad_pending: 0,
             key_sent_ms: 0,
             key_landed_ms: None,
             key_probe: (0, 0),
@@ -372,12 +513,17 @@ impl RateController {
             slow_until_ms: 0,
             carried: Default::default(),
             cuts: Default::default(),
+            paused: false,
         }
     }
 
     /// The cuts since the last call, by reason ([`CUT_NAMES`]).
     pub fn take_cuts(&mut self) -> [u32; CUT_NAMES.len()] {
         std::mem::take(&mut self.cuts)
+    }
+
+    pub fn switches(&self) -> Switches {
+        self.switches
     }
 
     pub fn set_switches(&mut self, switches: Switches) {
@@ -445,20 +591,111 @@ impl RateController {
         self.lan = lan;
     }
 
+    /// Whether the client is on the host's own network (see [`Self::set_lan`]).
+    pub fn lan(&self) -> bool {
+        self.lan
+    }
+
+    /// A lost frame or a standing queue: the LAN floor stands aside a while.
+    fn floor_yield(&mut self, now_ms: u64) {
+        let again = self.floor_yield_ms > 0 && now_ms < self.floor_yield_until_ms + LAN_FLOOR_CALM_MS;
+        if now_ms < self.floor_yield_until_ms {
+            return; // (already yielding)
+        }
+        self.floor_yield_ms = if again { (self.floor_yield_ms * 2).min(LAN_FLOOR_YIELD_MAX_MS) } else { LAN_FLOOR_YIELD_MS };
+        if again {
+            // (Yielding again and again: the link really is down, whatever
+            // it showed before.)
+            self.link_best.clear();
+        }
+        self.floor_yield_until_ms = now_ms + self.floor_yield_ms;
+    }
+
+    /// What the link carries, for judging queues and the LAN floor: the
+    /// estimate, or on the LAN the most its probes showed lately if more
+    /// (see [`Switches::link_memory`]).
+    fn link_shown(&self) -> Option<f64> {
+        let best = self.link_best.iter().map(|&(_, b)| b).reduce(f64::max).filter(|_| self.lan && self.switches.link_memory);
+        match (self.link_bps, best) {
+            (Some(l), Some(b)) => Some(l.max(b)),
+            (l, b) => l.or(b),
+        }
+    }
+
+    /// The least the bulk lane is cut to: on the LAN, as for the video (see
+    /// [`Self::lan_floor`]), [`BULK_LAN_MIN`] or half the link.
+    fn bulk_min(&self, now_ms: u64) -> f64 {
+        if self.lan_floor(now_ms) > 0.0 {
+            let shown = self.link_shown().map_or(f64::INFINITY, |l| l / 2.0);
+            BULK_LAN_MIN.min(shown).max(BULK_MIN)
+        } else {
+            BULK_MIN
+        }
+    }
+
+    /// The rate delay bumps alone don't cut under (encoder bits per second;
+    /// 0: none). See [`Switches::lan_floor`].
+    fn lan_floor(&self, now_ms: u64) -> f64 {
+        if !(self.lan && self.switches.lan_floor) || now_ms < self.floor_yield_until_ms {
+            return 0.0;
+        }
+        let shown = self.link_shown().map_or(f64::INFINITY, |l| l / self.overhead * 0.5);
+        LAN_FLOOR_BPS.min(shown).min(self.limits.max_bps as f64)
+    }
+
     /// Whether a frame of `bytes` should go out unpaced, as a probe of the
     /// link: on the LAN, a big enough one a second unless a queue stands.
     /// (Slow pacing too: on a LAN a probe is a millisecond's burst, and only
     /// it shows the link has room again.)
     pub fn probe_due(&mut self, bytes: usize, now_ms: u64) -> bool {
+        let every = if self.probe_idle(bytes, now_ms) { PROBE_IDLE_EVERY_MS } else { PROBE_EVERY_MS };
         let due = self.lan
-            && bytes >= PROBE_MIN_BYTES
+            && (bytes >= PROBE_MIN_BYTES || self.switches.probe_train)
             && !self.draining
             && self.standing_since_ms.is_none()
-            && self.last_probe_ms.is_none_or(|t| now_ms.saturating_sub(t) >= PROBE_EVERY_MS);
+            && self.last_probe_ms.is_none_or(|t| now_ms.saturating_sub(t) >= every);
         if due {
             self.last_probe_ms = Some(now_ms);
         }
         due
+    }
+
+    /// Whether a frame of `bytes` would be padded out to a train for a
+    /// reading not needed now (see [`PROBE_IDLE_EVERY_MS`]).
+    fn probe_idle(&self, bytes: usize, now_ms: u64) -> bool {
+        // (Mostly padding: a frame half a train or more is a scroll starting,
+        // whose first frames' reading the rate wants at once.)
+        let padded = crate::video::layout_of(bytes, true).0 < crate::video::PROBE_TRAIN_PACKETS / 2;
+        let recent = self.carried.iter().filter(|&&(t, _)| now_ms.saturating_sub(t) <= LINK_WINDOW_TRAIN_MS).map(|&(_, b)| b);
+        let carried = recent.fold(0.0, f64::max) * self.overhead;
+        self.switches.probe_idle
+            && self.switches.probe_train
+            && padded
+            && now_ms >= self.link_doubt_until_ms
+            && self.link_seen.len() >= LINK_KEEP_READINGS
+            && self.link_bps.is_some_and(|l| carried * PROBE_IDLE_SHARE < l)
+    }
+
+    /// Parity a probe train went out with beyond the frame's own (bytes on
+    /// the wire; see [`crate::video::probe_padding`]). Kept out of the sent
+    /// bytes and taken back out of the delivered ones: a 1 KB frame's 28 KB
+    /// train isn't the stream using its budget.
+    pub fn note_probe_padding(&mut self, bytes: usize) {
+        self.pad_pending += bytes as u64;
+    }
+
+    /// The client's window is minimized: the host sends nothing until it's
+    /// back. Its feedback still comes, every window empty and calm — which
+    /// the idle recovery reads as a still screen on a clean path, and grew
+    /// the rate back to resting (53 Mbps) over the minutes it was down. On
+    /// restore the keyframe and first frames were sized for that, and the
+    /// probe, standing and queue cuts slammed it to the 0.5 Mbps floor in
+    /// about 2 s (65 times in one host log). Paused, the rate holds where it
+    /// was (`pausehold`): nothing was learned about the path meanwhile.
+    /// (Only on the host's word: a still screen also sends nothing for long
+    /// stretches, and recovering there is what the next page of text needs.)
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
     }
 
     /// What the link has shown it carries (bits per second), if measured.
@@ -544,6 +781,20 @@ impl RateController {
     /// frames carry less there ([`CLEAN_FEC`]); keyframes always carry the
     /// full ratio. The first loss brings it back for all.
     pub fn parity_for(&self, bytes: usize, keyframe: bool) -> f32 {
+        self.parity_for_frame(bytes, keyframe, false)
+    }
+
+    /// [`Self::parity_for`], and for a repair at least [`REPAIR_FEC`].
+    pub fn parity_for_frame(&self, bytes: usize, keyframe: bool, repair: bool) -> f32 {
+        let fec = self.parity_of(bytes, keyframe);
+        if repair && self.switches.repair_fec {
+            fec.max(REPAIR_FEC)
+        } else {
+            fec
+        }
+    }
+
+    fn parity_of(&self, bytes: usize, keyframe: bool) -> f32 {
         if self.clean && !keyframe && bytes <= PARITY_FREE_BYTES {
             0.0
         } else if self.clean && !keyframe && self.switches.fec_floor {
@@ -594,6 +845,9 @@ impl RateController {
 
     /// Fold one feedback window (`window_ms` long) in.
     pub fn update(&mut self, fb: &Feedback, window_ms: u64, now_ms: u64) {
+        // (A train's padding arrives within milliseconds of going out.)
+        let pad = std::mem::take(&mut self.pad_pending).min(fb.bytes);
+        let fb = &Feedback { bytes: fb.bytes - pad, ..*fb };
         if self.sent_payload > 0 {
             let ratio = (self.sent_wire as f64 / self.sent_payload as f64).clamp(1.0, 3.0);
             self.overhead = self.overhead * 0.8 + ratio * 0.2;
@@ -662,11 +916,29 @@ impl RateController {
         if self.lan && fb.link_kbps > 0 && now_ms >= self.link_doubt_until_ms {
             self.link_seen.push_back((now_ms, (fb.link_kbps as f64 * 1000.0).min(LINK_MAX_BPS)));
         }
-        while self.link_seen.front().is_some_and(|&(t, _)| now_ms.saturating_sub(t) > LINK_WINDOW_MS) {
+        if self.lan && fb.link_kbps > 0 {
+            self.link_best.push_back((now_ms, (fb.link_kbps as f64 * 1000.0).min(LINK_MAX_BPS)));
+        }
+        while self.link_best.front().is_some_and(|&(t, _)| now_ms.saturating_sub(t) > LINK_BEST_MS) {
+            self.link_best.pop_front();
+        }
+        let window = if self.switches.probe_train { LINK_WINDOW_TRAIN_MS } else { LINK_WINDOW_MS };
+        let keep = if self.switches.probe_idle && self.switches.probe_train { LINK_KEEP_READINGS } else { 0 };
+        while self.link_seen.front().is_some_and(|&(t, _)| {
+            let age = now_ms.saturating_sub(t);
+            age > window && (self.link_seen.len() > keep || age > LINK_KEEP_MS)
+        }) {
             self.link_seen.pop_front();
         }
         if let Some(most) = self.link_seen.iter().map(|&(_, b)| b).reduce(f64::max) {
             self.link_bps = Some(most);
+        }
+        // Never under what it demonstrably delivered lately (wire terms).
+        if self.switches.probe_train && now_ms >= self.link_doubt_until_ms {
+            let recent = self.carried.iter().filter(|&&(t, _)| now_ms.saturating_sub(t) <= window).map(|&(_, b)| b);
+            if let (Some(l), Some(most)) = (&mut self.link_bps, recent.reduce(f64::max)) {
+                *l = l.max(most * self.overhead);
+            }
         }
 
         let mut queue_min_us = 0;
@@ -695,13 +967,24 @@ impl RateController {
         // (A radio's bump is one frame's; a queue still there a window later
         // is the stream's, whatever the link showed: something else took it.)
         let recent: u64 = self.gap.iter().rev().take(2).map(|e| e.1).sum();
-        let ours = self.link_bps.is_none_or(|l| recent as f64 * 8.0 / l * 1e6 >= QUEUE_SOFT_US as f64)
-            || (fb.frames > 0 && queue_us > QUEUE_HARD_US && self.last_queue_us > QUEUE_HARD_US);
+        // (And not one over twice what those bytes would take on the link,
+        // its fastest frame prompt: that's a radio's hold let go, whatever
+        // the stream sends — see [`Switches::own_queue`].)
+        let own_us = |l: f64| recent as f64 * 8.0 / l * 1e6;
+        let too_big = |l: f64| self.switches.own_queue && queue_us as f64 > 2.0 * own_us(l) && queue_min_us < QUEUE_SOFT_US;
+        // (A queue lasting is the stream's only if the window's fastest frame
+        // was late too, see [`Switches::held_burst`], and it had more than
+        // one frame or one later than a beacon interval, see
+        // [`Switches::lone_frame`].)
+        let burst = self.switches.held_burst && queue_min_us < (queue_us / 2).max(QUEUE_SOFT_US);
+        let lone = self.switches.lone_frame && fb.frames < 2 && queue_us <= STANDING_US;
+        let lasting = fb.frames > 0 && queue_us > QUEUE_HARD_US && self.last_queue_us > QUEUE_HARD_US && !burst && !lone;
+        let ours = self.link_shown().is_none_or(|l| own_us(l) >= QUEUE_SOFT_US as f64 && !too_big(l)) || lasting;
 
         // Bulk yields first: it halves at the first sign of queueing or a
         // lost frame, and grows only while something is waiting to go.
         if fb.frames_lost > 0 || queue_us > QUEUE_SOFT_US / 2 {
-            self.bulk = (self.bulk * 0.5).max(BULK_MIN);
+            self.bulk = (self.bulk * 0.5).max(self.bulk_min(now_ms));
         } else if self.bulk_busy {
             self.bulk = (self.bulk * 1.15).min(BULK_MAX);
         }
@@ -759,14 +1042,15 @@ impl RateController {
         // Mbps, and each bump after that was its queue.)
         let held = |(ratio, got): (f64, f64)| self.lan && self.link_bps.is_some_and(|l| l / self.overhead > 2.0 * got / ratio.max(0.01));
         if let Some((_, link)) = gap.filter(|&g| self.switches.gap_cut && g.0 < GAP_CUT && !probing && !held(g)) {
-            if link * 0.85 < self.bitrate {
-                self.bitrate = (link * 0.85).max(self.limits.min_bps as f64);
+            let floor = self.lan_floor(now_ms);
+            if link * 0.85 < self.bitrate && self.bitrate > floor {
+                self.bitrate = (link * 0.85).max(self.limits.min_bps as f64).max(floor);
                 self.hold_until_ms = now_ms + HOLD_MS;
                 self.last_cut_ms = Some(now_ms);
                 self.slow_until_ms = now_ms + SLOW_PATH_MS;
                 self.cuts[CUT_GAP] += 1;
                 self.doubt_link(link, now_ms);
-                self.bulk = BULK_MIN;
+                self.bulk = self.bulk_min(now_ms);
                 // (Once: the next check needs a fresh half second.)
                 self.gap.clear();
             }
@@ -833,6 +1117,7 @@ impl RateController {
             if let Some(link) = link_bps {
                 if link * 0.85 < self.bitrate {
                     self.cuts[CUT_DRAIN] += 1;
+                    self.floor_yield(now_ms);
                 }
                 self.bitrate = self.bitrate.min(link * 0.85).max(self.limits.min_bps as f64);
             }
@@ -844,8 +1129,12 @@ impl RateController {
             self.last_cut_ms = Some(now_ms);
             self.slow_until_ms = now_ms + SLOW_PATH_MS;
             self.cuts[CUT_STANDING] += 1;
+            self.floor_yield(now_ms);
             self.doubt_link(link, now_ms);
-            self.bulk = BULK_MIN;
+            // (A queue standing for a second is someone else's traffic on
+            // the link, or the link slowed: what it showed is past.)
+            self.link_best.clear();
+            self.bulk = self.bulk_min(now_ms);
             self.bitrate = self.bitrate.clamp(self.limits.min_bps as f64, self.limits.max_bps as f64);
             self.note_sustained();
             return;
@@ -889,6 +1178,17 @@ impl RateController {
             if queue_us <= QUEUE_SOFT_US {
                 self.bitrate = self.bitrate.max(delivered * 0.85).min(self.bitrate / f);
             }
+            if why == CUT_LOSS {
+                // Lost to a queue (not the radio's random loss): the link
+                // carries less than it showed; forget that.
+                if queue_us > QUEUE_SOFT_US {
+                    self.link_best.clear();
+                }
+                self.floor_yield(now_ms);
+            } else {
+                // A delay bump on the LAN: not under the floor.
+                self.bitrate = self.bitrate.max(self.lan_floor(now_ms).min(self.bitrate / f));
+            }
             self.hold_until_ms = now_ms + HOLD_MS;
             self.last_cut_ms = Some(now_ms);
         } else if now_ms >= self.hold_until_ms {
@@ -931,6 +1231,7 @@ impl RateController {
                 }
             } else if !busy
                 && calm
+                && !(self.paused && self.switches.pause_hold)
                 && self.bitrate < resting
                 && self.last_cut_ms.is_none_or(|t| now_ms.saturating_sub(t) >= RECOVER_AFTER_MS)
             {
@@ -939,6 +1240,8 @@ impl RateController {
                 self.bitrate = (self.bitrate * if warm { WARM_RAMP } else { 1.02 }).min(resting).min(ceiling);
             }
         }
+        // Under the LAN floor with nothing lost or standing lately: back to it.
+        self.bitrate = self.bitrate.max(self.lan_floor(now_ms));
         self.bitrate = self.bitrate.clamp(self.limits.min_bps as f64, self.limits.max_bps as f64);
         if busy && fb.frames > 0 {
             self.note_sustained();
@@ -1235,6 +1538,36 @@ mod tests {
             r.update(&fb(3_000, 5_500, 0, 0), 50, t * 50);
         }
         assert_eq!(r.bitrate_bps(), 30_000_000);
+    }
+
+    /// Minimized after a cut: nothing sent, feedback windows empty. The rate
+    /// holds there (`pausehold`), where before it drifted back to resting;
+    /// a still screen sending nothing, not paused, still recovers.
+    #[test]
+    fn a_paused_stream_holds_its_rate() {
+        let quiet = Feedback { shards: 0, frames: 0, bytes: 0, delay_min_us: 0, delay_avg_us: 0, ..fb(0, 0, 0, 0) };
+        let run = |paused: bool, switches: Switches| {
+            let mut r = RateController::new(Limits::default());
+            r.set_switches(switches);
+            r.set_resting(53_000_000);
+            for t in 0..4 {
+                r.update(&fb(3_000, 5_000, 1, 0), 50, t * 50);
+            }
+            let cut = r.bitrate_bps();
+            r.set_paused(paused);
+            // A minute down.
+            for t in 4..1_200 {
+                r.update(&quiet, 50, t * 50);
+            }
+            (cut, r.bitrate_bps())
+        };
+        let (cut, held) = run(true, Switches::default());
+        assert!(cut < 10_000_000, "{cut}");
+        assert_eq!(held, cut, "paused: held");
+        let (_, drifted) = run(true, Switches { pause_hold: false, ..Switches::default() });
+        assert_eq!(drifted, 53_000_000, "switched off: back to resting, as before");
+        let (_, still) = run(false, Switches::default());
+        assert_eq!(still, 53_000_000, "a still screen, not paused: recovers");
     }
 
     /// The Razer hosting over Wi-Fi to Wi-Fi on a LAN: the stream's first
@@ -1638,6 +1971,27 @@ mod tests {
         lan: bool,
         /// (Without them: a wired LAN.)
         bumps: bool,
+        /// The host's radio as it times a probe: the first packet goes
+        /// alone, the rest in aggregates after a channel access each (see
+        /// [`wifi_train_us`]); without, a probe's spread is its bytes at
+        /// the link's rate.
+        airtime: bool,
+        /// The client naps 1-2 ms after each receive (office mode) — through
+        /// a probe, unless it times trains ([`Switches::probe_train`]).
+        nap: bool,
+        /// The radio drops what would wait longer than this (µs) in its
+        /// queue (a lost frame); `None`: it queues and never drops.
+        buffer_us: Option<u64>,
+        /// The client's radio in power save (a laptop on battery), dozing
+        /// through one wake interval in this many: see [`doze_hold`]…
+        doze: Option<u64>,
+        /// …waking every this many beacons (its listen interval).
+        listen: u64,
+        /// Picks the radio's bumps and dozes (0: as ever).
+        seed: u64,
+        /// The frame rate follows the bitrate as office mode's does (down to
+        /// 10 fps; see [`FrameRate::follow_office`]).
+        office: bool,
     }
 
     impl Setup {
@@ -1654,6 +2008,16 @@ mod tests {
                     slow_pace: false,
                     grow_cap: false,
                     soft_slow: false,
+                    probe_train: false,
+                    pause_hold: false,
+                    held_burst: false,
+                    own_queue: false,
+                    lone_frame: false,
+                    repair_fec: false,
+                    interleave: false,
+                    probe_idle: false,
+                    lan_floor: false,
+                    link_memory: false,
                 },
                 fps_follow: false,
                 warm_bps: None,
@@ -1662,11 +2026,34 @@ mod tests {
                 wifi: false,
                 lan: false,
                 bumps: true,
+                airtime: false,
+                nap: false,
+                buffer_us: None,
+                doze: None,
+                listen: 1,
+                seed: 0,
+                office: false,
             }
         }
 
         fn after() -> Self {
-            Self { switches: Switches::default(), fps_follow: true, warm_bps: None, key_every_ms: None, active: None, wifi: false, lan: false, bumps: true }
+            Self {
+                switches: Switches::default(),
+                fps_follow: true,
+                warm_bps: None,
+                key_every_ms: None,
+                active: None,
+                wifi: false,
+                lan: false,
+                bumps: true,
+                airtime: false,
+                nap: false,
+                buffer_us: None,
+                doze: None,
+                listen: 1,
+                seed: 0,
+                office: false,
+            }
         }
     }
 
@@ -1680,6 +2067,17 @@ mod tests {
         audio: Vec<(u64, f64)>,
         /// The target each second (bits per second).
         targets: Vec<u32>,
+        /// Each second: when (ms), the target and the link the controller
+        /// saw (bits per second).
+        per_s: Vec<(u64, u32, u32)>,
+        /// Frames the radio dropped, and when (ms).
+        lost: u32,
+        lost_at: Vec<u64>,
+        /// The controller's cuts, by reason ([`CUT_NAMES`]), and when (ms).
+        cuts: [u32; CUT_NAMES.len()],
+        cut_at: Vec<u64>,
+        /// Probe trains' padding sent (bytes).
+        pad: u64,
     }
 
     impl Run {
@@ -1751,6 +2149,64 @@ mod tests {
         }
     }
 
+    /// A pseudo-random draw for `t` and `salt`.
+    fn draw(t: u64, salt: u64) -> u64 {
+        (t ^ salt.wrapping_mul(0xD6E8_FEB8_6659_FD93)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32
+    }
+
+    /// How long a probe of `packets` packets of `size` bytes takes from its
+    /// first packet's arrival to its last, sent at `t` from a laptop's radio
+    /// carrying `capacity` (bits per second of goodput). An idle radio
+    /// sends what it's handed a packet a channel access (a shallow queue
+    /// isn't aggregated); once [`WIFI_HEAD`] packets in, the backlog goes in
+    /// aggregates of up to 64. An access takes 0.1-0.4 ms two times in
+    /// three, 0.4-2 ms most of the rest, 2-10 ms one time in fifteen
+    /// (neighbours, Bluetooth on the same chip, power save). Fitted to the
+    /// host's log: 8-packet probes of 2-4 KB read 1-6 Mbit/s, 40-120 KB
+    /// game frames 93-384 on a ~300 Mbit/s uplink.
+    fn wifi_train_us(t: u64, packets: usize, size: usize, capacity: f64) -> u64 {
+        // (Airtime at the PHY rate: goodput is ~60% of it.)
+        let air = |n: usize| 60.0 + (n * size) as f64 * 8e6 / (capacity / 0.6);
+        let mut spread = 0.0;
+        let (mut left, mut i) = (packets.saturating_sub(1), 1u64);
+        while left > 0 {
+            let h = draw(t, i);
+            let access = match h % 20 {
+                0..=13 => 60 + h % 190,
+                14..=18 => 250 + h % 1_250,
+                _ => 1_500 + h % 6_500,
+            };
+            let n = if (i as usize) < WIFI_HEAD { 1 } else { left.min(64) };
+            spread += access as f64 + air(n);
+            (left, i) = (left - n, i + 1);
+        }
+        spread as u64
+    }
+
+    /// See [`wifi_train_us`].
+    const WIFI_HEAD: usize = 4;
+
+    /// A beacon interval (µs): 100 TU.
+    const BEACON_US: u64 = 102_400;
+    /// A radio in power save dozes after this long with nothing received (µs).
+    const DOZE_IDLE_US: u64 = 40_000;
+
+    /// When a frame reaching the access point at `first` (µs) reaches a
+    /// client whose radio is in power save, last woken by a frame at
+    /// `last_rx`: a dozing radio's traffic waits at the access point for the
+    /// next beacon, and comes in a burst. It dozes once nothing came for
+    /// [`DOZE_IDLE_US`] (a stream under ~25 fps, every frame), and through one
+    /// beacon interval in `every` anyway (a laptop on battery: Windows' power
+    /// saving on the Razer, whatever is sent). So a frame waits 0-100 ms now
+    /// and then, the fastest of a window's frames comes promptly (the last
+    /// one before the beacon), and the link carries all of it at once.
+    fn doze_hold(first: u64, last_rx: u64, every: u64, listen: u64, seed: u64) -> u64 {
+        let wake = BEACON_US * listen;
+        let k = first / wake;
+        let dozing = draw(k, 7 + seed) % every == 0 || first >= last_rx + DOZE_IDLE_US;
+        if dozing { (k + 1) * wake } else { first }
+    }
+
     /// A keyframe's size at a bitrate: the log's 240-380 KB at 20 Mbps, down
     /// to a floor (even the coarsest keyframe of a whole screen is tens of KB).
     fn sim_keyframe_bytes(bps: u32) -> usize {
@@ -1779,7 +2235,9 @@ mod tests {
         let mut free_at = 0u64;
         // The host's pacer: each frame's time leaving it.
         let mut pacing: VecDeque<(u64, u64, usize)> = VecDeque::new();
-        let mut wire: VecDeque<(u64, u64, usize, bool, u64, bool)> = VecDeque::new();
+        let mut wire: VecDeque<(u64, u64, usize, bool, u64, Option<u32>)> = VecDeque::new();
+        // Frames the radio dropped: when the client gives up on each.
+        let mut lost: VecDeque<u64> = VecDeque::new();
         // Each frame's first and last byte's arrival, and its size.
         let mut arriving: VecDeque<(u64, u64, usize)> = VecDeque::new();
         let mut requests: VecDeque<u64> = VecDeque::new();
@@ -1791,6 +2249,9 @@ mod tests {
         let mut floor = crate::video::DelayFloor::default();
         for t in (0..secs * 1_000_000).step_by(1_000) {
             let now_ms = t / 1000;
+            if t % 1_000_000 == 0 {
+                run.per_s.push((now_ms, r.bitrate_bps(), r.link_bps().unwrap_or(0)));
+            }
             while requests.front().is_some_and(|&a| a <= t) {
                 requests.pop_front();
                 if !r.collapse_keyframe_request(now_ms) {
@@ -1799,7 +2260,11 @@ mod tests {
             }
             while feedback.front().is_some_and(|(a, _)| *a <= t) {
                 let (_, f) = feedback.pop_front().unwrap();
+                let before: u32 = r.cuts.iter().sum();
                 r.update(&f, 50, now_ms);
+                if r.cuts.iter().sum::<u32>() > before {
+                    run.cut_at.push(now_ms);
+                }
             }
             if setup.key_every_ms.is_some_and(|e| now_ms > 0 && now_ms % e == 0 && t % 1000 == 0) {
                 want_key = true;
@@ -1817,7 +2282,11 @@ mod tests {
                         println!("        cuts so far: {:?}", CUT_NAMES.iter().zip(c).filter(|p| p.1 > 0).collect::<Vec<_>>());
                     }
                 }
-                let fps = if setup.fps_follow { fr.follow(bps, SIM_PIXELS, SIM_FPS, now_ms) } else { SIM_FPS };
+                let fps = match (setup.fps_follow, setup.office) {
+                    (false, _) => SIM_FPS,
+                    (true, false) => fr.follow(bps, SIM_PIXELS, SIM_FPS, now_ms),
+                    (true, true) => fr.follow_office(bps, SIM_PIXELS, SIM_FPS, now_ms),
+                };
                 let mut interval = 1_000_000 / fps as u64;
                 if let Some(d) = r.drain_fps(now_ms) {
                     interval = interval.max(1_000_000 / d as u64);
@@ -1845,6 +2314,11 @@ mod tests {
                     // one comes, as in the host's sender — except under the
                     // cap, where the next one waits its turn.)
                     let probe = r.probe_due(bytes, now_ms);
+                    let train = probe && r.switches.probe_train;
+                    let pad = if train { crate::video::probe_padding(bytes, r.parity_for(bytes, key)) } else { 0 };
+                    r.note_probe_padding(pad);
+                    run.pad += pad as u64;
+                    let on_wire = on_wire + pad;
                     let cap = r.pace_cap_bps().filter(|_| !probe);
                     let pace = if probe { f64::INFINITY } else { cap.map_or(bps as f64 * 2.5, |c| c as f64) };
                     let mut host_start = t;
@@ -1858,15 +2332,45 @@ mod tests {
                     let pacer_free = host_start + (on_wire as f64 * 8e6 / pace) as u64;
                     pacing.push_back((host_start, pacer_free, on_wire));
                     let start = free_at.max(host_start);
+                    // (The radio's queue full: the frame's gone.)
+                    let dropped = setup.buffer_us.is_some_and(|b| start.saturating_sub(host_start) > b);
+                    if dropped {
+                        run.lost += 1;
+                        run.lost_at.push(now_ms);
+                        lost.push_back(t + one_way);
+                    } else {
                     free_at = (start + (on_wire as f64 * 8e6 / capacity(now_ms)) as u64).max(pacer_free);
-                    let bump = if setup.wifi && setup.bumps { wifi_bump(t) } else { 0 };
-                    let first = (start + one_way + bump).max(last_arrival);
-                    let arrive = (free_at + one_way + bump).max(first);
+                    let bump = if setup.wifi && setup.bumps { wifi_bump(t.wrapping_add(setup.seed * 7_919)) } else { 0 };
+                    // (A dozing radio's frames wait from when they reach the
+                    // access point; at the beacon all that's waiting comes.)
+                    let ap = start + one_way + bump;
+                    let held = setup.doze.map_or(0, |every| doze_hold(ap, last_arrival, every, setup.listen, setup.seed) - ap);
+                    let first = (ap + held).max(last_arrival);
+                    let arrive = (free_at + one_way + bump + held).max(first);
                     last_arrival = arrive;
-                    wire.push_back((arrive, t, on_wire, key, first, probe));
+                    // How the client times it (kbit/s): an older host's probe
+                    // in 8 packets at least, a train in full ones; their bytes
+                    // after the first over the first's arrival to the last's.
+                    let timed = probe.then(|| {
+                        let (packets, spread) = if !setup.airtime {
+                            (on_wire.div_ceil(1172).max(8), arrive - first)
+                        } else {
+                            let packets = if train { on_wire.div_ceil(1172).max(crate::video::PROBE_TRAIN_PACKETS) } else { on_wire.div_ceil(1172).max(8) };
+                            (packets, wifi_train_us(t, packets, on_wire / packets, capacity(now_ms)))
+                        };
+                        let nap = if setup.nap && !train { 1_100 + draw(t, 99) % 1_100 } else { 0 };
+                        let bytes = if setup.airtime { on_wire * (packets - 1) / packets } else { on_wire };
+                        (bytes as u64 * 8 * 1000 / spread.max(nap).max(150).max(packets as u64 * 8)) as u32
+                    });
+                    wire.push_back((arrive, t, on_wire, key, first, timed));
                     arriving.push_back((first, arrive, on_wire));
+                    }
                     frame_id += 1;
                 }
+            }
+            while lost.front().is_some_and(|&a| a <= t) {
+                lost.pop_front();
+                win.frames_lost += 1;
             }
             while wire.front().is_some_and(|w| w.0 <= t) {
                 let (arrive, capture, bytes, key, first, probe) = wire.pop_front().unwrap();
@@ -1880,8 +2384,8 @@ mod tests {
                 win.shards += bytes.div_ceil(1176) as u32;
                 // (Timed as the clients do: first packet to last — a probe goes in
                 // enough packets for that, however small.)
-                if floor.prompt(delay, first) && probe {
-                    win.link_kbps = win.link_kbps.max((bytes as u64 * 8 * 1000 / (arrive - first).max(150)) as u32);
+                if let Some(kbps) = probe.filter(|_| floor.prompt(delay, first)) {
+                    win.link_kbps = win.link_kbps.max(kbps);
                 }
                 if key {
                     awaiting = false;
@@ -1926,6 +2430,7 @@ mod tests {
                 (win, delay_sum, window_start) = (Feedback::default(), 0, t);
             }
         }
+        run.cuts = r.cuts;
         run
     }
 
@@ -2101,5 +2606,492 @@ mod tests {
             }
         }
         assert!(worse > 0.0);
+    }
+    // ---- A laptop's Wi-Fi uplink, probes timed through it -------------------
+
+    /// The AX210 laptop host's uplink to a wired desktop: 200-400 Mbit/s of
+    /// goodput, moving every few seconds.
+    fn ax210(ms: u64) -> f64 {
+        [300e6, 220e6, 380e6, 260e6, 340e6, 200e6, 400e6][(ms / 4_000) as usize % 7]
+    }
+
+    impl Run {
+        /// The median target and link (bits per second) from `from_ms` to `to_ms`.
+        fn medians(&self, from_ms: u64, to_ms: u64) -> (u32, u32) {
+            let w: Vec<_> = self.per_s.iter().filter(|s| s.0 >= from_ms && s.0 < to_ms).collect();
+            let mid = |f: fn(&(u64, u32, u32)) -> u32| {
+                let mut v: Vec<u32> = w.iter().map(|s| f(s)).collect();
+                v.sort();
+                v.get(v.len() / 2).copied().unwrap_or(0)
+            };
+            (mid(|s| s.1), mid(|s| s.2))
+        }
+    }
+
+    fn old_probes(s: Setup) -> Setup {
+        Setup { switches: Switches { probe_train: false, ..s.switches }, ..s }
+    }
+
+    /// Runs `setup` with an older host's probes and with trains, and prints both.
+    fn both(name: &str, setup: Setup, secs: u64, link: impl Fn(u64) -> f64 + Copy, phases: &[(u64, u64)]) -> (Run, Run) {
+        let (old, new) = (simulate(old_probes(setup), secs, link), simulate(setup, secs, link));
+        old.print(&format!("{name}, small probes"), phases);
+        new.print(&format!("{name}, trains"), phases);
+        for &(a, b) in phases {
+            let ((ot, ol), (nt, nl)) = (old.medians(a, b), new.medians(a, b));
+            println!(
+                "  {}-{} s median: target {} -> {} kbps, link {} -> {} Mbit/s",
+                a / 1000,
+                b / 1000,
+                ot / 1000,
+                nt / 1000,
+                ol / 1_000_000,
+                nl / 1_000_000
+            );
+        }
+        println!("  frames lost: {} -> {}", old.lost, new.lost);
+        (old, new)
+    }
+
+    /// The host's log: an office screen on the laptop's Wi-Fi, warm started
+    /// from the last stream's 1.2 Mbit/s, the client napping between
+    /// receives. Its probes — 8 small packets — timed the radio's channel
+    /// access and the nap: a few Mbit/s, and with that every radio bump was
+    /// the stream's own queue, down and down (0.4 Mbit/s at 14 fps there).
+    /// Trains time the link, and the stream gets the room it has.
+    #[test]
+    fn wifi_office_trains_find_the_link() {
+        let scroll: fn(u64) -> bool = |ms| ms % 6_000 < 1_500;
+        let office = Setup {
+            wifi: true,
+            lan: true,
+            airtime: true,
+            nap: true,
+            buffer_us: Some(40_000),
+            warm_bps: Some(1_200_000),
+            active: Some(scroll),
+            switches: Switches { lan_floor: false, link_memory: false, ..Switches::default() },
+            ..Setup::after()
+        };
+        let phases = [(0, 10_000), (10_000, 60_000), (60_000, 120_000)];
+        let (old, new) = both("office wifi", office, 120, ax210, &phases);
+        let ((ot, ol), (nt, nl)) = (old.medians(60_000, 120_000), new.medians(60_000, 120_000));
+        assert!((150_000_000..=450_000_000).contains(&nl), "trains read {nl}");
+        assert!(nl > ol * 3, "small probes read {ol}");
+        assert!(nt >= 10_000_000 && nt > ot * 3, "{ot} -> {nt}");
+        assert_eq!(new.lost, 0);
+        assert!(new.stats(10_000, 120_000).1 <= old.stats(10_000, 120_000).1 + 5.0);
+    }
+
+    /// Game mode on the same uplink, cold: every frame uses its budget. It
+    /// settles where the radio's own bumps hold it (a tenth of the link, see
+    /// `ours` in [`RateController::update`]), never over the link, and
+    /// loses nothing.
+    #[test]
+    fn wifi_game_converges_without_loss() {
+        let game = Setup {
+            wifi: true,
+            lan: true,
+            airtime: true,
+            buffer_us: Some(40_000),
+            switches: Switches { lan_floor: false, link_memory: false, ..Switches::default() },
+            ..Setup::after()
+        };
+        let (old, new) = both("game wifi", game, 60, ax210, &[(0, 10_000), (10_000, 60_000)]);
+        let ((ot, _), (nt, nl)) = (old.medians(10_000, 60_000), new.medians(10_000, 60_000));
+        assert!(nt >= 15_000_000 && nt > ot * 2, "{ot} -> {nt}");
+        assert!((150_000_000..=450_000_000).contains(&nl), "{nl}");
+        assert_eq!(new.lost, 0);
+        assert!(new.stats(10_000, 60_000).1 < 60.0, "p95 {}", new.stats(10_000, 60_000).1);
+    }
+
+    /// Then a neighbour takes the uplink (20 Mbit/s left for 15 s) and the
+    /// radio drops what waits over 40 ms. A train reads high only between
+    /// the cuts (their doubt holds it off): the stream backs off as fast as
+    /// with small probes, loses no more, and comes back after.
+    #[test]
+    fn wifi_congestion_with_trains_still_backs_off() {
+        let link = |ms: u64| if (20_000..35_000).contains(&ms) { 20e6 } else { ax210(ms) };
+        let game = Setup { wifi: true, lan: true, airtime: true, buffer_us: Some(40_000), ..Setup::after() };
+        let (old, new) = both("congested wifi", game, 60, link, &[(10_000, 20_000), (20_000, 35_000), (40_000, 60_000)]);
+        let settle = |r: &Run| r.settled(20_000, 150.0).unwrap().saturating_sub(20_000);
+        println!("  late by >150 ms until +{} ms -> +{} ms", settle(&old), settle(&new));
+        assert!(settle(&new) <= settle(&old) + 500, "{} vs {}", settle(&new), settle(&old));
+        // (What's on its way when the link drops is lost before any feedback
+        // can tell: more of it for a stream that had more of the link.)
+        let after = |r: &Run| r.lost_at.iter().filter(|&&t| t >= 20_100).count();
+        assert!(after(&new) <= after(&old) + 2, "{} vs {}", new.lost, old.lost);
+        assert!(new.medians(22_000, 35_000).0 <= 20_000_000, "{:?}", new.medians(22_000, 35_000));
+        assert!(new.stats(20_000, 35_000).1 <= old.stats(20_000, 35_000).1 * 1.25 + 5.0);
+        assert!(new.medians(40_000, 60_000).0 >= 15_000_000, "recovers: {:?}", new.medians(40_000, 60_000));
+    }
+
+    /// Padded trains every 5 s while an office stream idles far under the
+    /// link (`probeidle`): its padding was most of what it sent. The link
+    /// is still found, the rate and latency the same; and when something
+    /// takes the link while the screen is still, the next scroll backs off
+    /// as well. 32 runs each, the uplink's moves shifted (one run's cuts
+    /// fall where its radio's bumps do: a probe 7 ms later moved one phase's
+    /// mean rate 15% over 64 runs).
+    #[test]
+    fn wifi_idle_probes_seldom() {
+        let scroll: fn(u64) -> bool = |ms| ms % 12_000 < 1_000;
+        let office = Setup {
+            wifi: true,
+            lan: true,
+            airtime: true,
+            nap: true,
+            buffer_us: Some(40_000),
+            warm_bps: Some(1_200_000),
+            active: Some(scroll),
+            switches: Switches { link_memory: false, ..Switches::default() },
+            ..Setup::after()
+        };
+        let off = Setup { switches: Switches { probe_idle: false, ..office.switches }, ..office };
+        const RUNS: u64 = 32;
+        for taken in [false, true] {
+            let name = if taken { "uplink taken (20 Mbit/s) 60-90 s" } else { "office on the laptop's uplink" };
+            // Per arm: padding and video bytes, frames lost, the mean target
+            // 10-120 s (kbps), the median link (Mbit/s), video p95 (ms) and
+            // p95 60-90 s.
+            let mut sum = [(0u64, 0u64, 0u32, 0f64, 0f64, 0f64, 0f64); 2];
+            for shift in 0..RUNS {
+                for (arm, setup) in [off, office].into_iter().enumerate() {
+                    let link = move |ms: u64| if taken && (60_000..90_000).contains(&ms) { 20e6 } else { ax210(ms + shift * 877) };
+                    let r = simulate(setup, 120, link);
+                    let s = &mut sum[arm];
+                    let targets: Vec<f64> = r.per_s.iter().filter(|x| x.0 >= 10_000).map(|x| x.1 as f64).collect();
+                    s.0 += r.pad;
+                    s.1 += r.shown.iter().map(|f| f.2 as u64).sum::<u64>() - r.pad;
+                    s.2 += r.lost;
+                    s.3 += targets.iter().sum::<f64>() / targets.len() as f64 / 1e3 / RUNS as f64;
+                    s.4 += r.medians(10_000, 120_000).1 as f64 / 1e6 / RUNS as f64;
+                    s.5 += r.stats(10_000, 120_000).1 / RUNS as f64;
+                    s.6 += r.stats(60_000, 90_000).1 / RUNS as f64;
+                }
+            }
+            println!("{name} ({RUNS} runs):");
+            for (arm, s) in ["every 1 s", "probeidle"].iter().zip(&sum) {
+                println!(
+                    "  {arm:<10} padding {:>6} KB ({:>2.0}% of the video), lost {}, target {:>5.0} kbps, link {:>3.0} Mbit/s, video p95 {:>3.0} ms (60-90 s {:>3.0})",
+                    s.0 / 1000,
+                    s.0 as f64 * 100.0 / s.1 as f64,
+                    s.2,
+                    s.3,
+                    s.4,
+                    s.5,
+                    s.6
+                );
+            }
+            let [a, b] = sum;
+            assert!((b.0 as f64) < a.0 as f64 * 0.6, "{name}: padding {} -> {}", a.0, b.0);
+            assert!(b.2 <= a.2, "{name}: lost {} -> {}", a.2, b.2);
+            assert!(b.3 >= a.3 * 0.95, "{name}: target {:.0} -> {:.0}", a.3, b.3);
+            assert!(b.4 >= a.4 * 0.9, "{name}: link {:.0} -> {:.0}", a.4, b.4);
+            assert!(b.5 <= a.5 * 1.05 + 1.0 && b.6 <= a.6 * 1.05 + 1.0, "{name}: p95 {:.0} -> {:.0}, {:.0} -> {:.0} ms", a.5, b.5, a.6, b.6);
+        }
+    }
+
+    /// What the client reads off a probe on the laptop's uplink (300 Mbit/s
+    /// goodput), by its shape: an older host's 8 small packets with the
+    /// office nap, a game frame, and trains.
+    #[test]
+    fn wifi_probe_readings_by_shape() {
+        let read = |packets: usize, size: usize, nap: bool| {
+            let mut v: Vec<u64> = (0..2_000u64)
+                .map(|i| {
+                    let t = i * 1_000_003;
+                    let spread = wifi_train_us(t, packets, size, 300e6).max(if nap { 1_100 + draw(t, 99) % 1_100 } else { 0 });
+                    ((packets - 1) * size) as u64 * 8 / spread.max(150)
+                })
+                .collect();
+            v.sort();
+            (v[200], v[1_000], v[1_800])
+        };
+        let small = read(8, 300, true);
+        let game = read(100, 1_172, false);
+        let train = read(crate::video::PROBE_TRAIN_PACKETS, 1_172, false);
+        println!("Mbit/s p10/p50/p90: 8 x 300 B, napping {small:?}; 117 KB frame {game:?}; train {train:?}");
+        assert!(small.1 < 15, "{small:?}");
+        assert!((100..400).contains(&game.1), "{game:?}");
+        assert!(train.1 > 10 * small.1 && train.2 < 400, "{train:?}");
+    }
+
+    // ---- Power save on a fast Wi-Fi LAN --------------------------------------
+
+    impl Run {
+        /// The 95th percentile over time of how old the newest picture the
+        /// client has is (ms, from its capture): lag, frame rate and delay as
+        /// the user sees them together. (Counted per frame, a run of frames
+        /// behind one the radio held weighs six times as much at 60 fps as at
+        /// 10.)
+        fn age_p95(&self, from_ms: u64, to_ms: u64) -> f64 {
+            let mut newest = f64::NEG_INFINITY;
+            let mut shown = self.shown.iter().peekable();
+            let mut ages = Vec::new();
+            for t in 0..to_ms {
+                while let Some(s) = shown.next_if(|s| s.0 <= t) {
+                    newest = newest.max(s.0 as f64 - s.1);
+                }
+                if t >= from_ms {
+                    ages.push(t as f64 - newest);
+                }
+            }
+            ages.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ages.get(ages.len() * 95 / 100).copied().unwrap_or(f64::NAN)
+        }
+    }
+
+    /// A scenario for the power-save switches: a setup on a link, measured
+    /// over `span` (ms), run with `seeds` different radios (bumps and dozes).
+    #[derive(Clone, Copy)]
+    struct Case {
+        name: &'static str,
+        setup: Setup,
+        link: fn(u64) -> f64,
+        secs: u64,
+        span: (u64, u64),
+        seeds: u64,
+        /// A truly slow or queued path: it must be cut as fast as ever.
+        slow: bool,
+        /// The link drops at once at the first time (ms), and is down until the
+        /// second: the frames lost meanwhile (those on their way when it
+        /// dropped, more of them for a stream that had the link's room, and
+        /// the probes') are counted apart.
+        drop_ms: Option<(u64, u64)>,
+    }
+
+    /// One arm on one case, over its seeds: the target's median and mean,
+    /// the link the controller saw, what was delivered (Mbit/s) at how many
+    /// frames a second, video's p95, the picture's age at p95 (see
+    /// [`Run::age_p95`]) and audio's p95 (ms) — averaged; frames lost, those
+    /// of them in the 300 ms after a drop, and the cuts by reason — summed.
+    #[derive(Default, Clone, Copy)]
+    struct Tally {
+        med: f64,
+        mean: f64,
+        link: f64,
+        delivered: f64,
+        fps: f64,
+        p95: f64,
+        age: f64,
+        audio: f64,
+        lost: u32,
+        at_drop: u32,
+        react: f64,
+        settle: f64,
+        cuts: [u32; CUT_NAMES.len()],
+    }
+
+    impl Tally {
+        fn of(c: &Case, switches: Switches) -> Self {
+            let mut t = Tally::default();
+            let (a, b) = c.span;
+            for seed in 0..c.seeds {
+                let r = simulate(Setup { switches, seed, ..c.setup }, c.secs, c.link);
+                let w: Vec<f64> = r.per_s.iter().filter(|s| s.0 >= a && s.0 < b).map(|s| s.1 as f64 / 1e6).collect();
+                let (_, p95, fps, _) = r.stats(a, b);
+                let (med, link) = r.medians(a, b);
+                t.med += med as f64 / 1e6;
+                t.mean += w.iter().sum::<f64>() / w.len().max(1) as f64;
+                t.link += link as f64 / 1e6;
+                t.delivered += r.window(a, b).iter().map(|s| s.2 as f64).sum::<f64>() * 8.0 / (b - a) as f64 / 1e3;
+                t.fps += fps;
+                t.p95 += p95;
+                t.age += r.age_p95(a, b);
+                t.audio += r.audio_p95(a, b);
+                t.lost += r.lost;
+                t.at_drop += c.drop_ms.map_or(0, |(d, e)| r.lost_at.iter().filter(|&&l| (d..e).contains(&l)).count() as u32);
+                t.settle += c.drop_ms.map_or(0, |(d, _)| r.settled(d, 400.0).unwrap() - d) as f64;
+                t.react += c.drop_ms.map_or(0, |(d, _)| r.cut_at.iter().find(|&&t| t >= d).map_or(c.secs * 1000, |&t| t) - d) as f64;
+                for (sum, n) in t.cuts.iter_mut().zip(r.cuts) {
+                    *sum += n;
+                }
+            }
+            let n = c.seeds as f64;
+            for v in [&mut t.med, &mut t.mean, &mut t.link, &mut t.delivered, &mut t.fps, &mut t.p95, &mut t.age, &mut t.audio, &mut t.settle, &mut t.react] {
+                *v /= n;
+            }
+            t
+        }
+
+        fn print(&self, case: &str, arm: &str) {
+            let cuts: Vec<String> = CUT_NAMES.iter().zip(self.cuts).filter(|c| c.1 > 0).map(|(n, c)| format!("{n}:{c}")).collect();
+            println!(
+                "  {case:<30} {arm:<3} | target {:>5.1} / {:>5.1} | link {:>4.0} | delivered {:>5.1} at {:>4.1} fps | p95 {:>4.0} age {:>4.0} audio {:>4.0} | lost {:>3} | drop: {:>3} lost meanwhile, cut after {:>3.0}, late until {:>4.0} ms | {}",
+                self.med,
+                self.mean,
+                self.link,
+                self.delivered,
+                self.fps,
+                self.p95,
+                self.age,
+                self.audio,
+                self.lost,
+                self.at_drop,
+                self.react,
+                self.settle,
+                cuts.join(" ")
+            );
+        }
+    }
+
+    /// The cases each power-save switch is tried on.
+    fn doze_cases() -> Vec<Case> {
+        let scroll: fn(u64) -> bool = |ms| ms % 6_000 < 1_500;
+        let lan = Setup { wifi: true, lan: true, airtime: true, buffer_us: Some(40_000), ..Setup::after() };
+        // (The radio's own bumps are its dozes here.)
+        let dozing = Setup { doze: Some(3), bumps: false, ..lan };
+        let office = Setup { active: Some(scroll), office: true, ..dozing };
+        let case = |name, setup, link, secs, span| Case { name, setup, link, secs, span, seeds: 4, slow: false, drop_ms: None };
+        let blip: fn(u64) -> f64 = |ms| if (10_000..13_000).contains(&ms) { 2e6 } else { 200e6 };
+        let to_3m: fn(u64) -> f64 = |ms| if ms < 20_000 { 200e6 } else { 3e6 };
+        let to_20m: fn(u64) -> f64 = |ms| if (20_000..35_000).contains(&ms) { 20e6 } else { ax210(ms) };
+        vec![
+            case("game, 200M dozing", dozing, |_| 200e6, 60, (10_000, 60_000)),
+            case("game, ax210 dozing", dozing, ax210, 60, (10_000, 60_000)),
+            // The host's log: a bad stream's rate remembered, office mode.
+            case("office, 200M dozing, warm 0.7M", Setup { warm_bps: Some(700_000), ..office }, |_| 200e6, 60, (10_000, 60_000)),
+            case("game, 200M dozing, warm 0.7M", Setup { warm_bps: Some(700_000), ..dozing }, |_| 200e6, 60, (10_000, 60_000)),
+            case("office, listen 3, warm 0.7M", Setup { warm_bps: Some(700_000), listen: 3, ..office }, |_| 200e6, 60, (10_000, 60_000)),
+            // Something takes the link for 3 s, and what's left after.
+            Case { drop_ms: Some((10_000, 13_000)), ..case("office, 200M dozing, 2M 3 s", office, blip, 90, (15_000, 90_000)) },
+            Case { drop_ms: Some((10_000, 13_000)), ..case("game, 200M dozing, 2M 3 s", dozing, blip, 90, (15_000, 90_000)) },
+            // Truly slow: 3 Mbit/s queueing up to 2 s, on the dozing LAN
+            // and over the relay; and the dozing LAN dropping to that.
+            Case { slow: true, ..case("game, 3M dozing, deep", Setup { buffer_us: Some(2_000_000), ..dozing }, |_| 3e6, 60, (10_000, 60_000)) },
+            Case { slow: true, seeds: 1, ..case("game, 3M relay, deep", Setup::after(), |_| 3e6, 60, (10_000, 60_000)) },
+            Case { slow: true, drop_ms: Some((20_000, 21_000)), ..case("game, 200M dozing to 3M, deep", Setup { buffer_us: Some(2_000_000), ..dozing }, to_3m, 50, (25_000, 50_000)) },
+            // The cases before power save (see `wifi_game_converges_without_loss`).
+            Case { seeds: 1, ..case("game, ax210 (bumps)", lan, ax210, 60, (10_000, 60_000)) },
+            Case { slow: true, drop_ms: Some((20_000, 21_000)), ..case("game, ax210 to 20M (bumps)", lan, to_20m, 60, (22_000, 35_000)) },
+        ]
+    }
+
+    /// Runs every case with a switch (`on`) and without, prints both, and
+    /// returns them.
+    fn doze_ab(switch: &str, off: fn(&mut Switches)) -> Vec<(Case, Tally, Tally)> {
+        // (Each without the LAN floor, which hides what the others do: see
+        // `the_lan_floor_holds_a_dozing_lan_clean` for it.)
+        let with = Switches { lan_floor: false, link_memory: false, ..Switches::default() };
+        doze_ab_from(switch, with, off)
+    }
+
+    fn doze_ab_from(switch: &str, with: Switches, off: fn(&mut Switches)) -> Vec<(Case, Tally, Tally)> {
+        println!("{switch}: target median / mean, link, delivered (Mbit/s); video p95, picture age p95, audio p95 (ms)");
+        let mut without = with;
+        off(&mut without);
+        doze_cases()
+            .into_iter()
+            .map(|c| {
+                let (on, no) = (Tally::of(&c, with), Tally::of(&c, without));
+                no.print(c.name, "off");
+                on.print(c.name, "on");
+                (c, on, no)
+            })
+            .collect()
+    }
+
+    /// Nothing worse with the switch: pictures no later and audio no more
+    /// delayed (5 ms for noise), no more frames lost (but while a dropped
+    /// link is down, see [`Case::drop_ms`]), a drop cut as fast (250 ms for
+    /// noise) and drained nearly as fast, and a slow path held no higher.
+    /// (A stream that had more of the link before it dropped has more in a
+    /// deep queue to drain at 3 Mbit/s after: 200M dozing to 3M was late
+    /// for 2.9 s after the drop with `ownq` or `heldburst`, 2.5 without
+    /// either, though cut sooner — so 500 ms for that.)
+    fn doze_no_worse(results: &[(Case, Tally, Tally)]) {
+        for (c, on, no) in results {
+            let n = c.name;
+            assert!(on.p95 <= no.p95 + 5.0, "{n}: p95 {} vs {}", on.p95, no.p95);
+            assert!(on.age <= no.age + 5.0, "{n}: age {} vs {}", on.age, no.age);
+            assert!(on.audio <= no.audio + 5.0, "{n}: audio {} vs {}", on.audio, no.audio);
+            assert!(on.lost - on.at_drop <= no.lost - no.at_drop, "{n}: lost {} ({}) vs {} ({})", on.lost, on.at_drop, no.lost, no.at_drop);
+            if c.drop_ms.is_some() {
+                assert!(on.react <= no.react + 250.0, "{n}: cut after {} vs {}", on.react, no.react);
+                assert!(on.settle <= no.settle + 500.0, "{n}: late until {} vs {}", on.settle, no.settle);
+            }
+            if c.slow {
+                assert!(on.mean <= no.mean * 1.1 + 0.1, "{n}: mean {} vs {}", on.mean, no.mean);
+            } else {
+                assert!(on.med >= no.med * 0.95 && on.mean >= no.mean * 0.95, "{n}: {} / {} vs {} / {}", on.med, on.mean, no.med, no.mean);
+            }
+        }
+    }
+
+    /// A case's (switch on, off).
+    fn doze_case<'a>(results: &'a [(Case, Tally, Tally)], name: &str) -> (&'a Tally, &'a Tally) {
+        let (_, on, no) = results.iter().find(|r| r.0.name == name).unwrap();
+        (on, no)
+    }
+
+    /// `heldburst`: a dozing radio's beacon burst lasting two windows isn't
+    /// the stream's queue.
+    #[test]
+    fn a_dozing_radios_burst_is_not_a_lasting_queue() {
+        let r = doze_ab("heldburst", |s| s.held_burst = false);
+        doze_no_worse(&r);
+        for name in ["game, 200M dozing", "game, ax210 dozing", "office, 200M dozing, warm 0.7M", "game, 200M dozing, warm 0.7M"] {
+            let (on, no) = doze_case(&r, name);
+            assert!(on.med > no.med * 1.5, "{name}: {} vs {}", on.med, no.med);
+            assert!(on.cuts[CUT_QUEUE] < no.cuts[CUT_QUEUE], "{name}: {:?} vs {:?}", on.cuts, no.cuts);
+        }
+    }
+
+    /// `ownq`: a queue the stream's bytes couldn't have made isn't its own.
+    #[test]
+    fn a_queue_bigger_than_the_streams_bytes_is_not_its_own() {
+        let r = doze_ab("ownq", |s| s.own_queue = false);
+        doze_no_worse(&r);
+        for name in ["game, 200M dozing", "game, ax210 dozing", "office, 200M dozing, warm 0.7M", "game, 200M dozing, warm 0.7M"] {
+            let (on, no) = doze_case(&r, name);
+            assert!(on.med > no.med * 1.3, "{name}: {} vs {}", on.med, no.med);
+            assert!(on.cuts[CUT_QUEUE] < no.cuts[CUT_QUEUE], "{name}: {:?} vs {:?}", on.cuts, no.cuts);
+        }
+    }
+
+    /// `loneframe`: under ~20 fps a lone frame the radio held doesn't make a
+    /// lasting queue.
+    #[test]
+    fn a_lone_held_frame_is_not_a_lasting_queue() {
+        let r = doze_ab("loneframe", |s| s.lone_frame = false);
+        doze_no_worse(&r);
+        let (on, no) = doze_case(&r, "office, 200M dozing, 2M 3 s");
+        assert!(on.med > no.med * 1.15 && on.age < no.age, "{} / {} vs {} / {}", on.med, on.age, no.med, no.age);
+        assert!(on.cuts[CUT_QUEUE] < no.cuts[CUT_QUEUE], "{:?} vs {:?}", on.cuts, no.cuts);
+    }
+
+    /// `linkmemory`: on a dozing LAN, what the link showed is remembered
+    /// over the cuts that reset the estimate to the stream's own rate.
+    #[test]
+    fn link_memory_keeps_a_dozing_lan_off_its_own_rate() {
+        let r = doze_ab_from("linkmemory", Switches::default(), |s| s.link_memory = false);
+        for (c, on, no) in &r {
+            if !c.slow && c.drop_ms.is_none() {
+                assert!(on.med >= no.med * 0.95, "{}: {} vs {}", c.name, on.med, no.med);
+            }
+            assert!(on.lost - on.at_drop <= no.lost - no.at_drop + 2, "{}: lost {} vs {}", c.name, on.lost, no.lost);
+        }
+    }
+
+    /// `lanfloor`: on a dozing LAN, delay bumps alone don't cut the stream
+    /// under 20 Mbit/s; a LAN link that really drops still gets cut.
+    #[test]
+    fn the_lan_floor_holds_a_dozing_lan_clean() {
+        let r = doze_ab_from("lanfloor", Switches::default(), |s| s.lan_floor = false);
+        for (c, on, no) in &r {
+            if !c.slow && c.drop_ms.is_none() {
+                assert!(on.med >= no.med * 0.95, "{}: {} vs {}", c.name, on.med, no.med);
+            }
+            assert!(on.lost - on.at_drop <= no.lost - no.at_drop + 2, "{}: lost {} vs {}", c.name, on.lost, no.lost);
+        }
+        // (The simulated LAN mostly recovers without it; where it doesn't —
+        // a LAN that dropped to 20 Mbit/s, bumps cutting it to 6 — it holds
+        // half what the link showed. Cost: on a LAN really down to 3 Mbit/s
+        // it streams at 2.4, not 0.5, ~35 ms later.)
+        let (on, no) = doze_case(&r, "office, 200M dozing, warm 0.7M");
+        assert!(on.med >= 15.0 && on.med > no.med * 1.1, "{} vs {}", on.med, no.med);
+        let (on, no) = doze_case(&r, "game, ax210 to 20M (bumps)");
+        assert!(on.med > no.med * 1.5, "{} vs {}", on.med, no.med);
     }
 }

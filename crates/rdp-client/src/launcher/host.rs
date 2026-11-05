@@ -42,6 +42,9 @@ pub struct Status {
     pub display_available: bool,
     /// How this PC streams (its This PC page switches).
     pub settings: crate::hyper_direct::HostSettings,
+    /// An integrated GPU beside a faster one (a hybrid laptop): the
+    /// integrated one's name, for the Host GPU choice (none: it has no effect).
+    pub integrated_gpu: Option<String>,
 }
 
 pub fn status() -> Status {
@@ -69,6 +72,8 @@ pub fn status() -> Status {
             .and_then(|e| e.parent().map(|d| d.join("rdpio-display").join("rdpio-display.inf")))
             .is_some_and(|p| p.exists()),
         settings: crate::hyper_direct::host_settings(),
+        // (Listing the adapters wakes no GPU: no device is made.)
+        integrated_gpu: rdp_gpu::hyper::battery::frugal(&rdp_gpu::hyper::battery::adapters()).map(|g| g.name.clone()),
     }
 }
 

@@ -14,24 +14,37 @@
 //! - [`input`]: client input that survives loss without stuck keys.
 //! - [`rate`]: delay- and loss-driven bitrate and FEC control.
 //! - [`audio`] + [`playout`]: Opus packets, and the jitter buffer that plays them.
+//! - [`autores`] + [`backlog`]: the clients' shared judgement of the link —
+//!   the stream's size from the bits that arrive, and when a decode backlog
+//!   goes for a fresh keyframe (the same on Windows and Android).
+//! - [`pause`]: when a paused host lets its GPU pipeline go, and takes it back.
+//! - [`ltr`]: long-term references, and when a loss is repaired from one.
 //!
 //! Platform-neutral; the capture/encode/decode ends live in `rdp-gpu` and
 //! `rdp-client`.
 
+pub mod bulk_tcp;
 pub mod audio;
 pub mod auth;
+pub mod autores;
+pub mod backlog;
 pub mod control;
 pub mod fec;
 pub mod input;
 pub mod lan;
 pub mod liveness;
+pub mod ltr;
 pub mod messages;
+pub mod pause;
 pub mod playout;
 pub mod rate;
 pub mod reliable;
 pub mod update;
 pub mod video;
 pub mod wire;
+
+#[cfg(test)]
+mod fecsim;
 
 /// Default UDP port the host agent listens on.
 pub const DEFAULT_PORT: u16 = 47998;

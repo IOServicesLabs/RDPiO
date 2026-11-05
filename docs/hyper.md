@@ -236,6 +236,13 @@ what it shows, 1:1.
   resolution and upscales the rest (`--upscale`).
 - A desktop of another shape than the screen (16:9 on a 3:2 Surface) keeps
   its shape, with black bars. The mouse maps to the picture.
+- **Auto resolution**, as in the Android app (`rdp_hyper::autores`): when the
+  link falls behind and the bits per pixel run short (~1 Mbps to a 2560x1440
+  window), the Windows client asks for 75/50% of the window (33% in office
+  mode) and upscales it with FSR+RCAS (office mode: bicubic; `--upscale`
+  overrides both); it goes
+  back up after 10 s clear. `--hyper-scale auto|100|75|50|33` pins it, and so
+  does an explicit `--render-scale`.
 
 `--hyper-size` on the host overrides all of this.
 
@@ -276,14 +283,40 @@ resolution changes, and monitor consolidation. If the network drops, the
 client reconnects by itself and the host keeps the session unlocked for 20 s;
 closing the window locks the host immediately.
 
-Clipboard and file copies only use what the stream leaves free: they slow
-down the moment the link starts queueing, and the pointer never waits behind
-them (it has its own lane).
+File copies go as fast as the network carries them: the bar is RDP's
+(250 MB over a Wi-Fi LAN in 15 s), and anything slower is a bug. On a LAN
+path the bulk lane isn't paced by the video's rate controller (`bulkfast`):
+the reliable channel's own congestion window (slow start; halving on loss,
+and on 25 ms of queueing over the least round trip, `bulkq`) finds the
+path's rate, as TCP's does, with up to 4096 chunks (4.9 MB) in flight to a
+current peer (256 to an older one). Elsewhere (relays, the internet) copies
+use only what the stream leaves free. The pointer never waits behind them
+(it has its own lane). A copy's sender logs `copied files all delivered`
+with its time and rate. Pasted files appear at once (virtual files, as in
+RDP), and stream in as they arrive. On a direct-mode host the agent runs as SYSTEM,
+and Windows hides a file copy's list from SYSTEM (even impersonating the
+user): it asks a short-lived `rdpio --hyper-clipboard-files` running as the
+signed-in user for the copied paths, and reads the files with the user's rights.
 
 A host whose display has gone to sleep is woken when a client connects (it
 has to be on to be captured), and stays awake while streamed — as does the
 client. Minimizing the client window pauses the stream (the host encodes
 nothing, the laptop decodes nothing); restoring it resumes at once.
+
+Paused for 10 s, the host also lets its GPU go: the encoder (NVENC) session,
+the capture with its NV12 converter and frames, and the capture's D3D11
+device (switch `pauserelease`). An open encoder session held a laptop's
+discrete GPU (RTX 2070 Max-Q) at P3 with its memory at full clock, ~25 W,
+with nothing encoded — and streams spend most of their time paused. Restored
+(or a keyframe asked for), it's all rebuilt and starts with a keyframe; the
+host log says `pause release: rebuilt in N ms` and when the first picture
+went out (the aim: within 200-300 ms). `pausereleasedev=0` keeps the capture
+and its device and lets only the encoder session go — to tell with
+`nvidia-smi` which holds the GPU up. Expected: the NVENC session (its P-state
+should fall towards P8 once it's gone); a GPU still at P3 with everything let
+go is held by the virtual monitor, whose desktop it renders. Dropping the
+device costs little (every capture opens its own anyway), and a live device,
+idle or not, keeps a hybrid laptop's GPU in use, so it can't power off.
 
 If the host's GPU driver resets or its encoder fails, the stream rebuilds
 itself within a second or two; if the client's GPU resets, the client starts a
@@ -421,12 +454,49 @@ The picture on a bad path (host; each a switch, on unless said):
   at 700 kbps sat at 0.5-4.5 Mbps (each scroll a smear) and now holds ~47
   (`a_slow_lan_stream_still_finds_the_link`). `link_mbps` in the perf line.
   Not over Tailscale: a relay hands packets over in bunches.
+- **Probe trains** (`probetrain`): a probe goes out as a train of at least
+  48 full-size packets, the frame's data then parity, and the client times
+  the whole train (parity after the frame completed too), with its office
+  receive nap off meanwhile. A few small packets timed first to last showed
+  the radio's channel access and the client's 1-2 ms nap, not the link: an
+  AX210 laptop's ~300 Mbit/s uplink read 1-6 Mbit/s in office mode (100-380
+  in game mode's big frames), and the stream sat at 0.4 Mbps, 13 fps. The
+  link is the most a train showed over 4 s, never under what was delivered;
+  the padding (~0.5 Mbit/s) isn't counted as the stream's. While the stream
+  carries under a twentieth of the link, a frame that would be mostly
+  padding probes only every 5 s (`probeidle`), the link then the most of the
+  last 4 readings (30 s at most), and after a cut's doubt 4 readings come a
+  second apart first: an idle office stream's trains were a third of its
+  packets. Simulated on a clean LAN, 13.1 → 11.2 packets a frame shown; on
+  the laptop's uplink, padding 17% → 9% of the video, the rate within 2%,
+  p95 the same.
 
 The host's perf line names why the rate came down in each 5 s (`cuts=`:
 `probe`, `gap`, `standing`, `drain`, `loss`, `queue`, `soft`).
 - **Clean-path parity** (`fecfloor`): after 10 s without loss, big non-key
   frames carry 2% parity instead of 5% (at least one parity packet a block
   still; keyframes keep theirs).
+- **Interleaved blocks** (`interleave`): a frame of several FEC blocks (over
+  64 packets: keyframes, big scrolls) goes a packet of each block in turn,
+  data then parity, so packets lost back to back cost each block a few that
+  its parity rebuilds, not one block all of them. Simulated packet by packet
+  (`cargo test -p rdp-hyper fecsim -- --nocapture`), 1% lost in runs of 8
+  and a keyframe every 5 s: keyframes lost 71 → 23 of ~430, resume to
+  picture 56 → 27 ms, frames never shown 497 → 291, packets a frame shown
+  18.5 → 17.3; the same elsewhere.
+- **Repair parity** (`repairfec`): a repair (a frame coded from a long-term
+  reference after a loss, the one that ends the client's freeze) carries at
+  least half its size in parity, clean path or not: lost too, the picture
+  stays frozen another request and round trip. Simulated, a game on Wi-Fi
+  losing 1% in runs of 8: frozen 72.6 → 55.1 s in 32 min, frames never
+  shown 7429 → 6639, packets +0.7%; office 1657 → 1554 ms.
+- **Repairs that worked** (`repairok`): a third repair within a second
+  brings a keyframe — unless the client has since decoded a kept frame newer
+  than the last repair, which shows it took. The rule is for repairs that
+  don't; on Wi-Fi losing a frame or two a second, each repaired, it sent a
+  300 KB keyframe every second or so (`rdp_hyper::ltr`). Simulated, a game
+  losing 1% in runs of 8: keyframes 386 → 67 in 32 min, bytes a frame -1.1%,
+  frozen 55.1 → 52.3 s.
 - **Slow pacing** (`slowpace=1`, off by default): on a slow or queued link
   frames are paced at 1.2x the target instead of 2.5x, so they wait on the
   host rather than in front of the audio in the relay. Simulated: audio p95
@@ -437,15 +507,37 @@ a cold start's latency 10-30 s in went from ~20 s to ~0.1 s (29 keyframes
 to 1); warm started, the first picture comes at 0.4 s instead of 2.7 s.
 
 Host switches (`%PUBLIC%\rdpio-hyper-switches.txt`, `name=0` turns one off,
-read live): `pathinfo`, `inputdup` (Windows client), `fastreconnect`,
-`keepmonitor`, `vbvcap`, `presetfollow=1`, `introfresh=1` (the last two off
+read live): `pathinfo`, `inputdup` and `burstok` (Windows client; the
+latter keeps a draining decode backlog instead of dropping it for a keyframe,
+as Android does: `rdp_hyper::backlog`), `fastreconnect`,
+`keepmonitor`, `vbvcap`, `lowbppcap` (at low bits per pixel a game-mode
+frame may take up to 0.2 bits a pixel, at most 100 ms of the link, instead
+of two frames' worth), `presetfollow=1`, `introfresh=1` (the last two off
 by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
-`gapcut`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
-`growcap`, `softslow`, `fecfloor`,
-`slowpace=1` (off by default), `audiorate`, `opusfec`, `audiofirst` (read as a sender starts),
+`gapcut`, `probetrain`, `warmstart` (read as a stream starts), `fpsfollow`, `officefps`,
+`growcap`, `softslow`, `fecfloor`, `interleave`, `probeidle`, `repairfec`, `repairok`,
+`gamesharpen` (game mode re-encodes a still screen sharper too, as office
+mode does, under 0.05 bits a pixel a frame: 1440p60 under ~11 Mbps),
+`pausehold` (a minimized client's stream holds its rate instead of drifting
+up to resting, which restore then slammed to the floor),
+`slowpace=1` (off by default), `battigpu` (read as a stream starts and as a stream would move; `0` forces the fastest GPU whatever Host GPU says; see On battery), `audiorate`, `opusfec`, `audiofirst` (read as a sender starts),
 `catchup` — the last three also on a Windows client, from its own
-`%PUBLIC%` file. The Android app's are `debug.rdpio.inputdup` and
+`%PUBLIC%` file — `pauserelease` and `pausereleasedev` (see below). The Android app's are `debug.rdpio.inputdup` and
 `debug.rdpio.fastreconnect` (see android.md).
+
+Host power switches (same file, on by default):
+
+- `clockbatt`: no GPU clock floor on battery (power source looked at every
+  3 s); the floor cost ~6 W on a laptop for an encode that took 3-4 ms anyway.
+- `pausequiet`: the client's window minimized 5 s, Wi-Fi streaming mode, the
+  1 ms timer, MMCSS and the REALTIME GPU class let go until it's back; a
+  paused stream sends nothing, yet those kept the laptop out of idle.
+- `pausepoll`: while paused, the capture loop sleeps until woken (window
+  back, keyframe, goodbye) or 500 ms, and the receive socket waits 100 ms
+  not 10: ~120 of a paused stream's ~250 wake-ups a second were these.
+- `displayretry`: `SetDisplayConfig` 5 (the desktop switching) is retried on
+  the input desktop for up to 8 s (2 s for the layout's restore) before the
+  host's own monitor is streamed; that fallback always ended in an error.
 
 ## Latency notes
 
@@ -520,6 +612,138 @@ by default; see Latency notes), `standingq`, `drain`, `onekey`, `keyprobe`,
   adds ≈ 2 ms. Packet pacing is adaptive: tight on a clean path, spread out
   only when loss shows a Wi-Fi radio or router can't take bursts.
 - HDR desktops are captured too (Windows converts them to SDR for the stream).
+
+## On battery: the host on the integrated GPU
+
+A hybrid laptop host (Razer Blade 15: Intel UHD 630 + RTX 2070 Max-Q) streaming
+office work on battery drew 35-42 W, 25-32 W of it the NVIDIA GPU alone while
+its encoder was 1-7% busy: the virtual monitor is rendered on it, captured on
+it and encoded on it, so it never powers off. With it off the laptop should
+draw ~10-14 W.
+
+**Host GPU** (the launcher's This PC page, shown only on a laptop with an
+integrated GPU beside a faster one; `"host_gpu"` in `hyper-host.json`, or
+`--hyper-host-settings host_gpu=auto|fastest|power_saving`):
+
+- *Auto* (the default): the integrated GPU on battery, the fastest plugged
+  in — and a running stream follows the cable (below).
+- *Fastest*: always the fastest GPU, as before there was a choice.
+- *Power saving*: always the integrated GPU, plugged in too, wherever its
+  encoder passes the trial (else the fastest, logged).
+
+On a machine with one GPU (or two discrete ones) it has no effect: there's
+nothing the discrete GPU could hand over to. The switch `battigpu=0` in
+`%PUBLIC%dpio-hyper-switches.txt` overrides all three: the fastest GPU,
+and nothing moves mid-stream.
+
+**What changes on the integrated GPU** (it's used only when the laptop has
+one with a hardware H.264 encoder; plugged in under Auto, nothing changes):
+
+- *Render adapter.* The virtual monitor is added with the integrated GPU as
+  its render adapter (`IddCxAdapterSetRenderAdapter`, already in the driver)
+  instead of the fastest GPU (`hyper_direct.rs`, `host_battery.rs`).
+- *Capture.* Follows by itself: the capture opens on the adapter the
+  monitor's output is on, and the driver shares its frames from there.
+- *Encoder.* Follows the capture's device: NVENC isn't tried on a non-NVIDIA
+  device, and Media Foundation's encoder is asked for *by GPU*
+  (`MFTEnum2` with `MFT_ENUM_ADAPTER_LUID`). The plain list carries no GPU
+  on its entries, so before this the fastest GPU's encoder was taken — and
+  NVIDIA's encoder handed an Intel device fails with E_UNEXPECTED, which is
+  how every stream on the Intel GPU ended at once before the monitor was
+  moved to the fastest GPU. On the fastest GPU the plain list is used as
+  before.
+- *Codec and rate.* H.264, at most 60 fps (the offer says so; a client
+  without H.264 stays on the fastest GPU).
+- *A trial first.* Once per agent, the integrated encoder codes three 1080p
+  frames of text before a stream is put on it; a failure (or a frame over
+  50 ms) keeps every stream on the fastest GPU. The choice and why are logged
+  at each sign-in ("the virtual monitor renders and encodes on the
+  integrated GPU" / "the integrated GPU is wanted, but staying on the
+  fastest GPU", with the setting and the power source).
+
+**Measured** on the UHD 630 through the host's own encoder (`cargo run
+--release -p rdp-gpu --example igpu_probe`; synthetic scrolling text, 1 ms
+timer), per frame, p50:
+
+| | 2560x1440 | 1920x1080 |
+|---|---|---|
+| Quick Sync H.264, fast | 8.0 ms (BGRA in: 8.5) | 6-7 ms |
+| Quick Sync H.264, office quality | 9-17 ms | 7-9 ms |
+| Intel HEVC, fast | fails on the first frame (E_FAIL) | fails |
+| Intel HEVC, office quality | 54 ms | 34-37 ms |
+| NVENC HEVC (for comparison) | 3.6 ms | |
+
+So H.264 only, and 1440p60 holds (8 ms of a 16.7 ms frame): no resolution cap.
+Quick Sync refuses 240 fps outright (MF_E_INVALIDMEDIATYPE), hence the 60 fps
+cap, which also saves the frames nobody needs on battery (the stream measured
+on battery delivered 9 fps median).
+
+**A power change mid-stream** (Auto only) moves the stream by reconnecting
+it. The stream's loop looks at the power source once a second
+(`host_battery::move_due`); once the new source has held for 10 s — a cable
+wiggled or a dock dropping for a moment doesn't bounce the stream — the host
+logs "the power source changed and held: moving the stream to the other
+GPU", ends the stream with `Control::Reconnect` (as for a service restart)
+and keeps the console unlocked for the client's new sign-in, which decides
+the GPU, codec and rate again: unplugged, H.264 at up to 60 fps on the
+integrated GPU; plugged in, the fastest GPU's codec (HEVC/AV1) and the
+client's full rate. One move a stream: the watch is gone once it fires and
+the new stream starts a fresh 10 s. A move to the integrated GPU happens only
+where the new sign-in would land there (the client decodes H.264, the stream
+fits 4096 a side, the encoder passes its trial), else the stream stays and
+says why — no reconnect every 10 s for nothing.
+
+Why a reconnect, not a move in place: the driver sets the render adapter only
+as it adds a monitor, so either way the virtual monitor is replaced and the
+pipeline reopened; but the codec changes with the GPU too (Intel's HEVC
+fails, NVIDIA's H.264 is the lesser choice there), and the protocol agrees a
+codec only at sign-in — neither client can switch decoders mid-stream, and an
+in-place change would need a new message every client understands. Every
+client already reconnects at once on `Reconnect` (250 ms, then sign-in), and
+the sign-in path is the one every stream takes. The Windows client shows
+"Reconnecting..." meanwhile (not "connection lost").
+
+The gap the user sees, estimated from the logged steps (not yet timed end to
+end on battery): the client's 250 ms wait and sign-in (a few round trips),
+the old virtual monitor removed (~0.8 s, the host's layout put back on the
+way), the new one added on the other GPU and streaming (~1.1 s; 0.9-1.9 s
+logged) and scaled (~0.4 s), the pipeline opened and a keyframe (~0.1 s):
+about 2.5-3 s of frozen picture, windows on the virtual monitor moving to the
+host's own screens and back as on a reconnect at a new size. The first move
+to the integrated GPU in an agent's life also runs its encoder trial (a few
+hundred ms) before the stream ends. Adding the new monitor with
+`RDPIO_DISPLAY_FLAG_REPLACE` before the old is removed would save the removal
+and the window shuffle; not done yet, since the old monitor's removal removes
+every monitor of ours.
+
+A monitor kept for a quick reconnect (`keepmonitor`) is kept across a move
+too, but it's streamed again only when made for the same render GPU (as well
+as the size, rate and scale): so it's reused only if the power source flips
+back before the client is in, and a reconnect after a power change always
+gets a monitor on the right GPU.
+
+**Risks.**
+
+- The discrete GPU powering off is expected, not yet measured: anything else
+  that touches it keeps it on. The clock floor (`GpuClockFloor`) talks to
+  the NVIDIA driver while a stream runs and must not on battery; polling
+  `nvidia-smi` to measure wakes it too (watch the battery draw instead).
+- Quick Sync shares the integrated GPU with the desktop's composition; a
+  heavy desktop on it may lengthen encodes beyond the synthetic numbers.
+- A game on the host still renders on the NVIDIA GPU; its frames are then
+  copied across to the integrated GPU's monitor (Windows does it), costing
+  latency and keeping the dGPU on — expected, and that's plugged-in use.
+- Intel's encoder differs from NVENC: no in-place bitrate changes (a big
+  move rebuilds it: ~30 ms and a keyframe), long-term references as Media
+  Foundation offers them.
+- Windows reports the integrated GPU as most frugal and not fastest; the
+  host also requires it to have under 512 MB of its own memory. A machine
+  where that guess is wrong stays on the fastest GPU (`battigpu=0` forces it).
+- A move mid-stream costs ~2.5-3 s of picture each time the cable goes in or
+  out for more than 10 s; Fastest or Power saving avoid it.
+- On the open-source Virtual Display Driver (the fallback) the render GPU
+  can't be chosen, so the integrated GPU only changes the codec and rate
+  there, and a move only reconnects.
 
 ## Updates and versions
 
