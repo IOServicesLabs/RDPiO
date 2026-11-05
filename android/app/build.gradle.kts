@@ -14,8 +14,8 @@ android {
         // Android 11: MediaCodec's low-latency decoding, Surface.setFrameRate.
         minSdk = 30
         targetSdk = 36
-        versionCode = 301
-        versionName = "0.3.1"
+        versionCode = 400
+        versionName = "0.4.0"
         ndk { abiFilters += "arm64-v8a" }
     }
 
