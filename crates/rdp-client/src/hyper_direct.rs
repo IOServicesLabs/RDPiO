@@ -162,11 +162,49 @@ pub struct HostSettings {
     pub auto_update: bool,
     /// …to nightly builds rather than releases.
     pub nightly: bool,
+    /// Which GPU a stream runs on, on a laptop with two (see host_battery).
+    pub host_gpu: HostGpu,
 }
 
 impl Default for HostSettings {
     fn default() -> Self {
-        Self { virtual_display: true, match_resolution: true, fast_refresh: true, keep_monitors: false, auto_update: true, nightly: false }
+        Self {
+            virtual_display: true,
+            match_resolution: true,
+            fast_refresh: true,
+            keep_monitors: false,
+            auto_update: true,
+            nightly: false,
+            host_gpu: HostGpu::Auto,
+        }
+    }
+}
+
+/// The This PC page's "Host GPU", on a hybrid laptop (an integrated GPU and a
+/// discrete one; one GPU: no effect). Only a stream on a virtual monitor
+/// moves: the host's own screens stay on the GPU they hang off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostGpu {
+    /// The integrated GPU on battery (the discrete one can power off), the
+    /// fastest plugged in — and a running stream follows the power cable.
+    #[default]
+    Auto,
+    /// The fastest GPU always: as before there was a choice.
+    Fastest,
+    /// The integrated GPU always, where its hardware H.264 encoder works
+    /// (H.264, at most 60 fps, plugged in too).
+    PowerSaving,
+}
+
+impl HostGpu {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "auto" => Some(Self::Auto),
+            "fastest" => Some(Self::Fastest),
+            "power_saving" => Some(Self::PowerSaving),
+            _ => None,
+        }
     }
 }
 
@@ -180,12 +218,17 @@ pub fn host_settings() -> HostSettings {
 }
 
 /// `--hyper-host-settings name=1,name=0,…` (elevated, from the launcher):
-/// changes the named settings, keeps the rest.
+/// changes the named settings, keeps the rest. `host_gpu=auto|fastest|power_saving`.
 pub fn save_host_settings() -> Result<(), Box<dyn std::error::Error>> {
     let spec = std::env::args().skip_while(|a| a != "--hyper-host-settings").nth(1).ok_or("no settings given")?;
     let mut s = host_settings();
     for pair in spec.split(',').filter(|p| !p.trim().is_empty()) {
         let (name, value) = pair.split_once('=').ok_or_else(|| format!("{pair:?} isn't name=0|1"))?;
+        // (The one setting that isn't on or off.)
+        if name.trim() == "host_gpu" {
+            s.host_gpu = HostGpu::from_name(value.trim()).ok_or_else(|| format!("{value:?} isn't auto, fastest or power_saving"))?;
+            continue;
+        }
         let on = match value.trim() {
             "1" | "on" | "true" => true,
             "0" | "off" | "false" => false,
@@ -760,6 +803,18 @@ fn supervise(opts: &HostOptions) {
 /// How often the service looks for a new rdpio (and how long after starting).
 const UPDATE_EVERY: Duration = Duration::from_secs(6 * 3600);
 const FIRST_UPDATE_CHECK: Duration = Duration::from_secs(120);
+/// A client on a newer rdpio signed in (see [`update_hint`]): the service
+/// looks within this long (s) instead of hours later — at most this often.
+const HINT_POLL: Duration = Duration::from_secs(10);
+const HINT_MIN_GAP: Duration = Duration::from_secs(600);
+
+/// Left by the agent when a client runs a newer rdpio than this host: the
+/// client was updated, the host service (its own copy, in Program Files)
+/// wasn't, and it would have stayed behind until its next look on GitHub —
+/// two PCs "both updated" with the host's half of a fix still missing.
+fn update_hint() -> PathBuf {
+    data_dir().join("hyper-update-hint")
+}
 
 /// Look on GitHub for a newer rdpio now and then (when this PC's settings
 /// allow); one that's found and checked waits in the returned slot.
@@ -788,7 +843,15 @@ fn watch_for_updates() -> Arc<Mutex<Option<rdp_hyper::update::Package>>> {
                     Err(e) => tracing::info!(error = %e, "couldn't look for updates"),
                 }
             }
-            sleep_unless_stopping(UPDATE_EVERY);
+            // Until the next look, or a newer client's hint (taken either way).
+            let (looked, next) = (Instant::now(), Instant::now() + UPDATE_EVERY);
+            while !STOP.load(Ordering::SeqCst) && Instant::now() < next {
+                if std::fs::remove_file(update_hint()).is_ok() && looked.elapsed() >= HINT_MIN_GAP {
+                    tracing::info!("a client runs a newer rdpio: looking for it now");
+                    break;
+                }
+                sleep_unless_stopping(HINT_POLL);
+            }
         }
     });
     slot
@@ -1030,6 +1093,49 @@ pub(crate) fn lock_as_user(session: u32) -> windows::core::Result<()> {
 /// and wait (up to 3 s) for it: its exit code, if it finished. Needs SYSTEM
 /// (the user's token).
 pub(crate) fn run_as_user(session: u32, args: &str) -> windows::core::Result<Option<u32>> {
+    spawn_as_user(session, args, None)
+}
+
+/// Most a [`output_as_user`] run may write.
+const USER_OUTPUT_MAX: u64 = 8 * 1024 * 1024;
+
+/// [`run_as_user`], with what it wrote to its stdout. One still running at
+/// the deadline is ended (its output is never half-read as complete).
+pub(crate) fn output_as_user(session: u32, args: &str) -> windows::core::Result<Option<(u32, Vec<u8>)>> {
+    use std::io::Read;
+    use std::os::windows::io::FromRawHandle;
+    use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAGS, HANDLE_FLAG_INHERIT};
+    use windows::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows::Win32::System::Pipes::CreatePipe;
+    unsafe {
+        let (mut read, mut write) = (HANDLE::default(), HANDLE::default());
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: true.into(),
+        };
+        CreatePipe(&mut read, &mut write, Some(&sa as *const _), 64 * 1024)?;
+        // Only the write end goes to the child; ours is read meanwhile (a
+        // long list mustn't fill the pipe and stall it).
+        let reader = std::fs::File::from_raw_handle(read.0 as _);
+        if let Err(e) = SetHandleInformation(read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) {
+            let _ = CloseHandle(write);
+            return Err(e);
+        }
+        let drain = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = reader.take(USER_OUTPUT_MAX).read_to_end(&mut out);
+            out
+        });
+        let code = spawn_as_user(session, args, Some(write));
+        // (The child's copy closes as it exits: then the read ends.)
+        let _ = CloseHandle(write);
+        let out = drain.join().unwrap_or_default();
+        code.map(|c| c.map(|c| (c, out)))
+    }
+}
+
+fn spawn_as_user(session: u32, args: &str, stdout: Option<HANDLE>) -> windows::core::Result<Option<u32>> {
     use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
     use windows::Win32::System::Threading::*;
     unsafe {
@@ -1047,11 +1153,16 @@ pub(crate) fn run_as_user(session: u32, args: &str) -> windows::core::Result<Opt
         let exe = std::env::current_exe().map_err(|e| windows::core::Error::new(windows::Win32::Foundation::E_FAIL, e.to_string()))?;
         let mut cmd_w = wide(&format!("\"{}\" {args}", exe.display()));
         let mut desktop = wide(r"winsta0\default");
-        let si = STARTUPINFOW {
+        let mut si = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
             lpDesktop: PWSTR(desktop.as_mut_ptr()),
             ..Default::default()
         };
+        // (Inherited: only handles made inheritable are — the pipe's end.)
+        if let Some(out) = stdout {
+            si.dwFlags = STARTF_USESTDHANDLES;
+            si.hStdOutput = out;
+        }
         let mut pi = PROCESS_INFORMATION::default();
         CreateProcessAsUserW(
             Some(token),
@@ -1059,7 +1170,7 @@ pub(crate) fn run_as_user(session: u32, args: &str) -> windows::core::Result<Opt
             Some(PWSTR(cmd_w.as_mut_ptr())),
             None,
             None,
-            false,
+            stdout.is_some(),
             CREATE_NO_WINDOW,
             None,
             PCWSTR::null(),
@@ -1067,6 +1178,9 @@ pub(crate) fn run_as_user(session: u32, args: &str) -> windows::core::Result<Opt
             &mut pi,
         )?;
         let finished = WaitForSingleObject(pi.hProcess, 3000) == WAIT_OBJECT_0;
+        if !finished && stdout.is_some() {
+            let _ = TerminateProcess(pi.hProcess, 1);
+        }
         let mut code = 0u32;
         let code = (finished && GetExitCodeProcess(pi.hProcess, &mut code).is_ok()).then_some(code);
         let _ = CloseHandle(pi.hThread);
@@ -1300,6 +1414,13 @@ impl SignIn {
                 tracing::info!(client = %from, client_app = %want.app, client_protocols = ?want.protocols, update = offer.update, "sign-in from an rdpio with no protocol in common");
             } else if offer.update {
                 tracing::info!(client = %from, client_app = %want.app, "the client runs an older rdpio; offering it this one");
+            } else if !want.app.is_empty()
+                && rdp_hyper::update::newer((&want.app, &want.build), (crate::updater::version(), crate::updater::build()))
+            {
+                // This host is the one behind: the service looks for the
+                // newer rdpio now, and puts it in once this stream ends.
+                tracing::info!(client = %from, client_app = %want.app, "the client runs a newer rdpio; this host updates after the stream");
+                let _ = std::fs::write(update_hint(), b"");
             }
             let fps = offer.fps;
             let fit_to = want.fit.then_some((want.width, want.height));
@@ -1424,8 +1545,9 @@ fn take_returning() -> Option<(Vec<u8>, SocketAddr)> {
 /// host's screens and back. Switch `keepmonitor`.
 struct KeptMonitor {
     monitor: crate::virtual_display::VirtualMonitor,
-    /// Width, height, refresh rate and scale it was made for.
-    made_for: (u32, u32, u32, u32),
+    /// Width, height, refresh rate, scale and render GPU (LUID) it was
+    /// made for: a reconnect after the power source changed gets a new one.
+    made_for: (u32, u32, u32, u32, i64),
     until: Instant,
 }
 
@@ -1559,19 +1681,36 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
                 }
             }
         }
+        // The integrated GPU the stream's virtual monitor goes on, on battery
+        // or as set (decided with the offer: it caps the codec and the
+        // refresh rate) — and whether this stream could go there at all (a
+        // move mid-stream must land where it's meant to).
+        let on_battery_gpu = std::cell::Cell::new(None::<crate::host_battery::Plan>);
+        let fits_integrated = std::cell::Cell::new(false);
         let offer = |want: &auth::Want| {
             let monitor = rdp_gpu::hyper::list_monitors().ok()?.into_iter().next()?;
             // With the virtual display, exactly the client's screen (made
             // after sign-in); else the desktop, scaled down to fit it.
-            let exact = (virtual_display.is_some() && want.fit && opts.stream_size.is_none())
-                .then(|| crate::virtual_display::even_size(want.width, want.height));
+            let virtual_monitor = virtual_display.is_some() && want.fit && opts.stream_size.is_none();
+            let exact = virtual_monitor.then(|| crate::virtual_display::even_size(want.width, want.height));
+            // (Only a virtual monitor moves GPUs: the host's own stays put.)
+            let battery = virtual_monitor.then(|| crate::host_battery::plan(&want.codecs, host_settings().host_gpu)).flatten();
             let size = exact.or_else(|| crate::hyper_host::client_stream_size(&opts, (monitor.width, monitor.height), want));
             let (width, height) = size.unwrap_or((monitor.width, monitor.height));
+            let fps = opts.max_fps.map_or(want.refresh_hz, |cap| want.refresh_hz.min(cap)).max(30);
+            // (Quick Sync's H.264 goes up to 4096 a side.)
+            let fits = virtual_monitor && width <= 4096 && height <= 4096 && crate::host_battery::decodes(&want.codecs);
+            fits_integrated.set(fits);
+            let (fps, codec) = match &battery {
+                Some(_) if fits => (fps.min(crate::host_battery::MAX_FPS), crate::host_battery::CODEC),
+                _ => (fps, rdp_gpu::hyper::choose_codec(&want.codecs, (width, height))?),
+            };
+            on_battery_gpu.set(battery.filter(|_| codec == crate::host_battery::CODEC));
             Some(Offer {
                 width,
                 height,
-                fps: opts.max_fps.map_or(want.refresh_hz, |cap| want.refresh_hz.min(cap)).max(30),
-                codec: rdp_gpu::hyper::choose_codec(&want.codecs, (width, height))?.name().into(),
+                fps,
+                codec: codec.name().into(),
                 // A touch screen's fingers become Windows touch here.
                 touch: true,
                 // Where a client through a VPN can find this PC directly.
@@ -1585,6 +1724,8 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
             })
         };
         let Some(client) = sign_in.handle(&socket, &buf[..n], from, offer) else { continue };
+        let battery_gpu = on_battery_gpu.take();
+        let fits_integrated = fits_integrated.get();
         if client.update_only {
             serve_update(&socket, client)?;
             continue;
@@ -1601,7 +1742,14 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
         let kept_monitor = kept.take();
         let (virtual_monitor, made_for) = match (&virtual_display, client.fit_to) {
             (Some(vd), Some((w, h))) if opts.stream_size.is_none() && settings.virtual_display && settings.match_resolution => {
-                let made_for = (w, h, client.fps, client.scale);
+                // Rendered on the fastest GPU (a hybrid laptop's
+                // discrete one), where the encoder is: left to Windows,
+                // it's the integrated GPU the panel hangs off. On battery
+                // (or set so), deliberately the integrated one (see
+                // host_battery). The GPU is part of what a kept monitor must
+                // match: one moved mid-stream comes back on the other GPU.
+                let render_luid = battery_gpu.as_ref().map(|p| p.luid).or_else(rdp_gpu::gpu::chosen_adapter_luid);
+                let made_for = (w, h, client.fps, client.scale, render_luid.unwrap_or(0));
                 match kept_monitor {
                     Some(k) if k.made_for == made_for => {
                         tracing::info!(device = %k.monitor.device_name, "a quick reconnect: streaming the kept virtual monitor");
@@ -1610,10 +1758,7 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
                     other => {
                         // (A different size: the old one goes first.)
                         drop(other);
-                        // Rendered on the fastest GPU (a hybrid laptop's
-                        // discrete one), where the encoder is: left to
-                        // Windows, it's the integrated GPU the panel hangs off.
-                        let render_adapter = rdp_gpu::gpu::chosen_adapter_luid().map(|l| LUID { LowPart: l as u32, HighPart: (l >> 32) as i32 });
+                        let render_adapter = render_luid.map(|l| LUID { LowPart: l as u32, HighPart: (l >> 32) as i32 });
                         let m = vd
                             .show(w, h, client.fps, render_adapter)
                             .inspect(|m| crate::virtual_display::set_scale(&m.device_name, client.scale))
@@ -1644,15 +1789,24 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
         let stream_opts = HostOptions { fit_to: client.fit_to, office: client.office, fast_text: client.fast_text, ..opts.clone() };
         *COMEBACK.lock().unwrap() = Some(sign_in.comeback());
         let _ = take_returning();
+        // In Auto, the power cable moves a stream on a virtual monitor
+        // between the GPUs (host_battery::move_due, in the stream's loop).
+        if virtual_monitor.is_some() {
+            crate::host_battery::watch(settings.host_gpu, battery_gpu.is_some(), fits_integrated);
+        }
         let end = crate::hyper_host::stream(socket.try_clone()?, client.addr, client.recv, client.send, &stream_opts, &device_name, fps, client.codec, true);
+        crate::host_battery::unwatch();
         COMEBACK.lock().unwrap().take();
         returning = take_returning();
         drop(display);
         drop(consolidated);
         // A dropped client (not one that said goodbye) likely comes straight
-        // back: its monitor stays a while.
+        // back: its monitor stays a while. So does one moved to the other GPU
+        // — the kept monitor is on the old one and won't match, but should the
+        // cable be back before the client is, it's streamed again.
+        let comes_back = matches!(end, Ok(crate::hyper_host::StreamEnd::Lost | crate::hyper_host::StreamEnd::GpuMove));
         match (virtual_monitor, made_for) {
-            (Some(monitor), Some(made_for)) if matches!(end, Ok(crate::hyper_host::StreamEnd::Lost)) && crate::host_ab::ab("keepmonitor", true) => {
+            (Some(monitor), Some(made_for)) if comes_back && crate::host_ab::ab("keepmonitor", true) => {
                 tracing::info!(secs = KEEP_MONITOR.as_secs(), "keeping the virtual monitor for a quick reconnect");
                 kept = Some(KeptMonitor { monitor, made_for, until: Instant::now() + KEEP_MONITOR });
             }
@@ -1663,6 +1817,13 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
         match end {
             Ok(crate::hyper_host::StreamEnd::Lost) => {
                 tracing::info!("client lost; holding the session for 20 s");
+                grace_until = Some(Instant::now() + RECONNECT_GRACE);
+            }
+            // Told to sign in again at once (Control::Reconnect): the console
+            // stays as it is meanwhile, and locks like a lost client's should
+            // it not come back.
+            Ok(crate::hyper_host::StreamEnd::GpuMove) => {
+                tracing::info!("the stream moves to the other GPU; holding the session for the client's new sign-in");
                 grace_until = Some(Instant::now() + RECONNECT_GRACE);
             }
             Ok(crate::hyper_host::StreamEnd::Bye | crate::hyper_host::StreamEnd::Stopping) => {

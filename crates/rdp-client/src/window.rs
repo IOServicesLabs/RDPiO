@@ -695,6 +695,46 @@ impl Window {
         }
     }
 
+    /// Every pixel of the picture is under other windows (visible, not
+    /// minimized or on another desktop, not see-through): the stream showing
+    /// behind a maximized browser, say. Layered and click-through windows
+    /// (overlays, notifications) don't count as covering it, so a miss only
+    /// keeps streaming. Walks the windows above this one: call it now and
+    /// then, not every frame.
+    pub fn covered(&self) -> bool {
+        unsafe {
+            let mut client = RECT::default();
+            if GetClientRect(self.hwnd, &mut client).is_err() {
+                return false;
+            }
+            let mut origin = windows::Win32::Foundation::POINT::default();
+            let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut origin);
+            let target = (origin.x, origin.y, origin.x + client.right, origin.y + client.bottom);
+            let root = GetAncestor(self.hwnd, GA_ROOT);
+            let mut above = Vec::new();
+            let mut h = GetWindow(if root.0.is_null() { self.hwnd } else { root }, GW_HWNDPREV).unwrap_or_default();
+            while !h.0.is_null() && above.len() < 512 {
+                if covers(h) {
+                    let mut r = RECT::default();
+                    // (The frame as drawn: GetWindowRect adds the invisible
+                    // resize borders and shadow.)
+                    if windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+                        h,
+                        windows::Win32::Graphics::Dwm::DWMWA_EXTENDED_FRAME_BOUNDS,
+                        &mut r as *mut RECT as *mut c_void,
+                        std::mem::size_of::<RECT>() as u32,
+                    )
+                    .is_ok()
+                    {
+                        above.push((r.left, r.top, r.right, r.bottom));
+                    }
+                }
+                h = GetWindow(h, GW_HWNDPREV).unwrap_or_default();
+            }
+            fully_covered(target, &above)
+        }
+    }
+
     /// Update the window title (e.g. to show a reconnecting status).
     pub fn set_title(&self, title: &str) {
         let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1546,9 +1586,112 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
+/// Whether window `h` hides what's under it: shown, not minimized, not on
+/// another virtual desktop, and opaque (not layered or click-through).
+unsafe fn covers(h: HWND) -> bool {
+    if !IsWindowVisible(h).as_bool() || IsIconic(h).as_bool() {
+        return false;
+    }
+    let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+    if ex & (WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0 | WS_EX_NOREDIRECTIONBITMAP.0) != 0 {
+        return false;
+    }
+    let mut cloaked = 0u32;
+    !(windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+        h,
+        windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
+        &mut cloaked as *mut u32 as *mut c_void,
+        std::mem::size_of::<u32>() as u32,
+    )
+    .is_ok()
+        && cloaked != 0)
+}
+
+/// Whether the rectangles `above` (left, top, right, bottom) together cover
+/// all of `target`: what's left of it after each is cut away.
+fn fully_covered(target: (i32, i32, i32, i32), above: &[(i32, i32, i32, i32)]) -> bool {
+    let mut left = vec![target];
+    left.retain(|&(l, t, r, b)| r > l && b > t);
+    for &(cl, ct, cr, cb) in above {
+        let mut next = Vec::with_capacity(left.len() + 4);
+        for (l, t, r, b) in left {
+            // No overlap: kept whole.
+            if cr <= l || cl >= r || cb <= t || ct >= b {
+                next.push((l, t, r, b));
+                continue;
+            }
+            // The parts above, below, left and right of the overlap.
+            if ct > t {
+                next.push((l, t, r, ct));
+            }
+            if cb < b {
+                next.push((l, cb, r, b));
+            }
+            let (mt, mb) = (t.max(ct), b.min(cb));
+            if cl > l {
+                next.push((l, mt, cl, mb));
+            }
+            if cr < r {
+                next.push((cr, mt, r, mb));
+            }
+        }
+        left = next;
+        if left.is_empty() {
+            return true;
+        }
+    }
+    left.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real windows: one put over another covers it; moved aside, it doesn't.
+    /// `cargo test -p rdp-client --bin rdpio covered_by_a_window -- --ignored`
+    #[test]
+    #[ignore = "opens windows"]
+    fn covered_by_a_window() {
+        let under = Window::new("rdpio cover test (under)", 400, 300).unwrap();
+        let over = Window::new("rdpio cover test (over)", 400, 300).unwrap();
+        let place = |w: &Window, x: i32, y: i32, cx: i32, cy: i32, top: bool| unsafe {
+            let _ = SetWindowPos(HWND(w.hwnd_raw() as _), if top { Some(HWND_TOP) } else { None }, x, y, cx, cy, SWP_SHOWWINDOW | if top { SET_WINDOW_POS_FLAGS(0) } else { SWP_NOZORDER });
+        };
+        let settle = |a: &Window, b: &Window| {
+            for _ in 0..20 {
+                let _ = a.pump();
+                let _ = b.pump();
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        };
+        place(&under, 200, 200, 400, 300, true);
+        place(&over, 900, 200, 400, 300, true);
+        settle(&under, &over);
+        assert!(!under.covered(), "side by side");
+        place(&over, 150, 150, 600, 450, true);
+        settle(&under, &over);
+        assert!(under.covered(), "under a bigger window");
+        place(&under, 200, 200, 400, 300, true);
+        settle(&under, &over);
+        assert!(!under.covered(), "brought to the front");
+    }
+
+    #[test]
+    fn a_window_is_covered_only_when_every_pixel_is() {
+        let w = (100, 100, 900, 700);
+        assert!(!fully_covered(w, &[]));
+        assert!(fully_covered(w, &[(0, 0, 1920, 1080)]));
+        // Two halves together.
+        assert!(fully_covered(w, &[(0, 0, 500, 1080), (500, 0, 1920, 1080)]));
+        // A one-pixel strip still shows.
+        assert!(!fully_covered(w, &[(0, 0, 899, 1080)]));
+        assert!(!fully_covered(w, &[(0, 0, 500, 1080), (501, 0, 1920, 1080)]));
+        // A window in the middle, then one over the rest in four pieces.
+        assert!(fully_covered(w, &[(300, 300, 400, 400), (0, 0, 1920, 300), (0, 400, 1920, 1080), (0, 300, 300, 400), (400, 300, 1920, 400)]));
+        assert!(!fully_covered(w, &[(0, 0, 1920, 300), (0, 400, 1920, 1080), (0, 300, 300, 400), (400, 300, 1920, 400)]));
+        // Elsewhere entirely.
+        assert!(!fully_covered(w, &[(1000, 0, 1920, 1080)]));
+    }
 
     /// A real window: Ctrl+Shift+F's toggle covers its monitor, then puts it
     /// back where it was. `cargo test -p rdp-client --bin rdpio fullscreen -- --ignored`

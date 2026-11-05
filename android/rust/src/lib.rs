@@ -7,8 +7,6 @@
 //! app shows one (the current) and switches between them at once.
 
 mod audio;
-mod autores;
-mod backlog;
 mod capture;
 mod client;
 mod decoder;

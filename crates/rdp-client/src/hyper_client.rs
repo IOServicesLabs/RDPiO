@@ -47,6 +47,8 @@ pub struct Link {
 
 /// This process downloaded an update (installed when it ends).
 static DOWNLOADED: AtomicBool = AtomicBool::new(false);
+/// The stream ended because the host said Reconnect (not a lost link).
+static HOST_ASKED: AtomicBool = AtomicBool::new(false);
 
 static LINK: Mutex<Option<Link>> = Mutex::new(None);
 /// `--hyper-vsync`: present on vblank instead of immediately (tearing).
@@ -293,16 +295,6 @@ struct Shared {
     update_note: Mutex<Option<String>>,
 }
 
-/// Decoding a backlog that would take longer than this skips it for a fresh
-/// keyframe instead (which costs a round trip and a bitrate spike). Frames
-/// that arrive together after a Wi-Fi stall are decoded in a moment and only
-/// the newest is shown: no keyframe for them.
-const MAX_CATCH_UP_US: u64 = 50_000;
-
-/// Whether decoding `backlog` frames at `decode_us` each takes too long.
-fn skip_backlog(backlog: u32, decode_us: u64) -> bool {
-    backlog as u64 * decode_us.max(200) > MAX_CATCH_UP_US
-}
 /// The bulk lane's pace toward the host (clipboard, files). The reliable
 /// channel also backs off on its own once the round trip grows.
 const CLIENT_BULK_BPS: u64 = 40_000_000;
@@ -460,7 +452,18 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     let (tx, rx) = mpsc::channel::<Event>();
     let (cursor_tx, cursor_rx) = mpsc::channel::<crate::session::CursorUpdate>();
     let reliable = crate::hyper_link::ReliableLink::new();
-    reliable.set_bulk_rate(Some(CLIENT_BULK_BPS));
+    // To a host on the LAN, copies go as fast as the path carries them, as
+    // the host's do (its BulkLane): unpaced, yielding to queues of 25 ms,
+    // reading a Wi-Fi radio's spikes as TCP does. (40 Mbit/s held a 250 MB
+    // copy to 50 s at best, where RDP took 17.) RDPIO_BULK_PACED=1: as before.
+    let lan = link.socket.peer_addr().is_ok_and(|a| crate::hyper_path::on_lan(a.ip()));
+    if lan && std::env::var_os("RDPIO_BULK_PACED").is_none() {
+        reliable.set_bulk_rate(None);
+        reliable.set_bulk_queue_limit(Duration::from_millis(25));
+        reliable.set_bulk_jitter_tolerant(true);
+    } else {
+        reliable.set_bulk_rate(Some(CLIENT_BULK_BPS));
+    }
     let pump_stop = Arc::new(AtomicBool::new(false));
     let pump = {
         let s = shared.clone();
@@ -487,6 +490,11 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     // Minimized: the host is told to encode nothing (repeated, in case a
     // packet is lost); restored: a keyframe brings the picture back.
     let (mut paused, mut pause_sent) = (false, Instant::now());
+    // RDPIO_NO_COPY_HOLDS=1: a copy doesn't hold the power settings.
+    let copy_holds = std::env::var_os("RDPIO_NO_COPY_HOLDS").is_none();
+    let mut copy_held = false;
+    // When the window was first seen fully covered (see COVERED_FOR).
+    let (mut covered_since, mut cover_checked) = (None::<Instant>, Instant::now());
     let mut last_input_send = Instant::now();
     let mut last_full_input_send = Instant::now();
     let mut awaiting_key = true;
@@ -503,8 +511,11 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     // Time in the decoder this second (total, longest call), in presenting,
     // and the process's CPU time (for a weak laptop: where its CPU goes).
     let (mut dec_us_total, mut dec_us_max) = (0u64, 0u64);
-    // Recent decode time per frame (until measured, a slow decoder's).
+    // Recent decode time per frame (until measured, a slow decoder's): for
+    // the log when a backlog goes.
     let mut decode_us_avg = 5_000u64;
+    // Whether a decode backlog is draining (see `rdp_hyper::backlog`).
+    let mut behind = rdp_hyper::backlog::Backlog::default();
     // When the power source was last looked at (see GPU_FOLLOWS_POWER).
     let mut power_checked = Instant::now();
     // The screen's refresh rate as last told to the host (see Control::Refresh),
@@ -514,6 +525,8 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     // The window's size, and since when it's been that (see Control::View).
     let (mut view_size, mut view_since) = ((0u32, 0u32), Instant::now());
     let mut view_told = (0u32, 0u32);
+    // The upscaler and sharpening last set on the renderer (see `upscale_for`).
+    let mut upscale_set: Option<(rdp_gpu::Upscaler, f32)> = None;
     let mut last_title = String::new();
     let mut present_us_total = 0u64;
     let mut cpu_before = process_cpu_us();
@@ -604,15 +617,32 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         // The window's size, to the host once it's settled (not at every
         // step of a drag: each new stream size costs a keyframe) — in a
         // window smaller than the stream, it streams smaller. Not a
-        // minimized or tiny one's (paused anyway).
+        // minimized or tiny one's (paused anyway). Scaled by Auto resolution
+        // or `--hyper-scale` (as Android does): the host fits its desktop to
+        // the smaller view on its GPU, and the renderer scales it up here.
+        let office_now = crate::window::office_mode();
+        let scale = AutoScale::current(office_now);
+        let view_want = scaled_view(view_size, scale);
         let view_settled = view_since.elapsed() >= VIEW_SETTLE && view_size.0 >= 320 && view_size.1 >= 200;
-        if view_settled && (view_size != view_told || refresh_sent.elapsed() >= Duration::from_secs(3)) {
-            let (vw, vh) = (view_size.0.min(u16::MAX as u32) as u16, view_size.1.min(u16::MAX as u32) as u16);
+        if view_settled && (view_want != view_told || refresh_sent.elapsed() >= Duration::from_secs(3)) {
+            let (vw, vh) = (view_want.0.min(u16::MAX as u32) as u16, view_want.1.min(u16::MAX as u32) as u16);
             shared.send(Kind::Control, &Control::View { width: vw, height: vh }.to_bytes());
-            if view_size != view_told && view_told != (0, 0) {
-                tracing::info!(width = vw, height = vh, "window resized; telling the host");
+            if view_want != view_told && view_told != (0, 0) {
+                tracing::info!(width = vw, height = vh, scale, "window resized or rescaled; telling the host");
             }
-            view_told = view_size;
+            view_told = view_want;
+        }
+        // Scaled down here: FSR + RCAS unless an upscaler was chosen (see
+        // `set_upscale`); full size again: the command line's, and its
+        // sharpening (none by default: a 1:1 picture keeps the one-pass
+        // present path, which sharpening turns off).
+        let upscale_want = upscale_for(scale, office_now);
+        if upscale_want.is_some() && upscale_want != upscale_set {
+            if let Some((mode, sharpen)) = upscale_want {
+                renderer.set_upscaler(mode);
+                renderer.set_sharpen(sharpen);
+            }
+            upscale_set = upscale_want;
         }
         let view = if renderer.keeps_aspect() { rdp_gpu::fit_rect((w, h), client) } else { (0, 0, client.0, client.1) };
         let raw = window.drain_input();
@@ -690,6 +720,11 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             }
         }
 
+        // (A copy going counts as activity: see hyper_link::copying.)
+        let copying = copy_holds && crate::hyper_link::copying();
+        if copying {
+            last_activity = Instant::now();
+        }
         if fine_timer.is_some() && last_activity.elapsed() > FINE_TIMER_IDLE {
             fine_timer = None;
         }
@@ -737,11 +772,15 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         }
 
         // Frames → screen. Decode every frame in order (P-frames reference
-        // their predecessor); present only the newest. A backlog that would
-        // take long to decode (a slow decoder that fell behind) isn't caught
-        // up on: drop it and resume from a fresh keyframe.
+        // their predecessor); present only the newest. A backlog the decoder
+        // isn't draining (slower than the stream), or seconds of frames, isn't
+        // caught up on: drop it and resume from a fresh keyframe. A clump off
+        // a stalled Wi-Fi or a relay drains in a few ms a frame: decoded, not
+        // dropped — dropping it asked for a keyframe, which arrived as the
+        // next clump (see `rdp_hyper::backlog`, the same as Android's).
+        // (Host A/B `burstok` off: dropped at once, as before.)
         let backlog = shared.queued.load(Ordering::Relaxed);
-        if skip_backlog(backlog, decode_us_avg) && !awaiting_key {
+        if !awaiting_key && behind.skip(Instant::now(), backlog, shared.host_fps.load(Ordering::Relaxed), crate::host_ab::ab("burstok", true)) {
             tracing::info!(backlog, decode_us_avg, "decode backlog; skipping to a fresh keyframe");
             awaiting_key = true;
             last_key_request = Instant::now() - Duration::from_secs(1);
@@ -836,7 +875,15 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         // this screen off, this PC locked): the host is told to encode
         // nothing; what still comes is decoded (every frame is a reference for
         // the next) but not drawn.
-        let minimized = window.output_hidden();
+        // …or buried under other windows a while (`coverpause`: looked at
+        // twice a second; uncovered, back at once).
+        if cover_checked.elapsed() >= COVER_CHECK_EVERY {
+            cover_checked = Instant::now();
+            let now = crate::host_ab::ab("coverpause", true) && window.covered();
+            covered_since = if now { covered_since.or(Some(Instant::now())) } else { None };
+        }
+        let covered = covered_since.is_some_and(|t| t.elapsed() >= COVERED_FOR);
+        let minimized = window.output_hidden() || covered;
         if let Some(v) = shared.update_note.lock().unwrap().take() {
             hint = crate::hyper_overlay::render(&[format!("rdpio {v} downloaded from the host: it installs when you close this window")]);
             hint_until = Instant::now() + Duration::from_secs(6);
@@ -879,6 +926,21 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                 tracing::info!("stream hidden: paused, Wi-Fi and power settings handed back");
             }
             (paused, pause_sent) = (minimized, Instant::now());
+        }
+        // Hidden, a copy going: Wi-Fi, the thread and the timer held for it
+        // (pasting is done with Explorer over the stream), and let go after.
+        if paused && copying && !copy_held {
+            wifi = crate::net_tune::WifiLowLatency::enable();
+            boost = crate::net_tune::ThreadBoost::games();
+            fine_timer.get_or_insert_with(crate::net_tune::FineTimer::new);
+            copy_held = true;
+            tracing::info!("stream hidden, a copy going: Wi-Fi and power settings held for it");
+        } else if copy_held && !(paused && copying) {
+            if paused {
+                (wifi, boost, fine_timer) = (None, None, None);
+                tracing::info!("the copy done: Wi-Fi and power settings handed back");
+            }
+            copy_held = false;
         }
         // Overlays: the stats (Ctrl+Shift+S) and, for the first seconds, the
         // hotkeys — shown before the first picture too, so even a stream that
@@ -1030,6 +1092,31 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                 frames_lost = lost,
                 "hyper"
             );
+            // This second's numbers, for Auto resolution (as Android feeds
+            // it: arrived, the host's target, median latency, round trip,
+            // the host's frame rate, pictures shown, the stream's size). A
+            // change goes to the host with the next View, above.
+            let office = crate::window::office_mode();
+            let sample = rdp_hyper::autores::Sample {
+                now_s: now_us() as f64 / 1e6,
+                received_bps: mbps * 1e6,
+                target_bps: shared.bitrate_kbps.load(Ordering::Relaxed) as f64 * 1000.0,
+                latency_ms: p(0.5),
+                rtt_ms: rtt,
+                fps: shared.host_fps.load(Ordering::Relaxed) as f64,
+                shown_fps: shown as f64 / secs,
+                width: w,
+                height: h,
+            };
+            if let Some(d) = AutoScale::step(&sample, office) {
+                let mode = if office { "Office" } else { "Game" };
+                hint = crate::hyper_overlay::render(&[if d.scale < d.from {
+                    format!("Slow connection: {mode} mode at {}% (Auto resolution)", d.scale)
+                } else {
+                    format!("The connection keeps up: {mode} mode at {}% (Auto resolution)", d.scale)
+                }]);
+                hint_until = Instant::now() + Duration::from_secs(3);
+            }
             // The screen stays on while the picture moves (someone watching
             // without touching anything); a still one may dim like any app's.
             if let Some(a) = awake.as_mut() {
@@ -1109,8 +1196,14 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             std::process::exit(0);
         });
     }
-    // (Back in an RDP session, the window has no video layer.)
+    // (Back in an RDP session, the window has no video layer, and the
+    // command line's upscaler: not the scaled stream's FSR.)
     renderer.set_video_layer(false);
+    let base = upscale_for(100, true);
+    if let Some((mode, sharpen)) = base.filter(|_| base != upscale_set) {
+        renderer.set_upscaler(mode);
+        renderer.set_sharpen(sharpen);
+    }
 
     shared.stop.store(true, Ordering::Relaxed);
     // Goodbye only when the window was closed: after a network drop or a
@@ -1125,6 +1218,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     pump_stop.store(true, Ordering::Relaxed);
     reliable.nudge();
     let _ = pump.join();
+    crate::hyper_tcp::end_session();
     drop(clipboard);
     result
 }
@@ -1143,6 +1237,11 @@ const INPUT_MOTION_EVERY: Duration = Duration::from_millis(1);
 /// Shown frames a second at which the picture counts as moving (video, a
 /// game) and keeps the screen on; office trickling stays under it.
 const MOVING_FPS: f64 = 15.0;
+
+/// The stream's window under others for this long counts as hidden (see
+/// `Window::covered`): an alt-tab glance away and back doesn't pause it.
+const COVERED_FOR: Duration = Duration::from_secs(2);
+const COVER_CHECK_EVERY: Duration = Duration::from_millis(500);
 
 /// No video this long: the receive loop wakes less often and the feedback
 /// thins out (nothing to report on a still screen).
@@ -1176,6 +1275,13 @@ pub fn set_gpu_choice(choice: &str) {
 
 fn on_battery() -> bool {
     use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    // (`RDPIO_POWER=battery` or `ac`: as if — for A/B runs of what
+    // follows the power source, on whatever cable the test machine has.)
+    match std::env::var("RDPIO_POWER").as_deref() {
+        Ok("battery") => return true,
+        Ok("ac") => return false,
+        _ => {}
+    }
     let mut s = SYSTEM_POWER_STATUS::default();
     // (ACLineStatus: 0 offline, 1 online, 255 unknown — a desktop.)
     unsafe { GetSystemPowerStatus(&mut s).is_ok() && s.ACLineStatus == 0 }
@@ -1189,6 +1295,110 @@ static FAST_TEXT: AtomicBool = AtomicBool::new(true);
 /// latency) or the fast one.
 pub fn set_fast_text(on: bool) {
     FAST_TEXT.store(on, Ordering::Relaxed);
+}
+
+/// `--hyper-scale`: the stream's size as a share of the window, pinned (%);
+/// 0: Auto (see [`AutoScale`]).
+static SCALE_PINNED: AtomicU32 = AtomicU32::new(0);
+
+/// The stream's size: `None` follows the link (Auto, the default), `Some(p)`
+/// keeps it at `p` % of the window (33..=100).
+pub fn set_scale(pinned: Option<u32>) {
+    SCALE_PINNED.store(pinned.map_or(0, |p| p.clamp(33, 100)), Ordering::Relaxed);
+}
+
+/// Auto resolution, as on Android (see `rdp_hyper::autores`): a link that
+/// carries ~1 Mbps to a 2560x1440 window gets a picture of mush at full size,
+/// and a sharp one at half size scaled up here (FSR). The pick per mode
+/// (office text compresses better: it goes down to a third), from full size
+/// at the start. Kept across reconnects (a link that drops is still the same
+/// link), not across processes (a slow link's pick would hold a LAN back).
+struct AutoScale {
+    res: rdp_hyper::autores::AutoRes,
+    game: u32,
+    office: u32,
+}
+
+static AUTO_SCALE: Mutex<Option<AutoScale>> = Mutex::new(None);
+
+impl AutoScale {
+    /// The stream's scale now (% of the window), in this mode.
+    fn current(office: bool) -> u32 {
+        let pinned = SCALE_PINNED.load(Ordering::Relaxed);
+        if pinned != 0 {
+            return pinned;
+        }
+        AUTO_SCALE.lock().unwrap().as_ref().map_or(100, |a| if office { a.office } else { a.game })
+    }
+
+    /// This second's numbers: `Some` when the scale changes (Auto only).
+    fn step(sample: &rdp_hyper::autores::Sample, office: bool) -> Option<rdp_hyper::autores::Decision> {
+        if SCALE_PINNED.load(Ordering::Relaxed) != 0 {
+            return None;
+        }
+        let mut guard = AUTO_SCALE.lock().unwrap();
+        let auto = guard.get_or_insert_with(|| AutoScale { res: Default::default(), game: 100, office: 100 });
+        let current = if office { auto.office } else { auto.game };
+        let d = auto.res.step(sample, current, office)?;
+        *(if office { &mut auto.office } else { &mut auto.game }) = d.scale;
+        tracing::info!(
+            "auto resolution: {}% ({:.1} Mbps, {:.3} bpp; was {}% at {:.3} bpp; {}x{} {:.0} fps, latency {:.0} ms, rtt {:.0} ms, {:.1} Mbps arrived, next up after {:.0} s clear)",
+            d.scale,
+            d.budget_bps / 1e6,
+            d.bpp,
+            d.from,
+            d.bpp_from,
+            sample.width,
+            sample.height,
+            sample.fps,
+            sample.latency_ms,
+            sample.rtt_ms,
+            sample.received_bps / 1e6,
+            auto.res.up_hold_s(),
+        );
+        Some(d)
+    }
+}
+
+/// The window's size scaled to `scale` %: what the host is asked to stream
+/// (it fits its desktop to it, on the GPU). Not below 320x200 (the smallest
+/// view the host takes): full size instead, as for a tiny window.
+fn scaled_view(window: (u32, u32), scale: u32) -> (u32, u32) {
+    let v = (window.0 * scale / 100, window.1 * scale / 100);
+    if v.0 >= 320 && v.1 >= 200 {
+        v
+    } else {
+        window
+    }
+}
+
+/// How a stream smaller than the window is scaled up: the upscaler from the
+/// command line, the user's `--sharpen`, and whether the upscaler was chosen
+/// by name. `None`: the renderer is left as it was set up.
+struct Upscale {
+    base: rdp_gpu::Upscaler,
+    sharpen: Option<f32>,
+    chosen: bool,
+}
+
+static UPSCALE: Mutex<Option<Upscale>> = Mutex::new(None);
+
+/// The upscaler as the command line left it (see [`Upscale`]). Unless one
+/// was chosen by name, a stream scaled down here (Auto, `--hyper-scale`) is
+/// scaled up with FSR + RCAS: built for game imagery, and the sharpest from a
+/// half-size picture. Office mode keeps the base one (bicubic): FSR's edge
+/// reconstruction plus RCAS rings on glyph edges (see the office preset in
+/// main.rs).
+pub fn set_upscale(base: rdp_gpu::Upscaler, sharpen: Option<f32>, chosen: bool) {
+    *UPSCALE.lock().unwrap() = Some(Upscale { base, sharpen, chosen });
+}
+
+/// The upscaler and sharpening for a stream at `scale` % in this mode.
+fn upscale_for(scale: u32, office: bool) -> Option<(rdp_gpu::Upscaler, f32)> {
+    let guard = UPSCALE.lock().unwrap();
+    let u = guard.as_ref()?;
+    let mode = if scale < 100 && !office && !u.chosen { rdp_gpu::Upscaler::Fsr } else { u.base };
+    Some((mode, crate::effective_sharpen(u.sharpen, mode)))
 }
 
 /// How long the hotkeys stay on screen when a stream starts.
@@ -1311,9 +1521,19 @@ fn receive_loop(
     // 11% of a core -> 4%), for up to a millisecond on a frame.
     // (RDPIO_NO_RX_NAP=1: no nap.)
     let nap = std::env::var_os("RDPIO_NO_RX_NAP").is_none();
+    // Never while a copy streams in: a nap after each batch of one or two
+    // datagrams held copied files to ~600 a second, 5.5 Mbit/s over a
+    // 900 Mbit/s Wi-Fi LAN (the rest waited in the socket's buffer: the
+    // host saw 100-190 ms round trips where a ping saw 2-6). Reliable data
+    // lifts the nap for a while. (RDPIO_RX_NAP_BULK=1: nap anyway.)
+    let nap_bulk = std::env::var_os("RDPIO_RX_NAP_BULK").is_some();
+    let mut bulk_at = Instant::now() - Duration::from_secs(1);
     let mut got = false;
     while !shared.stop.load(Ordering::Relaxed) {
-        if got && nap && crate::window::office_mode() {
+        // (Not through a probe train: the nap would be timed as the link —
+        // 1-2 ms on a few KB read a 300 Mbit/s Wi-Fi link as 1-6.)
+        let streaming_in = !nap_bulk && bulk_at.elapsed() < Duration::from_millis(250);
+        if got && nap && !streaming_in && crate::window::office_mode() && !reassembler.train_open() {
             std::thread::sleep(Duration::from_millis(1));
         }
         let datagrams = receiver.recv(&socket);
@@ -1389,10 +1609,13 @@ fn receive_loop(
                             }
                         }
                         // The host's console moved to another session (a
-                        // sign-in, a user switch): sign in again at once, not
-                        // after seconds of silence.
+                        // sign-in, a user switch), its service restarts, or
+                        // the stream moves to its other GPU (plugged in or
+                        // out): sign in again at once, not after seconds of
+                        // silence.
                         Some(Control::Reconnect) if !shared.stop.load(Ordering::Relaxed) => {
-                            tracing::info!("the host's console moved to another session; reconnecting now");
+                            tracing::info!("the host asked for a reconnect (another session, a restart or another GPU); reconnecting now");
+                            HOST_ASKED.store(true, Ordering::Relaxed);
                             shared.lost.store(true, Ordering::Relaxed);
                             shared.stop.store(true, Ordering::Relaxed);
                             crate::window::signal_frame();
@@ -1463,6 +1686,7 @@ fn receive_loop(
                     }
                     Kind::Reliable => {
                         use rdp_hyper::messages::Message;
+                        bulk_at = Instant::now();
                         let (ack, msgs) = reliable.on_packet(&body);
                         if let Some(a) = ack {
                             shared.send(Kind::Reliable, &a);
@@ -1480,6 +1704,14 @@ fn receive_loop(
                                         crate::session::CursorUpdate::Hide
                                     });
                                     crate::window::signal_frame();
+                                }
+                                // Copies over TCP of their own, on the LAN (see
+                                // hyper_tcp; RDPIO_NO_BULK_TCP=1: over the link).
+                                Message::BulkTcp { port, key, streams } => {
+                                    let host = socket.peer_addr().ok().filter(|a| crate::hyper_path::on_lan(a.ip()));
+                                    if let Some(host) = host.filter(|_| std::env::var_os("RDPIO_NO_BULK_TCP").is_none()) {
+                                        crate::hyper_tcp::client_connect(host, port, key, streams, clipboard.clone());
+                                    }
                                 }
                                 other => {
                                     if let Some(c) = &clipboard {
@@ -1905,10 +2137,16 @@ pub fn run_direct(
     if !codecs.iter().any(|c| rdp_gpu::h264::Codec::from_name(c).is_some_and(rdp_gpu::hyper::gpu_can_decode)) {
         tracing::warn!(?codecs, "no GPU video decoder (is the GPU driver installed?): decoding on the CPU");
     }
+    // A pinned smaller stream (`--hyper-scale 50`) from the first frame, not
+    // after a full-size keyframe and an encoder re-init (Auto starts full).
+    let (ww, wh) = match SCALE_PINNED.load(Ordering::Relaxed) {
+        0 => (mw, mh),
+        pinned => scaled_view((mw, mh), pinned),
+    };
     let mut want = rdp_hyper::auth::Want {
         codecs,
-        width: mw,
-        height: mh,
+        width: ww,
+        height: wh,
         refresh_hz: fps.unwrap_or_else(local_refresh_hz),
         // One monitor is streamed: see `HyperRedirector::new`.
         monitors: 1,
@@ -2007,11 +2245,16 @@ pub fn run_direct(
         }
         // The network dropped: sign in again (the host keeps the session
         // unlocked for a short grace period, so this resumes where we were).
-        window.set_title("RDPiO — Hyper: connection lost, reconnecting…");
+        // Or the host asked for it (Reconnect): nothing was lost, so not
+        // "connection lost" for the seconds a GPU move takes.
+        let (title, line) = if HOST_ASKED.swap(false, Ordering::Relaxed) {
+            ("RDPiO — Hyper: reconnecting…", "Reconnecting...")
+        } else {
+            ("RDPiO — Hyper: connection lost, reconnecting…", "Connection lost: reconnecting...")
+        };
+        window.set_title(title);
         // On screen too: a fullscreen window has no title bar to read it in.
-        if let Some((nw, nh, px)) =
-            crate::hyper_overlay::render(&["Connection lost: reconnecting...".to_string(), "Ctrl+Shift+Q   quit".to_string()])
-        {
+        if let Some((nw, nh, px)) = crate::hyper_overlay::render(&[line.to_string(), "Ctrl+Shift+Q   quit".to_string()]) {
             renderer.update_rect(16, 16, nw, nh, &px);
             let _ = renderer.present_frame();
         }
@@ -2864,14 +3107,4 @@ mod tests {
             assert!(passes < presents * 3 + 50, "the loop spun: {passes} passes");
             assert!(q(0.95) < 4.0, "presents waited: p95 {:.2} ms", q(0.95));
         }
-    }
-
-    #[test]
-    fn frames_bunched_by_a_stall_are_decoded_not_skipped() {
-        // A GPU decoder (0.4 ms) catches up on a Wi-Fi burst of 5 or 50.
-        assert!(!skip_backlog(5, 400));
-        assert!(!skip_backlog(50, 400));
-        // A CPU decoder at 12 ms a frame doesn't chase 5 behind.
-        assert!(skip_backlog(5, 12_000));
-        assert!(!skip_backlog(3, 12_000));
     }

@@ -337,12 +337,12 @@ struct Stats {
     auto: Mutex<Auto>,
 }
 
-/// Automatic resolution's state (see `autores`).
+/// Automatic resolution's state (see `rdp_hyper::autores`).
 #[derive(Default)]
 struct Auto {
-    res: crate::autores::AutoRes,
+    res: rdp_hyper::autores::AutoRes,
     /// The latest second's numbers, and their number (each used once).
-    sample: Option<(u64, crate::autores::Sample)>,
+    sample: Option<(u64, rdp_hyper::autores::Sample)>,
     used: u64,
 }
 
@@ -669,8 +669,9 @@ impl Client {
             // shards then come several to a call instead of one wake-up each
             // (through a VPN they trickle in one by one). The receive thread's
             // CPU, 24 Mbit/s over Tailscale: 11% of a core -> 4%, for up to a
-            // millisecond on a frame. (`debug.rdpio.rxnap=0`: no nap.)
-            if got && office && rx.pending() == 0 && crate::tune::ab("rxnap", true) {
+            // millisecond on a frame. (`debug.rdpio.rxnap=0`: no nap.) Not
+            // through a probe train: the nap would be timed as the link.
+            if got && office && rx.pending() == 0 && !reassembler.train_open() && crate::tune::ab("rxnap", true) {
                 std::thread::sleep(Duration::from_millis(1));
             }
             got = false;
@@ -730,7 +731,8 @@ impl Client {
                                 }
                             }
                             Some(Control::Reconnect) => {
-                                // (Its console moved to another session, or its service is restarting.)
+                                // (Its console moved to another session, its service is restarting,
+                                // or the stream moves to its other GPU: plugged in or out.)
                                 log::info!("the PC asked for a reconnect; reconnecting now");
                                 live.lost.store(true, Ordering::Relaxed);
                                 live.stop.store(true, Ordering::Relaxed);
@@ -951,7 +953,7 @@ impl Client {
         let mut can_repair = false;
         let mut awaiting_since = Instant::now();
         let mut bad_keyframes = 0u32;
-        let mut behind = crate::backlog::Backlog::default();
+        let mut behind = rdp_hyper::backlog::Backlog::default();
         let mut last_key_request = Instant::now() - Duration::from_secs(1);
         // (Each frame's handling against the frame interval.)
         let frame_time = |fps: u32| Duration::from_secs(1) / fps.clamp(24, 240);
@@ -1077,7 +1079,7 @@ impl Client {
                     // (a decoder slower than the stream): catching up would
                     // only add latency — drop them and start again from a
                     // fresh keyframe. A clump off a stalled link drains in a
-                    // few ms a frame: decoded, not dropped (see `backlog`).
+                    // few ms a frame: decoded, not dropped (see `rdp_hyper::backlog`).
                     let fps = live.fps.load(Ordering::Relaxed);
                     if !awaiting_key && behind.skip(Instant::now(), backlog, fps, crate::tune::ab("burstok", true)) {
                         log::info!("decode backlog of {backlog} frames; skipping to a fresh keyframe");
@@ -1361,7 +1363,7 @@ impl Client {
         {
             let mut auto = self.stats.auto.lock().unwrap();
             let seq = auto.sample.map_or(0, |(n, _)| n) + 1;
-            let sample = crate::autores::Sample {
+            let sample = rdp_hyper::autores::Sample {
                 now_s: now_s(),
                 received_bps: mbps * 1e6,
                 target_bps: live.bitrate_kbps.load(Ordering::Relaxed) as f64 * 1000.0,
@@ -1379,7 +1381,7 @@ impl Client {
 
     /// Automatic resolution: the stream's scale (% of the screen) to use,
     /// given the one in use (`current`) and the mode — `current` unless the
-    /// last second's numbers say to change (see `autores`). Each second's
+    /// last second's numbers say to change (see `rdp_hyper::autores`). Each second's
     /// numbers count once, however often the app asks.
     /// (`debug.rdpio.autores=0`: never changes.)
     pub fn auto_scale(&self, current: u32, office: bool) -> u32 {

@@ -52,6 +52,7 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
 
+pub mod battery;
 pub mod driver_frames;
 pub mod nvenc;
 
@@ -221,6 +222,10 @@ pub enum PointerEvent {
     Shape { width: u16, height: u16, hot_x: u16, hot_y: u16, rgba: Vec<u8> },
 }
 
+/// A reopened duplication's first frame (the whole desktop) comes within
+/// this (see `DesktopCapture::take`).
+const REOPENED_WITHIN_MS: u32 = 100;
+
 /// How long a capture waits for the driver's first frame before it
 /// duplicates the output instead (the stream's start nudges a repaint, so a
 /// working driver has one well within this).
@@ -269,6 +274,17 @@ pub struct DesktopCapture {
     luid: i64,
     /// A driver frame seen by [`peek`](Self::peek), not converted yet.
     peeked: Option<driver_frames::NextFrame>,
+    /// Desktop Duplication looked at before it's converted too
+    /// ([`set_defer_duplication`](Self::set_defer_duplication))…
+    defer_dup: bool,
+    /// …the frame [`peek`](Self::peek) acquired, held unconverted until
+    /// [`take`](Self::take), [`forget`](Self::forget) or the next look…
+    held: Option<(IDXGIResource, DXGI_OUTDUPL_FRAME_INFO)>,
+    /// …which lets it go unconverted: the screen has changed since the last
+    /// picture handed out, to what that frame showed (when it was presented,
+    /// µs). Nothing newer comes: `take` reopens the duplication, whose first
+    /// frame is the whole desktop.
+    pending: Option<u64>,
 }
 
 impl DesktopCapture {
@@ -379,6 +395,9 @@ impl DesktopCapture {
                 driver_seen: false,
                 luid,
                 peeked: None,
+                defer_dup: false,
+                held: None,
+                pending: None,
             })
         }
     }
@@ -391,6 +410,7 @@ impl DesktopCapture {
     }
 
     fn lose_duplication(&mut self) {
+        self.held = None;
         self.dup = None;
         // Those views hold the old duplication's surfaces.
         if let Some(vp) = &mut self.vp {
@@ -417,7 +437,36 @@ impl DesktopCapture {
     /// until a newer one comes. Desktop Duplication hands its frame back at
     /// once, so [`acquire`](Self::acquire) converts it there and then.
     pub fn defers(&self) -> bool {
-        self.driver.is_some() && !self.stale
+        (self.driver.is_some() || self.defer_dup) && !self.stale
+    }
+
+    /// Desktop Duplication deferred like the driver's frames: [`peek`](Self::peek)
+    /// acquires a frame and holds it, unconverted, and [`take`](Self::take)
+    /// converts it (and whatever newer came meanwhile) — a frame the stream's
+    /// rate skips is never copied or converted. (Converted on arrival, a
+    /// 240 Hz desktop streamed at 15 fps converts 16 frames per one sent.)
+    pub fn set_defer_duplication(&mut self, on: bool) {
+        if on == self.defer_dup {
+            return;
+        }
+        if !on {
+            self.forget();
+        }
+        self.defer_dup = on;
+    }
+
+    /// Let go of a frame [`peek`](Self::peek) saw and the caller won't
+    /// [`take`](Self::take) after all.
+    pub fn forget(&mut self) {
+        self.peeked = None;
+        self.pending = None;
+        if self.held.take().is_some() {
+            if let Some(dup) = &self.dup {
+                unsafe {
+                    let _ = dup.ReleaseFrame();
+                }
+            }
+        }
     }
 
     /// Driver frames: wait up to `timeout_ms` for a newer frame and say when
@@ -427,6 +476,9 @@ impl DesktopCapture {
     /// then says so, and [`acquire`](Self::acquire) duplicates the output).
     pub fn peek(&mut self, timeout_ms: u32) -> WinResult<Option<u64>> {
         unsafe {
+            if self.driver.is_none() {
+                return self.peek_duplication(timeout_ms);
+            }
             let Some(next) = self.driver_peek(timeout_ms)? else { return Ok(None) };
             let present_us = (next.state.present_qpc as f64 / self.qpc_per_us) as u64;
             self.peeked = Some(next);
@@ -438,6 +490,9 @@ impl DesktopCapture {
     /// or a newer one that came since. `Ok(None)` if there's none.
     pub fn take(&mut self) -> WinResult<Option<CapturedFrame>> {
         unsafe {
+            if self.driver.is_none() {
+                return self.take_duplication();
+            }
             let next = match self.driver_peek(0)? {
                 Some(newer) => Some(newer),
                 None => self.peeked.take(),
@@ -465,48 +520,134 @@ impl DesktopCapture {
             if self.driver.is_some() {
                 return self.acquire_from_driver(timeout_ms);
             }
-            if self.dup.is_none() {
-                match duplicate(&self.output, &self.device) {
-                    Ok(dup) if self.fits(&dup) => self.dup = Some(dup),
-                    Ok(_) => {
-                        tracing::info!("display mode changed; the capture needs rebuilding");
-                        self.stale = true;
-                        return Ok(None);
-                    }
-                    Err(e) => {
-                        std::thread::sleep(Duration::from_millis(50));
-                        return if e.code() == E_ACCESSDENIED { Ok(None) } else { Err(e) };
-                    }
-                }
-            }
-            let dup = self.dup.clone().expect("duplication");
-            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
-            let mut resource: Option<IDXGIResource> = None;
-            match dup.AcquireNextFrame(timeout_ms, &mut info, &mut resource) {
-                Ok(()) => {}
-                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
-                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                    tracing::info!("desktop duplication lost (mode change or secure desktop); recreating");
-                    self.lose_duplication();
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
-            }
-            self.note_pointer(&dup, &info);
+            self.forget();
+            let Some((dup, info, resource)) = self.dup_acquire(timeout_ms)? else { return Ok(None) };
             let slot = self.take_frame(resource, &info);
             // Hand the surface back to the compositor as early as possible; the
             // copy or conversion reading it is queued on the GPU ahead of this.
             let _ = dup.ReleaseFrame();
-            let Some(i) = slot? else {
-                return Ok(None);
-            };
-            self.ring_next = (i + 1) % self.ring.len();
-            Ok(Some(CapturedFrame {
-                nv12: self.ring[i].clone(),
-                present_us: (info.LastPresentTime as f64 / self.qpc_per_us) as u64,
-                accumulated: info.AccumulatedFrames,
-            }))
+            Ok(self.ring_out(slot?, &info))
         }
+    }
+
+    /// The duplication's next frame, waiting up to `timeout_ms` (opening the
+    /// duplication first if need be), acquired: the caller releases it.
+    /// `None` on timeout or a transient loss.
+    unsafe fn dup_acquire(
+        &mut self,
+        timeout_ms: u32,
+    ) -> WinResult<Option<(IDXGIOutputDuplication, DXGI_OUTDUPL_FRAME_INFO, Option<IDXGIResource>)>> {
+        if self.dup.is_none() {
+            match duplicate(&self.output, &self.device) {
+                Ok(dup) if self.fits(&dup) => self.dup = Some(dup),
+                Ok(_) => {
+                    tracing::info!("display mode changed; the capture needs rebuilding");
+                    self.stale = true;
+                    return Ok(None);
+                }
+                Err(e) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    return if e.code() == E_ACCESSDENIED { Ok(None) } else { Err(e) };
+                }
+            }
+        }
+        let dup = self.dup.clone().expect("duplication");
+        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+        let mut resource: Option<IDXGIResource> = None;
+        match dup.AcquireNextFrame(timeout_ms, &mut info, &mut resource) {
+            Ok(()) => {}
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
+            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                tracing::info!("desktop duplication lost (mode change or secure desktop); recreating");
+                self.lose_duplication();
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
+        self.note_pointer(&dup, &info);
+        Ok(Some((dup, info, resource)))
+    }
+
+    /// The frame in ring slot `slot` (filled by [`take_frame`](Self::take_frame)).
+    fn ring_out(&mut self, slot: Option<usize>, info: &DXGI_OUTDUPL_FRAME_INFO) -> Option<CapturedFrame> {
+        let i = slot?;
+        self.ring_next = (i + 1) % self.ring.len();
+        Some(CapturedFrame {
+            nv12: self.ring[i].clone(),
+            present_us: (info.LastPresentTime as f64 / self.qpc_per_us) as u64,
+            accumulated: info.AccumulatedFrames,
+        })
+    }
+
+    /// [`peek`](Self::peek) for Desktop Duplication: acquire the next frame
+    /// and hold it for the caller's [`take`](Self::take) — only until the
+    /// next look: a held frame keeps the compositor from updating the
+    /// duplicated desktop (measured: held to its turn, the stream's frames
+    /// went out stale and the rate controller cut on the gap). Let go
+    /// unconverted, it's [`pending`](Self::pending) until a newer one comes.
+    unsafe fn peek_duplication(&mut self, timeout_ms: u32) -> WinResult<Option<u64>> {
+        if self.stale {
+            std::thread::sleep(Duration::from_millis(timeout_ms.min(20) as u64));
+            return Ok(None);
+        }
+        if let Some((_, info)) = self.held.take() {
+            if let Some(dup) = &self.dup {
+                let _ = dup.ReleaseFrame();
+            }
+            self.pending = Some(self.present_us(&info));
+        }
+        let Some((dup, info, resource)) = self.dup_acquire(timeout_ms)? else { return Ok(None) };
+        match resource.filter(|_| info.LastPresentTime != 0) {
+            Some(resource) => {
+                self.held = Some((resource, info));
+                self.pending = None;
+                Ok(Some(self.present_us(&info)))
+            }
+            None => {
+                // Only the pointer moved: nothing to hold.
+                let _ = dup.ReleaseFrame();
+                Ok(None)
+            }
+        }
+    }
+
+    /// [`take`](Self::take) for Desktop Duplication: the held frame
+    /// converted; or, the screen having gone still on a frame let go
+    /// unconverted, the desktop as a reopened duplication first shows it.
+    unsafe fn take_duplication(&mut self) -> WinResult<Option<CapturedFrame>> {
+        if let Some((resource, info)) = self.held.take() {
+            let Some(dup) = self.dup.clone() else { return Ok(None) };
+            let slot = self.take_frame(Some(resource), &info);
+            let _ = dup.ReleaseFrame();
+            return Ok(self.ring_out(slot?, &info));
+        }
+        let Some(present_us) = self.pending.take() else { return Ok(None) };
+        self.lose_duplication();
+        let Some((dup, info, resource)) = self.dup_acquire(REOPENED_WITHIN_MS)? else {
+            // (Not yet — the secure desktop, say: next time.)
+            self.pending = Some(present_us);
+            return Ok(None);
+        };
+        // (The first frame shows the desktop whether or not it says it was
+        // presented.)
+        let mut first = info;
+        if resource.is_some() && first.LastPresentTime == 0 {
+            first.LastPresentTime = 1;
+        }
+        let slot = self.take_frame(resource, &first);
+        let _ = dup.ReleaseFrame();
+        let Some(mut frame) = self.ring_out(slot?, &info) else {
+            self.pending = Some(present_us);
+            return Ok(None);
+        };
+        if info.LastPresentTime == 0 {
+            frame.present_us = present_us;
+        }
+        Ok(Some(frame))
+    }
+
+    fn present_us(&self, info: &DXGI_OUTDUPL_FRAME_INFO) -> u64 {
+        (info.LastPresentTime as f64 / self.qpc_per_us) as u64
     }
 
     /// Put the acquired surface into the next ring slot — copied (RGB mode)
@@ -1198,7 +1339,8 @@ const FULL_BUFFER_BPS: u64 = 30_000_000;
 /// 2-3 s to deliver one such frame (keyframes of 240-380 KB). So the time a
 /// frame may take shrinks with the bitrate: 8 ms per Mbps (240 ms at 30 Mbps),
 /// never under 100 ms (12.5 Mbps and below) nor two frames' worth, and never
-/// over the tuning's own (game's two frames stay as they are). Measured
+/// over the tuning's own (game's two frames stay as they are; but see
+/// [`frame_cap_for`] at low bits per pixel). Measured
 /// (`hardware::bad_link`, HEVC 2250x1590, desktop-like): at 8 Mbps the first
 /// keyframe 188 -> 96 KB (193 -> 99 ms of the link), the largest P picture
 /// 32 -> 26 KB, luma -0.3 dB; at 3 Mbps keyframes 76 -> 60 KB; at 1 Mbps the
@@ -1223,6 +1365,41 @@ fn frame_cap_floor_ms() -> u64 {
     *FLOOR.get_or_init(|| std::env::var("RDPIO_NVENC_CAP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100))
 }
 
+/// Bits per pixel the largest frame may have at a low rate with `lowbppcap`
+/// (see [`frame_cap_for`]): ~92 KB at 2560x1440. (A keyframe of dense text
+/// at 2250x1590 bottoms out at ~45 KB, 0.1: the quantizer runs out there.)
+const LOW_RATE_FRAME_BPP: f64 = 0.2;
+
+/// [`frame_cap`], and with `lowbppcap` at least a picture's worth at low
+/// bits per pixel. Game mode's buffer is two frames, to keep each frame's time
+/// on the link flat (and frame_cap leaves it so). But at a few Mbps two
+/// frames of a 2560x1440 picture are 8-20 KB: every frame, and a keyframe or
+/// a scene cut above all, comes out at the coarsest quantizer (and over
+/// even so: frame_cap's 33 ms floor sent 2.2 Mbps at 1 Mbps) and stays that
+/// blocky for as long as the screen is still. So a frame may take
+/// [`LOW_RATE_FRAME_BPP`] of the picture, but never more than
+/// [`frame_cap_floor_ms`] (100 ms) of the stream's own rate — the floor the
+/// office cap keeps too. The latency trade: such a frame holds the link up to
+/// 100 ms instead of two frames' 33, and the next frames wait behind it (the
+/// encoder pays the bits back from them: the bitrate holds). Nothing changes
+/// where two frames already give that much: from ~22 Mbps at 1440p60, at the
+/// 20 fps the frame rate follows down to (two frames are 100 ms there), nor
+/// in office mode (its own cap is never less).
+///
+/// `encoded_fps`: the frames a second really encoded. The host scales the
+/// encoder's rate up by the ones it skips; the stream's is that scaled back.
+fn frame_cap_for(bitrate: u32, fps: u32, frames: u32, link: LinkTuning, pixels: u64, encoded_fps: u32) -> u32 {
+    let cap = frame_cap(bitrate, fps, frames, link.vbv_cap);
+    if !link.low_bpp_cap {
+        return cap;
+    }
+    let fps = fps.max(1);
+    let stream_bps = bitrate as u64 * encoded_fps.clamp(1, fps) as u64 / fps as u64;
+    let longest = stream_bps / 8 * frame_cap_floor_ms() / 1000;
+    let picture = (pixels as f64 * LOW_RATE_FRAME_BPP / 8.0) as u64;
+    (cap as u64).max(longest.min(picture)).min(u32::MAX as u64) as u32
+}
+
 /// How the encoder behaves on slow links: each part one of the host's A/B
 /// switches. Changed at any time with [`HwEncoder::set_link_tuning`] (NVENC
 /// directly; Media Foundation ignores it). Defaults from measurements
@@ -1237,11 +1414,14 @@ pub struct LinkTuning {
     /// `introfresh`: [`HwEncoder::request_recovery`] may repair a loss with a
     /// gradual refresh instead of a keyframe.
     pub intra_refresh: bool,
+    /// `lowbppcap`: at low bits per pixel a frame may take up to 100 ms of
+    /// the link, not just two frames' worth ([`frame_cap_for`]).
+    pub low_bpp_cap: bool,
 }
 
 impl Default for LinkTuning {
     fn default() -> Self {
-        Self { vbv_cap: true, preset_follow: false, intra_refresh: false }
+        Self { vbv_cap: true, preset_follow: false, intra_refresh: false, low_bpp_cap: true }
     }
 }
 
@@ -1818,6 +1998,10 @@ struct Nvenc {
     preset_refused: bool,
     /// The last keyframe's size (bytes; 0: none yet).
     last_key_bytes: usize,
+    /// The picture's size (pixels), and the frames a second the host really
+    /// encodes (see [`HwEncoder::set_encoded_fps`]).
+    pixels: u64,
+    encoded_fps: u32,
 }
 
 /// NVENC's preset: P1, the fastest. Measured on a screen of new office text
@@ -1832,6 +2016,11 @@ fn nvenc_preset() -> u32 {
 }
 
 impl Nvenc {
+    /// The largest frame at `bitrate` ([`frame_cap_for`]).
+    fn cap(&self, bitrate: u32) -> u32 {
+        frame_cap_for(bitrate, self.fps, self.tuning.buffer_frames, self.link, self.pixels, self.encoded_fps)
+    }
+
     /// The preset for `bps` (switch `presetfollow`), changed in place where
     /// it should change — NVENC takes a new preset through
     /// NvEncReconfigureEncoder without a new session or a keyframe.
@@ -1891,7 +2080,9 @@ impl HwEncoder {
         // AV1 always goes to NVENC directly where it opens: the Media
         // Foundation route has no quality setting for it to win on.
         let av1 = video_codec == crate::h264::Codec::Av1;
-        if (av1 || tuning.quality < MF_QUALITY) && std::env::var("RDPIO_NVENC").map_or(true, |v| v != "0") {
+        // (Not on another vendor's GPU — the integrated one, on battery — where
+        // NVENC can only fail, and loading NVIDIA's runtime there is no help.)
+        if (av1 || tuning.quality < MF_QUALITY) && std::env::var("RDPIO_NVENC").map_or(true, |v| v != "0") && battery::may_be_nvidia(device) {
             // Opened with the default link tuning (the host changes it with
             // set_link_tuning): the preset following the starting bitrate,
             // the largest frame capped, a gradual refresh available.
@@ -1901,7 +2092,8 @@ impl HwEncoder {
             // AV1 keeps long-term references only through API 13.0 (a driver
             // from 570); without them its losses take a keyframe.
             let slots = ltr_slots();
-            let vbv = frame_cap(bitrate, fps, tuning.buffer_frames, link.vbv_cap);
+            let pixels = width as u64 * height as u64;
+            let vbv = frame_cap_for(bitrate, fps, tuning.buffer_frames, link, pixels, fps);
             let opts = |intra_refresh| nvenc::Options { preset, ltr_frames: slots, argb: rgb, intra_refresh };
             // A gradual refresh if the driver takes one beside the references;
             // else without (losses then take a keyframe or a reference).
@@ -1931,6 +2123,8 @@ impl HwEncoder {
                             preset,
                             preset_refused: false,
                             last_key_bytes: 0,
+                            pixels,
+                            encoded_fps: fps.max(1),
                         }),
                         name,
                         bitrate,
@@ -1954,11 +2148,12 @@ impl HwEncoder {
                 (self.bitrate, self.id, self.ltr) = (mf.bitrate, mf.id, mf.ltr);
             }
             Inner::Nv(nv) => {
+                let cap = nv.cap(bps);
                 let Some(s) = nv.session.as_mut() else { return };
                 if nv.refused.is_some_and(|(r, t)| t.elapsed() < Duration::from_secs(5) && (r as i64 - bps as i64).unsigned_abs() < r as u64 / 10) {
                     return;
                 }
-                match s.set_bitrate(bps, frame_cap(bps, nv.fps, nv.tuning.buffer_frames, nv.link.vbv_cap)) {
+                match s.set_bitrate(bps, cap) {
                     Ok(()) => {
                         self.bitrate = bps;
                         nv.refused = None;
@@ -1980,18 +2175,43 @@ impl HwEncoder {
         if nv.link == link {
             return;
         }
-        let cap_changed = nv.link.vbv_cap != link.vbv_cap;
+        let cap_changed = nv.link.vbv_cap != link.vbv_cap || nv.link.low_bpp_cap != link.low_bpp_cap;
         tracing::info!(?link, "encoder link tuning");
         nv.link = link;
         if cap_changed {
             // The largest frame again, for the same bitrate.
+            let cap = nv.cap(self.bitrate);
             if let Some(s) = nv.session.as_mut() {
-                if let Err(e) = s.set_bitrate(self.bitrate, frame_cap(self.bitrate, nv.fps, nv.tuning.buffer_frames, link.vbv_cap)) {
+                if let Err(e) = s.set_bitrate(self.bitrate, cap) {
                     tracing::warn!(error = %e, "NVENC kept its frame cap");
                 }
             }
         }
         nv.follow_preset(self.bitrate);
+    }
+
+    /// The frames a second the host really encodes (the frame rate following
+    /// the bitrate; its rate is scaled up to match): what the stream's own
+    /// rate is, for the largest frame at low bits per pixel
+    /// ([`frame_cap_for`]). Cheap when unchanged, so it can be called every
+    /// frame.
+    pub fn set_encoded_fps(&mut self, fps: u32) {
+        let bitrate = self.bitrate;
+        let Inner::Nv(nv) = &mut self.inner else { return };
+        let fps = fps.clamp(1, nv.fps);
+        if nv.encoded_fps == fps {
+            return;
+        }
+        let before = nv.cap(bitrate);
+        nv.encoded_fps = fps;
+        let cap = nv.cap(bitrate);
+        if cap != before {
+            if let Some(s) = nv.session.as_mut() {
+                if let Err(e) = s.set_bitrate(bitrate, cap) {
+                    tracing::warn!(error = %e, "NVENC kept its frame cap");
+                }
+            }
+        }
     }
 
     /// The NVENC preset in use (0: Media Foundation's encoder).
@@ -2015,7 +2235,7 @@ impl HwEncoder {
         let key = if nv.last_key_bytes > 0 {
             nv.last_key_bytes as u64
         } else {
-            frame_cap(self.bitrate, nv.fps, nv.tuning.buffer_frames, nv.link.vbv_cap) as u64
+            nv.cap(self.bitrate) as u64
         };
         key * 8 * 1000 > self.bitrate.max(1) as u64 * GRADUAL_OVER.as_millis() as u64
     }
@@ -2342,6 +2562,16 @@ fn spawn_event_pump(events: IMFMediaEventGenerator) -> WinResult<mpsc::Receiver<
 }
 
 unsafe fn pick_hardware_encoder(adapter_luid: Option<i64>, codec: crate::h264::Codec) -> WinResult<IMFActivate> {
+    // Off the fastest GPU (the host on a hybrid laptop's integrated one, on
+    // battery), that GPU's own encoder, asked for by GPU: the plain list
+    // below carries no GPU on its entries, so its first — the fastest GPU's —
+    // was taken, and NVIDIA's encoder handed an Intel device fails at once
+    // (E_UNEXPECTED). On the fastest GPU, the plain list as it always was.
+    if let Some(luid) = adapter_luid.filter(|&l| battery::fastest_luid().is_some_and(|f| f != l)) {
+        if let Some(a) = battery::encoder_activates(codec, Some(luid)).into_iter().next() {
+            return Ok(a);
+        }
+    }
     let in_info = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
     let out_info = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: codec.subtype() };
     let mut activates: *mut Option<IMFActivate> = core::ptr::null_mut();
@@ -2722,6 +2952,27 @@ mod tests {
         assert_eq!(office(1_000_000), 12_500);
         // Never past the tuning's own (game: two frames).
         assert_eq!(frame_cap(8_000_000, 60, 2, true), hrd_bytes(8_000_000, 60, 2));
+    }
+
+    #[test]
+    fn a_low_rate_game_frame_may_take_100_ms() {
+        let px = 2560 * 1440;
+        let on = LinkTuning::default();
+        let off = LinkTuning { low_bpp_cap: false, ..on };
+        let game = |bps, link, encoded| frame_cap_for(bps, 60, 2, link, px, encoded);
+        // Off: two frames.
+        assert_eq!(game(4_000_000, off, 60), hrd_bytes(4_000_000, 60, 2));
+        // 4 Mbps at 60 fps: 100 ms of it (50 KB), not 33 (17 KB).
+        assert_eq!(game(4_000_000, on, 60), 50_000);
+        // 8 Mbps: 0.2 bits a pixel (92 KB) comes before 100 ms (100 KB).
+        assert_eq!(game(8_000_000, on, 60), (px as f64 * LOW_RATE_FRAME_BPP / 8.0) as u32);
+        // 30 Mbps: two frames give more than that already.
+        assert_eq!(game(30_000_000, on, 60), hrd_bytes(30_000_000, 60, 2));
+        // 1 Mbps at 20 fps of 60 (the encoder's rate scaled 3x): two frames
+        // are 100 ms of the stream already.
+        assert_eq!(game(3_000_000, on, 20), hrd_bytes(3_000_000, 60, 2));
+        // Office: its own cap, never less.
+        assert_eq!(frame_cap_for(8_000_000, 60, 15, on, px, 60), frame_cap(8_000_000, 60, 15, true));
     }
 
     #[test]
@@ -3335,7 +3586,7 @@ mod hardware {
                         std::env::set_var("RDPIO_NVENC_REFRESH", refresh.to_string());
                         let tuning = Tuning { buffer_frames: (fps / 4).max(2), quality: 0 };
                         let mut enc = HwEncoder::new_tuned(&device, None, w, h, fps, bps, false, Codec::Hevc, tuning).unwrap();
-                        enc.set_link_tuning(LinkTuning { vbv_cap: cap, preset_follow: false, intra_refresh: gradual });
+                        enc.set_link_tuning(LinkTuning { vbv_cap: cap, preset_follow: false, intra_refresh: gradual, low_bpp_cap: false });
                         assert_eq!(enc.preset(), preset);
                         let mut dec = crate::h264::H264GpuDecoder::with_codec(w, h, &device, &context, Codec::Hevc).unwrap();
                         let (mut enc_ms, mut psnrs, mut sizes, mut keys, mut errors) = (Vec::new(), vec![f64::NAN; n], Vec::new(), Vec::new(), 0);

@@ -824,14 +824,14 @@ dependencies = [
 
 [[package]]
 name = "rdp-asn1"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "rdp-channels"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "rdp-pdu",
  "thiserror",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "rdp-channels",
  "rdp-pdu",
@@ -850,11 +850,11 @@ dependencies = [
 
 [[package]]
 name = "rdp-crypto"
-version = "0.3.1"
+version = "0.4.0"
 
 [[package]]
 name = "rdp-graphics"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "rayon-core",
  "rdp-channels",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-hyper"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "base64",
  "ring",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-nla"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "rdp-asn1",
  "rdp-crypto",
@@ -890,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "rdp-pdu"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bitflags",
  "byteorder",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "rdpio-android"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "aes",
  "android_logger",

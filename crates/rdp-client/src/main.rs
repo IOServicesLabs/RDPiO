@@ -124,6 +124,13 @@ fn main() {
         let percent = std::env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(0);
         std::process::exit(if virtual_display::set_scale_here(&name, percent) { 0 } else { 1 });
     }
+    // The Hyper agent (SYSTEM) asking the signed-in user's own process for
+    // the files copied on this PC: Windows hides them from SYSTEM.
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("--hyper-clipboard-files") {
+        let seq = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        std::process::exit(hyper_clipboard::print_copied_paths(seq));
+    }
     #[cfg(windows)]
     if std::env::args().nth(1).as_deref() == Some("--hyper-lock-session") {
         unsafe {
@@ -174,6 +181,12 @@ fn main() {
     // First line of every log: which build produced it. Field reports from a
     // stale rdpio.exe are indistinguishable from current ones without this.
     tracing::info!(version = env!("CARGO_PKG_VERSION"), build = env!("RDPIO_BUILD"), "rdpio starting");
+    // The agent (SYSTEM): COM's access is set before anything marshals an
+    // interface (see hyper_clipboard::open_com_early).
+    #[cfg(windows)]
+    if std::env::args().any(|a| a == "--hyper-console-agent") {
+        hyper_clipboard::open_com_early();
+    }
     // Log the faulting module on any native crash (e.g. inside a hosted add-in),
     // so a hard crash is diagnosable instead of a silently-truncated log.
     #[cfg(windows)]
@@ -243,6 +256,8 @@ fn main() {
             hyper_client::set_vsync(args.hyper_vsync);
             hyper_client::set_fast_text(args.hyper_fast_text);
             hyper_client::set_gpu_choice(&args.hyper_gpu);
+            hyper_client::set_scale(args.hyper_scale);
+            hyper_client::set_upscale(args.upscale, args.sharpen, args.upscale_explicit);
             crate::window::set_system_keys_local(args.hyper_local_keys);
             match args.host.clone() {
                 Some(host) => Some(hyper_client::run_direct(
@@ -1088,6 +1103,10 @@ struct Args {
     /// FidelityFX SR 1.0, any GPU) reconstructs game imagery best; `vsr` engages
     /// the driver AI SR (NVIDIA RTX VSR / Intel VPE SR) for full-screen video.
     upscale: rdp_gpu::Upscaler,
+    /// `upscale` was chosen by name (`--upscale`, `--fsr`, `--vsr`,
+    /// `--no-vsr`): Hyper keeps it for a scaled-down stream too, instead of
+    /// switching to FSR (see `hyper_client::set_upscale`).
+    upscale_explicit: bool,
     /// RCAS adaptive-sharpen strength after the upscale (`--sharpen 0.0..=1.0`).
     /// `None` = default: on (0.9) for `--upscale fsr` — FSR 1.0 is designed as
     /// EASU+RCAS — off for everything else. `Some(0.0)` disables even for fsr.
@@ -1182,6 +1201,11 @@ struct Args {
     hyper_gpu: String,
     /// Client: Win, Alt+Tab, Alt+F4 start on this PC (`--hyper-local-keys`).
     hyper_local_keys: bool,
+    /// Client: the Hyper stream's size as a share of the window (`--hyper-scale
+    /// auto|100|75|50|33`); `None`: Auto, from the bits the link carries (see
+    /// `rdp_hyper::autores`). An explicit `--render-scale F` with no
+    /// `--hyper-scale` pins it at F too: one flag for "send fewer pixels".
+    hyper_scale: Option<u32>,
     /// Display name of the connection selected in the hub (hub launches only);
     /// recorded on the MRU entry. `None` for plain CLI launches.
     hub_display_name: Option<String>,
@@ -1225,6 +1249,7 @@ impl Args {
             no_seed: false,
             pace: 0,
             upscale: rdp_gpu::Upscaler::default(),
+            upscale_explicit: false,
             sharpen: None,
             backend: rdp_gpu::Backend::default(),
             replay_gfx: None,
@@ -1256,12 +1281,14 @@ impl Args {
             hyper_fast_text: true,
             hyper_gpu: "auto".into(),
             hyper_local_keys: false,
+            hyper_scale: None,
         };
         // Preset defaults must not silently override something the user asked for
         // by name, so track which of the presettable knobs were set explicitly.
         let mut low_latency_explicit = false;
         let mut render_scale_explicit = false;
         let mut upscale_explicit = false;
+        let mut hyper_scale_explicit = false;
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             match flag.as_str() {
@@ -1417,6 +1444,14 @@ impl Args {
                     }
                 }
                 "--hyper-local-keys" => args.hyper_local_keys = true,
+                "--hyper-scale" => match it.next().map(|v| v.trim().trim_end_matches('%').to_ascii_lowercase()).as_deref() {
+                    Some("auto") => hyper_scale_explicit = true,
+                    Some(v @ ("100" | "75" | "50" | "33")) => {
+                        args.hyper_scale = v.parse().ok();
+                        hyper_scale_explicit = true;
+                    }
+                    other => tracing::warn!("unknown --hyper-scale {other:?} (auto|100|75|50|33); using auto"),
+                },
                 "--hyper-host-settings" => {
                     let _ = it.next();
                 }
@@ -1501,6 +1536,12 @@ impl Args {
                 args.upscale = rdp_gpu::Upscaler::Bicubic;
             }
         }
+        // `--render-scale` means "fewer pixels, scaled up here" for Hyper too
+        // (pinned: no Auto) unless `--hyper-scale` says otherwise.
+        if render_scale_explicit && !hyper_scale_explicit {
+            args.hyper_scale = Some((args.render_scale * 100.0).round() as u32);
+        }
+        args.upscale_explicit = upscale_explicit;
         args
     }
 }
@@ -1625,9 +1666,18 @@ HYPER ACCELERATOR (low-latency game streaming beside RDP)
                            fastest plugged in.
     --hyper-local-keys     Win, Alt+Tab, Alt+F4 start on this PC, not the host
                            (Ctrl+Shift+K switches mid-stream).
+    --hyper-scale auto|100|75|50|33
+                           The stream's size as a share of the window. auto
+                           (default): full size until the link is behind and
+                           short of bits (~1 Mbps to a big window), then 75/50%
+                           (33% in office mode); back up after 10 s clear. A
+                           scaled stream is enlarged with FSR+RCAS (office
+                           mode: bicubic) unless --upscale names one. An
+                           explicit --render-scale pins it too.
     --hyper-host-settings <name=0|1,...>
                            Host (elevated): virtual_display, match_resolution,
-                           fast_refresh, keep_monitors.
+                           fast_refresh, keep_monitors; and
+                           host_gpu=auto|fastest|power_saving.
     --hyper-vsync          Present frames on vblank. Default: immediately (the
                            lowest latency; no visible tearing on G-Sync /
                            FreeSync displays).
@@ -1910,6 +1960,8 @@ mod net_tune;
 mod udp_batch;
 #[cfg(windows)]
 mod hyper_clipboard;
+#[cfg(windows)]
+mod hyper_tcp;
 
 #[cfg(windows)]
 mod hyper_camera;
@@ -1921,6 +1973,8 @@ mod wasapi;
 mod hyper_host;
 #[cfg(windows)]
 mod host_ab;
+#[cfg(windows)]
+mod host_battery;
 #[cfg(windows)]
 mod hyper_rates;
 #[cfg(windows)]
@@ -4545,6 +4599,8 @@ mod win {
         crate::window::set_system_keys_local(args.hyper_local_keys);
                 crate::window::set_office_mode(args.hyper_office);
                 crate::hyper_client::set_fast_text(args.hyper_fast_text);
+                crate::hyper_client::set_scale(args.hyper_scale);
+                crate::hyper_client::set_upscale(args.upscale, args.sharpen, args.upscale_explicit);
                 match crate::hyper_client::resolve(&config.hostname, config.port).ok() {
                     Some(addr) => {
                         let fps = args.hyper_fps.unwrap_or_else(crate::hyper_client::local_refresh_hz);

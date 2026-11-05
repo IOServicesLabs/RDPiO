@@ -16,11 +16,14 @@
 //! that has to be taken back soon makes the next up wait twice as long.
 //! Never down while the link keeps up (a LAN at full size stays there).
 //!
-//! Pure logic (no Android), tested on the PC: `rustc --test src/autores.rs`.
+//! Pure logic, shared by the clients: Android's app asks for it a second at
+//! a time (`Client::auto_scale`), the Windows client feeds it from its
+//! once-a-second report (`hyper_client::run`). `cargo test -p rdp-hyper`.
 
 use std::collections::VecDeque;
 
-/// One second's numbers from the perf line.
+/// One second's numbers from the perf line (Android's; the Windows client's
+/// `perf` log line has the same ones).
 #[derive(Clone, Copy, Debug)]
 pub struct Sample {
     /// Seconds, on any clock that only moves forward.
