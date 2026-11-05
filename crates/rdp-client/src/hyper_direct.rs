@@ -803,6 +803,18 @@ fn supervise(opts: &HostOptions) {
 /// How often the service looks for a new rdpio (and how long after starting).
 const UPDATE_EVERY: Duration = Duration::from_secs(6 * 3600);
 const FIRST_UPDATE_CHECK: Duration = Duration::from_secs(120);
+/// A client on a newer rdpio signed in (see [`update_hint`]): the service
+/// looks within this long (s) instead of hours later — at most this often.
+const HINT_POLL: Duration = Duration::from_secs(10);
+const HINT_MIN_GAP: Duration = Duration::from_secs(600);
+
+/// Left by the agent when a client runs a newer rdpio than this host: the
+/// client was updated, the host service (its own copy, in Program Files)
+/// wasn't, and it would have stayed behind until its next look on GitHub —
+/// two PCs "both updated" with the host's half of a fix still missing.
+fn update_hint() -> PathBuf {
+    data_dir().join("hyper-update-hint")
+}
 
 /// Look on GitHub for a newer rdpio now and then (when this PC's settings
 /// allow); one that's found and checked waits in the returned slot.
@@ -831,7 +843,15 @@ fn watch_for_updates() -> Arc<Mutex<Option<rdp_hyper::update::Package>>> {
                     Err(e) => tracing::info!(error = %e, "couldn't look for updates"),
                 }
             }
-            sleep_unless_stopping(UPDATE_EVERY);
+            // Until the next look, or a newer client's hint (taken either way).
+            let (looked, next) = (Instant::now(), Instant::now() + UPDATE_EVERY);
+            while !STOP.load(Ordering::SeqCst) && Instant::now() < next {
+                if std::fs::remove_file(update_hint()).is_ok() && looked.elapsed() >= HINT_MIN_GAP {
+                    tracing::info!("a client runs a newer rdpio: looking for it now");
+                    break;
+                }
+                sleep_unless_stopping(HINT_POLL);
+            }
         }
     });
     slot
@@ -1394,6 +1414,13 @@ impl SignIn {
                 tracing::info!(client = %from, client_app = %want.app, client_protocols = ?want.protocols, update = offer.update, "sign-in from an rdpio with no protocol in common");
             } else if offer.update {
                 tracing::info!(client = %from, client_app = %want.app, "the client runs an older rdpio; offering it this one");
+            } else if !want.app.is_empty()
+                && rdp_hyper::update::newer((&want.app, &want.build), (crate::updater::version(), crate::updater::build()))
+            {
+                // This host is the one behind: the service looks for the
+                // newer rdpio now, and puts it in once this stream ends.
+                tracing::info!(client = %from, client_app = %want.app, "the client runs a newer rdpio; this host updates after the stream");
+                let _ = std::fs::write(update_hint(), b"");
             }
             let fps = offer.fps;
             let fit_to = want.fit.then_some((want.width, want.height));
