@@ -783,6 +783,7 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
         <div class="card group" id="f-devices">
           <label class="switch"><div class="txt">Printer<span>Your default printer in the session.</span></div><span class="toggle"><input type="checkbox" id="f-printer"><i></i></span></label>
           <label class="switch"><div class="txt">Drives<span>Your drives in the session's File Explorer.</span></div><span class="toggle"><input type="checkbox" id="f-drives"><i></i></span></label>
+          <label class="switch" id="f-teams-row"><div class="txt">Teams camera &amp; mic<span>RDP: optimized Teams calls — your camera and microphone work in the session.</span></div><span class="toggle"><input type="checkbox" id="f-teams"><i></i></span></label>
           <label class="switch"><div class="txt">Trust any certificate<span>For a PC whose certificate Windows doesn't trust (its own, self-signed).</span></div><span class="toggle"><input type="checkbox" id="f-insecure"><i></i></span></label>
         </div>
       </div>
@@ -1115,6 +1116,7 @@ function syncEditVisibility() {
   $("#f-keys-row").hidden = !hyperish;
   $("#f-gpu-field").hidden = fTransport !== "direct";
   $("#f-multimon-row").hidden = fTransport !== "rdp";
+  $("#f-teams-row").hidden = fTransport !== "rdp";
   $("#f-devices").hidden = fTransport === "direct";
   $("#f-pw-field").hidden = fTransport === "direct";
 }
@@ -1150,6 +1152,7 @@ function openEdit(c) {
   $("#f-keys").checked = !o.local_keys;
   $("#f-printer").checked = !!o.printer;
   $("#f-drives").checked = !!o.drives;
+  $("#f-teams").checked = !!o.teams;
   $("#f-insecure").checked = !!o.insecure;
   $("#edit-delete").hidden = !(c && c.id);
   $("#edit-error").textContent = "";
@@ -1196,6 +1199,7 @@ function collect() {
       local_keys: !$("#f-keys").checked,
       printer: $("#f-printer").checked,
       drives: $("#f-drives").checked,
+      teams: $("#f-teams").checked,
       insecure: $("#f-insecure").checked,
     },
   };
