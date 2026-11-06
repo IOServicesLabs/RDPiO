@@ -70,6 +70,9 @@ pub struct Options {
     pub printer: bool,
     /// Share every local drive into an RDP session.
     pub drives: bool,
+    /// Teams "Optimized" calls in an RDP session: host the WebRTC redirector
+    /// add-in so the camera and microphone work in Teams.
+    pub teams: bool,
     /// Accept a host certificate Windows doesn't trust (RDP).
     pub insecure: bool,
 }
@@ -91,6 +94,7 @@ impl Default for Options {
             local_keys: false,
             printer: false,
             drives: false,
+            teams: false,
             insecure: false,
         }
     }
@@ -177,6 +181,9 @@ impl Options {
             if self.drives {
                 push("--drive");
                 push("all");
+            }
+            if self.teams && self.transport == Transport::Rdp {
+                push("--teams");
             }
             if self.insecure {
                 push("--insecure");
