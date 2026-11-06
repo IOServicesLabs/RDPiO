@@ -62,6 +62,14 @@ mod websocket;
 #[cfg(windows)]
 mod webview_auth;
 #[cfg(windows)]
+mod com_port;
+#[cfg(windows)]
+mod teams_bitmap;
+#[cfg(windows)]
+mod teams_share;
+#[cfg(windows)]
+mod teams_slimcore;
+#[cfg(windows)]
 mod token_cache;
 #[cfg(windows)]
 mod password_cache;
@@ -1042,6 +1050,10 @@ struct Args {
     shortpath: bool,
     /// Redirect the local default printer into the session (`--printer`).
     printer: bool,
+    /// Redirect every printer this PC has (`--printers`).
+    printers: bool,
+    /// Redirect every COM port this PC has (`--com`).
+    com: bool,
     /// Log decoded RDP-UDP datagrams for capture/diagnostics (`--udp-debug`).
     udp_debug: bool,
     /// Save files copied in the session to this local dir (`--clipboard-dir`).
@@ -1134,6 +1146,9 @@ struct Args {
     /// Force a fresh W365 sign-in (`--w365-relogin`), discarding the cached
     /// refresh token. Use this to switch accounts or recover from a bad cache.
     w365_relogin: bool,
+    /// Connect to this Cloud PC without asking which (`--w365-pc ID`; what the
+    /// launcher's Windows 365 list starts).
+    w365_pc: Option<String>,
     /// Discard only the cached RDSTLS logon password (`--forget-password`) and
     /// re-prompt, without clearing the OAuth token (so no re-MFA). Use after a
     /// mistyped or changed account password.
@@ -1159,6 +1174,9 @@ struct Args {
     /// needs no Microsoft binary, and is the path that will run on Linux. Takes
     /// precedence over `--teams` when both are set.
     teams_native: bool,
+    /// Host Microsoft's SlimCore Teams plugin too (`--teams-slimcore`; implies
+    /// `--teams` when no WebRTC backend was picked, as Teams starts out on WebRTC).
+    teams_slimcore: bool,
     /// Hyper Accelerator client (`--hyper`): sign in over RDP, then switch to
     /// rdpio's own low-latency stream if the host agent is running.
     hyper: bool,
@@ -1231,6 +1249,8 @@ impl Args {
             udp: false,
             shortpath: false,
             printer: false,
+        printers: false,
+        com: false,
             udp_debug: false,
             clipboard_dir: None,
             width: None,
@@ -1258,12 +1278,14 @@ impl Args {
             w365: false,
             w365_device_code: false,
             w365_relogin: false,
+        w365_pc: None,
             forget_password: false,
             tenant: None,
             client_id: None,
             rdp_file: None,
             teams: false,
             teams_native: false,
+        teams_slimcore: false,
             hyper: false,
             hyper_host: false,
             hyper_install: false,
@@ -1322,6 +1344,7 @@ impl Args {
                 "--cpu-yuv" => args.cpu_yuv = true,
                 "--teams" | "--webrtc" => args.teams = true,
                 "--teams-native" | "--webrtc-native" => args.teams_native = true,
+                "--teams-slimcore" => args.teams_slimcore = true,
                 "--low-latency" => {
                     args.low_latency = true;
                     low_latency_explicit = true;
@@ -1398,6 +1421,8 @@ impl Args {
                     args.udp_debug = true;
                 }
                 "--printer" => args.printer = true,
+                "--printers" => args.printers = true,
+                "--com" => args.com = true,
                 "--clipboard-dir" => args.clipboard_dir = it.next(),
                 "--width" => args.width = it.next().and_then(|v| v.parse().ok()),
                 "--height" => args.height = it.next().and_then(|v| v.parse().ok()),
@@ -1415,6 +1440,7 @@ impl Args {
                 "--w365" => args.w365 = true,
                 "--w365-device-code" => args.w365_device_code = true,
                 "--w365-relogin" | "--w365-logout" => args.w365_relogin = true,
+                "--w365-pc" => args.w365_pc = it.next(),
                 "--forget-password" => args.forget_password = true,
                 "--tenant" => args.tenant = it.next(),
                 "--client-id" => args.client_id = it.next(),
@@ -1638,6 +1664,7 @@ REDIRECTION
     --clipboard-dir <DIR>  Where pasted files from the session are staged.
                            Default: a per-session folder under %TEMP%.
     --teams-native         Native WebRTC engine for Teams media optimization.
+    --teams-slimcore Also host Microsoft's SlimCore Teams plugin (implies --teams)
     --teams                Teams optimization via the Microsoft add-in DLL.
 
 HYPER ACCELERATOR (low-latency game streaming beside RDP)
@@ -1707,6 +1734,7 @@ WINDOWS 365 / CLOUD PC
     --w365                 Sign in to Windows 365 and connect to a Cloud PC.
     --w365-device-code     Use device-code sign-in (no local browser).
     --w365-relogin         Force a fresh sign-in, discarding cached tokens.
+    --w365-pc ID           Connect to this Cloud PC without asking which.
     --tenant <ID>          Entra tenant ID.
     --client-id <ID>       Override the OAuth client ID.
     --feed <URL>           Connect through a specific workspace feed URL.
@@ -3899,17 +3927,7 @@ mod win {
             let entries = if args.feed.is_some() {
                 w365::fetch_feed(&token, tenant, args.client_id.as_deref(), args.feed.as_deref())?
             } else {
-                let cached = w365::discover_cached_cloud_pcs();
-                if cached.is_empty() {
-                    tracing::info!("no cached Cloud PCs found; querying live W365 ARM feed");
-                    w365::fetch_feed(&token, tenant, args.client_id.as_deref(), None)?
-                } else {
-                    tracing::info!(
-                        count = cached.len(),
-                        "discovered Cloud PCs from Windows App cache"
-                    );
-                    cached
-                }
+                w365::list_cloud_pcs(&token, tenant, args.client_id.as_deref())?
             };
             if entries.is_empty() {
                 return Err("W365: no Cloud PCs found (resource cache empty and feed returned none)".into());
@@ -3926,7 +3944,12 @@ mod win {
 
             // With more than one Cloud PC, let the user pick in a WebView panel.
             // A single resource (or a picker that can't open) connects directly.
-            let choice = if entries.len() > 1 {
+            let choice = if let Some(pc) = &args.w365_pc {
+                entries
+                    .iter()
+                    .position(|e| w365::pc_key(e) == pc)
+                    .ok_or("That Cloud PC is no longer on this account.")?
+            } else if entries.len() > 1 {
                 match crate::cloud_pc_picker::choose_cloud_pc(&entries) {
                     Ok(i) => i.min(entries.len() - 1),
                     Err(crate::cloud_pc_picker::PickerError::Cancelled) => {
@@ -4568,7 +4591,12 @@ mod win {
                     .with_owner(window.hwnd_raw()),
             ));
             session.set_audio_sink(Box::new(crate::audio::Win32Audio::new()));
-            if args.printer {
+            if args.printers {
+                for (name, driver, default, sink) in crate::printer::Win32Printer::all() {
+                    tracing::info!(%name, %driver, default, "redirecting a local printer");
+                    session.add_printer(name, driver, default, Box::new(sink));
+                }
+            } else if args.printer {
                 match crate::printer::Win32Printer::default_printer() {
                     Some((name, driver, sink)) => {
                         tracing::info!(%name, %driver, "redirecting local default printer");
@@ -4577,13 +4605,21 @@ mod win {
                     None => tracing::warn!("--printer set but no default printer found"),
                 }
             }
+            if args.com {
+                for (name, port) in crate::com_port::available() {
+                    tracing::info!(%name, "redirecting a local COM port");
+                    session.add_port(name, Box::new(port));
+                }
+            }
 
             // Share the D3D11 device/context with the worker so its H.264 path
             // can decode on the GPU (DXVA, zero-copy) into the same device.
             let gpu_device = renderer.device_context_clone();
             let gfx_caps = gfx_caps.clone();
             let no_seed = args.no_seed;
-            let teams = args.teams;
+            let teams = args.teams || args.teams_slimcore;
+            let teams_slimcore = args.teams_slimcore;
+            crate::teams_slimcore::set_session_window(window.hwnd_raw(), desktop_w, desktop_h);
             let teams_native = args.teams_native;
             // Hyper: answer the host agent on its side channel (direct hosts only:
             // the stream goes straight to the RDP server's address).
@@ -4742,7 +4778,13 @@ mod win {
                             r.map(|r| Box::new(r) as Box<dyn rdp_graphics::redirect::DvcRedirector>)
                         } else if teams {
                             tracing::info!("--teams: bringing up the Teams WebRTC redirector bridge");
-                            let r = crate::webrtc_addin::WebRtcRedirector::new();
+                            // Its video goes the same way as the native engine's.
+                            let overlay: crate::teams_video::OverlayOut =
+                                Box::new(move |o: crate::teams_video::Overlay| {
+                                    let _ = overlay_tx.send(FrameMsg::Overlay(o));
+                                    crate::window::signal_frame();
+                                });
+                            let r = crate::webrtc_addin::WebRtcRedirector::new(overlay);
                             tracing::info!(active = r.is_some(), "Teams WebRTC redirector bridge status");
                             r.map(|r| Box::new(r) as Box<dyn rdp_graphics::redirect::DvcRedirector>)
                         } else {
@@ -4751,6 +4793,20 @@ mod win {
                                  (pass --teams-native for the native engine, or --teams for the DLL)"
                             );
                             None
+                        };
+                    // SlimCore's plugin beside the WebRTC backend: each answers
+                    // its own channel, and Teams picks the stack it can.
+                    let slimcore = teams_slimcore
+                        .then(crate::webrtc_addin::WebRtcRedirector::slimcore)
+                        .flatten()
+                        .map(|r| Box::new(r) as Box<dyn rdp_graphics::redirect::DvcRedirector>);
+                    tracing::info!(requested = teams_slimcore, active = slimcore.is_some(), "Teams SlimCore plugin status");
+                    let redirector: Option<Box<dyn rdp_graphics::redirect::DvcRedirector>> =
+                        match (redirector, slimcore) {
+                            (Some(r), Some(s)) => {
+                                Some(Box::new(rdp_graphics::redirect::ChainRedirector::new(vec![s, r])))
+                            }
+                            (r, s) => r.or(s),
                         };
                     let redirector: Option<Box<dyn rdp_graphics::redirect::DvcRedirector>> =
                         match (redirector, hyper) {
@@ -5073,6 +5129,7 @@ mod win {
                                             let _ =
                                                 renderer.ensure_framebuffer(w as u32, h as u32);
                                             desktop = (w as u32, h as u32);
+                                            crate::teams_slimcore::set_desktop_size(desktop.0, desktop.1);
                                             dirty = true;
                                         }
                                         // Handled during drain; never queued.
@@ -5123,6 +5180,12 @@ mod win {
                         if dirty {
                             pending_present = true;
                             activity_deadline = std::time::Instant::now() + ACTIVITY_WINDOW;
+                            crate::teams_share::picture_changed();
+                        }
+                        if crate::teams_share::frame_due() {
+                            if let Some((w, h, rgba)) = renderer.readback_framebuffer() {
+                                crate::teams_share::offer_frame(w, h, rgba);
+                            }
                         }
                         let pace_ready =
                             pace_interval.map_or(true, |iv| last_present.elapsed() >= iv);
@@ -5211,6 +5274,9 @@ mod win {
                                     }
                                 }
                             };
+                            // A change that came too soon after the last shared
+                            // frame is still to be sent.
+                            let timeout_ms = if crate::teams_share::is_sharing() { timeout_ms.min(33) } else { timeout_ms };
                             if for_swapchain {
                                 if window.wait_for_work_or(timeout_ms, renderer.frame_ready_handle()) {
                                     renderer.note_frame_ready();
@@ -5333,6 +5399,29 @@ mod win {
         let (cx1, cy1) = ((x0 + w).min(desktop.0 as i64), (y0 + h).min(desktop.1 as i64));
         if cx1 <= cx0 || cy1 <= cy0 {
             return false;
+        }
+        // Part of it is behind another window: only the visible parts, on the CPU
+        // (the GPU path draws whole boxes). The server paints the rest.
+        if !o.is_unclipped() {
+            let rgba = o.picture.to_rgba(o.w, o.h);
+            let mut drew = false;
+            for c in o.clip.iter().flatten() {
+                let (l, t) = (i64::from(c.left).max(cx0), i64::from(c.top).max(cy0));
+                let (r, b) = (i64::from(c.right).min(cx1), i64::from(c.bottom).min(cy1));
+                if r <= l || b <= t {
+                    continue;
+                }
+                let (cw, ch) = ((r - l) as usize, (b - t) as usize);
+                let (sx, sy) = ((l - x0) as usize, (t - y0) as usize);
+                let mut part = Vec::with_capacity(cw * ch * 4);
+                for row in sy..sy + ch {
+                    let start = (row * o.w as usize + sx) * 4;
+                    part.extend_from_slice(&rgba[start..start + cw * 4]);
+                }
+                renderer.update_rect(l as u16, t as u16, cw as u16, ch as u16, &part);
+                drew = true;
+            }
+            return drew;
         }
         // Fitted, converted and drawn on the GPU where it can be.
         let crate::teams_video::Picture::Nv12 { nv12, width, height, cover, mirror } = &o.picture;

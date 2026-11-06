@@ -39,7 +39,7 @@
 #![allow(non_snake_case)]
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::Write as _;
@@ -52,7 +52,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use rdp_channels::{geometry, names};
 use rdp_graphics::redirect::DvcRedirector;
+
+use crate::teams_bitmap::MappedVideo;
+use crate::teams_share;
+use crate::teams_slimcore::{self, SessionWindow};
+use crate::teams_video::OverlayOut;
 
 use windows::core::{
     implement, interface, s, IUnknown, IUnknown_Vtbl, Interface, Ref, Result, BOOL, BSTR, GUID,
@@ -60,12 +66,13 @@ use windows::core::{
 };
 use windows::Win32::Foundation::{E_FAIL, E_NOINTERFACE, E_NOTIMPL, FreeLibrary, HMODULE, S_OK};
 use windows::Win32::System::Com::StructuredStorage::IPropertyBag;
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED};
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH,
 };
 use windows::Win32::System::RemoteDesktop::{
     IWTSListener, IWTSListenerCallback, IWTSListener_Impl, IWTSPlugin, IWTSVirtualChannel,
+    RDCLIENT_BITMAP_RENDER_SERVICE,
     IWTSVirtualChannelCallback, IWTSVirtualChannelManager, IWTSVirtualChannelManager_Impl,
     IWTSVirtualChannel_Impl,
 };
@@ -86,6 +93,8 @@ enum HostMsg {
     Data { channel_id: u32, data: Vec<u8> },
     /// The server closed an accepted channel.
     Close { channel_id: u32 },
+    /// Where a video element is now (MS-RDPEGT).
+    Geometry(geometry::GeometryUpdate),
     /// Tear the plugin down (on handle drop).
     Shutdown,
 }
@@ -190,7 +199,7 @@ unsafe extern "system" fn stub_query_interface(
     // running call) while still holding a valid non-null pointer for teardown.
     let is_iunknown = iid == IUnknown::IID;
     if log_throttle(&QI_LOGS, 64) {
-        tracing::debug!(
+        tracing::info!(
             iid = %guid_string(&iid),
             granted = is_iunknown,
             "host-service stub: QueryInterface"
@@ -355,6 +364,10 @@ struct ChannelManager {
     listeners: Rc<RefCell<Vec<(String, IWTSListenerCallback)>>>,
     /// Mirror of the registered names for the mux's `claims()`.
     names: Names,
+    /// Where the plugin's video goes, if this host draws any.
+    video: Option<Arc<MappedVideo>>,
+    /// The session's window, if this plugin draws in it itself.
+    window: Option<Arc<SessionWindow>>,
 }
 
 impl IWTSVirtualChannelManager_Impl for ChannelManager_Impl {
@@ -383,6 +396,23 @@ impl IMsRdcServiceProvider_Impl for ChannelManager_Impl {
         };
         if out.is_null() {
             return E_FAIL;
+        }
+        // The one service that's real: without it the add-in drops all video.
+        if let (true, Some(video)) = (g == RDCLIENT_BITMAP_RENDER_SERVICE, &self.video) {
+            tracing::info!("Teams add-in requested the bitmap render service");
+            unsafe { *out = video.service().into_raw() };
+            return S_OK;
+        }
+        if let (true, Some(window)) = (g == teams_slimcore::WINDOW_INFO_SERVICE, &self.window) {
+            tracing::info!("Teams SlimCore plugin requested the window-info service");
+            unsafe { *out = window.service() };
+            return S_OK;
+        }
+        // The add-in's alone: SlimCore's use of it isn't known yet.
+        if g == teams_share::SCREEN_CAPTURE_SERVICE && self.video.is_some() {
+            tracing::info!("Teams add-in requested the screen capture service");
+            unsafe { *out = teams_share::service() };
+            return S_OK;
         }
         // Hand back the null-safe stub (see `HostService`). This makes the
         // service field the add-in stores non-null, so its teardown paths (e.g.
@@ -418,6 +448,8 @@ struct VirtualChannel {
     channel_id: u32,
     outbound: Outbound,
     capture: Option<Capture>,
+    /// Copy what the plugin sends to the session's log (SlimCore's handshake).
+    log_messages: bool,
 }
 
 impl IWTSVirtualChannel_Impl for VirtualChannel_Impl {
@@ -435,6 +467,9 @@ impl IWTSVirtualChannel_Impl for VirtualChannel_Impl {
         tracing::debug!(channel_id = self.channel_id, len = bytes.len(), "WebRTC add-in → server");
         if let Some(cap) = &self.capture {
             cap.record(CAP_DIR_OUTBOUND, self.channel_id, &bytes);
+        }
+        if self.log_messages {
+            teams_slimcore::log_message(true, &bytes);
         }
         self.outbound.lock().unwrap().push_back((self.channel_id, bytes));
         // (The session worker sleeps until there's something to send.)
@@ -475,6 +510,8 @@ fn run_host(
     names: Names,
     outbound: Outbound,
     capture: Option<Capture>,
+    video: Option<Arc<MappedVideo>>,
+    window: Option<Arc<SessionWindow>>,
     ready: SyncSender<bool>,
 ) {
     unsafe {
@@ -483,7 +520,12 @@ fn run_host(
         // DirectShow-DMO / audio). Under MTA its internal setup QI'd an object
         // that came back E_NOINTERFACE and its cleanup path null-derefed (crash at
         // RtcRemoteDesktopPluginImpl.cpp). msrdc hosts DVC plugins on an STA too.
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        //
+        // SlimCore's plugin is the opposite: it initializes COM and WinRT for an
+        // MTA on the thread that hands it Teams' hello, and on an STA that fails
+        // (RPC_E_CHANGED_MODE) before it tries to load anything.
+        let apartment = if window.is_some() { COINIT_MULTITHREADED } else { COINIT_APARTMENTTHREADED };
+        let _ = CoInitializeEx(None, apartment);
 
         let module = match load_addin(&dll) {
             Ok(m) => m,
@@ -516,6 +558,8 @@ fn run_host(
         let manager: IWTSVirtualChannelManager = ChannelManager {
             listeners: listeners.clone(),
             names,
+            video: video.clone(),
+            window: window.clone(),
         }
         .into();
 
@@ -552,6 +596,7 @@ fn run_host(
                         channel_id,
                         outbound: outbound.clone(),
                         capture: capture.clone(),
+                        log_messages: window.is_some(),
                     }
                     .into();
                     let mut accept = BOOL(0);
@@ -579,11 +624,22 @@ fn run_host(
                         let _ = cb.OnClose();
                     }
                 }
+                HostMsg::Geometry(update) => {
+                    if let Some(video) = &video {
+                        video.geometry(update);
+                    }
+                }
                 HostMsg::Shutdown => {
                     running = false;
                     break;
                 }
                 }
+            }
+            if let Some(video) = &video {
+                video.deliver_sizes();
+            }
+            if let Some(window) = &window {
+                window.tick();
             }
             if !running {
                 break;
@@ -599,7 +655,10 @@ fn run_host(
             MsgWaitForMultipleObjectsEx(None, 10, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
         let _ = plugin.Terminated();
-        let _ = FreeLibrary(module);
+        // Stays loaded: its own threads may still be winding down, and unloading
+        // under them would crash. The process is about to end anyway.
+        std::mem::forget(plugin);
+        let _ = module;
     }
 }
 
@@ -616,14 +675,22 @@ pub struct WebRtcRedirector {
     /// webrtc.1 wire capture (inbound side); `None` unless `RDPIO_WEBRTC_CAPTURE`
     /// is set. Cloned onto the host thread for the outbound side.
     capture: Option<Capture>,
+    /// Where the plugin's video goes, if this host draws any.
+    video: Option<Arc<MappedVideo>>,
+    /// The MS-RDPEGT geometry channels the server has open (one per tracked
+    /// window, in practice).
+    geometry_channels: HashSet<u32>,
+    /// The session's window, if this plugin draws in it itself.
+    window: Option<Arc<SessionWindow>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl WebRtcRedirector {
     /// Locate, load, and initialize the add-in. Returns `None` (→ rdpio keeps
     /// declining the WebRTC channel) if the DLL is missing or the plugin refuses
-    /// to initialize. Blocks up to 10 s for the plugin's one-time init.
-    pub fn new() -> Option<Self> {
+    /// to initialize. Blocks up to 10 s for the plugin's one-time init. Its video
+    /// is drawn through `overlay` (the UI thread's renderer).
+    pub fn new(overlay: OverlayOut) -> Option<Self> {
         let Some(dll) = resolve_addin_dll() else {
             tracing::warn!(
                 "Teams WebRTC add-in DLL not found — install the Windows App / AVD HostApp \
@@ -632,17 +699,38 @@ impl WebRtcRedirector {
             return None;
         };
         tracing::info!(path = %dll.display(), "hosting Teams WebRTC add-in");
+        Self::host(dll, Capture::from_env(), Some(MappedVideo::new(overlay)), None)
+    }
 
+    /// Host Microsoft's newer Teams plugin, the one that runs calls on SlimCore
+    /// (Teams retires WebRTC calls from Windows PCs on 2027-04-01). It's a plugin
+    /// of the same shape as the add-in, though it draws for itself (see
+    /// [`teams_slimcore`]); `None` if this PC's Windows App has none.
+    pub fn slimcore() -> Option<Self> {
+        let Some(dll) = resolve_dll(SLIMCORE_PLUGIN, None) else {
+            tracing::warn!("no {SLIMCORE_PLUGIN} found: install the Windows App for SlimCore calls");
+            return None;
+        };
+        tracing::info!(path = %dll.display(), "hosting Teams SlimCore plugin");
+        Self::host(dll, None, None, Some(Arc::default()))
+    }
+
+    fn host(
+        dll: PathBuf,
+        capture: Option<Capture>,
+        video: Option<Arc<MappedVideo>>,
+        window: Option<Arc<SessionWindow>>,
+    ) -> Option<Self> {
+        let dll = runnable_copy(&dll);
         let names: Names = Arc::new(Mutex::new(Vec::new()));
         let outbound: Outbound = Arc::new(Mutex::new(VecDeque::new()));
-        let capture = Capture::from_env();
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
 
-        let (n, o, cap) = (names.clone(), outbound.clone(), capture.clone());
+        let (n, o, cap, v, w) = (names.clone(), outbound.clone(), capture.clone(), video.clone(), window.clone());
         let thread = std::thread::Builder::new()
             .name("webrtc-addin".into())
-            .spawn(move || run_host(dll, rx, n, o, cap, ready_tx))
+            .spawn(move || run_host(dll, rx, n, o, cap, v, w, ready_tx))
             .ok()?;
 
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
@@ -651,6 +739,9 @@ impl WebRtcRedirector {
                 names,
                 outbound,
                 capture,
+                video,
+                geometry_channels: HashSet::new(),
+                window,
                 thread: Some(thread),
             }),
             other => {
@@ -663,15 +754,25 @@ impl WebRtcRedirector {
 
 impl DvcRedirector for WebRtcRedirector {
     fn claims(&self, name: &str) -> bool {
-        self.names
-            .lock()
-            .map(|n| n.iter().any(|x| x == name))
-            .unwrap_or(false)
+        (self.video.is_some() && name.starts_with(names::GEOMETRY_PREFIX))
+            || self
+                .names
+                .lock()
+                .map(|n| n.iter().any(|x| x == name))
+                .unwrap_or(false)
     }
 
     fn on_create(&mut self, channel_id: u32, name: &str) -> bool {
+        if self.video.is_some() && name.starts_with(names::GEOMETRY_PREFIX) {
+            tracing::info!(channel_id, %name, "tracking desktop geometry for Teams video (MS-RDPEGT)");
+            self.geometry_channels.insert(channel_id);
+            return true;
+        }
         if !self.claims(name) {
             return false;
+        }
+        if self.window.is_some() {
+            tracing::info!(channel_id, %name, "Teams opened SlimCore's channel");
         }
         self.tx
             .send(HostMsg::NewChannel {
@@ -682,8 +783,20 @@ impl DvcRedirector for WebRtcRedirector {
     }
 
     fn on_data(&mut self, channel_id: u32, message: &[u8]) {
+        if self.geometry_channels.contains(&channel_id) {
+            match geometry::parse(message) {
+                Some(update) => {
+                    let _ = self.tx.send(HostMsg::Geometry(update));
+                }
+                None => tracing::debug!(len = message.len(), "unparsed geometry packet"),
+            }
+            return;
+        }
         if let Some(cap) = &self.capture {
             cap.record(CAP_DIR_INBOUND, channel_id, message);
+        }
+        if self.window.is_some() {
+            teams_slimcore::log_message(false, message);
         }
         let _ = self.tx.send(HostMsg::Data {
             channel_id,
@@ -692,6 +805,9 @@ impl DvcRedirector for WebRtcRedirector {
     }
 
     fn on_close(&mut self, channel_id: u32) {
+        if self.geometry_channels.remove(&channel_id) {
+            return;
+        }
         let _ = self.tx.send(HostMsg::Close { channel_id });
     }
 
@@ -705,11 +821,19 @@ impl DvcRedirector for WebRtcRedirector {
 
 impl Drop for WebRtcRedirector {
     fn drop(&mut self) {
+        if self.video.is_some() {
+            teams_share::end();
+        }
         let _ = self.tx.send(HostMsg::Shutdown);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
     }
+}
+
+/// Whether `--teams` would find Microsoft's add-in on this PC.
+pub fn addin_available() -> bool {
+    resolve_addin_dll().is_some()
 }
 
 /// Find `MsRdcWebRTCAddIn.dll`: the `RDPIO_WEBRTC_ADDIN_DLL` override, next to
@@ -718,14 +842,67 @@ impl Drop for WebRtcRedirector {
 /// Remote Desktop install, then a WindowsApps listing as a last resort. `None`
 /// if none of those has it.
 fn resolve_addin_dll() -> Option<PathBuf> {
-    const NAME: &str = "MsRdcWebRTCAddIn.dll";
+    resolve_dll("MsRdcWebRTCAddIn.dll", Some("RDPIO_WEBRTC_ADDIN_DLL"))
+}
 
+/// A copy of a plugin that sits in the Windows App's package, in rdpio's data
+/// folder: that folder lets other apps read its files but not run them (only
+/// packaged apps may), so LoadLibrary there says access denied. One folder per
+/// package version, so an updated Windows App brings its update along. Anything
+/// else, or a failed copy, stays where it was (and says why it won't load).
+fn runnable_copy(dll: &Path) -> PathBuf {
+    let package = dll.ancestors().find(|a| {
+        a.parent().and_then(Path::file_name).is_some_and(|n| n.eq_ignore_ascii_case("WindowsApps"))
+    });
+    let (Some(package), Some(name), Some(root)) = (package.and_then(Path::file_name), dll.file_name(), crate::hub::store::data_dir().ok()) else {
+        return dll.to_path_buf();
+    };
+    let root = root.join("teams-plugins");
+    let dir = root.join(package);
+    let copy = dir.join(name);
+    if copy.exists() {
+        return copy;
+    }
+    // (Written aside and moved in place: a half-written DLL must never be seen.)
+    let partial = copy.with_extension("partial");
+    let copied = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::copy(dll, &partial))
+        .and_then(|_| std::fs::rename(&partial, &copy));
+    match copied {
+        Ok(()) => {
+            tracing::info!(path = %copy.display(), "copied a Teams plugin out of the Windows App's package");
+            // Older versions' copies are done with.
+            for old in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+                if old.file_name() != package && same_app(&old.file_name(), package) {
+                    let _ = std::fs::remove_dir_all(old.path());
+                }
+            }
+            copy
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %dll.display(), "couldn't copy a Teams plugin out of the Windows App's package");
+            dll.to_path_buf()
+        }
+    }
+}
+
+/// Whether two package folders (`Name_1.2.3.4_x64__hash`) are the same app.
+fn same_app(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    let name = |p: &std::ffi::OsStr| p.to_string_lossy().split('_').next().unwrap_or_default().to_ascii_lowercase();
+    name(a) == name(b)
+}
+
+/// The SlimCore Teams plugin, in the same places as the add-in.
+const SLIMCORE_PLUGIN: &str = "MsTeamsPluginAvd.dll";
+
+/// Find a plugin DLL that ships with the Windows App (see [`resolve_addin_dll`]).
+fn resolve_dll(name: &str, override_var: Option<&str>) -> Option<PathBuf> {
     // Explicit override: point rdpio straight at the DLL. Needed when the add-in lives
     // in a WindowsApps package whose ROOT a normal process can't enumerate (ACL-locked
     // to TrustedInstaller) even though the specific file path is readable — the common
     // case on locked-down clients. Loaded with `LOAD_WITH_ALTERED_SEARCH_PATH`, so the
     // add-in's sibling dependencies still resolve from its package directory.
-    if let Some(p) = std::env::var_os("RDPIO_WEBRTC_ADDIN_DLL") {
+    if let Some(p) = override_var.and_then(std::env::var_os) {
         let p = PathBuf::from(p);
         if p.exists() {
             tracing::info!(path = %p.display(), "using RDPIO_WEBRTC_ADDIN_DLL override for the Teams add-in");
@@ -736,7 +913,7 @@ fn resolve_addin_dll() -> Option<PathBuf> {
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join(NAME);
+            let p = dir.join(name);
             if p.exists() {
                 return Some(p);
             }
@@ -754,7 +931,7 @@ fn resolve_addin_dll() -> Option<PathBuf> {
     ];
     for family in FAMILIES {
         for dir in package_dirs(family) {
-            for cand in [dir.join(NAME), dir.join("msrdc").join(NAME)] {
+            for cand in [dir.join(name), dir.join("msrdc").join(name)] {
                 if cand.exists() {
                     tracing::info!(%family, path = %cand.display(), "found Teams WebRTC add-in");
                     return Some(cand);
@@ -770,7 +947,7 @@ fn resolve_addin_dll() -> Option<PathBuf> {
             .map(|p| PathBuf::from(p).join("Apps").join("Remote Desktop")),
     ];
     for dir in msi_dirs.into_iter().flatten() {
-        let cand = dir.join(NAME);
+        let cand = dir.join(name);
         if cand.exists() {
             tracing::info!(path = %cand.display(), "found Teams WebRTC add-in (Remote Desktop MSI)");
             return Some(cand);
@@ -794,9 +971,9 @@ fn resolve_addin_dll() -> Option<PathBuf> {
                 // The add-in sits at <pkg>\ or <pkg>\msrdc\ per package layout.
                 for sub in ["", "msrdc"] {
                     let cand = if sub.is_empty() {
-                        entry.path().join(NAME)
+                        entry.path().join(name)
                     } else {
-                        entry.path().join(sub).join(NAME)
+                        entry.path().join(sub).join(name)
                     };
                     if cand.exists() && best.as_ref().is_none_or(|(b, _)| folder > *b) {
                         best = Some((folder.clone(), cand));
@@ -812,7 +989,7 @@ fn resolve_addin_dll() -> Option<PathBuf> {
     }
     match &best {
         Some((pkg, path)) => tracing::info!(package = %pkg, path = %path.display(), "found Teams WebRTC add-in"),
-        None => tracing::warn!("no MsRdcWebRTCAddIn.dll found in any WindowsApps package or next to rdpio.exe"),
+        None => tracing::warn!("no {name} found in any WindowsApps package or next to rdpio.exe"),
     }
     best.map(|(_, p)| p)
 }
@@ -869,6 +1046,55 @@ fn package_dirs(family: &str) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On a PC with the Windows App: `cargo test -- --ignored --nocapture
+    /// plugins_load_here`. Each loads, initializes, and names its channels.
+    #[test]
+    #[ignore = "loads the Windows App's real plugins"]
+    fn plugins_load_here() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        println!("add-in at {:?}", resolve_addin_dll());
+        println!("plugin at {:?}", resolve_dll(SLIMCORE_PLUGIN, None));
+        for (what, host) in [("WebRTC add-in", WebRtcRedirector::new(Box::new(|_| {}))), ("SlimCore plugin", WebRtcRedirector::slimcore())] {
+            match host {
+                Some(host) => println!("{what} listens on {:?}", host.names.lock().unwrap()),
+                None => println!("{what} didn't come up"),
+            }
+        }
+    }
+
+    /// `cargo test -- --ignored --nocapture slimcore_tries_to_load_here`. Teams'
+    /// hello as it comes from a Cloud PC, but its URL goes nowhere, so the plugin
+    /// must get as far as failing to download, and nothing is installed.
+    #[test]
+    #[ignore = "runs the Windows App's real plugin"]
+    fn slimcore_tries_to_load_here() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let mut host = WebRtcRedirector::slimcore().expect("no SlimCore plugin here");
+        assert!(host.on_create(7, "com.microsoft.rdc.dvc.cpc.1"));
+        let url = "https://rdpio-test.invalid/Microsoft.Teams.SlimCore.msix";
+        let hello = format!(
+            r#"{{"contentType":"scpie","messageName":"VMHello","requestId":1,"version":"2026.40.1.11","loadTimeoutMs":20000,"watchdogTimeoutMs":10000,"slimCoreStopTimeoutMs":7000,"rpcConnectionTimeoutMs":20000,"suspendedProcessTerminationTimeoutMs":30000,"cloudId":"test","optimizedScreenShare":true,"relevantReleases":30,"urls":{{"win-x64":"{url}"}},"urlsEx":["{url}"],"fwkUrls":["{url}"],"hostUrls":["{url}"],"bundleUrls":["{url}"]}}"#
+        );
+        host.on_data(7, hello.as_bytes());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+        let answer = loop {
+            let client_hello = host
+                .drain_outbound()
+                .into_iter()
+                .map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned())
+                .find(|m| m.contains(r#""messageName":"ClientHello""#));
+            if let Some(answer) = client_hello {
+                break answer;
+            }
+            assert!(std::time::Instant::now() < deadline, "no ClientHello");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        println!("ClientHello: {answer}");
+        // Still running its worker; a test process needn't tear that down.
+        std::mem::forget(host);
+        assert!(!answer.contains(r#"val\":262"#), "the plugin couldn't start on this thread");
+    }
 
     #[test]
     fn package_dirs_of_an_unknown_family_is_empty() {

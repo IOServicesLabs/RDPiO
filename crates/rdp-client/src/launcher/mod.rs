@@ -893,6 +893,18 @@ fn handle(st: &mut State, cmd: &str, req: &Value) -> Result<Value, String> {
             Ok(state_json(st))
         }
         "connect" => connect(st, req),
+        "w365_status" => {
+            w365_refresh(None);
+            Ok(Value::Null)
+        }
+        "w365_sign_in" => {
+            w365_sign_in();
+            Ok(Value::Null)
+        }
+        "w365_sign_out" => {
+            w365_sign_out()?;
+            Ok(Value::Null)
+        }
         "settings" => {
             if let Some(theme) = s(req, "theme").filter(|t| ["system", "dark", "light"].contains(&t.as_str())) {
                 st.prefs.file.theme = theme;
@@ -1165,8 +1177,9 @@ fn save(st: &mut State, req: &Value) -> Result<Value, String> {
     Ok(json!({ "id": record.id.to_string(), "state": state_json(st) }))
 }
 
-/// `{id}` (a saved connection) or `{target: {host, port, user, domain,
-/// options, name}}` (quick connect, a Recent entry), with optional
+/// `{id}` (a saved connection), `{w365: {id, name, account}}` (a Cloud PC of
+/// the Windows 365 list) or `{target: {host, port, user, domain, options,
+/// name}}` (quick connect, a Recent entry), with optional
 /// one-time `password` / `hyper_password` (and `remember` to save them on a
 /// saved connection). Replies `{need: "password" | "hyper_password"}` when a
 /// session would have to ask for one (it has no console to ask on).
@@ -1180,7 +1193,13 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
     let given_pw = req.get("password").and_then(Value::as_str).map(String::from);
     let given_hyper = req.get("hyper_password").and_then(Value::as_str).map(String::from);
     let remember = req.get("remember").and_then(Value::as_bool).unwrap_or(false);
-    let (name, host, port, user, domain, saved_pw, saved_hyper, options, id) = if let Some(id) = s(req, "id") {
+    let cloud = req.get("w365").filter(|c| c.is_object());
+    let (name, host, port, user, domain, saved_pw, saved_hyper, options, id) = if let Some(c) = cloud {
+        let name = s(c, "name").unwrap_or_else(|| "Cloud PC".to_string());
+        let options = Options::cloud_pc(&st.prefs.file.defaults);
+        let pw = s(c, "account").and_then(|a| crate::password_cache::load(&a));
+        (name.clone(), name, 3389, None, None, pw, None, options, None)
+    } else if let Some(id) = s(req, "id") {
         let id: uuid::Uuid = id.parse().map_err(|_| "no such connection")?;
         let r = st.connections.get(&id).cloned().ok_or("That connection no longer exists.")?;
         let e = st.prefs.entry(&id);
@@ -1200,7 +1219,11 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
     let password = given_pw.clone().or(saved_pw);
     let hyper_password = given_hyper.clone().or(saved_hyper);
     // Ask the page for what the session would otherwise prompt for.
-    if options.transport == Transport::Direct {
+    if cloud.is_some() {
+        if password.as_deref().unwrap_or("").is_empty() {
+            return Ok(json!({ "need": "w365_password" }));
+        }
+    } else if options.transport == Transport::Direct {
         if hyper_password.is_none() && !crate::hyper_client::has_saved_password(&host) {
             return Ok(json!({ "need": "hyper_password" }));
         }
@@ -1229,11 +1252,13 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
             }
         }
     }
-    let key = match id {
-        Some(id) => id.to_string(),
-        None => profile::recent_key(&host, port, user.as_deref()),
+    let cloud_pc = cloud.map(|c| s(c, "id").ok_or("no such Cloud PC")).transpose()?;
+    let key = match (&cloud_pc, id) {
+        (Some(pc), _) => format!("w365:{pc}"),
+        (_, Some(id)) => id.to_string(),
+        _ => profile::recent_key(&host, port, user.as_deref()),
     };
-    if id.is_none() {
+    if id.is_none() && cloud_pc.is_none() {
         st.prefs.file.recent.insert(profile::recent_key(&host, port, user.as_deref()), options.clone());
     }
     let _ = st.prefs.save();
@@ -1259,7 +1284,10 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
         options.multimon = false;
         args_size = Some(format!("{w}x{h}"));
     }
-    let mut args: Vec<String> = vec!["--host".into(), host.clone(), "--port".into(), port.to_string()];
+    let mut args: Vec<String> = match &cloud_pc {
+        Some(pc) => vec!["--w365".into(), "--w365-pc".into(), pc.clone()],
+        None => vec!["--host".into(), host.clone(), "--port".into(), port.to_string()],
+    };
     if let Some(u) = &user {
         args.extend(["--user".into(), u.clone()]);
     }
@@ -1271,6 +1299,15 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
         args.extend(["--launcher-id".into(), id.to_string()]);
     }
     args.extend(options.to_args());
+    // A Cloud PC's Teams calls run on this PC: with Microsoft's add-in where
+    // the Windows App put one, else rdpio's own engine.
+    if cloud_pc.is_some() {
+        args.extend(profile::CLOUD_PC_REDIRECTS.map(String::from));
+        // Teams calls: SlimCore where Teams can use it (WebRTC, below, ends for
+        // Windows PCs on 2027-04-01), with WebRTC beside it as Teams starts there.
+        args.push("--teams-slimcore".into());
+        args.push(if crate::webrtc_addin::addin_available() { "--teams".into() } else { "--teams-native".into() });
+    }
     if let Some(size) = args_size {
         args.extend(["--size".into(), size]);
     }
@@ -1627,6 +1664,84 @@ fn on_event(e: Value) {
         }
         _ => send(st, &e),
     });
+}
+
+// ------------------------------------------------------------ Windows 365
+
+/// The tenant of a launcher sign-in: `--w365`'s default, so its sessions find
+/// the token cached.
+const W365_TENANT: &str = "common";
+
+/// A sign-in or a look at the account is going on.
+static W365_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Tell the page who's signed in and their Cloud PCs (never the token).
+/// `token`: from a sign-in just done; else the cached one, refreshed quietly.
+fn w365_post(token: Option<crate::w365::AccessToken>, sign_in_error: Option<String>) {
+    let Some(token) = token.or_else(|| crate::token_cache::load_silent(W365_TENANT, None)) else {
+        post_event(json!({ "event": "w365", "signed_in": false, "pcs": [], "sign_in_error": sign_in_error }));
+        return;
+    };
+    let (pcs, error) = match crate::w365::list_cloud_pcs(&token, W365_TENANT, None) {
+        Ok(pcs) => (pcs, None),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list the Cloud PCs");
+            (Vec::new(), Some(e.to_string()))
+        }
+    };
+    let pcs: Vec<Value> = pcs.iter().map(|e| json!({ "id": crate::w365::pc_key(e), "name": e.display_name })).collect();
+    post_event(json!({ "event": "w365", "signed_in": true, "account": token.username, "pcs": pcs, "error": error }));
+}
+
+/// Claim [`W365_BUSY`] and run `f` off the UI thread (it waits on the network,
+/// a sign-in on the user too).
+fn w365_job(name: &str, f: impl FnOnce() + Send + 'static) {
+    if W365_BUSY.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name(name.into()).spawn(move || {
+        f();
+        W365_BUSY.store(false, Ordering::SeqCst);
+    });
+    if let Err(e) = spawned {
+        W365_BUSY.store(false, Ordering::SeqCst);
+        post_event(json!({ "event": "w365", "signed_in": false, "pcs": [], "sign_in_error": e.to_string() }));
+    }
+}
+
+fn w365_refresh(token: Option<crate::w365::AccessToken>) {
+    w365_job("launcher-w365", move || w365_post(token, None));
+}
+
+/// Microsoft's sign-in in a window of its own; its token is cached for the
+/// sessions to use.
+fn w365_sign_in() {
+    w365_job("launcher-w365-sign-in", || match crate::webview_auth::authenticate(W365_TENANT, None) {
+        Ok(token) => {
+            crate::token_cache::store(W365_TENANT, None, &token);
+            tracing::info!("signed in to Windows 365");
+            w365_post(Some(token), None);
+        }
+        Err(crate::webview_auth::WebViewAuthError::Cancelled) => w365_post(None, None),
+        Err(e) => {
+            tracing::warn!(error = %e, "Windows 365 sign-in failed");
+            w365_post(None, Some(e.to_string()));
+        }
+    });
+}
+
+/// Forget the account: its tokens, the Cloud PC password, and the sign-in
+/// window's cookies (else it would sign the same account straight back in).
+fn w365_sign_out() -> Result<(), String> {
+    if W365_BUSY.load(Ordering::SeqCst) {
+        return Err("Windows 365 is still signing in.".into());
+    }
+    crate::token_cache::clear().map_err(|e| e.to_string())?;
+    crate::password_cache::clear().map_err(|e| e.to_string())?;
+    crate::webview_auth::forget_browser_data();
+    tracing::info!("signed out of Windows 365");
+    post_event(json!({ "event": "w365", "signed_in": false, "pcs": [] }));
+    Ok(())
 }
 
 // ------------------------------------------------------------ updates

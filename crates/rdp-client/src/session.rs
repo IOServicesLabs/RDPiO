@@ -1077,6 +1077,42 @@ impl ActiveSession {
         self.rdpdr.channel.set_printer(print_name, driver_name, sink);
     }
 
+    /// Redirect one more local printer (see [`Self::set_printer`]).
+    #[cfg(windows)]
+    pub fn add_printer(
+        &mut self,
+        print_name: String,
+        driver_name: String,
+        default: bool,
+        sink: Box<dyn rdp_channels::rdpdr::PrinterSink>,
+    ) {
+        self.rdpdr.channel.add_printer(print_name, driver_name, default, sink);
+    }
+
+    /// Redirect a local COM port into the session. Call before the session loop
+    /// runs the rdpdr handshake.
+    #[cfg(windows)]
+    pub fn add_port(&mut self, name: String, backend: Box<dyn rdp_channels::rdpdr::PortBackend>) {
+        self.rdpdr.channel.add_port(name, backend);
+    }
+
+    /// Send the answers of device requests that finished on their own threads.
+    fn pump_rdpdr<S: Write>(&mut self, stream: &mut S) -> Result<(), ActivateError> {
+        let completed = self.rdpdr.channel.take_completed();
+        if completed.is_empty() {
+            return Ok(());
+        }
+        let Some(rdpdr_id) = self.info.channel_id(rdp_pdu::gcc::RDPDR_CHANNEL) else {
+            return Ok(());
+        };
+        for resp in completed {
+            for piece in rdp_channels::svc::chunks(&resp) {
+                self.send_channel(stream, rdpdr_id, &piece)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Feed one inbound rdpsnd channel chunk: reassemble, run the RDPSND state
     /// machine against the OS audio sink, and send any responses (format reply,
     /// training echo, wave confirms) back on the rdpsnd channel.
@@ -1619,6 +1655,7 @@ pub fn pump_once<S: Read + Write, F: FrameSink>(
     // ...and start staging the session's clipboard files if a paste wants them.
     #[cfg(any(windows, target_os = "android"))]
     session.pump_clipboard_files(stream)?;
+    session.pump_rdpdr(stream)?;
 
     let pdu = read_tpkt_pdu(stream)?;
     let (channel, payload) = mcs::parse_send_data_indication(&pdu)?;
@@ -2283,6 +2320,7 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         // ...and start staging the session's clipboard files if a paste is
         // waiting on them (the lazy half of file redirection).
         session.pump_clipboard_files(stream)?;
+        session.pump_rdpdr(stream)?;
 
         // Forward a pending window-resize as a Display Control request, but only
         // after the size has been stable for RESIZE_SETTLE (drag-end), so one

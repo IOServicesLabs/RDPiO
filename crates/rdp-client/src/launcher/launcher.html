@@ -292,6 +292,10 @@ select.input option { background: var(--raised); color: var(--text); }
 .item .grow { flex: 1; min-width: 0; }
 .item .when { color: var(--text-3); font-size: 12px; white-space: nowrap; }
 .item .acts { display: flex; gap: 4px; opacity: .0; transition: opacity .12s; }
+.item .avatar svg { width: 18px; height: 18px; }
+.w365-head { display: flex; align-items: center; gap: 8px; }
+.w365-head .count { font-weight: 400; text-transform: none; letter-spacing: 0; }
+.w365-head .btn { font-family: var(--font); text-transform: none; letter-spacing: 0; }
 .item:hover .acts, .item:focus-within .acts { opacity: 1; }
 
 .empty { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 48px 20px; color: var(--text-2); gap: 10px; }
@@ -522,6 +526,7 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
   <symbol id="i-logo" viewBox="0 0 108 32"><rect class="logo-bar" x="1" y="8.75" width="69" height="15.5" rx=".6" stroke-width="1.5"/><circle class="logo-o" cx="91" cy="16.5" r="15.25" stroke-width="1.5"/></symbol>
   <symbol id="i-conn" viewBox="0 0 20 20"><rect x="2.5" y="3.5" width="15" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7 16.5h6M10 13.5v3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
   <symbol id="i-host" viewBox="0 0 20 20"><rect x="4" y="2.5" width="12" height="15" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7 6h6M7 9h6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="10" cy="13.5" r="1.2" fill="currentColor"/></symbol>
+  <symbol id="i-cloud" viewBox="0 0 20 20"><path d="M6 15.5h8a3.5 3.5 0 0 0 .6-6.95A5 5 0 0 0 5 9.1a3.25 3.25 0 0 0 1 6.4Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></symbol>
   <symbol id="i-gear" viewBox="0 0 20 20"><path d="M10 6.8a3.2 3.2 0 1 0 0 6.4 3.2 3.2 0 0 0 0-6.4Z" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8.6 2.5h2.8l.4 2.1 1.5.9 2-.8 1.4 2.4-1.6 1.4v1.8l1.6 1.4-1.4 2.4-2-.8-1.5.9-.4 2.1H8.6l-.4-2.1-1.5-.9-2 .8-1.4-2.4 1.6-1.4V8.5L3.3 7.1l1.4-2.4 2 .8 1.5-.9Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></symbol>
   <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
   <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="m10.5 10.5 3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
@@ -585,6 +590,10 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
     <div id="saved-wrap">
       <h2>Saved <span class="count" id="saved-count"></span></h2>
       <div class="grid" id="saved"></div>
+    </div>
+    <div id="w365-wrap">
+      <h2 class="w365-head">Windows 365 <span class="count" id="w365-account"></span><span class="spacer"></span><button class="btn ghost" id="w365-out" hidden>Sign out</button></h2>
+      <div class="card list" id="w365"></div>
     </div>
     <div id="recent-wrap">
       <h2>Recent <span class="count" id="recent-count"></span></h2>
@@ -979,17 +988,67 @@ function render() {
   $("#recent-wrap").hidden = recent.length === 0;
   const nothing = state.connections.length === 0 && state.recent.length === 0;
   $("#empty").hidden = !nothing;
-  $("#no-match").hidden = nothing || saved.length + recent.length > 0;
+  const cloud = renderW365(q);
+  $("#no-match").hidden = nothing || saved.length + recent.length + cloud > 0;
 
   const live = state.connections.filter(c => c.running).length + state.recent.filter(r => r.running && !r.connection_id).length;
   $("#nav-live").hidden = live === 0;
   $("#nav-live").textContent = live ? `${live} live` : "";
 }
 
+// Windows 365: the signed-in account's Cloud PCs. Returns how many match `q`.
+let w365 = { loading: true, busy: false, signed_in: false, pcs: [] };
+function renderW365(q) {
+  const pcs = w365.pcs.filter(p => !q || p.name.toLowerCase().includes(q));
+  $("#w365-wrap").hidden = !!q && pcs.length === 0;
+  $("#w365-account").textContent = w365.signed_in && w365.account ? w365.account : "";
+  $("#w365-out").hidden = !w365.signed_in;
+  const note = (title, sub, button) => `
+    <div class="item"><div class="avatar">${icon("cloud")}</div>
+      <div class="grow"><div class="conn-name">${esc(title)}</div><div class="conn-sub" title="${esc(sub)}">${esc(sub)}</div></div>${button}</div>`;
+  if (w365.busy) $("#w365").innerHTML = note("Signing in…", "Finish in Microsoft's sign-in window.", "");
+  else if (w365.loading) $("#w365").innerHTML = note("Windows 365", "Looking for your Cloud PCs…", "");
+  else if (!w365.signed_in) $("#w365").innerHTML = note("Sign in with your work account", "Your Cloud PCs show up here, ready to connect.", `<button class="btn primary" data-act="sign-in">${icon("cloud")}Sign in</button>`);
+  else if (w365.error) $("#w365").innerHTML = note("Couldn't list your Cloud PCs", w365.error, `<button class="btn" data-act="refresh">${icon("refresh")}Try again</button>`);
+  else if (!w365.pcs.length) $("#w365").innerHTML = note("No Cloud PCs on this account", "Sign out to use another account.", `<button class="btn" data-act="refresh">${icon("refresh")}Refresh</button>`);
+  else $("#w365").innerHTML = pcs.map(p => {
+    const running = state && state.sessions.some(s => s.key === `w365:${p.id}`);
+    return `
+    <div class="item" data-id="${esc(p.id)}" tabindex="-1">
+      ${avatar(p.name)}
+      <div class="grow"><div class="conn-name">${esc(p.name)}${running ? ` <span class="badge ok" style="margin-left:6px"><span class="dot live"></span>Connected</span>` : ""}</div>
+        <div class="conn-sub" title="Clipboard, sound, microphone, camera, all this PC's drives, printers and COM ports, and Teams calls">Cloud PC · RDP · all redirects on</div></div>
+      <div class="acts"><button class="btn ghost icon" data-act="password" title="Enter the Cloud PC's password again">${icon("edit")}</button></div>
+      <button class="btn" data-act="connect">${icon("play")}${running ? "Show" : "Connect"}</button>
+    </div>`; }).join("");
+  return pcs.length;
+}
+async function w365Connect(p, askAgain) {
+  const what = { name: p.name, user: w365.account };
+  const req = { w365: { id: p.id, name: p.name, account: w365.account } };
+  if (!askAgain) return connect(req, what);
+  const pw = await askPassword("w365_password", what, false);
+  if (pw) return connect(req, what, { password: pw.value });
+}
+$("#w365").addEventListener("click", e => {
+  const btn = e.target.closest("[data-act]"); if (!btn) return;
+  const row = e.target.closest(".item");
+  const p = row && w365.pcs.find(x => x.id === row.dataset.id);
+  if (btn.dataset.act === "sign-in") { w365.busy = true; render(); call("w365_sign_in").catch(e => { w365.busy = false; render(); fail(e); }); }
+  if (btn.dataset.act === "refresh") { w365.loading = true; w365.error = null; w365.signed_in = false; render(); call("w365_status").catch(fail); }
+  if (btn.dataset.act === "connect" && p) w365Connect(p, false);
+  if (btn.dataset.act === "password" && p) w365Connect(p, true);
+});
+$("#w365").addEventListener("dblclick", e => {
+  const row = e.target.closest(".item"); if (!row || e.target.closest("button")) return;
+  const p = w365.pcs.find(x => x.id === row.dataset.id); if (p) w365Connect(p, false);
+});
+$("#w365-out").onclick = () => call("w365_sign_out").catch(fail);
+
 $("#search").addEventListener("input", render);
 $("#search").addEventListener("keydown", e => {
   if (e.key === "Enter") {
-    const first = $("#saved .conn") || $("#recent .item");
+    const first = $("#saved .conn") || $("#w365 .item[data-id]") || $("#recent .item");
     if (first) first.querySelector('[data-act="connect"]').click();
     else if ($("#search").value.trim()) { $("#quick-host").value = $("#search").value.trim(); $("#quick").requestSubmit(); }
   }
@@ -1051,7 +1110,7 @@ const connecting = new Set();
 // A starting session's toast, by session: it shows the session's latest line.
 const liveToasts = new Map();
 async function connect(req, what, extra = {}) {
-  const key = req.id || (req.target && req.target.host);
+  const key = req.id || (req.w365 && `w365:${req.w365.id}`) || (req.target && req.target.host);
   if (connecting.has(key)) return null;
   connecting.add(key);
   // (A Workspace tab says how it's going itself.)
@@ -1062,7 +1121,7 @@ async function connect(req, what, extra = {}) {
       if (t) t.remove();
       const pw = await askPassword(r.need, what, !!req.id);
       if (pw === null) return null;
-      const more = r.need === "password" ? { password: pw.value } : { hyper_password: pw.value };
+      const more = r.need === "hyper_password" ? { hyper_password: pw.value } : { password: pw.value };
       connecting.delete(key);
       return connect(req, what, { ...extra, ...more, remember: pw.remember });
     }
@@ -1080,10 +1139,11 @@ async function connect(req, what, extra = {}) {
 
 let pwResolve = null;
 function askPassword(need, what, canRemember) {
-  const hyper = need === "hyper_password";
-  $("#pw-title").textContent = hyper ? "Hyper password" : "Password";
+  const hyper = need === "hyper_password", cloud = need === "w365_password";
+  $("#pw-title").textContent = hyper ? "Hyper password" : cloud ? "Cloud PC password" : "Password";
   $("#pw-sub").textContent = hyper
     ? `For the Hyper stream on ${what.name || what.host} (set on that PC under This PC).`
+    : cloud ? `${what.name} signs in with the password of ${what.user || "your work account"}. It's kept encrypted on this PC, for you only, until you sign out.`
     : `Windows password for ${what.user || "your account"} on ${what.name || what.host}.`;
   $("#pw-input").value = "";
   $("#pw-remember-row").hidden = !canRemember;
@@ -1915,11 +1975,20 @@ function onEvent(m) {
       const why = m.reason ? m.reason.replace(/^rdpio:\s*/, "") : m.failed ? `The session stopped (code ${m.code}).` : "";
       const inTab = wsEnded(m, why);
       if (m.failed && !(inTab && pageIs("workspace"))) {
-        toast("bad", m.seconds < 12 ? `Couldn't connect to ${m.name}` : `Disconnected from ${m.name}`, why, 15000, [{ label: "Show the log", run: () => showLog(m.key) }]);
+        const pc = w365.pcs.find(p => `w365:${p.id}` === m.key);
+        toast("bad", m.seconds < 12 ? `Couldn't connect to ${m.name}` : `Disconnected from ${m.name}`, why, 15000, [
+          ...(pc ? [{ label: "Enter the password again", run: () => w365Connect(pc, true) }] : []),
+          { label: "Show the log", run: () => showLog(m.key) },
+        ]);
       }
       break;
     }
     case "log": addLines(m.lines); break;
+    case "w365":
+      w365 = { ...m, loading: false, busy: false };
+      if (m.sign_in_error) toast("bad", "Couldn't sign in to Windows 365", m.sign_in_error, 15000);
+      render();
+      break;
     case "embedded": {
       const t = tabs.find(x => x.key === m.key);
       if (t) { t.state = "live"; renderTabs(); if (activeTab === m.key) renderWsView(); }
@@ -1937,6 +2006,7 @@ function onEvent(m) {
 
 call("state").then(s => { setState(s); $("#quick-host").focus(); }).catch(fail);
 call("logs", { since: 0 }).then(r => addLines(r.lines)).catch(() => {});
+call("w365_status").catch(() => {});
 setInterval(render, 60000); // ("5 min ago" stays current)
 </script>
 </body>
