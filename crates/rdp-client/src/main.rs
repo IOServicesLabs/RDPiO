@@ -4795,8 +4795,16 @@ mod win {
                             None
                         };
                     // SlimCore's plugin beside the WebRTC backend: each answers
-                    // its own channel, and Teams picks the stack it can.
-                    let slimcore = teams_slimcore
+                    // its own channel, and Teams picks the stack it can. ON BY
+                    // DEFAULT on this branch: every session hosts Microsoft's
+                    // SlimCore plugin (--teams-slimcore asks for it explicitly;
+                    // RDPIO_SLIMCORE_PROBE=0 opts out) to watch which DVC it
+                    // listens on and how its handshake goes — the black-box
+                    // step toward SlimCore (VDI 2.0) support. A crash inside
+                    // the plugin kills the session process, which is part of
+                    // what this is meant to find out.
+                    let slimcore = (teams_slimcore
+                        || std::env::var_os("RDPIO_SLIMCORE_PROBE").is_none_or(|v| v != "0"))
                         .then(crate::webrtc_addin::WebRtcRedirector::slimcore)
                         .flatten()
                         .map(|r| Box::new(r) as Box<dyn rdp_graphics::redirect::DvcRedirector>);
@@ -4815,30 +4823,6 @@ mod win {
                             ))),
                             (None, Some(h)) => Some(Box::new(h)),
                             (r, None) => r,
-                        };
-                    // RDPIO_SLIMCORE_PROBE=1: additionally host Microsoft's SlimCore
-                    // Teams plugin (MsTeamsPluginAvd.dll, loaded in place from the
-                    // Windows App package so its SlimCore/Rtm siblings resolve), to
-                    // watch which DVC it listens on and how its handshake goes — the
-                    // first black-box step toward SlimCore (VDI 2.0) support. Off by
-                    // default; a crash inside the plugin kills the session process,
-                    // which is part of what this probe is meant to find out.
-                    let redirector: Option<Box<dyn rdp_graphics::redirect::DvcRedirector>> =
-                        if std::env::var_os("RDPIO_SLIMCORE_PROBE").is_some() {
-                            tracing::info!("RDPIO_SLIMCORE_PROBE: hosting Microsoft's SlimCore Teams plugin");
-                            match crate::webrtc_addin::WebRtcRedirector::new_slimcore_probe() {
-                                Some(p) => {
-                                    let p: Box<dyn rdp_graphics::redirect::DvcRedirector> = Box::new(p);
-                                    let both: Box<dyn rdp_graphics::redirect::DvcRedirector> = match redirector {
-                                        Some(r) => Box::new(rdp_graphics::redirect::ChainRedirector::new(vec![r, p])),
-                                        None => p,
-                                    };
-                                    Some(both)
-                                }
-                                None => redirector,
-                            }
-                        } else {
-                            redirector
                         };
                     let result = session::run_graphics_session(
                         &mut transport,
