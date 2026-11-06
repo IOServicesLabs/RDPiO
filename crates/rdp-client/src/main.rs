@@ -4773,6 +4773,20 @@ mod win {
                 .then(|| std::time::Duration::from_secs_f32(1.0 / args.pace as f32));
             let mut last_present = std::time::Instant::now();
             let mut pending_present = false;
+            // The hotkeys hint, like the Hyper stream's first-seconds overlay:
+            // a small panel at the top-left listing this session's own keys.
+            // Re-uploaded at each present while it lives (a still screen
+            // presents nothing on its own); gone after ~8 s, with the region
+            // asked of the server again so the panel's pixels don't linger on
+            // a quiet desktop.
+            let hint = crate::hyper_overlay::render(&[
+                "Ctrl+Shift+Q   quit".to_string(),
+                "Ctrl+Shift+M   lock the mouse in (games)".to_string(),
+                "Ctrl+Alt+End   Ctrl+Alt+Del on the host".to_string(),
+            ]);
+            let hint_until = std::time::Instant::now() + Duration::from_secs(8);
+            let mut hint_repaint = std::time::Instant::now() - Duration::from_secs(1);
+            let mut hint_erased = false;
             let mut metrics_report_start = std::time::Instant::now();
             let mut activity_deadline = std::time::Instant::now();
             // The 1 ms system timer, held only while H.264 video arrives: the
@@ -4870,13 +4884,37 @@ mod win {
                             let events: Vec<inpdu::EventBytes> = window
                                 .drain_input()
                                 .into_iter()
-                                .filter_map(|raw| {
+                                .flat_map(|raw| {
                                     if let RawInput::Touch { id, x, y, phase } = raw {
                                         let slot = touch_slot(&mut touch_slots, id, phase);
                                         touches.push(touch_to_contact(slot, x, y, phase, desktop, client));
-                                        return None;
+                                        return Vec::new();
+                                    }
+                                    // Ctrl+Alt+End = Ctrl+Alt+Del on the host (as in
+                                    // mstsc): the real combination is reserved for
+                                    // this machine. Sent as the three scancodes;
+                                    // the End press itself is swallowed (its later
+                                    // key-up finds no key held down and is a no-op
+                                    // on the host).
+                                    if let RawInput::Key { scancode: 0x4F, extended: true, down: true } = raw {
+                                        if crate::window::ctrl_alt_held() {
+                                            tracing::info!("Ctrl+Alt+End: sending Ctrl+Alt+Del to the host");
+                                            return vec![
+                                                inpdu::keyboard_event(0, 0x1d),
+                                                inpdu::keyboard_event(0, 0x38),
+                                                inpdu::keyboard_event(inpdu::KBDFLAGS_EXTENDED, 0x53),
+                                                inpdu::keyboard_event(
+                                                    inpdu::KBDFLAGS_EXTENDED | inpdu::KBDFLAGS_RELEASE,
+                                                    0x53,
+                                                ),
+                                                inpdu::keyboard_event(inpdu::KBDFLAGS_RELEASE, 0x38),
+                                                inpdu::keyboard_event(inpdu::KBDFLAGS_RELEASE, 0x1d),
+                                            ];
+                                        }
                                     }
                                     map_input(raw, desktop, client, &mut last_pos, rel_capture)
+                                        .into_iter()
+                                        .collect()
                                 })
                                 .collect();
                             let events = coalesce_input_events(events);
@@ -5075,6 +5113,31 @@ mod win {
                             pending_present = true;
                             activity_deadline = std::time::Instant::now() + ACTIVITY_WINDOW;
                         }
+                        // The hotkeys hint (declared above): re-present periodically
+                        // so it stays visible on a still screen; when its time is up,
+                        // ask the server to repaint the spot — its pixels would
+                        // otherwise linger in the framebuffer until the next desktop
+                        // update there.
+                        let hint_live = hint.is_some() && std::time::Instant::now() < hint_until;
+                        if hint_live {
+                            if hint_repaint.elapsed() >= Duration::from_millis(500) {
+                                hint_repaint = std::time::Instant::now();
+                                if !hidden {
+                                    pending_present = true;
+                                }
+                            }
+                        } else if !hint_erased {
+                            hint_erased = true;
+                            if let Some((hw, hh, _)) = &hint {
+                                let (cw, ch) = (client.0.max(1) as u64, client.1.max(1) as u64);
+                                let (dw, dh) = (desktop.0 as u64, desktop.1 as u64);
+                                let x = (16u64 * dw / cw) as i32;
+                                let y = (16u64 * dh / ch) as i32;
+                                let w = (*hw as u64 * dw / cw + 1) as u32;
+                                let h = (*hh as u64 * dh / ch + 1) as u32;
+                                crate::session::request_refresh(x, y, w, h);
+                            }
+                        }
                         let pace_ready =
                             pace_interval.map_or(true, |iv| last_present.elapsed() >= iv);
                         // Presented once the swapchain has room — polled, never
@@ -5084,6 +5147,11 @@ mod win {
                         let present_now =
                             pending_present && pace_ready && !hidden && renderer.frame_ready();
                         if present_now {
+                            if hint_live {
+                                if let Some((hw, hh, px)) = &hint {
+                                    renderer.update_rect(16, 16, *hw, *hh, px);
+                                }
+                            }
                             let present_start = std::time::Instant::now();
                             if let Err(e) = renderer.present_frame() {
                                 // Don't take the session down with the GPU:
