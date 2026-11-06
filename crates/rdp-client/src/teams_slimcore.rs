@@ -12,7 +12,7 @@
 #![allow(non_snake_case)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::{implement, interface, IUnknown, IUnknown_Vtbl, Interface, GUID, HRESULT};
@@ -56,6 +56,22 @@ unsafe trait IWindowChanged: IUnknown {
 static SESSION_HWND: AtomicIsize = AtomicIsize::new(0);
 static DESKTOP_W: AtomicU32 = AtomicU32::new(0);
 static DESKTOP_H: AtomicU32 = AtomicU32::new(0);
+/// This session hosts the SlimCore plugin (default-on). While it's set, rdpio
+/// keeps its own hands off the physical camera: RDPECAM advertisement is off,
+/// so nothing of ours holds a webcam the SlimCore engine (`MsTeamsVdi.exe`)
+/// needs — an open camera on our side fails its video stage (observed as
+/// `StageFailureCallback code=5` on every `EngineVideoStart`).
+static PLUGIN_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether this session hosts the SlimCore plugin.
+pub fn plugin_active() -> bool {
+    PLUGIN_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Record whether this session hosts the SlimCore plugin.
+pub fn set_plugin_active(active: bool) {
+    PLUGIN_ACTIVE.store(active, Ordering::SeqCst);
+}
 
 /// The session's window, and the size of the desktop it shows.
 pub fn set_session_window(hwnd: isize, desktop_w: u32, desktop_h: u32) {

@@ -4809,6 +4809,7 @@ mod win {
                         .flatten()
                         .map(|r| Box::new(r) as Box<dyn rdp_graphics::redirect::DvcRedirector>);
                     tracing::info!(requested = teams_slimcore, active = slimcore.is_some(), "Teams SlimCore plugin status");
+                    crate::teams_slimcore::set_plugin_active(slimcore.is_some());
                     let redirector: Option<Box<dyn rdp_graphics::redirect::DvcRedirector>> =
                         match (redirector, slimcore) {
                             (Some(r), Some(s)) => {

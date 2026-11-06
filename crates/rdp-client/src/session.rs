@@ -2217,8 +2217,15 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     let mut audio_in = rdp_channels::audio_input::AudioInputChannel::new();
     let mut mic_started = false;
     // Camera redirection (MS-RDPECAM): enumerate local webcams and advertise
-    // them. Empty (no webcam) → nothing announced, feature stays off.
-    let cameras = crate::mf_camera::MfCamera::enumerate();
+    // them. Empty (no webcam) → nothing announced, feature stays off. With the
+    // SlimCore plugin hosted, its engine owns the physical cameras instead —
+    // advertising them here would hold the webcam against the engine.
+    let cameras = if crate::teams_slimcore::plugin_active() {
+        tracing::info!("SlimCore plugin active: not advertising local cameras for redirection");
+        Vec::new()
+    } else {
+        crate::mf_camera::MfCamera::enumerate()
+    };
     tracing::info!(
         count = cameras.len(),
         names = ?cameras.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
