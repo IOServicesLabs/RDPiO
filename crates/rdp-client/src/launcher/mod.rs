@@ -1263,14 +1263,19 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
     }
     let _ = st.prefs.save();
     if let Some((&pid, s)) = st.sessions.iter().find(|(_, s)| s.key == key) {
-        match on_connect_again(s.embedded, !windows_of(pid).is_empty()) {
+        // Already open: its tab, or its window brought forward, instead of a
+        // second session. A hung window ("not responding") counts as no window:
+        // bringing one of those forward was exactly the reconnect freeze.
+        let windows = windows_of(pid);
+        let hung = windows.iter().any(|&w| unsafe { IsHungAppWindow(w) }.as_bool());
+        match on_connect_again(s.embedded, !windows.is_empty() && !hung) {
             Again::ShowTab => return Ok(json!({ "already": true, "key": key, "embedded": true })),
             Again::BringForward => {
                 bring_forward(pid);
                 return Ok(json!({ "already": true, "key": key }));
             }
             Again::Replace => {
-                tracing::warn!(pid, "Connect clicked while that session has no window (still signing in, retrying, or stuck); ending it and starting a fresh one");
+                tracing::warn!(pid, hung, "Connect clicked while that session has no live window (hung, still signing in, or stuck); ending it and starting a fresh one");
                 st.sessions.remove(&pid);
                 end_session_now(pid);
             }
