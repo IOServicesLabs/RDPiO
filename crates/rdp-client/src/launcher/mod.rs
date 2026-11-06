@@ -189,6 +189,10 @@ static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 static LOGS_DUE: AtomicBool = AtomicBool::new(false);
 /// The page is in sight: sessions' logs are read often (else now and then).
 static PAGE_SHOWN: AtomicBool = AtomicBool::new(true);
+/// Sessions the launcher ended itself because a reconnect found them stale
+/// (crashed, hung, stuck closing): their late `_ended` is swallowed, so it
+/// doesn't read on the page as the NEW session's end (sessions match by key).
+static REAPED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// A log line was kept (any thread): the page gets it soon.
 fn notify_logs() {
@@ -1245,15 +1249,23 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
         if s.embedded {
             return Ok(json!({ "already": true, "key": key, "embedded": true }));
         }
-        // Unless the window it had is gone while the process isn't (stuck
-        // closing, or after a resume): bringing it forward would show
-        // nothing. It's ended, and a new one starts.
-        if !s.seen_window || !windows_of(pid).is_empty() {
+        let windows = windows_of(pid);
+        let hung = windows.iter().any(|&w| unsafe { IsHungAppWindow(w) }.as_bool());
+        // Still starting (young, no window yet — a Cloud PC sign-in takes a
+        // while), or up with a live window: that one comes forward.
+        let starting = !s.seen_window && s.started.elapsed() < STARTUP;
+        if process_alive(pid) && !hung && (starting || !windows.is_empty()) {
             bring_forward(pid);
             return Ok(json!({ "already": true, "key": key }));
         }
-        tracing::warn!(pid, "that session's window is gone but its process isn't; ending it and starting a new one");
+        // Stale — crashed without its `_ended`, hung ("not responding"), or
+        // stuck closing: reconnecting starts a new session, never re-shows a
+        // dead one. It's ended for real; the fall-through spawns the new one.
+        // Its late `_ended` is swallowed (REAPED), else it would read on the
+        // page as the NEW session's end (sessions match by key).
+        tracing::warn!(pid, hung, seen_window = s.seen_window, "reconnect found a stale session; ending it and starting a new one");
         st.sessions.remove(&pid);
+        REAPED.lock().unwrap().push(pid);
         close_session(pid, None);
     }
     // In a tab: a window of the tab's size, never full screen.
@@ -1497,6 +1509,33 @@ fn bring_forward(pid: u32) {
     }
 }
 
+/// The session process still runs. An entry goes stale when the process is
+/// gone but its `_ended` hasn't reached the UI thread yet (a crashed or
+/// stuck-closing session).
+fn process_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return false };
+        let mut code = 0u32;
+        let alive = GetExitCodeProcess(h, &mut code).is_ok() && code == STILL_ACTIVE.0 as u32;
+        let _ = CloseHandle(h);
+        alive
+    }
+}
+
+/// Whether a deliberately-ended stale session's `_ended` for `pid` is waiting
+/// to be swallowed, taking it out.
+fn reaped_take(pid: u32) -> bool {
+    let mut reaped = REAPED.lock().unwrap();
+    if let Some(i) = reaped.iter().position(|&p| p == pid) {
+        reaped.swap_remove(i);
+        true
+    } else {
+        false
+    }
+}
+
 /// Events from the worker threads, on the UI thread.
 fn on_event(e: Value) {
     let kind = e.get("event").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1543,6 +1582,11 @@ fn on_event(e: Value) {
                 st.mru = m;
             }
             send(st, &json!({ "event": "state", "state": state_json(st) }));
+        }
+        // (A reaped stale session's late end is not news: the page would show
+        // the NEW session — same key — as ended.)
+        "_ended" if reaped_take(e.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32) => {
+            tracing::info!("a reaped stale session's late _ended, swallowed");
         }
         "_ended" => {
             let pid = e.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
