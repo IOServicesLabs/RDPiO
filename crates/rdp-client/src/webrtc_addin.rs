@@ -349,6 +349,8 @@ impl Capture {
 /// implement that too.
 #[implement(IWTSVirtualChannelManager, IMsRdcServiceProvider)]
 struct ChannelManager {
+    /// Which plugin we host ("Teams WebRTC add-in" / "SlimCore plugin") — log lines.
+    label: &'static str,
     /// `name → listener callback`, read on the host thread when a channel opens.
     /// `Rc`/`RefCell`: only ever touched on the host thread (CreateListener runs
     /// synchronously inside `plugin.Initialize`).
@@ -365,7 +367,7 @@ impl IWTSVirtualChannelManager_Impl for ChannelManager_Impl {
         plistenercallback: Ref<IWTSListenerCallback>,
     ) -> Result<IWTSListener> {
         let name = unsafe { pszchannelname.to_string() }.unwrap_or_default();
-        tracing::info!(%name, "WebRTC add-in registered a DVC listener");
+        tracing::info!(%name, "add-in registered a DVC listener ({})", self.label);
         self.names.lock().unwrap().push(name.clone());
         if let Ok(cb) = plistenercallback.ok() {
             self.listeners.borrow_mut().push((name, cb.clone()));
@@ -471,6 +473,7 @@ unsafe fn get_plugin(get_instance: GetInstanceFn) -> Result<IWTSPlugin> {
 
 fn run_host(
     dll: PathBuf,
+    label: &'static str,
     rx: Receiver<HostMsg>,
     names: Names,
     outbound: Outbound,
@@ -488,13 +491,13 @@ fn run_host(
         let module = match load_addin(&dll) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!(error = %e, "WebRTC add-in: LoadLibrary failed");
+                tracing::warn!(error = %e, %label, "add-in: LoadLibrary failed");
                 let _ = ready.send(false);
                 return;
             }
         };
         let Some(proc) = GetProcAddress(module, s!("VirtualChannelGetInstance")) else {
-            tracing::warn!("WebRTC add-in: VirtualChannelGetInstance export missing");
+            tracing::warn!(%label, "add-in: VirtualChannelGetInstance export missing");
             let _ = FreeLibrary(module);
             let _ = ready.send(false);
             return;
@@ -504,7 +507,7 @@ fn run_host(
         let plugin = match get_plugin(get_instance) {
             Ok(p) => p,
             Err(e) => {
-                tracing::warn!(error = %e, "WebRTC add-in: could not create IWTSPlugin");
+                tracing::warn!(error = %e, %label, "add-in: could not create IWTSPlugin");
                 let _ = FreeLibrary(module);
                 let _ = ready.send(false);
                 return;
@@ -514,13 +517,14 @@ fn run_host(
         let listeners: Rc<RefCell<Vec<(String, IWTSListenerCallback)>>> =
             Rc::new(RefCell::new(Vec::new()));
         let manager: IWTSVirtualChannelManager = ChannelManager {
+            label,
             listeners: listeners.clone(),
             names,
         }
         .into();
 
         if let Err(e) = plugin.Initialize(&manager) {
-            tracing::warn!(error = %e, "WebRTC add-in: Initialize failed");
+            tracing::warn!(error = %e, %label, "add-in: Initialize failed");
             let _ = FreeLibrary(module);
             let _ = ready.send(false);
             return;
@@ -528,7 +532,8 @@ fn run_host(
         let _ = plugin.Connected();
         tracing::info!(
             listeners = listeners.borrow().len(),
-            "Teams WebRTC add-in initialized and connected"
+            %label,
+            "add-in initialized and connected"
         );
         let _ = ready.send(true);
 
@@ -559,12 +564,12 @@ fn run_host(
                     let empty = BSTR::default();
                     match lcb.OnNewChannelConnection(&vc, &empty, &mut accept, &mut cb) {
                         Ok(()) => {
-                            tracing::info!(channel_id, %name, accept = accept.as_bool(), "WebRTC add-in bound new channel");
+                            tracing::info!(channel_id, %name, %label, accept = accept.as_bool(), "add-in bound new channel");
                             if let Some(cb) = cb {
                                 channels.insert(channel_id, cb);
                             }
                         }
-                        Err(e) => tracing::warn!(channel_id, error = %e, "OnNewChannelConnection failed"),
+                        Err(e) => tracing::warn!(channel_id, error = %e, %label, "OnNewChannelConnection failed"),
                     }
                 }
                 HostMsg::Data { channel_id, data } => {
@@ -624,14 +629,29 @@ impl WebRtcRedirector {
     /// declining the WebRTC channel) if the DLL is missing or the plugin refuses
     /// to initialize. Blocks up to 10 s for the plugin's one-time init.
     pub fn new() -> Option<Self> {
-        let Some(dll) = resolve_addin_dll() else {
+        Self::host("MsRdcWebRTCAddIn.dll", "Teams WebRTC add-in")
+    }
+
+    /// Probe: host Microsoft's SlimCore Teams plugin (`MsTeamsPluginAvd.dll`)
+    /// the same way, so we can watch which DVC it listens on and how its
+    /// handshake goes — the first step toward SlimCore (VDI 2.0) support
+    /// without reimplementing anything. Off unless requested (see `main`).
+    pub fn new_slimcore_probe() -> Option<Self> {
+        Self::host("MsTeamsPluginAvd.dll", "SlimCore plugin")
+    }
+
+    /// Shared hosting path for a Microsoft DVC plugin (the WebRTC add-in or the
+    /// SlimCore plugin — same `VirtualChannelGetInstance` ABI).
+    fn host(dll_name: &str, label: &'static str) -> Option<Self> {
+        let Some(dll) = resolve_addin_dll(dll_name) else {
             tracing::warn!(
-                "Teams WebRTC add-in DLL not found — install the Windows App / AVD HostApp \
-                 (or drop MsRdcWebRTCAddIn.dll next to rdpio.exe); staying on decline"
+                dll = dll_name,
+                "plugin DLL not found — install the Windows App / AVD HostApp \
+                 (or drop the DLL next to rdpio.exe); staying on decline"
             );
             return None;
         };
-        tracing::info!(path = %dll.display(), "hosting Teams WebRTC add-in");
+        tracing::info!(path = %dll.display(), %label, "hosting plugin");
 
         let names: Names = Arc::new(Mutex::new(Vec::new()));
         let outbound: Outbound = Arc::new(Mutex::new(VecDeque::new()));
@@ -641,8 +661,8 @@ impl WebRtcRedirector {
 
         let (n, o, cap) = (names.clone(), outbound.clone(), capture.clone());
         let thread = std::thread::Builder::new()
-            .name("webrtc-addin".into())
-            .spawn(move || run_host(dll, rx, n, o, cap, ready_tx))
+            .name("dvc-plugin".into())
+            .spawn(move || run_host(dll, label, rx, n, o, cap, ready_tx))
             .ok()?;
 
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
@@ -654,7 +674,7 @@ impl WebRtcRedirector {
                 thread: Some(thread),
             }),
             other => {
-                tracing::warn!(?other, "Teams WebRTC add-in did not initialize; staying on decline");
+                tracing::warn!(?other, %label, "plugin did not initialize; staying on decline");
                 None
             }
         }
@@ -712,13 +732,13 @@ impl Drop for WebRtcRedirector {
     }
 }
 
-/// Find `MsRdcWebRTCAddIn.dll`: the `RDPIO_WEBRTC_ADDIN_DLL` override, next to
+/// Find a Microsoft DVC plugin DLL (`MsRdcWebRTCAddIn.dll` or
+/// `MsTeamsPluginAvd.dll`): the `RDPIO_WEBRTC_ADDIN_DLL` override, next to
 /// our exe (a user-supplied copy), the installed Windows App / AVD HostApp /
 /// Remote Desktop package (located by family, no folder listing needed), an MSI
 /// Remote Desktop install, then a WindowsApps listing as a last resort. `None`
 /// if none of those has it.
-fn resolve_addin_dll() -> Option<PathBuf> {
-    const NAME: &str = "MsRdcWebRTCAddIn.dll";
+fn resolve_addin_dll(name: &str) -> Option<PathBuf> {
 
     // Explicit override: point rdpio straight at the DLL. Needed when the add-in lives
     // in a WindowsApps package whose ROOT a normal process can't enumerate (ACL-locked
@@ -728,7 +748,7 @@ fn resolve_addin_dll() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("RDPIO_WEBRTC_ADDIN_DLL") {
         let p = PathBuf::from(p);
         if p.exists() {
-            tracing::info!(path = %p.display(), "using RDPIO_WEBRTC_ADDIN_DLL override for the Teams add-in");
+            tracing::info!(path = %p.display(), "using RDPIO_WEBRTC_ADDIN_DLL override for the plugin DLL");
             return Some(p);
         }
         tracing::warn!(path = %p.display(), "RDPIO_WEBRTC_ADDIN_DLL is set but the file does not exist; falling back to search");
@@ -736,7 +756,7 @@ fn resolve_addin_dll() -> Option<PathBuf> {
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join(NAME);
+            let p = dir.join(name);
             if p.exists() {
                 return Some(p);
             }
@@ -754,9 +774,9 @@ fn resolve_addin_dll() -> Option<PathBuf> {
     ];
     for family in FAMILIES {
         for dir in package_dirs(family) {
-            for cand in [dir.join(NAME), dir.join("msrdc").join(NAME)] {
+            for cand in [dir.join(name), dir.join("msrdc").join(name)] {
                 if cand.exists() {
-                    tracing::info!(%family, path = %cand.display(), "found Teams WebRTC add-in");
+                    tracing::info!(%family, path = %cand.display(), "found plugin DLL");
                     return Some(cand);
                 }
             }
@@ -770,9 +790,9 @@ fn resolve_addin_dll() -> Option<PathBuf> {
             .map(|p| PathBuf::from(p).join("Apps").join("Remote Desktop")),
     ];
     for dir in msi_dirs.into_iter().flatten() {
-        let cand = dir.join(NAME);
+        let cand = dir.join(name);
         if cand.exists() {
-            tracing::info!(path = %cand.display(), "found Teams WebRTC add-in (Remote Desktop MSI)");
+            tracing::info!(path = %cand.display(), "found plugin DLL (Remote Desktop MSI)");
             return Some(cand);
         }
     }
@@ -791,12 +811,12 @@ fn resolve_addin_dll() -> Option<PathBuf> {
                 if !PREFIXES.iter().any(|p| folder.starts_with(p)) {
                     continue;
                 }
-                // The add-in sits at <pkg>\ or <pkg>\msrdc\ per package layout.
+                // The plugins sit at <pkg>\ or <pkg>\msrdc\ per package layout.
                 for sub in ["", "msrdc"] {
                     let cand = if sub.is_empty() {
-                        entry.path().join(NAME)
+                        entry.path().join(name)
                     } else {
-                        entry.path().join(sub).join(NAME)
+                        entry.path().join(sub).join(name)
                     };
                     if cand.exists() && best.as_ref().is_none_or(|(b, _)| folder > *b) {
                         best = Some((folder.clone(), cand));
@@ -807,12 +827,12 @@ fn resolve_addin_dll() -> Option<PathBuf> {
         Err(e) => {
             // WindowsApps is ACL-restricted; on some machines a normal process
             // can't enumerate it. Surface it instead of failing silently.
-            tracing::warn!(error = %e, "could not enumerate C:\\Program Files\\WindowsApps for the add-in");
+            tracing::warn!(error = %e, "could not enumerate C:\\Program Files\\WindowsApps for the plugin DLL");
         }
     }
     match &best {
-        Some((pkg, path)) => tracing::info!(package = %pkg, path = %path.display(), "found Teams WebRTC add-in"),
-        None => tracing::warn!("no MsRdcWebRTCAddIn.dll found in any WindowsApps package or next to rdpio.exe"),
+        Some((pkg, path)) => tracing::info!(package = %pkg, path = %path.display(), "found plugin DLL"),
+        None => tracing::warn!(dll = name, "plugin DLL not found in any WindowsApps package or next to rdpio.exe"),
     }
     best.map(|(_, p)| p)
 }
@@ -883,6 +903,6 @@ mod tests {
             "windows365 package dirs: {:?}",
             package_dirs("MicrosoftCorporationII.Windows365_8wekyb3d8bbwe")
         );
-        eprintln!("add-in: {:?}", resolve_addin_dll());
+        eprintln!("add-in: {:?}", resolve_addin_dll("MsRdcWebRTCAddIn.dll"));
     }
 }
