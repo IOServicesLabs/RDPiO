@@ -19,7 +19,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 // `MONITORINFOF_PRIMARY` lives under WindowsAndMessaging (glob-imported below).
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetFocus, GetKeyState, SetFocus, VK_CAPITAL, VK_CONTROL, VK_NUMLOCK, VK_SCROLL, VK_SHIFT,
+    GetAsyncKeyState, GetFocus, GetKeyState, SetFocus, VK_CAPITAL, VK_CONTROL, VK_MENU, VK_NUMLOCK,
+    VK_SCROLL, VK_SHIFT,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
@@ -218,6 +219,16 @@ pub fn system_keys_to_host() -> bool {
 /// Whether the stats overlay is on (Ctrl+Shift+S).
 pub fn stats_overlay() -> bool {
     STATS.load(Ordering::Relaxed)
+}
+
+/// Whether Ctrl and Alt are both held right now. main.rs maps
+/// Ctrl+Alt+End to Ctrl+Alt+Del on the host (as mstsc does); the live
+/// key state is checked because the End key event arrives alone.
+pub fn ctrl_alt_held() -> bool {
+    unsafe {
+        (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
+            && (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0
+    }
 }
 
 /// Hyper office mode (crisp text), toggled with Ctrl+Shift+O.
