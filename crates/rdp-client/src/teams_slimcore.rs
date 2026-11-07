@@ -57,10 +57,11 @@ static SESSION_HWND: AtomicIsize = AtomicIsize::new(0);
 static DESKTOP_W: AtomicU32 = AtomicU32::new(0);
 static DESKTOP_H: AtomicU32 = AtomicU32::new(0);
 /// This session hosts the SlimCore plugin (default-on). While it's set, rdpio
-/// keeps its own hands off the physical camera: RDPECAM advertisement is off,
-/// so nothing of ours holds a webcam the SlimCore engine (`MsTeamsVdi.exe`)
-/// needs — an open camera on our side fails its video stage (observed as
-/// `StageFailureCallback code=5` on every `EngineVideoStart`).
+/// keeps its own hands off the physical camera: RDPECAM streams synthesize
+/// black frames instead of opening a webcam (which the SlimCore engine
+/// `MsTeamsVdi.exe` needs exclusive — an MF open on our side fails its video
+/// stage, observed as `StageFailureCallback code=5` on `EngineVideoStart`).
+/// The devices are still advertised so the VM sees them.
 static PLUGIN_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Whether this session hosts the SlimCore plugin.

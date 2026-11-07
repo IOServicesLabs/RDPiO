@@ -2161,6 +2161,18 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
     tracing::info!("decode loop ended");
 }
 
+/// Start the RDPECAM capture for a negotiated media type. While the SlimCore
+/// plugin is hosted (`slimcore`) the capture synthesizes black frames instead
+/// of opening the physical webcam, which the SlimCore engine needs exclusive.
+#[cfg(any(windows, target_os = "android"))]
+fn start_cam_capture(slimcore: bool, media: rdp_channels::camera::MediaType) -> crate::mf_camera::MfCamera {
+    if slimcore {
+        crate::mf_camera::MfCamera::start_on_demand_black(media)
+    } else {
+        crate::mf_camera::MfCamera::start_on_demand(0, media)
+    }
+}
+
 /// Like [`run_session`], but also drives the RDPGFX dynamic channel: it demuxes
 /// the static `drdynvc` channel into a [`rdp_graphics::channel::GraphicsChannel`],
 /// sends that channel's DVC responses and frame-acks back over `stream`, and
@@ -2217,15 +2229,19 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     let mut audio_in = rdp_channels::audio_input::AudioInputChannel::new();
     let mut mic_started = false;
     // Camera redirection (MS-RDPECAM): enumerate local webcams and advertise
-    // them. Empty (no webcam) → nothing announced, feature stays off. With the
-    // SlimCore plugin hosted, its engine owns the physical cameras instead —
-    // advertising them here would hold the webcam against the engine.
-    let cameras = if crate::teams_slimcore::plugin_active() {
-        tracing::info!("SlimCore plugin active: not advertising local cameras for redirection");
-        Vec::new()
-    } else {
-        crate::mf_camera::MfCamera::enumerate()
-    };
+    // them. Empty (no webcam) → nothing announced, feature stays off. While the
+    // SlimCore plugin is hosted its media engine owns the physical cameras — an
+    // MF open on our side fails its video stage (code=5) — but the devices must
+    // still show up in the VM (Teams' picker matches against them), so they are
+    // advertised and stream black frames without touching the hardware.
+    let slimcore_cam = crate::teams_slimcore::plugin_active();
+    let cameras = crate::mf_camera::MfCamera::enumerate();
+    if slimcore_cam && !cameras.is_empty() {
+        tracing::info!(
+            count = cameras.len(),
+            "SlimCore plugin active: cameras advertised as inert black-frame devices (engine owns the hardware)"
+        );
+    }
     tracing::info!(
         count = cameras.len(),
         names = ?cameras.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
@@ -2794,11 +2810,12 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                     cam_capture = Some((
                         *chan_id,
                         media,
-                        crate::mf_camera::MfCamera::start_on_demand(0, media),
+                        start_cam_capture(slimcore_cam, media),
                     ));
                     tracing::info!(
                         channel_id = *chan_id,
                         ?media,
+                        black = slimcore_cam,
                         "camera capture started; streaming frames to the session"
                     );
                 }
@@ -2806,10 +2823,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                     if owner == *chan_id && streaming != Some(media) =>
                 {
                     drop(cam_capture.take()); // joins the old capture thread first
-                    cam_capture = streaming.map(|m| {
-                        (owner, m, crate::mf_camera::MfCamera::start_on_demand(0, m))
-                    });
-                    tracing::info!(channel_id = owner, ?streaming, "camera stream changed");
+                    cam_capture = streaming.map(|m| (owner, m, start_cam_capture(slimcore_cam, m)));
+                    tracing::info!(channel_id = owner, ?streaming, black = slimcore_cam, "camera stream changed");
                 }
                 _ => {}
             }

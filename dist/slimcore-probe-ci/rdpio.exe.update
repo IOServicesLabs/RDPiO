@@ -1,0 +1,4 @@
+{
+  "manifest": "{\"product\":\"rdpio-windows-x86_64\",\"version\":\"0.3.1\",\"build\":\"2026.11.06.1731+18689ad\",\"protocol_min\":4,\"protocol_max\":4,\"size\":26545152,\"sha256\":\"6778101a53c43f5af47000f9bdb0a8d9be258ad2da16e8fa96ce4f8f8f93569b\"}",
+  "signature": "KACq2eiulHM+pC3QTPSGWlD95SVyrdMEUV40tNdnEvwn5jImh8NIr8pnq8mSIc/C6ml9z8t3kU9qXVVRKn47BQ=="
+}

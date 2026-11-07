@@ -1308,10 +1308,11 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
     // the Windows App put one, else rdpio's own engine.
     if cloud_pc.is_some() {
         args.extend(profile::CLOUD_PC_REDIRECTS.map(String::from));
-        // Teams calls: SlimCore where Teams can use it (WebRTC, below, ends for
-        // Windows PCs on 2027-04-01), with WebRTC beside it as Teams starts there.
+        // Teams calls run on SlimCore (VDI 2.0) only — the way the Windows App
+        // hosts it. The WebRTC add-in (VDI 1.0) is not hosted beside it: Teams
+        // then splits device enumeration across the two providers and the
+        // picker's list comes out empty.
         args.push("--teams-slimcore".into());
-        args.push(if crate::webrtc_addin::addin_available() { "--teams".into() } else { "--teams-native".into() });
     }
     if let Some(size) = args_size {
         args.extend(["--size".into(), size]);
