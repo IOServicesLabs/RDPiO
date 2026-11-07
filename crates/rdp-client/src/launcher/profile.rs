@@ -70,6 +70,9 @@ pub struct Options {
     pub printer: bool,
     /// Share every local drive into an RDP session.
     pub drives: bool,
+    /// Teams "Optimized" calls in an RDP session: host the WebRTC redirector
+    /// add-in so the camera and microphone work in Teams.
+    pub teams: bool,
     /// Accept a host certificate Windows doesn't trust (RDP).
     pub insecure: bool,
 }
@@ -91,12 +94,34 @@ impl Default for Options {
             local_keys: false,
             printer: false,
             drives: false,
+            teams: false,
             insecure: false,
         }
     }
 }
 
+/// A Cloud PC's redirects beyond what [`Options`] holds.
+pub const CLOUD_PC_REDIRECTS: [&str; 2] = ["--printers", "--com"];
+
 impl Options {
+    /// A Cloud PC's session: nothing of Hyper can be installed there, so plain
+    /// RDP at its fastest (motion first, presents that don't wait for vblank)
+    /// with every redirect on. Only the window's shape follows `defaults`.
+    pub fn cloud_pc(defaults: &Self) -> Self {
+        Self {
+            transport: Transport::Rdp,
+            profile: Profile::Game,
+            low_latency: true,
+            // (Every printer: see `CLOUD_PC_REDIRECTS`.)
+            printer: false,
+            drives: true,
+            insecure: false,
+            fullscreen: defaults.fullscreen,
+            multimon: defaults.multimon,
+            ..Self::default()
+        }
+    }
+
     /// The session's command line (passwords never: they go by environment).
     pub fn to_args(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
@@ -156,6 +181,9 @@ impl Options {
             if self.drives {
                 push("--drive");
                 push("all");
+            }
+            if self.teams && self.transport == Transport::Rdp {
+                push("--teams");
             }
             if self.insecure {
                 push("--insecure");
@@ -274,6 +302,23 @@ mod tests {
         assert!(old.fullscreen);
         let file: LauncherFile = serde_json::from_str("{}").unwrap();
         assert_eq!(file.theme, "system");
+    }
+
+    #[test]
+    fn a_cloud_pc_is_fast_rdp_with_every_redirect_whatever_the_defaults() {
+        let defaults = Options {
+            transport: Transport::Direct,
+            profile: Profile::Office,
+            fps: 30,
+            insecure: true,
+            fullscreen: false,
+            multimon: true,
+            ..Options::default()
+        };
+        assert_eq!(
+            Options::cloud_pc(&defaults).to_args(),
+            ["--gaming", "--multimon", "--low-latency", "--drive", "all"]
+        );
     }
 
     #[test]

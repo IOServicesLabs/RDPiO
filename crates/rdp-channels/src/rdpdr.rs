@@ -29,11 +29,14 @@ const PAKID_CORE_SERVER_USER_LOGGEDON: u16 = 0x554C;
 const PAKID_CORE_DEVICE_IOREQUEST: u16 = 0x4952;
 const PAKID_CORE_DEVICE_IOCOMPLETION: u16 = 0x4943;
 
+const CAP_PRINTER_TYPE: u16 = 0x0002;
+const CAP_PORT_TYPE: u16 = 0x0003;
 const CAP_GENERAL_TYPE: u16 = 0x0001;
 const GENERAL_CAPABILITY_VERSION_02: u32 = 0x0000_0002;
 const RDPDR_EXTENDED_PDU: u32 = 0x0000_0007;
 const RDPDR_IOCODE1_ALL: u32 = 0x0000_FFFF;
 
+const RDPDR_DTYP_SERIAL: u32 = 0x0000_0001;
 const RDPDR_DTYP_FILESYSTEM: u32 = 0x0000_0003;
 const RDPDR_DTYP_PRINT: u32 = 0x0000_0004;
 
@@ -67,11 +70,15 @@ const FILE_CREATED: u8 = 2;
 const FILE_OVERWRITTEN: u8 = 3;
 
 // NTSTATUS.
-const STATUS_SUCCESS: u32 = 0x0000_0000;
+pub const STATUS_CANCELLED: u32 = 0xC000_0120;
+const STATUS_SHARING_VIOLATION: u32 = 0xC000_0043;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
+pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_NO_MORE_FILES: u32 = 0x8000_0006;
-const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+pub const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 const STATUS_NO_SUCH_FILE: u32 = 0xC000_000F;
-const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
@@ -714,6 +721,10 @@ impl PrinterSink for NullPrinter {
 /// hand to the local spooler.
 struct PrinterDevice {
     device_id: u32,
+    /// `PRN1`, `PRN2`, ... (the wire's PreferredDosName).
+    dos_name: String,
+    /// This PC's default printer: the session's too.
+    default: bool,
     /// Display name shown in the remote session's printer list.
     print_name: String,
     /// The driver the server renders with (must exist server-side).
@@ -724,9 +735,11 @@ struct PrinterDevice {
 }
 
 impl PrinterDevice {
-    fn new(device_id: u32, print_name: String, driver_name: String, sink: Box<dyn PrinterSink>) -> Self {
+    fn new(index: u32, default: bool, print_name: String, driver_name: String, sink: Box<dyn PrinterSink>) -> Self {
         Self {
-            device_id,
+            device_id: PRINTER_DEVICE_ID + index,
+            dos_name: format!("PRN{}", index + 1),
+            default,
             print_name,
             driver_name,
             sink,
@@ -781,12 +794,8 @@ impl PrinterDevice {
         let mut v = Vec::new();
         v.extend_from_slice(&RDPDR_DTYP_PRINT.to_le_bytes());
         v.extend_from_slice(&self.device_id.to_le_bytes());
-        // PreferredDosName: "PRN1" padded to 8 bytes.
-        let mut dos = [0u8; 8];
-        for (i, b) in b"PRN1".iter().enumerate() {
-            dos[i] = *b;
-        }
-        v.extend_from_slice(&dos);
+        // PreferredDosName, padded to 8 bytes.
+        v.extend_from_slice(&dos_name_field(&self.dos_name));
 
         // DeviceData = RDPDR_PRINTER_ANNOUNCE_DATA.
         let driver = {
@@ -800,7 +809,8 @@ impl PrinterDevice {
             d
         };
         let mut data = Vec::new();
-        data.extend_from_slice(&RDPDR_PRINTER_ANNOUNCE_FLAG_DEFAULTPRINTER.to_le_bytes()); // Flags
+        let flags = if self.default { RDPDR_PRINTER_ANNOUNCE_FLAG_DEFAULTPRINTER } else { 0 };
+        data.extend_from_slice(&flags.to_le_bytes()); // Flags
         data.extend_from_slice(&0u32.to_le_bytes()); // CodePage
         data.extend_from_slice(&0u32.to_le_bytes()); // PnPNameLen (none)
         data.extend_from_slice(&(driver.len() as u32).to_le_bytes()); // DriverNameLen
@@ -816,17 +826,184 @@ impl PrinterDevice {
     }
 }
 
+/// A `PreferredDosName`: ASCII, NUL-padded, at most 7 characters.
+fn dos_name_field(name: &str) -> [u8; 8] {
+    let mut dos = [0u8; 8];
+    for (d, b) in dos.iter_mut().zip(name.bytes().filter(u8::is_ascii).take(7)) {
+        *d = b;
+    }
+    dos
+}
+
+/// What a session asks of a redirected COM port (MS-RDPESP).
+#[derive(Debug, PartialEq, Eq)]
+pub enum PortRequest {
+    Open,
+    Close,
+    Read { length: u32 },
+    Write { data: Vec<u8> },
+    /// A serial driver control code; MS-RDPESP's are the driver's own, with
+    /// the same structures in and out, so a real port takes them as they come.
+    Control { code: u32, input: Vec<u8>, output_length: u32 },
+}
+
+/// Finishes a [`PortRequest`], from any thread: NT status, bytes written (a
+/// `Write`), bytes read or returned (a `Read`, a `Control`).
+pub type PortDone = Box<dyn FnOnce(u32, u32, Vec<u8>) + Send>;
+
+/// A local COM port. A request may take as long as the port does (a read waits
+/// for data, a control call for an event), so each finishes through its `done`;
+/// the backend then wakes the session to send [`RdpdrChannel::take_completed`].
+pub trait PortBackend: Send {
+    fn request(&mut self, request: PortRequest, done: PortDone);
+}
+
+/// Requests on one port at a time, and the most data one may ask to move: what
+/// the session can make this PC hold.
+const MAX_PORT_REQUESTS: usize = 64;
+const MAX_PORT_IO: u32 = 1 << 20;
+/// `FILE_DEVICE_SERIAL_PORT`, a control code's top half: the only ones passed on.
+const SERIAL_DEVICE_TYPE: u32 = 0x1B;
+/// The FileId of a port's one open.
+const PORT_FILE_ID: u32 = 1;
+
+struct PortDevice {
+    device_id: u32,
+    dos_name: String,
+    backend: Box<dyn PortBackend>,
+    open: bool,
+    /// An open that failed (possibly after `io` returned): not open after all.
+    failed_open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PortDevice {
+    fn io(&mut self, body: &[u8], completed: &Completed) {
+        use std::sync::atomic::Ordering;
+        let (device_id, file_id) = (self.device_id, u32le(body, 4).unwrap_or(0));
+        let completion_id = u32le(body, 8).unwrap_or(0);
+        let major = u32le(body, 12).unwrap_or(0);
+        let params = body.get(20..).unwrap_or(&[]);
+        if self.failed_open.swap(false, Ordering::SeqCst) {
+            self.open = false;
+        }
+        let finish = {
+            let completed = completed.clone();
+            move |status: u32, payload: Vec<u8>| {
+                let mut v = header(PAKID_CORE_DEVICE_IOCOMPLETION);
+                v.extend_from_slice(&device_id.to_le_bytes());
+                v.extend_from_slice(&completion_id.to_le_bytes());
+                v.extend_from_slice(&status.to_le_bytes());
+                v.extend_from_slice(&payload);
+                completed.lock().unwrap().push(v);
+            }
+        };
+        let empty = |major: u32| match major {
+            IRP_MJ_CREATE | IRP_MJ_WRITE => vec![0u8; 5],
+            _ => vec![0u8; 4],
+        };
+        if major == IRP_MJ_CREATE && self.open {
+            return finish(STATUS_SHARING_VIOLATION, empty(major));
+        }
+        if major != IRP_MJ_CREATE && (!self.open || file_id != PORT_FILE_ID) {
+            return finish(STATUS_UNSUCCESSFUL, empty(major));
+        }
+        let request = match major {
+            IRP_MJ_CREATE => PortRequest::Open,
+            IRP_MJ_CLOSE => PortRequest::Close,
+            IRP_MJ_READ => PortRequest::Read { length: u32le(params, 0).unwrap_or(0).min(MAX_PORT_IO) },
+            IRP_MJ_WRITE => {
+                // DR_WRITE_REQUEST: Length(4), Offset(8), Padding(20), WriteData.
+                let length = (u32le(params, 0).unwrap_or(0) as usize).min(MAX_PORT_IO as usize);
+                let data = params.get(32..).unwrap_or(&[]);
+                PortRequest::Write { data: data[..length.min(data.len())].to_vec() }
+            }
+            IRP_MJ_DEVICE_CONTROL => {
+                // DR_CONTROL_REQ: OutputBufferLength(4), InputBufferLength(4),
+                // IoControlCode(4), Padding(20), InputBuffer.
+                let output_length = u32le(params, 0).unwrap_or(0).min(MAX_PORT_IO);
+                let input_length = (u32le(params, 4).unwrap_or(0) as usize).min(MAX_PORT_IO as usize);
+                let code = u32le(params, 8).unwrap_or(0);
+                if code >> 16 != SERIAL_DEVICE_TYPE {
+                    return finish(STATUS_INVALID_DEVICE_REQUEST, empty(major));
+                }
+                let input = params.get(32..).unwrap_or(&[]);
+                PortRequest::Control { code, input: input[..input_length.min(input.len())].to_vec(), output_length }
+            }
+            _ => return finish(STATUS_NOT_SUPPORTED, empty(major)),
+        };
+        if self.in_flight.load(Ordering::SeqCst) >= MAX_PORT_REQUESTS {
+            return finish(STATUS_INSUFFICIENT_RESOURCES, empty(major));
+        }
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        if major == IRP_MJ_CREATE {
+            self.open = true; // (A failed open gives it back, below.)
+        }
+        if major == IRP_MJ_CLOSE {
+            self.open = false;
+        }
+        let in_flight = self.in_flight.clone();
+        let opened = major == IRP_MJ_CREATE;
+        let failed_open = self.failed_open.clone();
+        self.backend.request(
+            request,
+            Box::new(move |status, written, data| {
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let payload = match major {
+                    IRP_MJ_CREATE => {
+                        let id = if status == STATUS_SUCCESS { PORT_FILE_ID } else { 0 };
+                        let mut p = id.to_le_bytes().to_vec();
+                        p.push(0); // Information
+                        p
+                    }
+                    IRP_MJ_WRITE => {
+                        let mut p = written.to_le_bytes().to_vec();
+                        p.push(0); // Padding
+                        p
+                    }
+                    IRP_MJ_READ | IRP_MJ_DEVICE_CONTROL => {
+                        let mut p = (data.len() as u32).to_le_bytes().to_vec();
+                        p.extend_from_slice(&data);
+                        p
+                    }
+                    _ => vec![0u8; 4],
+                };
+                if opened && status != STATUS_SUCCESS {
+                    failed_open.store(true, Ordering::SeqCst);
+                }
+                finish(status, payload);
+            }),
+        );
+    }
+
+    fn announce_entry(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&RDPDR_DTYP_SERIAL.to_le_bytes());
+        v.extend_from_slice(&self.device_id.to_le_bytes());
+        v.extend_from_slice(&dos_name_field(&self.dos_name));
+        v.extend_from_slice(&0u32.to_le_bytes()); // DeviceDataLength
+        v
+    }
+}
+
+/// Completions of device requests that finished after their PDU was handled.
+type Completed = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
 /// The device-redirection channel: init handshake + any number of shared
-/// drives and an optional redirected printer.
+/// drives, redirected printers and COM ports.
 #[derive(Default)]
 pub struct RdpdrChannel {
     client_id: u32,
     drives: Vec<DriveDevice>,
-    printer: Option<PrinterDevice>,
+    printers: Vec<PrinterDevice>,
+    ports: Vec<PortDevice>,
+    completed: Completed,
 }
 
-/// The printer's device id — clear of the drive ids, which grow from 1.
+/// Printers' device ids — clear of the drive ids, which grow from 1.
 const PRINTER_DEVICE_ID: u32 = 100;
+/// COM ports' — clear of the printers'.
+const PORT_DEVICE_ID: u32 = 1000;
 
 impl RdpdrChannel {
     pub fn new() -> Self {
@@ -852,12 +1029,26 @@ impl RdpdrChannel {
     /// `driver_name` is the driver the server renders with; `sink` spools the
     /// returned job to the local printer.
     pub fn set_printer(&mut self, print_name: String, driver_name: String, sink: Box<dyn PrinterSink>) {
-        self.printer = Some(PrinterDevice::new(
-            PRINTER_DEVICE_ID,
-            print_name,
-            driver_name,
-            sink,
-        ));
+        self.printers.clear();
+        self.add_printer(print_name, driver_name, true, sink);
+    }
+
+    /// Redirect one more local printer (`default`: this PC's default, the one
+    /// the session should default to too).
+    pub fn add_printer(&mut self, print_name: String, driver_name: String, default: bool, sink: Box<dyn PrinterSink>) {
+        let index = self.printers.len() as u32;
+        self.printers.push(PrinterDevice::new(index, default, print_name, driver_name, sink));
+    }
+
+    /// Redirect a local COM port, announced under its own name (`"COM3"`).
+    pub fn add_port(&mut self, name: String, backend: Box<dyn PortBackend>) {
+        let device_id = PORT_DEVICE_ID + self.ports.len() as u32;
+        self.ports.push(PortDevice { device_id, dos_name: name, backend, open: false, in_flight: Default::default(), failed_open: Default::default() });
+    }
+
+    /// Responses of device requests that have finished since last asked.
+    pub fn take_completed(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut *self.completed.lock().unwrap())
     }
 
     /// Process one inbound RDPDR PDU, returning the responses to send.
@@ -885,11 +1076,16 @@ impl RdpdrChannel {
     fn device_io(&mut self, msg: &[u8]) -> Vec<Vec<u8>> {
         let device_id = u32le(msg, 4).unwrap_or(0);
         // Body starts after the 4-byte rdpdr header. Route to whichever device
-        // the request targets (one of the drives, or the printer).
+        // the request targets (a drive, a printer, or a COM port: its answer
+        // may come later).
+        if let Some(p) = self.ports.iter_mut().find(|p| p.device_id == device_id) {
+            p.io(&msg[4..], &self.completed);
+            return self.take_completed();
+        }
         let io = if let Some(d) = self.drives.iter_mut().find(|d| d.device_id == device_id) {
             Some(d.io(&msg[4..]))
-        } else if self.printer.as_ref().is_some_and(|p| p.device_id == device_id) {
-            self.printer.as_mut().map(|p| p.io(&msg[4..]))
+        } else if let Some(p) = self.printers.iter_mut().find(|p| p.device_id == device_id) {
+            Some(p.io(&msg[4..]))
         } else {
             None
         };
@@ -925,7 +1121,12 @@ impl RdpdrChannel {
 
     fn capability_response(&self) -> Vec<u8> {
         let mut v = header(PAKID_CORE_CLIENT_CAPABILITY);
-        v.extend_from_slice(&1u16.to_le_bytes()); // numCapabilities
+        // (Beside the general set, one for each kind of device that needs it.)
+        let extra: Vec<u16> = [(!self.printers.is_empty(), CAP_PRINTER_TYPE), (!self.ports.is_empty(), CAP_PORT_TYPE)]
+            .into_iter()
+            .filter_map(|(has, cap)| has.then_some(cap))
+            .collect();
+        v.extend_from_slice(&(1 + extra.len() as u16).to_le_bytes()); // numCapabilities
         v.extend_from_slice(&0u16.to_le_bytes()); // pad
         v.extend_from_slice(&CAP_GENERAL_TYPE.to_le_bytes());
         v.extend_from_slice(&44u16.to_le_bytes());
@@ -940,6 +1141,11 @@ impl RdpdrChannel {
         v.extend_from_slice(&0u32.to_le_bytes()); // extraFlags1
         v.extend_from_slice(&0u32.to_le_bytes()); // extraFlags2
         v.extend_from_slice(&0u32.to_le_bytes()); // SpecialTypeDeviceCap
+        for cap in extra {
+            v.extend_from_slice(&cap.to_le_bytes());
+            v.extend_from_slice(&8u16.to_le_bytes());
+            v.extend_from_slice(&1u32.to_le_bytes()); // version 1
+        }
         v
     }
 
@@ -950,7 +1156,11 @@ impl RdpdrChannel {
             entries.extend_from_slice(&d.announce_entry());
             count += 1;
         }
-        if let Some(p) = self.printer.as_ref() {
+        for p in &self.printers {
+            entries.extend_from_slice(&p.announce_entry());
+            count += 1;
+        }
+        for p in &self.ports {
             entries.extend_from_slice(&p.announce_entry());
             count += 1;
         }
@@ -1160,6 +1370,125 @@ mod tests {
         fn end_job(&mut self) {
             self.jobs.lock().unwrap().push(std::mem::take(&mut self.current));
         }
+    }
+
+    #[test]
+    fn every_printer_is_announced_and_spools_to_its_own_sink() {
+        let mut r = RdpdrChannel::new();
+        let (a, b) = (std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        r.add_printer("A".into(), "Driver".into(), false, Box::new(MockPrinter { jobs: a.clone(), current: Vec::new() }));
+        r.add_printer("B".into(), "Driver".into(), true, Box::new(MockPrinter { jobs: b.clone(), current: Vec::new() }));
+        let dl = r.device_list();
+        assert_eq!(u32::from_le_bytes([dl[4], dl[5], dl[6], dl[7]]), 2);
+        assert_eq!(&dl[16..24], b"PRN1\0\0\0\0");
+        // The first isn't the default (flags, right after DeviceDataLength).
+        assert_eq!(u32::from_le_bytes([dl[28], dl[29], dl[30], dl[31]]), 0);
+
+        let second = PRINTER_DEVICE_ID + 1;
+        r.process(&io_request(second, 0, 1, IRP_MJ_CREATE, 0, &[]));
+        let mut w = 2u32.to_le_bytes().to_vec();
+        w.extend_from_slice(&[0u8; 28]);
+        w.extend_from_slice(b"hi");
+        r.process(&io_request(second, 1, 2, IRP_MJ_WRITE, 0, &w));
+        r.process(&io_request(second, 1, 3, IRP_MJ_CLOSE, 0, &[]));
+        assert!(a.lock().unwrap().is_empty());
+        assert_eq!(b.lock().unwrap().as_slice(), [b"hi".to_vec()]);
+    }
+
+    /// A port that finishes requests when told to.
+    #[derive(Clone, Default)]
+    struct MockPort {
+        asked: std::sync::Arc<std::sync::Mutex<Vec<(PortRequest, PortDone)>>>,
+    }
+    impl PortBackend for MockPort {
+        fn request(&mut self, request: PortRequest, done: PortDone) {
+            self.asked.lock().unwrap().push((request, done));
+        }
+    }
+    impl MockPort {
+        fn finish(&self, status: u32, written: u32, data: &[u8]) -> PortRequest {
+            let (request, done) = self.asked.lock().unwrap().remove(0);
+            done(status, written, data.to_vec());
+            request
+        }
+    }
+    fn status_of(m: &[u8]) -> u32 {
+        u32::from_le_bytes([m[12], m[13], m[14], m[15]])
+    }
+
+    #[test]
+    fn a_com_port_is_announced_with_its_capability() {
+        let mut r = RdpdrChannel::new();
+        r.add_port("COM3".into(), Box::new(MockPort::default()));
+        let dl = r.device_list();
+        assert_eq!(u32::from_le_bytes([dl[8], dl[9], dl[10], dl[11]]), RDPDR_DTYP_SERIAL);
+        assert_eq!(u32::from_le_bytes([dl[12], dl[13], dl[14], dl[15]]), PORT_DEVICE_ID);
+        assert_eq!(&dl[16..24], b"COM3\0\0\0\0");
+        let caps = r.capability_response();
+        assert_eq!(u16::from_le_bytes([caps[4], caps[5]]), 2);
+        assert_eq!(u16::from_le_bytes([caps[caps.len() - 8], caps[caps.len() - 7]]), CAP_PORT_TYPE);
+    }
+
+    #[test]
+    fn a_com_port_read_answers_when_the_data_comes() {
+        let port = MockPort::default();
+        let mut r = RdpdrChannel::new();
+        r.add_port("COM3".into(), Box::new(port.clone()));
+        assert!(r.process(&io_request(PORT_DEVICE_ID, 0, 1, IRP_MJ_CREATE, 0, &[])).is_empty());
+        assert_eq!(port.finish(STATUS_SUCCESS, 0, &[]), PortRequest::Open);
+        let opened = r.take_completed();
+        assert_eq!(status_of(&opened[0]), STATUS_SUCCESS);
+        assert_eq!(u32::from_le_bytes([opened[0][16], opened[0][17], opened[0][18], opened[0][19]]), PORT_FILE_ID);
+
+        // A read waits: nothing to send until the port has something.
+        let read = 16u32.to_le_bytes();
+        assert!(r.process(&io_request(PORT_DEVICE_ID, PORT_FILE_ID, 2, IRP_MJ_READ, 0, &read)).is_empty());
+        assert!(r.take_completed().is_empty());
+        assert_eq!(port.finish(STATUS_SUCCESS, 0, b"data"), PortRequest::Read { length: 16 });
+        let done = r.take_completed();
+        assert_eq!(u32::from_le_bytes([done[0][8], done[0][9], done[0][10], done[0][11]]), 2); // CompletionId
+        assert_eq!(&done[0][16..], [4, 0, 0, 0, b'd', b'a', b't', b'a']);
+    }
+
+    #[test]
+    fn a_com_port_passes_on_serial_control_codes_only() {
+        let port = MockPort::default();
+        let mut r = RdpdrChannel::new();
+        r.add_port("COM3".into(), Box::new(port.clone()));
+        r.process(&io_request(PORT_DEVICE_ID, 0, 1, IRP_MJ_CREATE, 0, &[]));
+        port.finish(STATUS_SUCCESS, 0, &[]);
+        r.take_completed();
+        let control = |code: u32| {
+            let mut p = 8u32.to_le_bytes().to_vec(); // OutputBufferLength
+            p.extend_from_slice(&2u32.to_le_bytes()); // InputBufferLength
+            p.extend_from_slice(&code.to_le_bytes());
+            p.extend_from_slice(&[0u8; 20]);
+            p.extend_from_slice(&[7, 9]);
+            p
+        };
+        // Not a serial driver's: refused here, never reaching the port.
+        let out = r.process(&io_request(PORT_DEVICE_ID, PORT_FILE_ID, 2, IRP_MJ_DEVICE_CONTROL, 0, &control(0x0022_0000)));
+        assert_eq!(status_of(&out[0]), STATUS_INVALID_DEVICE_REQUEST);
+        assert!(port.asked.lock().unwrap().is_empty());
+        // IOCTL_SERIAL_SET_BAUD_RATE goes through as it came.
+        r.process(&io_request(PORT_DEVICE_ID, PORT_FILE_ID, 3, IRP_MJ_DEVICE_CONTROL, 0, &control(0x001B_0004)));
+        assert_eq!(port.finish(STATUS_SUCCESS, 0, &[]), PortRequest::Control { code: 0x001B_0004, input: vec![7, 9], output_length: 8 });
+    }
+
+    #[test]
+    fn a_com_port_refuses_a_second_open_and_reopens_after_a_failed_one() {
+        let port = MockPort::default();
+        let mut r = RdpdrChannel::new();
+        r.add_port("COM3".into(), Box::new(port.clone()));
+        r.process(&io_request(PORT_DEVICE_ID, 0, 1, IRP_MJ_CREATE, 0, &[]));
+        let out = r.process(&io_request(PORT_DEVICE_ID, 0, 2, IRP_MJ_CREATE, 0, &[]));
+        assert_eq!(status_of(&out[0]), STATUS_SHARING_VIOLATION);
+        port.finish(STATUS_ACCESS_DENIED, 0, &[]);
+        assert_eq!(status_of(&r.take_completed()[0]), STATUS_ACCESS_DENIED);
+        // (Another app held it; it's free to try again.)
+        r.process(&io_request(PORT_DEVICE_ID, 0, 3, IRP_MJ_CREATE, 0, &[]));
+        port.finish(STATUS_SUCCESS, 0, &[]);
+        assert_eq!(status_of(&r.take_completed()[0]), STATUS_SUCCESS);
     }
 
     #[test]

@@ -68,6 +68,32 @@ impl MappedGeometry {
             bottom: self.top_level.top + self.rect.bottom,
         }
     }
+
+    /// The region's visible part in desktop coordinates: what video may be drawn
+    /// on, the rest being behind another window. `None` when the server sent no
+    /// visible region, or one that doesn't fit the region (nothing to go by).
+    ///
+    /// MS-RDPEGT doesn't say which coordinates the rectangles are in, so they're
+    /// read as whichever fits: the desktop's, else relative to the top-level window.
+    pub fn visible_on_desktop(&self) -> Option<Vec<GeoRect>> {
+        if self.visible.is_empty() {
+            return None;
+        }
+        let inside = |r: &GeoRect, area: &GeoRect| {
+            r.left >= area.left && r.top >= area.top && r.right <= area.right && r.bottom <= area.bottom
+        };
+        let on_desktop = self.desktop_rect();
+        if self.visible.iter().all(|r| inside(r, &on_desktop)) {
+            return Some(self.visible.clone());
+        }
+        self.visible.iter().all(|r| inside(r, &self.rect)).then(|| {
+            let (dx, dy) = (self.top_level.left, self.top_level.top);
+            self.visible
+                .iter()
+                .map(|r| GeoRect { left: r.left + dx, top: r.top + dy, right: r.right + dx, bottom: r.bottom + dy })
+                .collect()
+        })
+    }
 }
 
 /// One decoded packet.
@@ -136,6 +162,26 @@ fn parse_region(b: &[u8]) -> Vec<GeoRect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_visible_part_reads_as_whichever_coordinates_fit() {
+        let r = |left, top, right, bottom| GeoRect { left, top, right, bottom };
+        let mut g = MappedGeometry {
+            rect: r(10, 10, 110, 110),
+            top_level: r(500, 300, 1500, 1300),
+            ..Default::default()
+        };
+        assert_eq!(g.visible_on_desktop(), None);
+        // In desktop coordinates already.
+        g.visible = vec![r(510, 310, 560, 410)];
+        assert_eq!(g.visible_on_desktop(), Some(vec![r(510, 310, 560, 410)]));
+        // Relative to the top-level window.
+        g.visible = vec![r(10, 10, 60, 110)];
+        assert_eq!(g.visible_on_desktop(), Some(vec![r(510, 310, 560, 410)]));
+        // Neither: nothing to go by.
+        g.visible = vec![r(0, 0, 5000, 5000)];
+        assert_eq!(g.visible_on_desktop(), None);
+    }
 
     fn rect(out: &mut Vec<u8>, l: i32, t: i32, r: i32, b: i32) {
         for v in [l, t, r, b] {

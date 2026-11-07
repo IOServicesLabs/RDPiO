@@ -451,6 +451,28 @@ pub fn fetch_feed(
     crate::feed::parse(&body).map_err(|e| AuthError::Failed(format!("feed parse error: {e}")))
 }
 
+/// The user's Cloud PCs: the Windows App's local cache when it has them (signed
+/// ARM `.rdp`s, the validated broker path), else the live ARM feed.
+pub fn list_cloud_pcs(
+    token: &AccessToken,
+    tenant_id: &str,
+    client_id: Option<&str>,
+) -> Result<Vec<crate::feed::FeedEntry>, AuthError> {
+    let cached = discover_cached_cloud_pcs();
+    if cached.is_empty() {
+        tracing::info!("no cached Cloud PCs found; querying live W365 ARM feed");
+        return fetch_feed(token, tenant_id, client_id, None);
+    }
+    tracing::info!(count = cached.len(), "discovered Cloud PCs from Windows App cache");
+    Ok(cached)
+}
+
+/// What names one Cloud PC of [`list_cloud_pcs`] (`--w365-pc`): several can
+/// share a SKU's display name, so that's the last resort.
+pub fn pc_key(e: &crate::feed::FeedEntry) -> &str {
+    [&e.resource_id, &e.id, &e.display_name].into_iter().find(|k| !k.is_empty()).map_or("", |k| k.as_str())
+}
+
 /// Package family name of the Microsoft "Windows App" (formerly Windows 365)
 /// MSIX package. Its `LocalCache\ResourceCache` holds one signed ARM `.rdp` per
 /// subscribed Cloud PC.
@@ -573,6 +595,17 @@ mod tests {
         for e in discover_cached_cloud_pcs() {
             println!("{} ({} bytes of .rdp)", e.display_name, e.rdp_file.map_or(0, |r| r.len()));
         }
+    }
+
+    #[test]
+    fn a_cloud_pc_is_named_by_its_resource_first() {
+        let mut e = crate::feed::FeedEntry::default();
+        e.display_name = "Cloud PC".into();
+        assert_eq!(pc_key(&e), "Cloud PC");
+        e.id = "feed-id".into();
+        assert_eq!(pc_key(&e), "feed-id");
+        e.resource_id = "resource-id".into();
+        assert_eq!(pc_key(&e), "resource-id");
     }
 
     #[test]

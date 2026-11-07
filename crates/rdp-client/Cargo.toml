@@ -114,6 +114,8 @@ windows = { workspace = true, features = [
     # Hyper direct mode: the service and its SYSTEM console agent.
     "Win32_System_Services",
     "Win32_Devices_Display",
+    # Serial redirection: this PC's COM ports.
+    "Win32_Devices_Communication",
     "Win32_Security",
     # WASAPI device names (PKEY_Device_FriendlyName → string).
     "Win32_Devices_FunctionDiscovery",

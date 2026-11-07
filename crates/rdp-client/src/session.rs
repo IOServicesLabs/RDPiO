@@ -1077,6 +1077,42 @@ impl ActiveSession {
         self.rdpdr.channel.set_printer(print_name, driver_name, sink);
     }
 
+    /// Redirect one more local printer (see [`Self::set_printer`]).
+    #[cfg(windows)]
+    pub fn add_printer(
+        &mut self,
+        print_name: String,
+        driver_name: String,
+        default: bool,
+        sink: Box<dyn rdp_channels::rdpdr::PrinterSink>,
+    ) {
+        self.rdpdr.channel.add_printer(print_name, driver_name, default, sink);
+    }
+
+    /// Redirect a local COM port into the session. Call before the session loop
+    /// runs the rdpdr handshake.
+    #[cfg(windows)]
+    pub fn add_port(&mut self, name: String, backend: Box<dyn rdp_channels::rdpdr::PortBackend>) {
+        self.rdpdr.channel.add_port(name, backend);
+    }
+
+    /// Send the answers of device requests that finished on their own threads.
+    fn pump_rdpdr<S: Write>(&mut self, stream: &mut S) -> Result<(), ActivateError> {
+        let completed = self.rdpdr.channel.take_completed();
+        if completed.is_empty() {
+            return Ok(());
+        }
+        let Some(rdpdr_id) = self.info.channel_id(rdp_pdu::gcc::RDPDR_CHANNEL) else {
+            return Ok(());
+        };
+        for resp in completed {
+            for piece in rdp_channels::svc::chunks(&resp) {
+                self.send_channel(stream, rdpdr_id, &piece)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Feed one inbound rdpsnd channel chunk: reassemble, run the RDPSND state
     /// machine against the OS audio sink, and send any responses (format reply,
     /// training echo, wave confirms) back on the rdpsnd channel.
@@ -1619,6 +1655,7 @@ pub fn pump_once<S: Read + Write, F: FrameSink>(
     // ...and start staging the session's clipboard files if a paste wants them.
     #[cfg(any(windows, target_os = "android"))]
     session.pump_clipboard_files(stream)?;
+    session.pump_rdpdr(stream)?;
 
     let pdu = read_tpkt_pdu(stream)?;
     let (channel, payload) = mcs::parse_send_data_indication(&pdu)?;
@@ -2124,6 +2161,18 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
     tracing::info!("decode loop ended");
 }
 
+/// Start the RDPECAM capture for a negotiated media type. While the SlimCore
+/// plugin is hosted (`slimcore`) the capture synthesizes black frames instead
+/// of opening the physical webcam, which the SlimCore engine needs exclusive.
+#[cfg(any(windows, target_os = "android"))]
+fn start_cam_capture(slimcore: bool, media: rdp_channels::camera::MediaType) -> crate::mf_camera::MfCamera {
+    if slimcore {
+        crate::mf_camera::MfCamera::start_on_demand_black(media)
+    } else {
+        crate::mf_camera::MfCamera::start_on_demand(0, media)
+    }
+}
+
 /// Like [`run_session`], but also drives the RDPGFX dynamic channel: it demuxes
 /// the static `drdynvc` channel into a [`rdp_graphics::channel::GraphicsChannel`],
 /// sends that channel's DVC responses and frame-acks back over `stream`, and
@@ -2180,8 +2229,19 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     let mut audio_in = rdp_channels::audio_input::AudioInputChannel::new();
     let mut mic_started = false;
     // Camera redirection (MS-RDPECAM): enumerate local webcams and advertise
-    // them. Empty (no webcam) → nothing announced, feature stays off.
+    // them. Empty (no webcam) → nothing announced, feature stays off. While the
+    // SlimCore plugin is hosted its media engine owns the physical cameras — an
+    // MF open on our side fails its video stage (code=5) — but the devices must
+    // still show up in the VM (Teams' picker matches against them), so they are
+    // advertised and stream black frames without touching the hardware.
+    let slimcore_cam = crate::teams_slimcore::plugin_active();
     let cameras = crate::mf_camera::MfCamera::enumerate();
+    if slimcore_cam && !cameras.is_empty() {
+        tracing::info!(
+            count = cameras.len(),
+            "SlimCore plugin active: cameras advertised as inert black-frame devices (engine owns the hardware)"
+        );
+    }
     tracing::info!(
         count = cameras.len(),
         names = ?cameras.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
@@ -2283,6 +2343,7 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         // ...and start staging the session's clipboard files if a paste is
         // waiting on them (the lazy half of file redirection).
         session.pump_clipboard_files(stream)?;
+        session.pump_rdpdr(stream)?;
 
         // Forward a pending window-resize as a Display Control request, but only
         // after the size has been stable for RESIZE_SETTLE (drag-end), so one
@@ -2749,11 +2810,12 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                     cam_capture = Some((
                         *chan_id,
                         media,
-                        crate::mf_camera::MfCamera::start_on_demand(0, media),
+                        start_cam_capture(slimcore_cam, media),
                     ));
                     tracing::info!(
                         channel_id = *chan_id,
                         ?media,
+                        black = slimcore_cam,
                         "camera capture started; streaming frames to the session"
                     );
                 }
@@ -2761,10 +2823,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                     if owner == *chan_id && streaming != Some(media) =>
                 {
                     drop(cam_capture.take()); // joins the old capture thread first
-                    cam_capture = streaming.map(|m| {
-                        (owner, m, crate::mf_camera::MfCamera::start_on_demand(0, m))
-                    });
-                    tracing::info!(channel_id = owner, ?streaming, "camera stream changed");
+                    cam_capture = streaming.map(|m| (owner, m, start_cam_capture(slimcore_cam, m)));
+                    tracing::info!(channel_id = owner, ?streaming, black = slimcore_cam, "camera stream changed");
                 }
                 _ => {}
             }

@@ -1,6 +1,6 @@
 //! Win32 print-spooler sink for printer redirection (MS-RDPEPC).
 //!
-//! Spools redirected print jobs to the local default printer via the winspool
+//! Spools redirected print jobs to a local printer via the winspool
 //! API: each job is `OpenPrinter` → `StartDocPrinter` (RAW datatype) →
 //! `WritePrinter`* → `EndDocPrinter` → `ClosePrinter`. Implements
 //! [`rdp_channels::rdpdr::PrinterSink`]. Runs on the session worker thread.
@@ -9,8 +9,9 @@
 use rdp_channels::rdpdr::PrinterSink;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Graphics::Printing::{
-    ClosePrinter, EndDocPrinter, EndPagePrinter, GetDefaultPrinterW, GetPrinterW, OpenPrinterW,
-    StartDocPrinterW, StartPagePrinter, WritePrinter, DOC_INFO_1W, PRINTER_HANDLE, PRINTER_INFO_2W,
+    ClosePrinter, EndDocPrinter, EndPagePrinter, EnumPrintersW, GetDefaultPrinterW, GetPrinterW, OpenPrinterW,
+    StartDocPrinterW, StartPagePrinter, WritePrinter, DOC_INFO_1W, PRINTER_ENUM_CONNECTIONS, PRINTER_ENUM_LOCAL,
+    PRINTER_HANDLE, PRINTER_INFO_2W,
 };
 
 /// A redirected local printer spooled via winspool.
@@ -58,6 +59,39 @@ impl Win32Printer {
                     handle: None,
                 },
             ))
+        }
+    }
+}
+
+impl Win32Printer {
+    /// Every printer this PC has (its own and its connections), as
+    /// `(print_name, driver_name, is_default, sink)`.
+    pub fn all() -> Vec<(String, String, bool, Self)> {
+        let default = Self::default_printer().map(|(name, ..)| name);
+        unsafe {
+            let flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS;
+            let (mut needed, mut count) = (0u32, 0u32);
+            let _ = EnumPrintersW(flags, None, 2, None, &mut needed, &mut count); // sizes the buffer
+            if needed == 0 {
+                return Vec::new();
+            }
+            // (u64s: PRINTER_INFO_2W's alignment, and the strings follow it.)
+            let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+            let bytes = std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), needed as usize);
+            if let Err(e) = EnumPrintersW(flags, None, 2, Some(bytes), &mut needed, &mut count) {
+                tracing::warn!(error = %e, "couldn't list this PC's printers");
+                return Vec::new();
+            }
+            std::slice::from_raw_parts(buf.as_ptr().cast::<PRINTER_INFO_2W>(), count as usize)
+                .iter()
+                .filter_map(|info| {
+                    let name = info.pPrinterName.to_string().ok()?;
+                    let driver = info.pDriverName.to_string().unwrap_or_default();
+                    let is_default = default.as_deref() == Some(name.as_str());
+                    let wide = name.encode_utf16().chain([0]).collect();
+                    Some((name, driver, is_default, Self { name: wide, handle: None }))
+                })
+                .collect()
         }
     }
 }
