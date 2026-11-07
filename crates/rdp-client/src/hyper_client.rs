@@ -884,6 +884,20 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         }
         let covered = covered_since.is_some_and(|t| t.elapsed() >= COVERED_FOR);
         let minimized = window.output_hidden() || covered;
+        // On battery with nothing moving, the stream's holds go back: the PC
+        // may sleep and boost may disengage. Input or a moving picture (any
+        // activity) re-arms them, as does coming back from hidden.
+        let battery_idle = crate::net_tune::on_battery() && last_activity.elapsed() >= POWER_IDLE;
+        if battery_idle && awake.is_some() {
+            (wifi, boost, awake) = (None, None, None);
+            tracing::info!("on battery, stream idle: Wi-Fi and power settings handed back");
+        }
+        if awake.is_none() && !minimized && !battery_idle {
+            wifi = crate::net_tune::WifiLowLatency::enable();
+            boost = crate::net_tune::ThreadBoost::games();
+            awake = Some(crate::net_tune::KeepAwake::new());
+            tracing::info!("stream holds re-armed");
+        }
         if let Some(v) = shared.update_note.lock().unwrap().take() {
             hint = crate::hyper_overlay::render(&[format!("rdpio {v} downloaded from the host: it installs when you close this window")]);
             hint_until = Instant::now() + Duration::from_secs(6);
@@ -913,10 +927,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             if paused && !minimized {
                 awaiting_key = true;
                 last_key_request = Instant::now() - Duration::from_secs(1);
-                // Seen again: the stream's holds come back before its picture.
-                wifi = crate::net_tune::WifiLowLatency::enable();
-                boost = crate::net_tune::ThreadBoost::games();
-                awake = Some(crate::net_tune::KeepAwake::new());
+                // The holds themselves come back in the re-arm above this block.
                 tracing::info!("stream visible again");
             } else if !paused && minimized {
                 // Nothing to show: Wi-Fi may nap and scan again, the screen
@@ -1230,6 +1241,13 @@ static IN_PLACE_FAILED: AtomicBool = AtomicBool::new(false);
 /// No picture and no input this long: the 1 ms timer goes (it keeps the
 /// laptop's CPU from its deeper sleep on a still screen).
 const FINE_TIMER_IDLE: Duration = Duration::from_secs(2);
+
+/// No picture and no input this long on battery: the "keep the machine up"
+/// holds (Wi-Fi low latency, MMCSS, keep-awake) are handed back so the
+/// laptop may sleep — a fullscreen window showing a still picture must not
+/// pin "best performance" and block sleep while the battery drains. Any
+/// activity, or plugging back in, brings them back.
+const POWER_IDLE: Duration = Duration::from_secs(300);
 
 /// Pointer motion goes at most this often (see the input send in `run`).
 const INPUT_MOTION_EVERY: Duration = Duration::from_millis(1);

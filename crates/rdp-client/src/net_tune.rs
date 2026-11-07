@@ -128,6 +128,15 @@ impl Drop for KeepAwake {
     }
 }
 
+/// Running on battery right now (AC offline). A desktop — or a firmware that
+/// won't say — counts as plugged in, so the "keep the machine up" holds stay.
+/// (`SYSTEM_POWER_STATUS.ACLineStatus`: 0 = offline.)
+pub fn on_battery() -> bool {
+    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    let mut status = SYSTEM_POWER_STATUS::default();
+    unsafe { GetSystemPowerStatus(&mut status) }.is_ok() && status.ACLineStatus == 0
+}
+
 /// The calling thread in MMCSS's "Games" class (scheduled like a game's own
 /// render thread) until dropped.
 pub struct ThreadBoost(HANDLE);
