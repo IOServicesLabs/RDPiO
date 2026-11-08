@@ -621,7 +621,8 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         // or `--hyper-scale` (as Android does): the host fits its desktop to
         // the smaller view on its GPU, and the renderer scales it up here.
         let office_now = crate::window::office_mode();
-        let scale = AutoScale::current(office_now);
+        let eco = eco_mode();
+        let scale = AutoScale::current(office_now).min(if eco { ECO_MAX_SCALE } else { 100 });
         let view_want = scaled_view(view_size, scale);
         let view_settled = view_since.elapsed() >= VIEW_SETTLE && view_size.0 >= 320 && view_size.1 >= 200;
         if view_settled && (view_want != view_told || refresh_sent.elapsed() >= Duration::from_secs(3)) {
@@ -688,13 +689,14 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         }
         input.ack(shared.input_ack.load(Ordering::Relaxed));
         // New input goes at once — but pointer motion at most once a
-        // millisecond, merged meanwhile: a 4-8 kHz gaming mouse otherwise
-        // costs a Wi-Fi packet per report. Unacknowledged input is resent
-        // every 15 ms.
+        // millisecond (eco on battery: four), merged meanwhile: a 4-8 kHz
+        // gaming mouse otherwise costs a Wi-Fi packet per report.
+        // Unacknowledged input is resent every 15 ms.
         let unsent = input.unsent();
+        let motion_every = if eco { Duration::from_millis(4) } else { INPUT_MOTION_EVERY };
         let due = match unsent {
             Some(false) => true,
-            Some(true) => last_input_send.elapsed() >= INPUT_MOTION_EVERY,
+            Some(true) => last_input_send.elapsed() >= motion_every,
             None => false,
         };
         // `inputdup`: each packet carries the newest few events (and any key
@@ -736,7 +738,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         if refresh_sent.elapsed() >= Duration::from_secs(3) {
             let epoch = crate::window::display_epoch();
             if epoch != refresh_epoch || refresh_read.elapsed() >= Duration::from_secs(15) {
-                let hz = window_refresh_hz(window);
+                let hz = window_refresh_hz(window).min(if eco { ECO_MAX_FPS } else { u32::MAX });
                 if hz != refresh_hz && refresh_hz != 0 {
                     tracing::info!(hz, "this screen's refresh rate changed; telling the host");
                 }
@@ -886,8 +888,10 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         let minimized = window.output_hidden() || covered;
         // On battery with nothing moving, the stream's holds go back: the PC
         // may sleep and boost may disengage. Input or a moving picture (any
-        // activity) re-arms them, as does coming back from hidden.
-        let battery_idle = crate::net_tune::on_battery() && last_activity.elapsed() >= POWER_IDLE;
+        // activity) re-arms them, as does coming back from hidden. A dying
+        // battery hands them back early.
+        let idle_for = if eco_critical() { Duration::from_secs(60) } else { POWER_IDLE };
+        let battery_idle = crate::net_tune::on_battery() && last_activity.elapsed() >= idle_for;
         if battery_idle && awake.is_some() {
             (wifi, boost, awake) = (None, None, None);
             tracing::info!("on battery, stream idle: Wi-Fi and power settings handed back");
@@ -1108,6 +1112,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             // the host's frame rate, pictures shown, the stream's size). A
             // change goes to the host with the next View, above.
             let office = crate::window::office_mode();
+            let eco = eco_mode();
             let sample = rdp_hyper::autores::Sample {
                 now_s: now_us() as f64 / 1e6,
                 received_bps: mbps * 1e6,
@@ -1119,7 +1124,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                 width: w,
                 height: h,
             };
-            if let Some(d) = AutoScale::step(&sample, office) {
+            if let Some(d) = AutoScale::step(&sample, office, eco) {
                 let mode = if office { "Office" } else { "Game" };
                 hint = crate::hyper_overlay::render(&[if d.scale < d.from {
                     format!("Slow connection: {mode} mode at {}% (Auto resolution)", d.scale)
@@ -1242,6 +1247,14 @@ static IN_PLACE_FAILED: AtomicBool = AtomicBool::new(false);
 /// laptop's CPU from its deeper sleep on a still screen).
 const FINE_TIMER_IDLE: Duration = Duration::from_secs(2);
 
+/// Battery eco (office mode on battery, see [`eco_mode`]) caps the stream at
+/// this frame rate — 30 made scrolling jitter.
+const ECO_MAX_FPS: u32 = 60;
+
+/// …and at this share of the window (Auto resolution, see [`AutoScale`]):
+/// fewer pixels to decode and carry, FSR-upscaled here.
+const ECO_MAX_SCALE: u32 = 75;
+
 /// No picture and no input this long on battery: the "keep the machine up"
 /// holds (Wi-Fi low latency, MMCSS, keep-awake) are handed back so the
 /// laptop may sleep — a fullscreen window showing a still picture must not
@@ -1292,17 +1305,21 @@ pub fn set_gpu_choice(choice: &str) {
 }
 
 fn on_battery() -> bool {
-    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
-    // (`RDPIO_POWER=battery` or `ac`: as if — for A/B runs of what
-    // follows the power source, on whatever cable the test machine has.)
-    match std::env::var("RDPIO_POWER").as_deref() {
-        Ok("battery") => return true,
-        Ok("ac") => return false,
-        _ => {}
-    }
-    let mut s = SYSTEM_POWER_STATUS::default();
-    // (ACLineStatus: 0 offline, 1 online, 255 unknown — a desktop.)
-    unsafe { GetSystemPowerStatus(&mut s).is_ok() && s.ACLineStatus == 0 }
+    crate::net_tune::on_battery()
+}
+
+/// Battery eco mode: on battery, in office mode. Every optimization that
+/// costs the picture something (the stream rate cap, the pointer-input
+/// cadence, the Auto resolution ceiling) applies only here; game mode is
+/// never touched. All on by default; follows Ctrl+Shift+O and the cable.
+fn eco_mode() -> bool {
+    crate::net_tune::on_battery() && crate::window::office_mode()
+}
+
+/// A dying battery (<20%, or Windows' Energy Saver on): the idle power holds
+/// go back after a minute instead of the usual five.
+fn eco_critical() -> bool {
+    crate::net_tune::battery_low() || crate::window::energy_saver()
 }
 
 /// Office mode with the encoder's fast preset (the default; `--hyper-text
@@ -1350,14 +1367,18 @@ impl AutoScale {
     }
 
     /// This second's numbers: `Some` when the scale changes (Auto only).
-    fn step(sample: &rdp_hyper::autores::Sample, office: bool) -> Option<rdp_hyper::autores::Decision> {
+    /// `eco` caps what the link may raise it back to (see [`ECO_MAX_SCALE`]).
+    fn step(sample: &rdp_hyper::autores::Sample, office: bool, eco: bool) -> Option<rdp_hyper::autores::Decision> {
         if SCALE_PINNED.load(Ordering::Relaxed) != 0 {
             return None;
         }
         let mut guard = AUTO_SCALE.lock().unwrap();
         let auto = guard.get_or_insert_with(|| AutoScale { res: Default::default(), game: 100, office: 100 });
         let current = if office { auto.office } else { auto.game };
-        let d = auto.res.step(sample, current, office)?;
+        let mut d = auto.res.step(sample, current, office)?;
+        if eco && d.scale > ECO_MAX_SCALE {
+            d.scale = ECO_MAX_SCALE;
+        }
         *(if office { &mut auto.office } else { &mut auto.game }) = d.scale;
         tracing::info!(
             "auto resolution: {}% ({:.1} Mbps, {:.3} bpp; was {}% at {:.3} bpp; {}x{} {:.0} fps, latency {:.0} ms, rtt {:.0} ms, {:.1} Mbps arrived, next up after {:.0} s clear)",
