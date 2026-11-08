@@ -622,7 +622,10 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         // the smaller view on its GPU, and the renderer scales it up here.
         let office_now = crate::window::office_mode();
         let eco = eco_mode();
-        let scale = AutoScale::current(office_now).min(if eco { ECO_MAX_SCALE } else { 100 });
+        // A dying battery streams at a smaller size (fewer pixels to decode
+        // and carry); merely being on battery doesn't — office mode is for
+        // crisp text, and 75% upscaled reads as blurry (reported in testing).
+        let scale = AutoScale::current(office_now).min(if eco_critical() { ECO_MAX_SCALE } else { 100 });
         let view_want = scaled_view(view_size, scale);
         let view_settled = view_since.elapsed() >= VIEW_SETTLE && view_size.0 >= 320 && view_size.1 >= 200;
         if view_settled && (view_want != view_told || refresh_sent.elapsed() >= Duration::from_secs(3)) {
@@ -1112,7 +1115,6 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             // the host's frame rate, pictures shown, the stream's size). A
             // change goes to the host with the next View, above.
             let office = crate::window::office_mode();
-            let eco = eco_mode();
             let sample = rdp_hyper::autores::Sample {
                 now_s: now_us() as f64 / 1e6,
                 received_bps: mbps * 1e6,
@@ -1124,7 +1126,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                 width: w,
                 height: h,
             };
-            if let Some(d) = AutoScale::step(&sample, office, eco) {
+            if let Some(d) = AutoScale::step(&sample, office, eco_critical()) {
                 let mode = if office { "Office" } else { "Game" };
                 hint = crate::hyper_overlay::render(&[if d.scale < d.from {
                     format!("Slow connection: {mode} mode at {}% (Auto resolution)", d.scale)
@@ -1251,8 +1253,10 @@ const FINE_TIMER_IDLE: Duration = Duration::from_secs(2);
 /// this frame rate — 30 made scrolling jitter.
 const ECO_MAX_FPS: u32 = 60;
 
-/// …and at this share of the window (Auto resolution, see [`AutoScale`]):
-/// fewer pixels to decode and carry, FSR-upscaled here.
+/// A dying battery (see [`eco_critical`]) streams at this share of the
+/// window instead (Auto resolution, see [`AutoScale`]): fewer pixels to
+/// decode and carry, FSR-upscaled here. Not plain on-battery — office mode
+/// is for crisp text, and 75% upscaled reads as blurry.
 const ECO_MAX_SCALE: u32 = 75;
 
 /// No picture and no input this long on battery: the "keep the machine up"
@@ -1367,8 +1371,9 @@ impl AutoScale {
     }
 
     /// This second's numbers: `Some` when the scale changes (Auto only).
-    /// `eco` caps what the link may raise it back to (see [`ECO_MAX_SCALE`]).
-    fn step(sample: &rdp_hyper::autores::Sample, office: bool, eco: bool) -> Option<rdp_hyper::autores::Decision> {
+    /// `cap` limits what the link may raise it back to — a dying battery
+    /// only (see [`ECO_MAX_SCALE`]).
+    fn step(sample: &rdp_hyper::autores::Sample, office: bool, cap: bool) -> Option<rdp_hyper::autores::Decision> {
         if SCALE_PINNED.load(Ordering::Relaxed) != 0 {
             return None;
         }
@@ -1376,7 +1381,7 @@ impl AutoScale {
         let auto = guard.get_or_insert_with(|| AutoScale { res: Default::default(), game: 100, office: 100 });
         let current = if office { auto.office } else { auto.game };
         let mut d = auto.res.step(sample, current, office)?;
-        if eco && d.scale > ECO_MAX_SCALE {
+        if cap && d.scale > ECO_MAX_SCALE {
             d.scale = ECO_MAX_SCALE;
         }
         *(if office { &mut auto.office } else { &mut auto.game }) = d.scale;
