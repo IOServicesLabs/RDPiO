@@ -9,7 +9,9 @@
 //! the refresh rate the client asked for, and streams it: Desktop Duplication
 //! → GPU colour conversion → hardware H.264 → FEC + AES-GCM over UDP. Client
 //! input is injected with `SendInput`. When the client leaves (or goes quiet)
-//! the monitor's mode is restored and the PC is locked.
+//! the monitor's mode is restored and the PC is locked. Ctrl+Alt+F12 pressed
+//! at the host takes the PC back instead: the stream ends and the console
+//! stays with whoever is sitting there, unlocked.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -71,6 +73,101 @@ pub(crate) enum StreamEnd {
     /// with the codec and rate that GPU takes (see host_battery). Nothing is
     /// put back or locked meanwhile.
     GpuMove,
+    /// Someone at the host pressed Ctrl+Alt+F12: the stream ends at once and
+    /// the console stays with whoever is sitting there, unlocked.
+    Takeover,
+}
+
+/// Set by the takeover hook the moment the physical combo is pressed; the
+/// stream loop reads it and ends as [`StreamEnd::Takeover`].
+static TAKEOVER_PRESSED: AtomicBool = AtomicBool::new(false);
+/// The takeover watch thread's pump sees this and exits (the hook with it).
+static TAKEOVER_WATCH_STOP: AtomicBool = AtomicBool::new(false);
+
+/// While a stream runs, a low-level keyboard hook watches the host's own
+/// keyboard: **Ctrl+Alt+F12 pressed physically takes the PC back** — the
+/// stream ends (the client sees `Control::HostTakeover`), the monitor mode is
+/// restored, and the console is left unlocked with whoever is sitting at it.
+/// Input injected for the streamer doesn't count (`LLKHF_INJECTED`), so only
+/// a hand at the host can take over, and the combo is swallowed before the
+/// session — or the streamer — sees it.
+struct TakeoverWatch {
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TakeoverWatch {
+    fn start() -> Self {
+        TAKEOVER_PRESSED.store(false, Ordering::SeqCst);
+        TAKEOVER_WATCH_STOP.store(false, Ordering::SeqCst);
+        Self { thread: Some(std::thread::spawn(takeover_watch_thread)) }
+    }
+
+    /// The combo was pressed.
+    fn requested(&self) -> bool {
+        TAKEOVER_PRESSED.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for TakeoverWatch {
+    fn drop(&mut self) {
+        TAKEOVER_WATCH_STOP.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The hook's callbacks fire on the thread that installed it: this one pumps
+/// messages until the stream ends, then the hook comes out (it must not
+/// linger — it swallows the combo even with no stream running).
+fn takeover_watch_thread() {
+    use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    unsafe {
+        let hmod = GetModuleHandleW(None).unwrap_or_default();
+        let hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(takeover_hook), Some(HINSTANCE(hmod.0)), 0) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!(error = %e, "takeover watch failed to install; Ctrl+Alt+F12 won't end the stream");
+                None
+            }
+        };
+        while !TAKEOVER_WATCH_STOP.load(Ordering::SeqCst) {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if let Some(h) = hook {
+            let _ = UnhookWindowsHookEx(h);
+        }
+    }
+}
+
+unsafe extern "system" fn takeover_hook(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    if code == HC_ACTION as i32 && matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+        let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        const VK_F12: u32 = 0x7B;
+        let injected = kb.flags.0 & LLKHF_INJECTED.0 != 0;
+        let ctrl = (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+        let alt = (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
+        if !injected && ctrl && alt && kb.vkCode == VK_F12 {
+            TAKEOVER_PRESSED.store(true, Ordering::SeqCst);
+            tracing::info!("Ctrl+Alt+F12 at the host: taking the PC back from the stream");
+            return LRESULT(1); // the session never sees the combo
+        }
+    }
+    CallNextHookEx(None, code, wparam, lparam)
 }
 
 /// While a stream runs, what the host changed is written here, so a crashed
@@ -1210,6 +1307,8 @@ fn stream_inner(
             move |body: &[u8]| send_shared.send(&sock, Kind::Control, body),
         )
     };
+    // Ctrl+Alt+F12 at the host takes the PC back (see [`TakeoverWatch`]).
+    let takeover_watch = TakeoverWatch::start();
 
     let mut frame_id = 0u32;
     // Each frame's packet bodies go in one buffer from here, given back once
@@ -1298,6 +1397,11 @@ fn stream_inner(
         }
         if crate::hyper_direct::client_returning() {
             return Ok(StreamEnd::Lost);
+        }
+        // Someone at the host pressed Ctrl+Alt+F12: give them the PC back.
+        // The client is told after the loop, as a farewell like Bye.
+        if takeover_watch.requested() {
+            return Ok(StreamEnd::Takeover);
         }
         // The service is stopping (or the PC shutting down): end as if the
         // client said goodbye, so everything is put back and locked, but have
@@ -2047,6 +2151,7 @@ fn stream_inner(
     // every client since Reconnect existed does so at once (~250 ms).
     let farewell = match result {
         Ok(StreamEnd::Bye) => Some(Control::Bye),
+        Ok(StreamEnd::Takeover) => Some(Control::HostTakeover),
         Ok(StreamEnd::Moved | StreamEnd::Stopping | StreamEnd::GpuMove) => Some(Control::Reconnect),
         _ => None,
     };

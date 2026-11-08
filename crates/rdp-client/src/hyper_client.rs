@@ -275,6 +275,9 @@ struct Shared {
     size: Mutex<(u32, u32)>,
     /// Why the stream stopped (set by the receive thread).
     host_bye: AtomicBool,
+    /// The host ended the stream because someone there took the PC back
+    /// (Ctrl+Alt+F12): said on screen before the window leaves.
+    takeover: AtomicBool,
     lost: AtomicBool,
     /// Anything authentic came from the host since sign-in.
     heard: AtomicBool,
@@ -410,6 +413,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         bytes: AtomicU64::new(0),
         size: Mutex::new(link.size),
         host_bye: AtomicBool::new(false),
+        takeover: AtomicBool::new(false),
         lost: AtomicBool::new(false),
         heard: AtomicBool::new(false),
         queued: AtomicU32::new(0),
@@ -574,6 +578,23 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         if shared.stop.load(Ordering::Relaxed) {
             if shared.lost.load(Ordering::Relaxed) {
                 break if shared.heard.load(Ordering::Relaxed) { Ended::Lost } else { Ended::NeverStarted };
+            }
+            // A takeover at the host: the stream is gone for good, and a
+            // fullscreen window has no title bar to explain — say it on the
+            // picture for a few seconds (closable meanwhile).
+            if shared.takeover.load(Ordering::Relaxed) {
+                tracing::info!("the host took over; telling why, then leaving");
+                if let Some((nw, nh, px)) = crate::hyper_overlay::render(&["The host took over this PC".to_string()]) {
+                    renderer.update_rect(16, 16, nw, nh, &px);
+                    let _ = renderer.present_frame();
+                }
+                let until = Instant::now() + Duration::from_secs(4);
+                while Instant::now() < until {
+                    if matches!(window.pump(), Frame::Quit) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
             tracing::info!("host ended the Hyper stream");
             break Ended::HostLeft;
@@ -1636,6 +1657,15 @@ fn receive_loop(
                             shared.fec_permille.store(fec_permille as u32, Ordering::Relaxed);
                         }
                         Some(Control::Bye) => {
+                            shared.host_bye.store(true, Ordering::Relaxed);
+                            shared.stop.store(true, Ordering::Relaxed);
+                            crate::window::signal_frame();
+                        }
+                        // Someone at the host pressed Ctrl+Alt+F12 and took the
+                        // PC back: end like a bye, but the client says why.
+                        Some(Control::HostTakeover) => {
+                            tracing::info!("the host took over this PC; its stream ended");
+                            shared.takeover.store(true, Ordering::Relaxed);
                             shared.host_bye.store(true, Ordering::Relaxed);
                             shared.stop.store(true, Ordering::Relaxed);
                             crate::window::signal_frame();
