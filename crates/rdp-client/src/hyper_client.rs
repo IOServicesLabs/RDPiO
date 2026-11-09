@@ -384,6 +384,10 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     // Input from before the stream (a reconnect wait) is stale: drop it
     // rather than replay seconds of it into the game.
     let _ = window.drain_input();
+    // A resume flag left over from before this stream (set while a reconnect
+    // wait slept) is already answered by the fresh sign-in — don't tear the
+    // new link down for it.
+    let _ = crate::window::take_resumed();
     // The window may have changed size while no stream was playing (not
     // while minimized: an empty rect isn't a size).
     {
@@ -574,6 +578,16 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                     renderer.resize(cw, ch)?;
                 }
             }
+        }
+        // Resumed from sleep or hibernation mid-stream: the clocks, FEC state
+        // and decoder are stale — frames limp in with multi-second latency
+        // (the link's UDP packets flow again, so the silence watchdog never
+        // fires). Sign in afresh through the reconnect flow below, like the
+        // RDP path; a visible "reconnecting" beats a silently mangled picture.
+        if crate::window::take_resumed() {
+            tracing::info!("resumed from sleep; reconnecting");
+            HOST_ASKED.store(true, Ordering::Relaxed);
+            break Ended::Lost;
         }
         if shared.stop.load(Ordering::Relaxed) {
             if shared.lost.load(Ordering::Relaxed) {
