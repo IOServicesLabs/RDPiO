@@ -112,6 +112,11 @@ pub enum Control {
     Status { input_ack: u32, width: u16, height: u16, fps: u16, bitrate_kbps: u32, fec_permille: u16 },
     /// Either side is leaving.
     Bye,
+    /// Host → client: someone at the host pressed the takeover combo
+    /// (Ctrl+Alt+F12 there); the stream is over and the console is theirs.
+    /// (Older clients don't know id 20 and ignore it: they see the stream
+    /// die like a network drop.)
+    HostTakeover,
     /// Host → client: an app on the host is (or stopped) listening to the
     /// microphone, so the client should (or need no longer) capture it.
     Mic { on: bool },
@@ -253,6 +258,7 @@ impl Control {
                 o.extend_from_slice(&fec_permille.to_le_bytes());
             }
             Self::Bye => o.push(6),
+            Self::HostTakeover => o.push(20),
             Self::Mic { on } => {
                 o.push(7);
                 o.push(*on as u8);
@@ -341,6 +347,7 @@ impl Control {
                 fec_permille: u16_at(15)?,
             },
             6 => Self::Bye,
+            20 => Self::HostTakeover,
             7 => Self::Mic { on: *b.get(1)? != 0 },
             8 => Self::Paused { paused: *b.get(1)? != 0 },
             9 => Self::Mode { office: *b.get(1)? != 0, fast_text: b.get(2).is_some_and(|&v| v != 0) },
@@ -408,6 +415,7 @@ mod tests {
             Control::Recover,
             Control::Status { input_ack: 1, width: 2560, height: 1440, fps: 120, bitrate_kbps: 30_000, fec_permille: 100 },
             Control::Bye,
+            Control::HostTakeover,
             Control::Mic { on: true },
             Control::Paused { paused: true },
             Control::Mode { office: true, fast_text: false },

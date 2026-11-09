@@ -19,7 +19,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 // `MONITORINFOF_PRIMARY` lives under WindowsAndMessaging (glob-imported below).
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetFocus, GetKeyState, SetFocus, VK_CAPITAL, VK_CONTROL, VK_NUMLOCK, VK_SCROLL, VK_SHIFT,
+    GetAsyncKeyState, GetFocus, GetKeyState, SetFocus, VK_CAPITAL, VK_CONTROL, VK_MENU, VK_NUMLOCK,
+    VK_SCROLL, VK_SHIFT,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
@@ -89,6 +90,9 @@ pub fn take_resumed() -> bool {
 /// This PC's screen is off (the display timed out, the lid closed) — from
 /// `GUID_CONSOLE_DISPLAY_STATE`. Dimmed still counts as on.
 static DISPLAY_OFF: AtomicBool = AtomicBool::new(false);
+/// Windows 11's Energy Saver is on — from `GUID_POWER_SAVING_STATUS`. The
+/// stream's power holds go back early while it is (see `hyper_client`).
+static ENERGY_SAVER: AtomicBool = AtomicBool::new(false);
 /// This PC's session is locked (`WM_WTSSESSION_CHANGE`).
 static SESSION_LOCKED: AtomicBool = AtomicBool::new(false);
 /// Moves on whenever a display mode may have changed: `WM_DISPLAYCHANGE`, the
@@ -104,6 +108,15 @@ pub fn display_epoch() -> u32 {
 /// `GUID_CONSOLE_DISPLAY_STATE` (the SystemServices feature isn't built in).
 const CONSOLE_DISPLAY_STATE: windows::core::GUID =
     windows::core::GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
+
+/// `GUID_POWER_SAVING_STATUS` (ditto).
+const POWER_SAVING_STATUS: windows::core::GUID =
+    windows::core::GUID::from_u128(0xe00958c0_c213_4e31_ad0e_49e6e25cfff3);
+
+/// Windows 11's Energy Saver is on (see [`ENERGY_SAVER`]).
+pub fn energy_saver() -> bool {
+    ENERGY_SAVER.load(Ordering::Relaxed)
+}
 /// Input events captured in the window procedure, drained by the UI loop.
 static INPUT_QUEUE: Mutex<Vec<RawInput>> = Mutex::new(Vec::new());
 /// The current server cursor (HCURSOR as isize; 0 = none → default arrow). The
@@ -218,6 +231,16 @@ pub fn system_keys_to_host() -> bool {
 /// Whether the stats overlay is on (Ctrl+Shift+S).
 pub fn stats_overlay() -> bool {
     STATS.load(Ordering::Relaxed)
+}
+
+/// Whether Ctrl and Alt are both held right now. main.rs maps
+/// Ctrl+Alt+End to Ctrl+Alt+Del on the host (as mstsc does); the live
+/// key state is checked because the End key event arrives alone.
+pub fn ctrl_alt_held() -> bool {
+    unsafe {
+        (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
+            && (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0
+    }
 }
 
 /// Hyper office mode (crisp text), toggled with Ctrl+Shift+O.
@@ -648,6 +671,13 @@ impl Window {
             let _ = windows::Win32::System::Power::RegisterPowerSettingNotification(
                 HANDLE(hwnd.0),
                 &CONSOLE_DISPLAY_STATE,
+                DEVICE_NOTIFY_WINDOW_HANDLE,
+            );
+            // Energy Saver: the stream reads it to hand its power holds back
+            // early on a dying battery.
+            let _ = windows::Win32::System::Power::RegisterPowerSettingNotification(
+                HANDLE(hwnd.0),
+                &POWER_SAVING_STATUS,
                 DEVICE_NOTIFY_WINDOW_HANDLE,
             );
             let _ = windows::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(
@@ -1437,6 +1467,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if DISPLAY_OFF.swap(off, Ordering::Relaxed) != off {
                         tracing::info!(screen_off = off, "this PC's screen changed");
                         signal_frame();
+                    }
+                }
+                if s.PowerSetting == POWER_SAVING_STATUS && s.DataLength >= 4 {
+                    // (Data is typed [u8; 1]; the DWORD follows it in the
+                    // message — read it through the raw pointer.)
+                    let data = std::slice::from_raw_parts(s.Data.as_ptr(), s.DataLength as usize);
+                    let on = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) != 0;
+                    if ENERGY_SAVER.swap(on, Ordering::Relaxed) != on {
+                        tracing::info!(energy_saver = on, "Windows Energy Saver changed");
                     }
                 }
             }

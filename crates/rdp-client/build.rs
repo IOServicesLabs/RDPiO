@@ -4,8 +4,9 @@
 //!   1. Stamp the build time and git commit into the binary so every log
 //!      identifies exactly which build produced it — field logs from stale
 //!      copies of rdpio.exe are otherwise indistinguishable from current ones.
-//!   2. Embed `res/rdpio.rc` (the rdpio.ico icon as resource id 1) into the exe.
-//!      `embed_resource::NONE` = icon only; no manifest, no version resource.
+//!   2. Embed the rdpio.ico icon (resource id 1) and a version resource into the
+//!      exe. Microsoft's Teams plugin tells Teams its host's name and version from
+//!      that resource.
 
 fn main() {
     // --- Job 1: build stamp ------------------------------------------------
@@ -43,11 +44,60 @@ fn main() {
     build_vcam();
 
     // --- Job 2: embed the icon resource ------------------------------------
-    // Path is relative to CARGO_MANIFEST_DIR (the crate root). The rc file
-    // declares the icon as resource id 1 and nothing else. In embed-resource
-    // 2.5.x `compile` returns () and emits a compile error via the cargo
+    // Written here to carry the crate's version. In embed-resource 2.5.x
+    // `compile` returns () and emits a compile error via the cargo
     // rerun-if-changed mechanism on failure.
-    embed_resource::compile("res/rdpio.rc", embed_resource::NONE);
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap().replace('\\', "/");
+    let version = env!("CARGO_PKG_VERSION");
+    let rc = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("rdpio.rc");
+    std::fs::write(&rc, version_rc(&manifest_dir, version)).expect("write rdpio.rc");
+    embed_resource::compile(&rc, embed_resource::NONE);
+
+    // --- A manifest asking for common controls 6 -----------------------------
+    // Microsoft's Teams add-in imports functions only that version has, so
+    // without this Windows refuses to load it ("procedure not found").
+    if std::env::var("TARGET").is_ok_and(|t| t.contains("windows-msvc")) {
+        for link_arg in [
+            "/MANIFEST:EMBED",
+            "/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0'              processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'",
+        ] {
+            println!("cargo:rustc-link-arg-bins={link_arg}");
+        }
+    }
+}
+
+/// The exe's resources: the icon, as resource id 1, and rdpio's name and version.
+fn version_rc(manifest_dir: &str, version: &str) -> String {
+    let mut parts = version.split('.').map(|p| p.parse::<u16>().unwrap_or(0));
+    let mut part = || parts.next().unwrap_or(0);
+    let numbers = format!("{},{},{},0", part(), part(), part());
+    format!(
+        r#"1 ICON "{manifest_dir}/res/rdpio.ico"
+1 VERSIONINFO
+FILEVERSION {numbers}
+PRODUCTVERSION {numbers}
+FILEOS 0x40004
+FILETYPE 1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "IO Services"
+            VALUE "FileDescription", "RDPiO"
+            VALUE "FileVersion", "{version}"
+            VALUE "OriginalFilename", "rdpio.exe"
+            VALUE "ProductName", "RDPiO"
+            VALUE "ProductVersion", "{version}"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 0x4B0
+    END
+END
+"#
+    )
 }
 
 /// `rdpio_vcam.dll` (vcam/rdpio_vcam.cpp): the media source Windows' Frame

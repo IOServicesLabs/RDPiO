@@ -1833,6 +1833,9 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
             // The agent in the console's new session takes over (the client
             // reconnects to it); this one is on its way out.
             Ok(crate::hyper_host::StreamEnd::Moved) => crate::hyper_host::clear_streaming(),
+            // Someone at this PC pressed Ctrl+Alt+F12: it stays with them,
+            // unlocked — locking now would lock out the person who took over.
+            Ok(crate::hyper_host::StreamEnd::Takeover) => crate::hyper_host::clear_streaming(),
             Err(e) => {
                 tracing::warn!(error = %e, "stream ended with an error");
                 lock_session();

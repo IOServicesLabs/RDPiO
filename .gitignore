@@ -1,6 +1,9 @@
 # Build artifacts
 /target/
 
+# Local test builds (shipped from CI instead)
+/dist/
+
 # Runtime logs
 *.log
 

@@ -40,6 +40,19 @@ pub struct Overlay {
     pub w: u32,
     pub h: u32,
     pub picture: Picture,
+    /// The parts to draw, in desktop coordinates, the rest being behind another
+    /// window. `None`: all of it.
+    pub clip: Option<Vec<GeoRect>>,
+}
+
+impl Overlay {
+    /// Whether `clip` leaves the whole box to draw (as most frames' does).
+    pub fn is_unclipped(&self) -> bool {
+        let Some(clip) = &self.clip else { return true };
+        let (x, y) = (self.x, self.y);
+        let (r, b) = (x + self.w as i32, y + self.h as i32);
+        clip.iter().any(|c| c.left <= x && c.top <= y && c.right >= r && c.bottom >= b)
+    }
 }
 
 /// What an [`Overlay`] shows.
@@ -99,6 +112,7 @@ enum Source {
 /// One element to draw this frame.
 struct Target {
     rect: GeoRect,
+    clip: Option<Vec<GeoRect>>,
     cover: bool,
     mirror: bool,
     source: Source,
@@ -228,6 +242,7 @@ fn targets(s: &State, skipped: &mut HashSet<u64>) -> Vec<Target> {
                 if rect.width() > 0 && rect.height() > 0 && rect.width() <= MAX_SIDE && rect.height() <= MAX_SIDE {
                     out.push(Target {
                         rect,
+                        clip: g.visible_on_desktop(),
                         cover: e.object_fit.as_deref() == Some("cover"),
                         mirror: e.is_mirrored(),
                         source,
@@ -310,7 +325,7 @@ fn render_loop(state: Arc<Mutex<State>>, stop: Arc<AtomicBool>, out: OverlayOut)
                 cover: t.cover,
                 mirror: t.mirror,
             };
-            out(Overlay { x: t.rect.left, y: t.rect.top, w, h, picture });
+            out(Overlay { x: t.rect.left, y: t.rect.top, w, h, picture, clip: t.clip.clone() });
             if !drawn.contains(&t.rect) {
                 drawn.push(t.rect);
             }
@@ -359,6 +374,7 @@ fn render_loop(state: Arc<Mutex<State>>, stop: Arc<AtomicBool>, out: OverlayOut)
                 w: t.rect.width() as u32,
                 h: t.rect.height() as u32,
                 picture,
+                clip: t.clip.clone(),
             });
             if !drawn.contains(&t.rect) {
                 drawn.push(t.rect);

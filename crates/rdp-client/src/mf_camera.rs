@@ -117,17 +117,33 @@ impl MfCamera {
     /// Begin capturing `device_index` at the given media type on a worker
     /// thread, free-running: read frames with [`MfCamera::poll_frame`].
     pub fn start(device_index: u32, media: MediaType) -> Self {
-        Self::spawn(device_index, media, None)
+        Self::spawn(CaptureSource::Device(device_index), media, None)
     }
 
     /// Begin capturing on demand: nothing is produced until
     /// [`MfCamera::request_frames`] asks for it; read with
     /// [`MfCamera::next_frame`].
     pub fn start_on_demand(device_index: u32, media: MediaType) -> Self {
-        Self::spawn(device_index, media, Some(Arc::new(AtomicU32::new(0))))
+        Self::spawn(
+            CaptureSource::Device(device_index),
+            media,
+            Some(Arc::new(AtomicU32::new(0))),
+        )
     }
 
-    fn spawn(device_index: u32, media: MediaType, demand: Option<Arc<AtomicU32>>) -> Self {
+    /// Begin an on-demand capture that synthesizes black frames instead of
+    /// opening a physical device. Same contract as [`MfCamera::start_on_demand`];
+    /// used while the SlimCore Teams engine owns the webcam — the RDPECAM device
+    /// stays visible and streams in the VM, but the hardware is never touched.
+    pub fn start_on_demand_black(media: MediaType) -> Self {
+        Self::spawn(
+            CaptureSource::Black,
+            media,
+            Some(Arc::new(AtomicU32::new(0))),
+        )
+    }
+
+    fn spawn(source: CaptureSource, media: MediaType, demand: Option<Arc<AtomicU32>>) -> Self {
         let frames = Arc::new(Mutex::new(VecDeque::new()));
         let ready = Arc::new(Condvar::new());
         let stop = Arc::new(AtomicBool::new(false));
@@ -137,9 +153,26 @@ impl MfCamera {
         let worker = std::thread::spawn(move || unsafe {
             // (Media Foundation's capture objects want COM on this thread.)
             crate::wasapi::com_init();
-            if let Err(e) =
-                capture_loop(device_index, media, &frames_w, &ready_w, &stop_w, demand_w.as_deref(), &keyframe_w)
-            {
+            let result = match source {
+                CaptureSource::Device(index) => capture_loop(
+                    index,
+                    media,
+                    &frames_w,
+                    &ready_w,
+                    &stop_w,
+                    demand_w.as_deref(),
+                    &keyframe_w,
+                ),
+                CaptureSource::Black => black_capture_loop(
+                    media,
+                    &frames_w,
+                    &ready_w,
+                    &stop_w,
+                    demand_w.as_deref(),
+                    &keyframe_w,
+                ),
+            };
+            if let Err(e) = result {
                 tracing::warn!(error = %e, "camera capture loop ended");
             }
             ready_w.notify_all();
@@ -205,6 +238,13 @@ impl Drop for MfCamera {
     }
 }
 
+/// Where capture frames come from: a physical device index, or synthesized
+/// black frames (no device opened — see [`MfCamera::start_on_demand_black`]).
+enum CaptureSource {
+    Device(u32),
+    Black,
+}
+
 /// The camera's H.264 encoder: the GPU's (see `FrameEncoder`) where there is
 /// one, else Windows' software encoder on the processor.
 enum CameraEncoder {
@@ -252,6 +292,98 @@ impl CameraEncoder {
             Self::Cpu(e) => e.encode(nv12),
         }
     }
+}
+
+/// Synthesize black frames at the negotiated media type. The RDPECAM device is
+/// advertised, picked and streamed like a real one, but no physical webcam is
+/// opened — while the SlimCore Teams engine owns the camera, any MF open on our
+/// side fails its video stage (observed as `StageFailureCallback code=5`).
+/// Black is valid limited-range NV12 (Y = 16, U/V = 128). Same pacing/demand
+/// contract as [`capture_loop`]. Runs on the capture worker thread.
+unsafe fn black_capture_loop(
+    media: MediaType,
+    frames: &Arc<Mutex<VecDeque<Vec<u8>>>>,
+    ready: &Condvar,
+    stop: &Arc<AtomicBool>,
+    demand: Option<&AtomicU32>,
+    keyframe: &AtomicBool,
+) -> windows::core::Result<()> {
+    let fps = media.fps_num.max(1) / media.fps_den.max(1);
+    let mut nv12 = vec![0u8; (media.width * media.height * 3 / 2) as usize];
+    let y_bytes = (media.width * media.height) as usize;
+    for b in &mut nv12[..y_bytes] {
+        *b = 16;
+    }
+    for b in &mut nv12[y_bytes..] {
+        *b = 128;
+    }
+
+    // Same encoder policy as the device path: H.264 when negotiated (best-effort
+    // — fall back to raw NV12 if no encoder can be created), raw otherwise.
+    let mut encoder = if media.format == CamFormat::H264 {
+        match CameraEncoder::new(media.width, media.height, fps, 2_000_000) {
+            Ok(e) => Some(e),
+            Err(e) => {
+                tracing::warn!(error = %e, "H.264 camera encoder unavailable; sending raw NV12");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // A real camera paces itself; here the free-running case sleeps per frame
+    // and the on-demand case waits until frames are owed (in small slices so
+    // `stop` stays responsive).
+    let interval = std::time::Duration::from_millis((1000 / u64::from(fps).max(1)).max(1));
+    while !stop.load(Ordering::SeqCst) {
+        match demand {
+            Some(d) => {
+                while d.load(Ordering::SeqCst) == 0 {
+                    if stop.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            None => std::thread::sleep(interval),
+        }
+        let frame = match encoder.as_mut() {
+            Some(enc) => match {
+                if keyframe.swap(false, Ordering::SeqCst) {
+                    enc.request_keyframe();
+                }
+                enc.encode(&nv12)
+            } {
+                Ok(h264) if !h264.is_empty() => Some(h264),
+                Ok(_) => None, // encoder buffered this frame; nothing to send yet
+                Err(e) => {
+                    tracing::debug!(error = %e, "camera H.264 encode failed; skipping frame");
+                    None
+                }
+            },
+            None => Some(nv12.clone()),
+        };
+        if let Some(frame) = frame {
+            if let Ok(mut q) = frames.lock() {
+                match demand {
+                    Some(d) => {
+                        let _ = d.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                            v.checked_sub(1)
+                        });
+                    }
+                    None if q.len() > 2 => q.clear(),
+                    None => {}
+                }
+                q.push_back(frame);
+                ready.notify_all();
+            }
+            crate::net_wait::worker_wake::signal();
+        } else {
+            std::thread::sleep(interval);
+        }
+    }
+    Ok(())
 }
 
 /// Activate `device_index`, configure NV12 at the requested size, and pump

@@ -78,6 +78,25 @@ impl From<WindowsError> for WebViewAuthError {
     }
 }
 
+/// The login panel's browser data (its Microsoft sign-in cookies): beside
+/// rdpio's other data, since the exe's own folder (WebView2's default) is often
+/// not writable.
+fn browser_data_dir() -> Option<std::path::PathBuf> {
+    let dir = crate::hub::store::data_dir().ok()?.join("webview-auth");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Forget the panel's sign-in cookies, so the next sign-in can be another
+/// account.
+pub fn forget_browser_data() {
+    if let Some(dir) = browser_data_dir() {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(error = %e, "couldn't clear the sign-in window's data");
+        }
+    }
+}
+
 /// Open a WebView2 login panel, let the user complete authorization-code auth,
 /// and return the resulting access token.
 pub fn authenticate(
@@ -260,10 +279,11 @@ fn init_webview(
     // instead of relying on a plain blocking recv.
     let ready_event = unsafe { CreateEventW(None, false, false, None)? };
 
+    let data = browser_data_dir().map(|d| HSTRING::from(d.as_os_str())).unwrap_or_default();
     let create_result = unsafe {
         CreateCoreWebView2EnvironmentWithOptions(
-            None,
-            None,
+            PCWSTR::null(),
+            &data,
             None,
             &CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
                 move |_, env| {

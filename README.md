@@ -165,8 +165,11 @@ rdpio --host 192.168.1.50 --user alice --password 'hunter2' --insecure `
       --multimon --gaming --render-scale 0.66 --upscale fsr
 ```
 
-**A Windows 365 Cloud PC** — signs in through the browser and lists your Cloud
-PCs to pick from:
+**A Windows 365 Cloud PC** — in the app, **Sign in** under Windows 365 on the
+Connections page lists your Cloud PCs, ready to connect: RDP at its fastest
+(`--gaming --low-latency`) with every redirect on (clipboard, sound, mic,
+camera, `--drive all`, `--printers`, `--com`, Teams). From a terminal, this signs in
+through the browser and lists your Cloud PCs to pick from:
 
 ```powershell
 rdpio --w365
@@ -278,9 +281,12 @@ is silent — check the startup log if a flag seems to have no effect.
 | --- | --- |
 | `--drive PATH`, `-D` | Share a local folder or drive root as a redirected drive. **Repeatable** (`--drive C:\ --drive D:\Media`), and `--drive all` shares every mounted drive letter — mapped network drives included. Each appears in the session under its drive letter or folder name |
 | `--printer` | Redirect the local default printer |
+| `--printers` | Redirect every printer on this PC. One shows up in the session only if the session's PC has its driver |
+| `--com` | Redirect every COM port on this PC. A port opens when an app in the session opens it |
 | `--clipboard-dir DIR` | Stage files copied in the session under DIR instead of a temp folder. Clipboard file copy works **without** this flag; set it if you want the pasted files to persist (temp staging is deleted when the copy is superseded or the session ends) |
 | `--teams`, `--webrtc` | Teams "Optimized" A/V by hosting Microsoft's WebRTC add-in |
 | `--teams-native`, `--webrtc-native` | Teams "Optimized" through RDPiO's own WebRTC engine |
+| `--teams-slimcore` | Also host Microsoft's SlimCore Teams plugin, from the Windows App (implies `--teams`). It may install Microsoft's SlimCore package for this user. Experimental, and on by default for Cloud PCs in the app |
 
 **Windows 365 / AVD** *(Windows)*
 
@@ -292,6 +298,7 @@ is silent — check the startup log if a flag seems to have no effect.
 | `--tenant ID`, `--client-id ID` | Override the Entra tenant / app registration |
 | `--w365-device-code` | Use the device-code sign-in flow instead of the browser |
 | `--w365-relogin`, `--w365-logout` | Clear the cached token and sign in again |
+| `--w365-pc ID` | Connect to this Cloud PC without asking which |
 | `--forget-password` | Drop the cached Cloud PC password |
 | `--shortpath` | Probe the W365 Shortpath UDP rendezvous (diagnostic) |
 

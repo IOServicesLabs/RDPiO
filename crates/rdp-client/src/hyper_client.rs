@@ -275,6 +275,9 @@ struct Shared {
     size: Mutex<(u32, u32)>,
     /// Why the stream stopped (set by the receive thread).
     host_bye: AtomicBool,
+    /// The host ended the stream because someone there took the PC back
+    /// (Ctrl+Alt+F12): said on screen before the window leaves.
+    takeover: AtomicBool,
     lost: AtomicBool,
     /// Anything authentic came from the host since sign-in.
     heard: AtomicBool,
@@ -381,6 +384,10 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     // Input from before the stream (a reconnect wait) is stale: drop it
     // rather than replay seconds of it into the game.
     let _ = window.drain_input();
+    // A resume flag left over from before this stream (set while a reconnect
+    // wait slept) is already answered by the fresh sign-in — don't tear the
+    // new link down for it.
+    let _ = crate::window::take_resumed();
     // The window may have changed size while no stream was playing (not
     // while minimized: an empty rect isn't a size).
     {
@@ -410,6 +417,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         bytes: AtomicU64::new(0),
         size: Mutex::new(link.size),
         host_bye: AtomicBool::new(false),
+        takeover: AtomicBool::new(false),
         lost: AtomicBool::new(false),
         heard: AtomicBool::new(false),
         queued: AtomicU32::new(0),
@@ -571,9 +579,36 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                 }
             }
         }
+        // Resumed from sleep or hibernation mid-stream: the clocks, FEC state
+        // and decoder are stale — frames limp in with multi-second latency
+        // (the link's UDP packets flow again, so the silence watchdog never
+        // fires). Sign in afresh through the reconnect flow below, like the
+        // RDP path; a visible "reconnecting" beats a silently mangled picture.
+        if crate::window::take_resumed() {
+            tracing::info!("resumed from sleep; reconnecting");
+            HOST_ASKED.store(true, Ordering::Relaxed);
+            break Ended::Lost;
+        }
         if shared.stop.load(Ordering::Relaxed) {
             if shared.lost.load(Ordering::Relaxed) {
                 break if shared.heard.load(Ordering::Relaxed) { Ended::Lost } else { Ended::NeverStarted };
+            }
+            // A takeover at the host: the stream is gone for good, and a
+            // fullscreen window has no title bar to explain — say it on the
+            // picture for a few seconds (closable meanwhile).
+            if shared.takeover.load(Ordering::Relaxed) {
+                tracing::info!("the host took over; telling why, then leaving");
+                if let Some((nw, nh, px)) = crate::hyper_overlay::render(&["The host took over this PC".to_string()]) {
+                    renderer.update_rect(16, 16, nw, nh, &px);
+                    let _ = renderer.present_frame();
+                }
+                let until = Instant::now() + Duration::from_secs(4);
+                while Instant::now() < until {
+                    if matches!(window.pump(), Frame::Quit) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
             tracing::info!("host ended the Hyper stream");
             break Ended::HostLeft;
@@ -621,6 +656,10 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         // or `--hyper-scale` (as Android does): the host fits its desktop to
         // the smaller view on its GPU, and the renderer scales it up here.
         let office_now = crate::window::office_mode();
+        let eco = eco_mode();
+        // The stream's scale (Auto resolution, a pinned `--hyper-scale`): no
+        // battery cap — a smaller stream upscaled here read as blurry AND
+        // choppy when scrolling (75% on a dying battery, tested).
         let scale = AutoScale::current(office_now);
         let view_want = scaled_view(view_size, scale);
         let view_settled = view_since.elapsed() >= VIEW_SETTLE && view_size.0 >= 320 && view_size.1 >= 200;
@@ -688,13 +727,14 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         }
         input.ack(shared.input_ack.load(Ordering::Relaxed));
         // New input goes at once — but pointer motion at most once a
-        // millisecond, merged meanwhile: a 4-8 kHz gaming mouse otherwise
-        // costs a Wi-Fi packet per report. Unacknowledged input is resent
-        // every 15 ms.
+        // millisecond (eco on battery: four), merged meanwhile: a 4-8 kHz
+        // gaming mouse otherwise costs a Wi-Fi packet per report.
+        // Unacknowledged input is resent every 15 ms.
         let unsent = input.unsent();
+        let motion_every = if eco { Duration::from_millis(4) } else { INPUT_MOTION_EVERY };
         let due = match unsent {
             Some(false) => true,
-            Some(true) => last_input_send.elapsed() >= INPUT_MOTION_EVERY,
+            Some(true) => last_input_send.elapsed() >= motion_every,
             None => false,
         };
         // `inputdup`: each packet carries the newest few events (and any key
@@ -736,7 +776,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         if refresh_sent.elapsed() >= Duration::from_secs(3) {
             let epoch = crate::window::display_epoch();
             if epoch != refresh_epoch || refresh_read.elapsed() >= Duration::from_secs(15) {
-                let hz = window_refresh_hz(window);
+                let hz = window_refresh_hz(window).min(if eco { ECO_MAX_FPS } else { u32::MAX });
                 if hz != refresh_hz && refresh_hz != 0 {
                     tracing::info!(hz, "this screen's refresh rate changed; telling the host");
                 }
@@ -884,6 +924,22 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         }
         let covered = covered_since.is_some_and(|t| t.elapsed() >= COVERED_FOR);
         let minimized = window.output_hidden() || covered;
+        // On battery with nothing moving, the stream's holds go back: the PC
+        // may sleep and boost may disengage. Input or a moving picture (any
+        // activity) re-arms them, as does coming back from hidden. A dying
+        // battery hands them back early.
+        let idle_for = if eco_critical() { Duration::from_secs(60) } else { POWER_IDLE };
+        let battery_idle = crate::net_tune::on_battery() && last_activity.elapsed() >= idle_for;
+        if battery_idle && awake.is_some() {
+            (wifi, boost, awake) = (None, None, None);
+            tracing::info!("on battery, stream idle: Wi-Fi and power settings handed back");
+        }
+        if awake.is_none() && !minimized && !battery_idle {
+            wifi = crate::net_tune::WifiLowLatency::enable();
+            boost = crate::net_tune::ThreadBoost::games();
+            awake = Some(crate::net_tune::KeepAwake::new());
+            tracing::info!("stream holds re-armed");
+        }
         if let Some(v) = shared.update_note.lock().unwrap().take() {
             hint = crate::hyper_overlay::render(&[format!("rdpio {v} downloaded from the host: it installs when you close this window")]);
             hint_until = Instant::now() + Duration::from_secs(6);
@@ -913,10 +969,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             if paused && !minimized {
                 awaiting_key = true;
                 last_key_request = Instant::now() - Duration::from_secs(1);
-                // Seen again: the stream's holds come back before its picture.
-                wifi = crate::net_tune::WifiLowLatency::enable();
-                boost = crate::net_tune::ThreadBoost::games();
-                awake = Some(crate::net_tune::KeepAwake::new());
+                // The holds themselves come back in the re-arm above this block.
                 tracing::info!("stream visible again");
             } else if !paused && minimized {
                 // Nothing to show: Wi-Fi may nap and scan again, the screen
@@ -1231,6 +1284,17 @@ static IN_PLACE_FAILED: AtomicBool = AtomicBool::new(false);
 /// laptop's CPU from its deeper sleep on a still screen).
 const FINE_TIMER_IDLE: Duration = Duration::from_secs(2);
 
+/// Battery eco (office mode on battery, see [`eco_mode`]) caps the stream at
+/// this frame rate — 30 made scrolling jitter.
+const ECO_MAX_FPS: u32 = 60;
+
+/// No picture and no input this long on battery: the "keep the machine up"
+/// holds (Wi-Fi low latency, MMCSS, keep-awake) are handed back so the
+/// laptop may sleep — a fullscreen window showing a still picture must not
+/// pin "best performance" and block sleep while the battery drains. Any
+/// activity, or plugging back in, brings them back.
+const POWER_IDLE: Duration = Duration::from_secs(300);
+
 /// Pointer motion goes at most this often (see the input send in `run`).
 const INPUT_MOTION_EVERY: Duration = Duration::from_millis(1);
 
@@ -1274,17 +1338,22 @@ pub fn set_gpu_choice(choice: &str) {
 }
 
 fn on_battery() -> bool {
-    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
-    // (`RDPIO_POWER=battery` or `ac`: as if — for A/B runs of what
-    // follows the power source, on whatever cable the test machine has.)
-    match std::env::var("RDPIO_POWER").as_deref() {
-        Ok("battery") => return true,
-        Ok("ac") => return false,
-        _ => {}
-    }
-    let mut s = SYSTEM_POWER_STATUS::default();
-    // (ACLineStatus: 0 offline, 1 online, 255 unknown — a desktop.)
-    unsafe { GetSystemPowerStatus(&mut s).is_ok() && s.ACLineStatus == 0 }
+    crate::net_tune::on_battery()
+}
+
+/// Battery eco mode: on battery, in office mode. The picture-affecting
+/// optimizations (the stream rate cap, the pointer-input cadence) apply only
+/// here; game mode is never touched, and the resolution never is (a smaller
+/// stream upscaled reads as blurry and choppy). All on by default; follows
+/// Ctrl+Shift+O and the cable.
+fn eco_mode() -> bool {
+    crate::net_tune::on_battery() && crate::window::office_mode()
+}
+
+/// A dying battery (<20%, or Windows' Energy Saver on): the idle power holds
+/// go back after a minute instead of the usual five.
+fn eco_critical() -> bool {
+    crate::net_tune::battery_low() || crate::window::energy_saver()
 }
 
 /// Office mode with the encoder's fast preset (the default; `--hyper-text
@@ -1592,6 +1661,15 @@ fn receive_loop(
                             shared.fec_permille.store(fec_permille as u32, Ordering::Relaxed);
                         }
                         Some(Control::Bye) => {
+                            shared.host_bye.store(true, Ordering::Relaxed);
+                            shared.stop.store(true, Ordering::Relaxed);
+                            crate::window::signal_frame();
+                        }
+                        // Someone at the host pressed Ctrl+Alt+F12 and took the
+                        // PC back: end like a bye, but the client says why.
+                        Some(Control::HostTakeover) => {
+                            tracing::info!("the host took over this PC; its stream ended");
+                            shared.takeover.store(true, Ordering::Relaxed);
                             shared.host_bye.store(true, Ordering::Relaxed);
                             shared.stop.store(true, Ordering::Relaxed);
                             crate::window::signal_frame();

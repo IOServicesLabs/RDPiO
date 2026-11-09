@@ -128,6 +128,31 @@ impl Drop for KeepAwake {
     }
 }
 
+/// Running on battery right now (AC offline). A desktop — or a firmware that
+/// won't say — counts as plugged in, so the "keep the machine up" holds stay.
+/// (`SYSTEM_POWER_STATUS.ACLineStatus`: 0 = offline.)
+pub fn on_battery() -> bool {
+    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    // (`RDPIO_POWER=battery` or `ac`: as if — for A/B runs of what follows
+    // the power source, on whatever cable the test machine has.)
+    match std::env::var("RDPIO_POWER").as_deref() {
+        Ok("battery") => return true,
+        Ok("ac") => return false,
+        _ => {}
+    }
+    let mut status = SYSTEM_POWER_STATUS::default();
+    unsafe { GetSystemPowerStatus(&mut status) }.is_ok() && status.ACLineStatus == 0
+}
+
+/// Battery down to its last fifth (and the firmware can say): the one case
+/// where the idle power holds go back after a minute instead of the usual
+/// five. (`BatteryLifePercent` 0-100, 255 = won't say.)
+pub fn battery_low() -> bool {
+    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    let mut status = SYSTEM_POWER_STATUS::default();
+    unsafe { GetSystemPowerStatus(&mut status) }.is_ok() && status.BatteryLifePercent != 255 && status.BatteryLifePercent < 20
+}
+
 /// The calling thread in MMCSS's "Games" class (scheduled like a game's own
 /// render thread) until dropped.
 pub struct ThreadBoost(HANDLE);
