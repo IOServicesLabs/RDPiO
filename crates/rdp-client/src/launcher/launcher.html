@@ -778,6 +778,10 @@ body.on-ws.ws-wide .toasts { top: 4px; bottom: auto; left: auto; right: 8px; max
          the app's, and nowhere else. -->
     <div class="card group" id="host-updates" hidden></div>
     <h2>Shortcuts</h2>
+    <div class="card group">
+      <label class="switch"><div class="txt">Show the bar at the top of a full-screen session<span>Pin, Minimize, Window, Stats, Save and Disconnect, when you point at the top edge. Off: the shortcuts below do it all. Sessions you start from now on follow this.</span></div>
+        <span class="toggle"><input type="checkbox" id="session-bar"><i></i></span></label>
+    </div>
     <div class="card keys" id="keys"></div>
   </section>
 </main>
@@ -1982,6 +1986,7 @@ function renderSettings() {
   const s = state.settings;
   $$("#theme-seg button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.v === s.theme)));
   $("#keep-open").checked = !!s.keep_open;
+  $("#session-bar").checked = s.session_bar !== false;
   setHTML($("#def-chips"), chips(s.defaults));
   $("#version").textContent = `Version ${state.version}`;
   renderKeys();
@@ -2045,6 +2050,7 @@ let quickModeSet = false;
 $$("#quick-mode button").forEach(b => b.addEventListener("click", () => { quickModeSet = true; }));
 $$("#theme-seg button").forEach(b => b.onclick = () => call("settings", { theme: b.dataset.v }).then(setState).catch(fail));
 $("#keep-open").onchange = e => call("settings", { keep_open: e.target.checked }).then(setState).catch(fail);
+$("#session-bar").onchange = e => call("settings", { session_bar: e.target.checked }).then(setState).catch(fail);
 $("#def-change").onclick = () => openEdit({ defaults: true, options: state.settings.defaults });
 // The shortcuts, from the list the sessions themselves go by (`state.hotkeys`).
 const KEY_PLACES = [["all", "In a session"], ["hyper", "In a Hyper stream"], ["host", "At the PC being streamed"], ["launcher", "In this window"]];

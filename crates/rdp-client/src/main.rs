@@ -4337,7 +4337,9 @@ mod win {
         // Borderless modes have no window frame to close from: add a floating
         // connection bar (Minimize, Disconnect, …) at the top of the window's
         // screen, or of the primary one when the session spans several.
-        let conn_bar = if args.multimon || args.per_monitor || args.fullscreen {
+        let conn_bar = if crate::connbar::turned_off() {
+            None
+        } else if args.multimon || args.per_monitor || args.fullscreen {
             let single = !args.multimon && !args.per_monitor;
             let screen = if single { window.monitor_rect() } else { crate::window::enumerate_monitors().primary_rect() };
             let sessions: Vec<isize> = std::iter::once(window.hwnd_raw()).chain(extra_hwnds.iter().copied()).collect();

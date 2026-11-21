@@ -159,7 +159,9 @@ of its screen: it shows for the first 3 seconds, then whenever the pointer
 touches the top edge there (never while the mouse is locked in). Its
 buttons: **Pin** (keep it shown), **Minimize**, **Window** (leave full
 screen; one-window sessions), **Stats** (Hyper), **Save** (keep this
-connection; not in Hyper Direct) and **Disconnect**. Full screen opens on
+connection; not in Hyper Direct) and **Disconnect**. If you go by the
+hotkeys, turn it off in the launcher (Settings → Shortcuts), or start a
+session with `RDPIO_NO_SESSION_BAR=1` set. Full screen opens on
 the screen the pointer is on, which is the launcher's when you connect from
 it.
 

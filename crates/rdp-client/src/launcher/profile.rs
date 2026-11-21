@@ -229,6 +229,9 @@ pub struct LauncherFile {
     /// "host:port|user" (recents that aren't saved connections).
     pub recent: BTreeMap<String, Options>,
     pub updates: UpdatePrefs,
+    /// Full-screen sessions get the bar at the top (Pin, Minimize, Window,
+    /// Stats, Save, Disconnect). Off: the hotkeys only.
+    pub session_bar: bool,
 }
 
 impl Default for LauncherFile {
@@ -239,6 +242,7 @@ impl Default for LauncherFile {
             entries: BTreeMap::new(),
             recent: BTreeMap::new(),
             updates: UpdatePrefs::default(),
+            session_bar: true,
         }
     }
 }
@@ -335,6 +339,7 @@ mod tests {
         }"#;
         let file: LauncherFile = serde_json::from_str(json).unwrap();
         assert_eq!(file.theme, "dark");
+        assert!(file.session_bar, "the bar stays on for a file that never had the setting");
         assert_eq!(file.defaults, Options::default());
         assert_eq!(file.updates, UpdatePrefs { check: false, from_hosts: true, channel: "nightly".into() });
         let hyper = &file.entries[&"11111111-1111-1111-1111-111111111111".parse().unwrap()];

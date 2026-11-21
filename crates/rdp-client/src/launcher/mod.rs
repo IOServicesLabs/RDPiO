@@ -277,6 +277,7 @@ pub fn run() -> Result<(), LauncherError> {
     let connections = ConnectionStore::load()?;
     let mru = MruStore::load()?;
     let prefs = profile::Store::load()?;
+    SESSION_BAR.store(prefs.file.session_bar, Ordering::Relaxed);
     let keep_open = crate::hub::store::settings_path().map(|p| crate::hub::store::load_settings(&p).keep_hub_open).unwrap_or(true);
     let dark = match prefs.file.theme.as_str() {
         "dark" => true,
@@ -1020,6 +1021,10 @@ fn handle(st: &mut State, cmd: &str, req: &Value) -> Result<Value, String> {
             if let Some(d) = req.get("defaults") {
                 st.prefs.file.defaults = serde_json::from_value(d.clone()).map_err(|e| e.to_string())?;
             }
+            if let Some(on) = req.get("session_bar").and_then(Value::as_bool) {
+                st.prefs.file.session_bar = on;
+                SESSION_BAR.store(on, Ordering::Relaxed);
+            }
             st.prefs.save().map_err(|e| e.to_string())?;
             if let Some(k) = req.get("keep_open").and_then(Value::as_bool) {
                 st.keep_open = k;
@@ -1241,6 +1246,7 @@ fn state_json(st: &State) -> Value {
             "keep_open": st.keep_open,
             "defaults": st.prefs.file.defaults,
             "updates": st.prefs.file.updates,
+            "session_bar": st.prefs.file.session_bar,
         },
         "update": update_json(),
         "mica": st.mica,
@@ -1592,6 +1598,9 @@ fn safe_file_name(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).take(64).collect()
 }
 
+/// Whether sessions started from here get the bar at the top (Settings).
+static SESSION_BAR: AtomicBool = AtomicBool::new(true);
+
 /// Start a session process and threads that watch it (and read its log).
 /// `parent`: open its window inside that one (a Workspace tab).
 fn spawn_session(
@@ -1615,6 +1624,11 @@ fn spawn_session(
     }
     if let Some(p) = hyper_password {
         cmd.env(crate::HYPER_PASSWORD_ENV, p);
+    }
+    if SESSION_BAR.load(Ordering::Relaxed) {
+        cmd.env_remove(crate::connbar::OFF_ENV);
+    } else {
+        cmd.env(crate::connbar::OFF_ENV, "1");
     }
     match parent {
         Some(p) => cmd.env("RDPIO_EMBED_PARENT", p.to_string()),

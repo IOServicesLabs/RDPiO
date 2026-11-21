@@ -154,9 +154,23 @@ fn now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+/// Set (to anything) in a session's environment: no bar at all, for someone
+/// who goes by the hotkeys. The launcher sets it from its Settings.
+pub const OFF_ENV: &str = "RDPIO_NO_SESSION_BAR";
+
+/// The bar was turned off for this process ([`OFF_ENV`]).
+pub fn turned_off() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os(OFF_ENV).is_some())
+}
+
 /// Give this process's session window a bar once it's full screen (now or
 /// after Ctrl+Shift+F): for sessions whose window is made elsewhere (Hyper).
+/// Nothing when the bar is turned off.
 pub fn want() {
+    if turned_off() {
+        return;
+    }
     WANTED.store(true, Ordering::Relaxed);
 }
 
