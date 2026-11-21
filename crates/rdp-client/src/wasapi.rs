@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use rdp_hyper::playout::{frames, Playout};
+use rdp_hyper::playout::{frames, Playout, TARGET_MS};
 use windows::core::{Interface, GUID, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::*;
@@ -557,6 +557,8 @@ pub struct Player {
     queue: Arc<Mutex<Playout>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// The rate pushed samples are in (frames a second).
+    rate: u32,
 }
 
 /// Render threads whose device didn't open in time (a driver stuck in
@@ -568,7 +570,17 @@ static STALLED: Mutex<Vec<(Option<String>, JoinHandle<()>)>> = Mutex::new(Vec::n
 impl Player {
     /// Play to `device` (endpoint id) or the default output.
     pub fn new(device: Option<String>, channels: usize) -> windows::core::Result<Self> {
+        Self::with_rate(device, channels, RATE)
+    }
+
+    /// Like [`Player::new`], for samples pushed at `rate` rather than 48 kHz
+    /// (an RDP server's 44.1 kHz sound): the device is opened at that rate and
+    /// the audio engine converts (`AUTOCONVERTPCM`). The jitter buffer's target
+    /// is kept in milliseconds; its other limits are counted in 48 kHz frames,
+    /// so they run a few percent longer or shorter at other rates.
+    pub fn with_rate(device: Option<String>, channels: usize, rate: u32) -> windows::core::Result<Self> {
         let channels = channels.clamp(1, 2);
+        let rate = rate.clamp(8_000, 192_000);
         // Which device this is, so a stuck default doesn't hold up a new one.
         let id = match &device {
             Some(id) => Some(id.clone()),
@@ -581,14 +593,16 @@ impl Player {
                 return Err(windows::core::Error::new(E_FAIL, "audio output still stuck opening"));
             }
         }
-        let queue = Arc::new(Mutex::new(Playout::new(channels)));
+        let mut playout = Playout::new(channels);
+        playout.target = frames_at(rate, TARGET_MS);
+        let queue = Arc::new(Mutex::new(playout));
         let stop = Arc::new(AtomicBool::new(false));
         let (q, s) = (queue.clone(), stop.clone());
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("wasapi-render".into())
             .spawn(move || {
-                let r = unsafe { render_thread(device, channels, q, s, &ready_tx) };
+                let r = unsafe { render_thread(device, channels, rate, q, s, &ready_tx) };
                 if let Err(e) = r {
                     let _ = ready_tx.send(Err(e.clone()));
                     tracing::warn!(error = %e, "audio output stopped");
@@ -596,7 +610,7 @@ impl Player {
             })
             .map_err(|e| windows::core::Error::new(E_FAIL, e.to_string()))?;
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(Ok(())) => Ok(Self { queue, stop, thread: Some(thread) }),
+            Ok(Ok(())) => Ok(Self { queue, stop, thread: Some(thread), rate }),
             Ok(Err(e)) => {
                 let _ = thread.join();
                 Err(e)
@@ -620,7 +634,8 @@ impl Player {
     /// Hold the queue's low point at `ms` from now on (it was `TARGET_MS`):
     /// as much room as the network's jitter needs, and no more delay.
     pub fn set_target_ms(&self, ms: u32) {
-        self.queue.lock().unwrap().target = frames(ms as usize);
+        let target = frames_at(self.rate, ms as usize);
+        self.queue.lock().unwrap().target = target;
     }
 
     /// Cut a backlog out (matched and crossfaded) rather than play it away
@@ -651,6 +666,16 @@ impl Drop for Player {
 }
 
 
+/// Frames in `ms` milliseconds at `rate`; the same as `playout::frames` at
+/// 48 kHz.
+fn frames_at(rate: u32, ms: usize) -> usize {
+    if rate == RATE {
+        frames(ms)
+    } else {
+        rate as usize * ms / 1000
+    }
+}
+
 /// Closes an event handle on drop, whichever way the render thread ends.
 struct Event(HANDLE);
 
@@ -676,6 +701,7 @@ impl Drop for Started<'_> {
 unsafe fn render_thread(
     device: Option<String>,
     channels: usize,
+    rate: u32,
     queue: Arc<Mutex<Playout>>,
     stop: Arc<AtomicBool>,
     ready: &std::sync::mpsc::Sender<windows::core::Result<()>>,
@@ -700,8 +726,8 @@ unsafe fn render_thread(
     let fmt = WAVEFORMATEX {
         wFormatTag: 3, // IEEE float
         nChannels: channels as u16,
-        nSamplesPerSec: RATE,
-        nAvgBytesPerSec: RATE * block as u32,
+        nSamplesPerSec: rate,
+        nAvgBytesPerSec: rate * block as u32,
         nBlockAlign: block,
         wBitsPerSample: 32,
         cbSize: 0,
@@ -763,6 +789,14 @@ unsafe fn render_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targets_count_frames_at_the_players_rate() {
+        assert_eq!(frames_at(RATE, 30), frames(30));
+        assert_eq!(frames_at(RATE, 60), 2880);
+        assert_eq!(frames_at(44_100, 60), 2646);
+        assert_eq!(frames_at(22_050, 10), 220);
+    }
 
     fn ep(id: &str) -> Option<Endpoint> {
         Some(Endpoint { id: id.into(), name: id.to_uppercase() })

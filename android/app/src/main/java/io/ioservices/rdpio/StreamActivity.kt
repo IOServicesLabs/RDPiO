@@ -196,26 +196,26 @@ class StreamActivity : Activity() {
             item("Alt+Tab to PC", { onOff(KeyCapture.enabled && captureKeys) }) { toggleCapture() }
             section("Stream")
             item("Mode", { if (Native.office()) "Office" else "Game" }) { toggleOffice() }
-            item("Game resolution", { if (gameScale == AUTO) "Auto $autoGame%" else "$gameScale%" }) {
+            item("Game resolution", { (if (gameScale == AUTO) "Auto $autoGame%" else "$gameScale%") + sizeNow(false) }) {
                 gameScale = when (gameScale) { AUTO -> 100; 100 -> 75; 75 -> 50; else -> AUTO }
                 getSharedPreferences("settings", MODE_PRIVATE).edit().putInt("gameScale", gameScale).apply()
                 layoutPicture()
                 say(
                     when (gameScale) {
                         AUTO -> "Game mode: the resolution follows the connection (now $autoGame%)"
-                        100 -> "Game mode at the screen's full resolution"
+                        100 -> "Game mode at the PC display's full resolution"
                         else -> "Game mode at $gameScale%: fewer pixels to send and decode, scaled up here"
                     },
                 )
             }
-            item("Office resolution", { if (officeScale == AUTO) "Auto $autoOffice%" else "$officeScale%" }) {
+            item("Office resolution", { (if (officeScale == AUTO) "Auto $autoOffice%" else "$officeScale%") + sizeNow(true) }) {
                 officeScale = when (officeScale) { AUTO -> 100; 100 -> 75; 75 -> 50; 50 -> 33; else -> AUTO }
                 getSharedPreferences("settings", MODE_PRIVATE).edit().putInt("officeScale", officeScale).apply()
                 layoutPicture()
                 say(
                     when (officeScale) {
                         AUTO -> "Office mode: the resolution follows the connection (now $autoOffice%)"
-                        100 -> "Office mode at the screen's full resolution"
+                        100 -> "Office mode at the PC display's full resolution"
                         else -> "Office mode at $officeScale%: for a weak connection, far less data, scaled up here"
                     } + if (Native.sessions().startsWith("w365")) " (Hyper only: Windows 365 stays at full)" else "",
                 )
@@ -268,7 +268,7 @@ class StreamActivity : Activity() {
         onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT) { menu.toggle() }
         // The connection lives on while the app is in the background.
         KeepAlive.start(this)
-        say("Ctrl+Shift+M locks the mouse · Ctrl+Shift+Tab switches session · Ctrl+Shift+Q disconnects · the round button or Shift+Esc opens the menu (drag it anywhere)", 6000)
+        say(Hotkeys.REMINDER, 6000)
         watchNotify()
         ui.post(poll)
     }
@@ -320,7 +320,18 @@ class StreamActivity : Activity() {
         upscaler = null
     }
 
-    private fun wantUpscale() = upscaleOn && !upscaleFailed && scale() < 100
+    /**
+     * The picture is drawn noticeably larger than the stream came: smaller
+     * from the menu's Game/Office resolution or from the connect form's PC
+     * display size (the PC takes the smaller of the two), so decided from the
+     * real sizes. Until the first picture's size is known, no; [poll]
+     * reattaches once it is. Windows 365 comes at the screen's size.
+     */
+    private fun wantUpscale(): Boolean {
+        if (!upscaleOn || upscaleFailed || streamW == 0 || streamH == 0) return false
+        if (Native.sessions().startsWith("w365")) return false
+        return min(root.width.toFloat() / streamW, root.height.toFloat() / streamH) > 1.02f
+    }
 
     /** The stream's resolution, % of the screen, for the session and mode in front (Windows 365: always full). */
     private fun scale() = when {
@@ -328,6 +339,14 @@ class StreamActivity : Activity() {
         Native.office() -> if (officeScale == AUTO) autoOffice else officeScale
         else -> if (gameScale == AUTO) autoGame else gameScale
     }
+
+    /**
+     * For the menu's Game/Office resolution: the size the stream really is
+     * (the connect form's PC display size can make it smaller than the
+     * percentage says), when that mode's Hyper stream is the one in front.
+     */
+    private fun sizeNow(office: Boolean) =
+        if (streamW > 0 && !Native.sessions().startsWith("w365") && Native.office() == office) " · ${streamW}×${streamH}" else ""
 
     /**
      * Auto resolution: the core's pick from the last second's numbers (it
@@ -786,7 +805,7 @@ class StreamActivity : Activity() {
             }
         }
         if (state.startsWith("reconnecting")) {
-            banner.text = "Connection lost — reconnecting…"
+            banner.text = "Connection lost: reconnecting…"
             banner.visibility = View.VISIBLE
             bannerUntil = System.currentTimeMillis() + 1000
         }
@@ -827,7 +846,7 @@ class StreamActivity : Activity() {
             }
             followAuto()
             if (showStats) stats.text = st.substringAfter('\n') + "\n" + meter.line + "  " + thermal.line + (upscaler?.let { "\n" + it.line } ?: "")
-            // Game mode below 100% (or not any more), or the upscaler switched: a new Surface.
+            // The stream smaller than the screen (or not any more), or the upscaler switched: a new Surface.
             if (video.holder.surface?.isValid == true && wantUpscale() != (upscaler != null)) reattach()
             input.tick()
             // Ten times a second while someone's at it (a held finger's right

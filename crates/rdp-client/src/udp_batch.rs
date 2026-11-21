@@ -115,15 +115,33 @@ impl Default for SendBatch {
 
 impl SendBatch {
     /// Add one datagram; what's gathered goes first if this one can't join
-    /// it (another size or peer, or the batch is full).
+    /// it (another size or peer, or the batch is full). (The stream seals
+    /// into the batch instead: [`push_with`](Self::push_with).)
+    #[cfg(test)]
     pub fn push(&mut self, socket: &UdpSocket, peer: SocketAddr, packet: &[u8]) {
-        if !self.buf.is_empty() && (packet.len() != self.seg || self.peer != Some(peer) || self.buf.len() / self.seg >= MAX_SEGMENTS) {
+        self.push_with(socket, peer, packet.len(), |out| out.extend_from_slice(packet));
+    }
+
+    /// Add one datagram of `len` bytes that `write` appends to the batch's
+    /// own buffer (sealed straight into it: no packet of its own, no copy);
+    /// what's gathered goes first if this one can't join it (another size or
+    /// peer, or the batch is full). `write` must append exactly `len` bytes;
+    /// one that doesn't goes on its own, so the batch's datagrams stay
+    /// equal-sized.
+    pub fn push_with(&mut self, socket: &UdpSocket, peer: SocketAddr, len: usize, write: impl FnOnce(&mut Vec<u8>)) {
+        if !self.buf.is_empty() && (len != self.seg || self.peer != Some(peer) || self.buf.len() / self.seg >= MAX_SEGMENTS) {
             self.flush(socket);
         }
         if self.buf.is_empty() {
-            (self.seg, self.peer) = (packet.len(), Some(peer));
+            (self.seg, self.peer) = (len, Some(peer));
         }
-        self.buf.extend_from_slice(packet);
+        let at = self.buf.len();
+        write(&mut self.buf);
+        if self.buf.len() - at != len {
+            let packet = self.buf.split_off(at);
+            self.flush(socket);
+            let _ = socket.send_to(&packet, peer);
+        }
     }
 
     /// Send what's gathered.
@@ -185,11 +203,13 @@ impl Receiver {
         Self { buf: vec![0; 65_536], recv_msg }
     }
 
-    /// The next datagrams (as the socket's read timeout allows), one slice each.
-    pub fn recv(&mut self, socket: &UdpSocket) -> io::Result<std::slice::Chunks<'_, u8>> {
+    /// The next datagrams (as the socket's read timeout allows), one slice
+    /// each, writable: a packet can be opened where it lies
+    /// (`Session::open_in_place`), not copied out first.
+    pub fn recv(&mut self, socket: &UdpSocket) -> io::Result<std::slice::ChunksMut<'_, u8>> {
         let Some(recv_msg) = self.recv_msg else {
             let n = socket.recv(&mut self.buf)?;
-            return Ok(self.buf[..n].chunks(n.max(1)));
+            return Ok(self.buf[..n].chunks_mut(n.max(1)));
         };
         let mut control = Control([0; 32]);
         let mut data = WSABUF { len: self.buf.len() as u32, buf: windows::core::PSTR(self.buf.as_mut_ptr()) };
@@ -221,7 +241,15 @@ impl Receiver {
                 }
             }
         }
-        Ok(self.buf[..n].chunks(seg.max(1)))
+        Ok(self.buf[..n].chunks_mut(seg.max(1)))
+    }
+
+    /// Whether datagrams wait in `socket`'s buffer now (never blocks): a
+    /// caller that rests between calls reads on at once while this says so.
+    /// (A socket that can't tell reads as empty.)
+    pub fn pending(&self, socket: &UdpSocket) -> bool {
+        let mut bytes = 0u32;
+        unsafe { ioctlsocket(socket_of(socket), FIONREAD, &mut bytes) == 0 && bytes > 0 }
     }
 }
 
@@ -287,5 +315,98 @@ mod tests {
         }
         println!("segmentation offload: {}, receive coalescing: {}", SEND_OFFLOAD.load(Ordering::Relaxed), r.recv_msg.is_some());
         assert_eq!(got, sent);
+    }
+
+    /// Datagrams sealed straight into the batch go out byte for byte as
+    /// sealed ones pushed: a frame's equal-sized packets, a short last one,
+    /// and a writer that appends the wrong length (sent on its own).
+    #[test]
+    fn sealed_into_the_batch_is_sealed_and_pushed() {
+        use rdp_hyper::wire::{Direction, Kind, Session, OVERHEAD};
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let peer = rx.local_addr().unwrap();
+        let key = [5u8; 32];
+        let (mut a, mut b) = (Session::new(&key, Direction::HostToClient), Session::new(&key, Direction::HostToClient));
+        let bodies: Vec<Vec<u8>> = (0..6u8).map(|i| vec![i; 1100]).chain([vec![42u8; 200]]).collect();
+        let mut sent = Vec::new();
+        let mut batch = SendBatch::default();
+        for body in &bodies {
+            sent.push(a.seal(Kind::Video, body));
+            batch.push_with(&tx, peer, body.len() + OVERHEAD, |out| b.seal_into(Kind::Video, body, out));
+        }
+        // (Claims a length it doesn't write.)
+        let odd = vec![1u8, 2, 3];
+        sent.push(odd.clone());
+        batch.push_with(&tx, peer, 1100 + OVERHEAD, |out| out.extend_from_slice(&odd));
+        batch.flush(&tx);
+        let mut r = Receiver::new(&rx);
+        let mut got = Vec::new();
+        while got.len() < sent.len() {
+            for d in r.recv(&rx).expect("all of them") {
+                got.push(d.to_vec());
+            }
+        }
+        // (The odd one goes on its own, right after what was gathered.)
+        let odd_at = got.iter().position(|d| d == &odd).expect("the odd one");
+        got.remove(odd_at);
+        sent.pop();
+        assert_eq!(got, sent);
+    }
+
+    /// Received datagrams open where they lie in the receive buffer, to the
+    /// bodies sealed, batched or one by one.
+    #[test]
+    fn received_datagrams_open_in_place() {
+        use rdp_hyper::wire::{Direction, Kind, Session};
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let peer = rx.local_addr().unwrap();
+        let key = [9u8; 32];
+        let (mut seal, mut open) = (Session::new(&key, Direction::HostToClient), Session::new(&key, Direction::ClientToHost));
+        let bodies: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; 1100]).chain([vec![77u8; 90]]).collect();
+        let mut batch = SendBatch::default();
+        for body in &bodies {
+            batch.push(&tx, peer, &seal.seal(Kind::Video, body));
+        }
+        batch.flush(&tx);
+        tx.send_to(&seal.seal(Kind::Control, b"alone"), peer).unwrap();
+        let mut r = Receiver::new(&rx);
+        let mut got: Vec<(Kind, Vec<u8>)> = Vec::new();
+        while got.len() < bodies.len() + 1 {
+            for d in r.recv(&rx).expect("all of them") {
+                let (kind, body) = open.open_in_place(d).expect("authentic");
+                got.push((kind, body.to_vec()));
+            }
+        }
+        let want: Vec<(Kind, Vec<u8>)> = bodies.into_iter().map(|b| (Kind::Video, b)).chain([(Kind::Control, b"alone".to_vec())]).collect();
+        assert_eq!(got, want);
+    }
+
+    /// A socket says it holds datagrams from when they arrive until the last
+    /// is read, and not before or after.
+    #[test]
+    fn a_socket_says_when_datagrams_wait() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.connect(rx.local_addr().unwrap()).unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut r = Receiver::new(&rx);
+        assert!(!r.pending(&rx), "nothing was sent yet");
+        for i in 0..3u8 {
+            tx.send(&[i; 1200]).unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !r.pending(&rx) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(r.pending(&rx), "three datagrams wait");
+        let mut got = 0;
+        while got < 3 {
+            got += r.recv(&rx).expect("all of them").count();
+        }
+        assert!(!r.pending(&rx), "all three were read");
     }
 }

@@ -86,6 +86,11 @@ object CloudStore {
     fun user(ctx: Context): String = prefs(ctx).getString("user", "") ?: ""
     fun password(ctx: Context): String? = prefs(ctx).getString("password", null)?.let { Secret.open(it) }
 
+    // Whether one is kept, without unsealing it ([refresh] and [password] are
+    // a Keystore round trip each: off the UI thread).
+    fun hasRefresh(ctx: Context): Boolean = prefs(ctx).contains("refresh")
+    fun hasPassword(ctx: Context): Boolean = prefs(ctx).contains("password")
+
     fun signedIn(ctx: Context, user: String, refresh: String) {
         prefs(ctx).edit().putString("user", user).putString("refresh", Secret.seal(refresh)).apply()
     }

@@ -64,6 +64,13 @@ impl Message {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut o = Vec::new();
+        self.write_to(&mut o);
+        o
+    }
+
+    /// Append the message's bytes (as [`Self::to_bytes`] gives them) to `o`:
+    /// a 1 MB file chunk goes straight into a record, not through a copy.
+    pub fn write_to(&self, o: &mut Vec<u8>) {
         match self {
             Self::CursorShape { width, height, hot_x, hot_y, rgba } => {
                 o.push(1);
@@ -100,7 +107,6 @@ impl Message {
                 o.push(*streams);
             }
         }
-        o
     }
 
     pub fn parse(b: &[u8]) -> Option<Self> {
@@ -155,7 +161,12 @@ mod tests {
             },
             Message::FileChunk { transfer: 3, index: 0, offset: 0, data: b"hello".to_vec() },
         ] {
-            assert_eq!(Message::parse(&m.to_bytes()), Some(m));
+            assert_eq!(Message::parse(&m.to_bytes()), Some(m.clone()));
+            // Appended after what's there, the same bytes.
+            let mut o = vec![0xAA; 3];
+            m.write_to(&mut o);
+            assert_eq!(&o[..3], &[0xAA; 3]);
+            assert_eq!(o[3..], m.to_bytes()[..]);
         }
     }
 

@@ -25,12 +25,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use windows::Win32::Foundation::SYSTEMTIME;
-use windows::Win32::Globalization::{
-    GetDateFormatW, GetTimeFormatW, DATE_SHORTDATE, LOCALE_USER_DEFAULT, TIME_NOSECONDS,
-};
-use windows::Win32::System::Time::SystemTimeToTzSpecificLocalTime;
-
 use crate::hub::model::{now_unix, ConnectionRecord, MruRecord, ProtectedPassword};
 use crate::hub::HubError;
 
@@ -140,6 +134,22 @@ where
     }
 }
 
+/// Read a JSON array of records from `path` for a change about to be written
+/// back. A missing file is an empty store; anything else that goes wrong (the
+/// file held open by another program, an I/O error, content that doesn't parse)
+/// is an error, so the caller writes nothing rather than replacing every saved
+/// record with an empty list. The file is left as it is.
+fn try_load_records<T>(path: &Path) -> Result<Vec<T>, HubError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    match fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+    }
+}
+
 /// Move a corrupt store file aside so a later inspection keeps the evidence
 /// without letting it break the next load. Best-effort: failures are logged.
 fn backup_corrupt(path: &Path) {
@@ -198,6 +208,26 @@ impl ConnectionStore {
         Ok(Self { path, records })
     }
 
+    /// Read the file again for display: another process (a session's
+    /// connection bar, a second rdpio) may have written it since this store was
+    /// loaded. When it can't be read just now, the records already in memory
+    /// stay.
+    pub fn reload(&mut self) {
+        match try_load_records(&self.path) {
+            Ok(records) => self.records = records,
+            Err(e) => tracing::warn!(path = %self.path.display(), error = %e, "could not re-read connections; keeping the ones loaded"),
+        }
+    }
+
+    /// Read the file again before a change that will be written back. Fails,
+    /// keeping the records in memory, when the file is there but can't be read
+    /// or parsed, so the change never overwrites saved connections it didn't
+    /// see.
+    pub fn reload_strict(&mut self) -> Result<(), HubError> {
+        self.records = try_load_records(&self.path)?;
+        Ok(())
+    }
+
     /// All saved records, in insertion order.
     pub fn list(&self) -> &[ConnectionRecord] {
         &self.records
@@ -217,6 +247,9 @@ impl ConnectionStore {
     /// a blank/`None` password preserves the existing blob when updating (so an
     /// edit that leaves the password field empty does not clobber the saved
     /// credential), and stores a protected empty password for brand-new records.
+    ///
+    /// Like every change here it starts from the file as it is now, so a
+    /// record another process saved in the meantime is kept.
     pub fn upsert(&mut self, input: ConnectionInput) -> Result<ConnectionRecord, HubError> {
         if input.host.trim().is_empty() {
             return Err(HubError::invalid("host must not be empty"));
@@ -224,6 +257,7 @@ impl ConnectionStore {
         if input.port == 0 {
             return Err(HubError::invalid("port must be 1-65535"));
         }
+        self.reload_strict()?;
 
         let now = now_unix();
         let existing = input
@@ -271,6 +305,7 @@ impl ConnectionStore {
     /// Remove the record with `id` and persist. Returns `false` (and writes
     /// nothing) when no such record exists.
     pub fn delete(&mut self, id: &uuid::Uuid) -> Result<bool, HubError> {
+        self.reload_strict()?;
         let before = self.records.len();
         self.records.retain(|r| &r.id != id);
         if self.records.len() == before {
@@ -280,9 +315,29 @@ impl ConnectionStore {
         Ok(true)
     }
 
+    /// The position of the record with `id` in [`list`](Self::list).
+    pub fn position(&self, id: &uuid::Uuid) -> Option<usize> {
+        self.records.iter().position(|r| &r.id == id)
+    }
+
+    /// Put back a record that [`delete`](Self::delete) removed (an undo), as it
+    /// was, password blob and dates included, at `at` (or last), and persist.
+    /// Returns `false` (and writes nothing) when a record with its id is there.
+    pub fn restore(&mut self, record: ConnectionRecord, at: usize) -> Result<bool, HubError> {
+        self.reload_strict()?;
+        if self.records.iter().any(|r| r.id == record.id) {
+            return Ok(false);
+        }
+        let at = at.min(self.records.len());
+        self.records.insert(at, record);
+        self.save()?;
+        Ok(true)
+    }
+
     /// Replace a record's saved password outright (an `upsert` keeps it when
     /// the new one is blank). Returns `false` when there's no such record.
     pub fn replace_password(&mut self, id: &uuid::Uuid, password: ProtectedPassword) -> Result<bool, HubError> {
+        self.reload_strict()?;
         let Some(rec) = self.records.iter_mut().find(|r| &r.id == id) else {
             return Ok(false);
         };
@@ -328,25 +383,29 @@ impl MruStore {
         Ok(Self { path, records })
     }
 
+    /// Read the file again for display (sessions record their own
+    /// connections), newest first. When it can't be read just now, the entries
+    /// already in memory stay.
+    pub fn reload(&mut self) {
+        if let Err(e) = self.reload_strict() {
+            tracing::warn!(path = %self.path.display(), error = %e, "could not re-read history; keeping the entries loaded");
+        }
+    }
+
+    /// Read the file again before a change that will be written back, newest
+    /// first. Fails, keeping the entries in memory, when the file is there but
+    /// can't be read or parsed, so the change never overwrites history it
+    /// didn't see.
+    pub fn reload_strict(&mut self) -> Result<(), HubError> {
+        let mut records: Vec<MruRecord> = try_load_records(&self.path)?;
+        records.sort_by(|a, b| b.last_connected_at.cmp(&a.last_connected_at));
+        self.records = records;
+        Ok(())
+    }
+
     /// All history entries, newest first (the maintained sort order).
     pub fn list_most_recent_first(&self) -> &[MruRecord] {
         &self.records
-    }
-
-    /// The most recently used non-empty username, or `None` when history has
-    /// no usable username.
-    ///
-    /// Walks the MRU list from the front (most recent) to the back and returns
-    /// the first username that is present and not blank. This is the New
-    /// Connection form's preferred username prefill: the most recent person
-    /// this user connected as. Read-only; never mutates the MRU list, so
-    /// ordering, cap, dedupe, and move-to-front behavior are untouched.
-    pub fn last_used_username(&self) -> Option<&str> {
-        self.records
-            .iter()
-            .filter_map(|r| r.username.as_deref())
-            .map(str::trim)
-            .find(|u| !u.is_empty())
     }
 
     /// Record one successful connection and persist immediately.
@@ -369,6 +428,8 @@ impl MruStore {
     ) -> Result<(), HubError> {
         let host = host.into();
         let display_name = display_name.into();
+        // (From the file as it is now: other processes record too.)
+        self.reload_strict()?;
 
         let position = self.records.iter().position(|r| {
             r.host == host && r.port == port && r.username == username && r.domain == domain
@@ -418,6 +479,7 @@ impl MruStore {
     /// Forget every entry for `host:port` as `username` (any domain), and
     /// persist. Host and user compare without case, as Windows does.
     pub fn remove(&mut self, host: &str, port: u16, username: Option<&str>) -> Result<bool, HubError> {
+        self.reload_strict()?;
         let before = self.records.len();
         let same = |a: Option<&str>, b: Option<&str>| a.unwrap_or("").trim().eq_ignore_ascii_case(b.unwrap_or("").trim());
         self.records
@@ -509,136 +571,6 @@ pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), HubError> {
     write_json_atomic(path, settings)
 }
 
-/// Render the identity portion of a Recent entry: `user@host` when the user
-/// is present and non-empty, otherwise just `host`.
-///
-/// Pure and side-effect free so the Recent-list formatting (step-12) can be
-/// unit-tested without a window. A blank username renders as bare `host`,
-/// matching the CLI convention (`main.rs` shows `user@host` only when a user
-/// is known). The username is trimmed so a whitespace-only value degrades to
-/// the bare-host form instead of producing a dangling `@`.
-pub fn format_recent_identity(user: Option<&str>, host: &str) -> String {
-    match user.map(str::trim).filter(|u| !u.is_empty()) {
-        Some(user) => format!("{user}@{host}"),
-        None => host.to_string(),
-    }
-}
-
-/// Build the UTC [`SYSTEMTIME`] for a unix timestamp using the standard
-/// civil-from-days conversion. Pure arithmetic (no chrono / Win32 calls), so
-/// it is deterministic and testable; the time-zone shift happens afterwards in
-/// [`unix_to_local_systemtime`].
-fn unix_to_utc_systemtime(unix: u64) -> SYSTEMTIME {
-    let days = unix / 86400;
-    let secs = unix % 86400;
-    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    let z = days as i64 + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    SYSTEMTIME {
-        wYear: y as u16,
-        wMonth: m as u16,
-        wDay: d as u16,
-        wHour: hh as u16,
-        wMinute: mm as u16,
-        wSecond: ss as u16,
-        wMilliseconds: 0,
-        wDayOfWeek: 0,
-    }
-}
-
-/// Convert a unix timestamp to the user's local [`SYSTEMTIME`] by shifting the
-/// UTC time through `SystemTimeToTzSpecificLocalTime`. Returns `None` when the
-/// native conversion fails, so callers can fall back instead of panicking on
-/// the UI path.
-fn unix_to_local_systemtime(unix: u64) -> Option<SYSTEMTIME> {
-    let st_utc = unix_to_utc_systemtime(unix);
-    unsafe {
-        let mut st_local = SYSTEMTIME::default();
-        SystemTimeToTzSpecificLocalTime(None, &st_utc, &mut st_local)
-            .ok()
-            .map(|()| st_local)
-    }
-}
-
-/// Render a unix timestamp as a plain UTC "YYYY-MM-DD HH:MM" string. Pure
-/// arithmetic (no chrono dependency), used only as the defensive fallback when
-/// the native locale-aware formatter cannot produce a value.
-fn format_ts_utc(unix: u64) -> String {
-    let st = unix_to_utc_systemtime(unix);
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
-    )
-}
-
-/// Format a unix timestamp as the user's **local** short date + time, e.g.
-/// "1/15/2024 3:04 PM" on an en-US system. Uses `GetDateFormatW` with
-/// `DATE_SHORTDATE` and `GetTimeFormatW` with `TIME_NOSECONDS`, so the output
-/// follows the current user's locale and time zone — the "Last Used" column of
-/// the Recent list. Falls back to the UTC [`format_ts_utc`] rendering if the
-/// native path fails, so a locale edge case can never panic the hub.
-pub fn format_local_short_datetime(unix: u64) -> String {
-    let Some(st) = unix_to_local_systemtime(unix) else {
-        return format_ts_utc(unix);
-    };
-    unsafe {
-        let mut date = [0u16; 64];
-        let mut time = [0u16; 64];
-        // Both calls return the written length *including* the trailing NUL
-        // (or 0 on failure); 64 u16s is ample for any short date / time.
-        let dlen = GetDateFormatW(
-            LOCALE_USER_DEFAULT,
-            DATE_SHORTDATE.0,
-            Some(&st),
-            None,
-            Some(&mut date),
-        );
-        let tlen = GetTimeFormatW(
-            LOCALE_USER_DEFAULT,
-            TIME_NOSECONDS.0,
-            Some(&st),
-            None,
-            Some(&mut time),
-        );
-        if dlen <= 1 || tlen <= 1 {
-            return format_ts_utc(unix);
-        }
-        let date = String::from_utf16_lossy(&date[..dlen as usize - 1]);
-        let time = String::from_utf16_lossy(&time[..tlen as usize - 1]);
-        format!("{date} {time}")
-    }
-}
-
-/// Render a Recent (MRU) entry as one display string: `user@host` (or bare
-/// `host` when the record has no usable username) followed by the local short
-/// date + time of the last connection, e.g. `alice@box.local 1/15/2024 3:04 PM`.
-///
-/// A record with no usable timestamp (`last_connected_at == 0`, the sentinel
-/// for "never recorded") renders as the bare address only, so the Recent list
-/// never shows a meaningless epoch date.
-///
-/// The Recent list's columns are populated from exactly the two halves of this
-/// formatter — the identity in the "User" column and the local date + time in
-/// the "Last Used" column — so the list and this helper cannot drift.
-pub fn format_recent_entry(record: &MruRecord) -> String {
-    let identity = format_recent_identity(record.username.as_deref(), &record.host);
-    if record.last_connected_at == 0 {
-        return identity;
-    }
-    format!(
-        "{identity} {}",
-        format_local_short_datetime(record.last_connected_at)
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,6 +650,108 @@ mod tests {
         assert!(!store.delete(&id).unwrap(), "double delete is a no-op");
         let reloaded = ConnectionStore::load_from(path.clone()).unwrap();
         assert!(reloaded.list().is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_store_loaded_earlier_keeps_what_another_process_saved() {
+        // The launcher loads its store once; a session's bar saves through a
+        // store of its own. The launcher's next change must not erase it.
+        let path = temp_file("two-writers");
+        let mut launcher = ConnectionStore::load_from(path.clone()).unwrap();
+        let mine = launcher.upsert(input("Mine", "mine.corp", 3389, None)).unwrap();
+        let mut bar = ConnectionStore::load_from(path.clone()).unwrap();
+        let theirs = bar.upsert(input("Theirs", "theirs.corp", 3389, None)).unwrap();
+        launcher.upsert(ConnectionInput { id: Some(mine.id), ..input("Mine, renamed", "mine.corp", 3389, None) }).unwrap();
+        let ids: Vec<_> = ConnectionStore::load_from(path.clone()).unwrap().list().iter().map(|r| r.id).collect();
+        assert_eq!(ids, [mine.id, theirs.id]);
+        // Deleting, restoring and replacing a password start from the file too.
+        let other = bar.upsert(input("Other", "other.corp", 3389, None)).unwrap();
+        assert!(launcher.delete(&mine.id).unwrap());
+        assert!(launcher.replace_password(&other.id, ProtectedPassword::protect("pw").unwrap()).unwrap());
+        let ids: Vec<_> = ConnectionStore::load_from(path.clone()).unwrap().list().iter().map(|r| r.id).collect();
+        assert_eq!(ids, [theirs.id, other.id]);
+        // A reload shows the others' records without changing anything.
+        let mut fresh = ConnectionStore::load_from(path.clone()).unwrap();
+        bar.upsert(input("Late", "late.corp", 3389, None)).unwrap();
+        fresh.reload();
+        assert_eq!(fresh.list().len(), 3);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_file_that_cant_be_read_is_never_written_over() {
+        // Loaded fine at start; later the file can't be read back (here its
+        // content doesn't parse). Changes refuse to write instead of saving a
+        // list without the records they didn't see, and the file stays as it is.
+        let path = temp_file("unreadable");
+        let mut store = ConnectionStore::load_from(path.clone()).unwrap();
+        let kept = store.upsert(input("Kept", "kept.corp", 3389, None)).unwrap();
+        let mut history = MruStore::load_from(path.with_extension("history")).unwrap();
+        history.record("kept.corp", 3389, None, None, "Kept", None).unwrap();
+        let garbage = b"{ not json";
+        fs::write(&path, garbage).unwrap();
+        fs::write(path.with_extension("history"), garbage).unwrap();
+
+        assert!(store.upsert(input("New", "new.corp", 3389, None)).is_err());
+        assert!(store.upsert(ConnectionInput { id: Some(kept.id), ..input("Renamed", "kept.corp", 3389, None) }).is_err());
+        assert!(store.delete(&kept.id).is_err());
+        assert!(store.restore(kept.clone(), 0).is_err());
+        assert!(store.replace_password(&kept.id, ProtectedPassword::protect("pw").unwrap()).is_err());
+        assert!(history.record("new.corp", 3389, None, None, "New", None).is_err());
+        assert!(history.remove("kept.corp", 3389, None).is_err());
+        assert_eq!(fs::read(&path).unwrap(), garbage);
+        assert_eq!(fs::read(path.with_extension("history")).unwrap(), garbage);
+
+        // A reload for display keeps what was loaded.
+        store.reload();
+        assert_eq!(store.list().iter().map(|r| r.id).collect::<Vec<_>>(), [kept.id]);
+        history.reload();
+        assert_eq!(history.list_most_recent_first().len(), 1);
+
+        // A missing file is still an empty store that a change can start.
+        fs::remove_file(&path).unwrap();
+        assert!(store.upsert(input("New", "new.corp", 3389, None)).is_ok());
+        assert_eq!(ConnectionStore::load_from(path.clone()).unwrap().list().len(), 1);
+        let _ = fs::remove_file(path.with_extension("history"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn history_loaded_earlier_keeps_what_another_process_recorded() {
+        let path = temp_file("two-histories");
+        let mut launcher = MruStore::load_from(path.clone()).unwrap();
+        let mut session = MruStore::load_from(path.clone()).unwrap();
+        session.record("rdp.corp", 3389, None, None, "RDP", None).unwrap();
+        launcher.record("hyper.corp", 3389, None, None, "Hyper", None).unwrap();
+        let hosts: Vec<_> = MruStore::load_from(path.clone()).unwrap().list_most_recent_first().iter().map(|r| r.host.clone()).collect();
+        assert_eq!(hosts, ["hyper.corp", "rdp.corp"]);
+        session.record("late.corp", 3389, None, None, "Late", None).unwrap();
+        assert!(launcher.remove("hyper.corp", 3389, None).unwrap());
+        let hosts: Vec<_> = MruStore::load_from(path.clone()).unwrap().list_most_recent_first().iter().map(|r| r.host.clone()).collect();
+        assert_eq!(hosts, ["late.corp", "rdp.corp"]);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_deleted_connection_comes_back_whole() {
+        let path = temp_file("restore");
+        let mut store = ConnectionStore::load_from(path.clone()).unwrap();
+        let a = store.upsert(input("A", "a.corp", 3389, Some("pa"))).unwrap();
+        let b = store.upsert(input("B", "b.corp", 3390, Some("pb"))).unwrap();
+        let c = store.upsert(input("C", "c.corp", 3391, None)).unwrap();
+        let at = store.position(&b.id).unwrap();
+        let gone = store.get(&b.id).cloned().unwrap();
+        assert!(store.delete(&b.id).unwrap());
+        assert!(store.restore(gone.clone(), at).unwrap());
+        assert!(!store.restore(gone, at).unwrap(), "a second restore is a no-op");
+        // Back in its place, with its password, after a reload too.
+        let reloaded = ConnectionStore::load_from(path.clone()).unwrap();
+        let ids: Vec<_> = reloaded.list().iter().map(|r| r.id).collect();
+        assert_eq!(ids, [a.id, b.id, c.id]);
+        let back = reloaded.get(&b.id).unwrap();
+        assert_eq!(back.saved_password.unprotect().unwrap(), "pb");
+        assert_eq!((back.port, back.created_at), (3390, b.created_at));
         cleanup(&path);
     }
 
@@ -1063,57 +1097,6 @@ mod tests {
         cleanup(&path);
     }
 
-    #[test]
-    fn last_used_username_walks_mru_front_to_back() {
-        let path = temp_file("lastuser");
-        let mut store = MruStore::load_from(path.clone()).unwrap();
-        assert_eq!(
-            store.last_used_username(),
-            None,
-            "empty history has no username"
-        );
-
-        store
-            .record("first", 3389, None, None, "First", None)
-            .unwrap();
-        assert_eq!(store.last_used_username(), None, "no entry has a username");
-
-        store
-            .record("second", 3389, Some("bob".into()), None, "Second", None)
-            .unwrap();
-        store
-            .record("third", 3389, Some("carol".into()), None, "Third", None)
-            .unwrap();
-        // Newest first: carol is the most recent non-empty username.
-        assert_eq!(store.last_used_username(), Some("carol"));
-
-        // A blank username at the front is skipped in favour of the next one.
-        store
-            .record("blank", 3390, Some("".into()), None, "Blank", None)
-            .unwrap();
-        assert_eq!(store.last_used_username(), Some("carol"));
-
-        // The helper is read-only: history is unchanged by calling it.
-        assert_eq!(store.list_most_recent_first().len(), 4);
-        cleanup(&path);
-    }
-
-    #[test]
-    fn format_recent_identity_renders_user_at_host_or_bare_host() {
-        assert_eq!(
-            format_recent_identity(Some("alice"), "box.local"),
-            "alice@box.local"
-        );
-        assert_eq!(
-            format_recent_identity(Some("alice"), "10.0.0.5"),
-            "alice@10.0.0.5"
-        );
-        // Empty or blank user → bare host, never a dangling '@'.
-        assert_eq!(format_recent_identity(None, "box.local"), "box.local");
-        assert_eq!(format_recent_identity(Some(""), "box.local"), "box.local");
-        assert_eq!(format_recent_identity(Some("  "), "box.local"), "box.local");
-    }
-
     /// A fixed MRU record with the given username / timestamp; the remaining
     /// fields are constants so tests read as "username present / absent".
     fn mru(user: Option<&str>, last_connected_at: u64) -> MruRecord {
@@ -1127,75 +1110,5 @@ mod tests {
             connect_count: 1,
             connection_id: None,
         }
-    }
-
-    #[test]
-    fn format_recent_entry_with_username_includes_user_at_host_and_local_time() {
-        // 2023-11-14 22:13:20 UTC — the timestamp half must render as the
-        // user's local short date + time, never an epoch or blank.
-        let text = format_recent_entry(&mru(Some("alice"), 1_700_000_000));
-        assert!(
-            text.starts_with("alice@box.local "),
-            "identity half must be user@host: {text}"
-        );
-        let ts = text.trim_start_matches("alice@box.local ");
-        assert!(!ts.is_empty(), "timestamp half must not be empty: {text}");
-        assert!(
-            ts.chars().any(|c| c.is_ascii_digit()),
-            "timestamp half must carry a real date/time: {text}"
-        );
-        // The whole entry is one line with the identity and time separated.
-        assert!(text.contains(' '));
-    }
-
-    #[test]
-    fn format_recent_entry_without_username_uses_bare_host() {
-        let text = format_recent_entry(&mru(None, 1_700_000_000));
-        assert!(
-            text.starts_with("box.local "),
-            "no username must render bare host (no dangling '@'): {text}"
-        );
-        let ts = text.trim_start_matches("box.local ");
-        assert!(!ts.is_empty());
-        assert!(ts.chars().any(|c| c.is_ascii_digit()));
-        // Blank username degrades to the bare-host form too.
-        let blank = format_recent_entry(&mru(Some("   "), 1_700_000_000));
-        assert!(blank.starts_with("box.local "), "{blank}");
-    }
-
-    #[test]
-    fn format_recent_entry_without_timestamp_shows_address_only() {
-        // last_connected_at == 0 is the "no timestamp" sentinel: the entry is
-        // the bare address, with no epoch date appended.
-        assert_eq!(
-            format_recent_entry(&mru(Some("alice"), 0)),
-            "alice@box.local"
-        );
-        assert_eq!(format_recent_entry(&mru(None, 0)), "box.local");
-        assert_eq!(format_recent_entry(&mru(Some("  "), 0)), "box.local");
-    }
-
-    #[test]
-    fn format_local_short_datetime_renders_local_date_and_time() {
-        let text = format_local_short_datetime(1_700_000_000);
-        assert!(!text.is_empty(), "local datetime must never be blank");
-        assert!(
-            text.chars().any(|c| c.is_ascii_digit()),
-            "must contain a real date/time: {text}"
-        );
-        // DATE_SHORTDATE + TIME_NOSECONDS yields two parts separated by space.
-        assert!(text.contains(' '), "date and time must be separated: {text}");
-        // The zero timestamp (sentinel) still formats deterministically.
-        let epoch = format_local_short_datetime(0);
-        assert!(!epoch.is_empty());
-    }
-
-    #[test]
-    fn format_ts_utc_fallback_renders_civil_datetime() {
-        assert_eq!(format_ts_utc(0), "1970-01-01 00:00");
-        // 1700000000 = 2023-11-14 22:13:20 UTC.
-        assert_eq!(format_ts_utc(1_700_000_000), "2023-11-14 22:13");
-        // Round-trips through a full day boundary without wrapping.
-        assert_eq!(format_ts_utc(86400), "1970-01-02 00:00");
     }
 }

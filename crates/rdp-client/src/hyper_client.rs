@@ -107,7 +107,12 @@ impl HyperRedirector {
     pub fn new(host: IpAddr, width: u32, height: u32, fps: u32, codec: Option<rdp_gpu::h264::Codec>) -> Self {
         // HEVC first where the GPU decodes it (faster through NVENC and
         // better for the bits; see the direct sign-in).
-        let codecs = rdp_gpu::hyper::client_codecs(codec);
+        // (As probed last run where the GPU is the same, checked again
+        // meanwhile: the RDP session takes seconds to reach the stream.)
+        let (codecs, gpu, from_last_run) = client_codecs_cached(codec);
+        if from_last_run {
+            refresh_decoder_cache(codecs.clone(), gpu);
+        }
         let hello = Handshake::ClientHello {
             protocol: PROTOCOL,
             codecs,
@@ -351,7 +356,12 @@ impl Decoder {
             };
             match made {
                 Ok(d) => return Ok(Self::Gpu(d)),
-                Err(e) => tracing::warn!(error = %e, codec = codec.name(), "no GPU decoder (check the GPU driver); decoding on the CPU"),
+                Err(e) => {
+                    tracing::warn!(error = %e, codec = codec.name(), "no GPU decoder (check the GPU driver); decoding on the CPU");
+                    // (Which a saved probe may have promised: probed afresh
+                    // at the next start.)
+                    forget_decoder_cache();
+                }
             }
         }
         Ok(Self::Cpu(rdp_gpu::h264::H264Decoder::with_codec(w, h, codec)?))
@@ -503,6 +513,8 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     let mut copy_held = false;
     // When the window was first seen fully covered (see COVERED_FOR).
     let (mut covered_since, mut cover_checked) = (None::<Instant>, Instant::now());
+    // When the window last had input (see USED_FOR).
+    let mut used_at: Option<Instant> = None;
     let mut last_input_send = Instant::now();
     let mut last_full_input_send = Instant::now();
     let mut awaiting_key = true;
@@ -539,11 +551,17 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     let mut present_us_total = 0u64;
     let mut cpu_before = process_cpu_us();
     let mut report = Instant::now();
-    let mut overlay: Option<(u16, u16, Vec<u8>)> = None;
-    // The hotkeys, on screen for the stream's first seconds (later, a mode
-    // change's notice for a moment).
+    let mut overlay: Option<crate::hyper_overlay::Panel> = None;
+    // The hotkeys, on screen for the first stream's first seconds (later, a
+    // mode change's notice for a moment).
     let mut hint_until = Instant::now() + HINT_FOR;
-    let mut hint = crate::hyper_overlay::render(&hint_lines(matches!(decoder, Decoder::Cpu(_))));
+    let mut hint = start_hint(matches!(decoder, Decoder::Cpu(_)), w);
+    // The panels the renderer copies over a one-pass picture (see
+    // `show_panel`): which one, and how far down, per slot (stats, hint).
+    let mut panels_set: [Option<(u64, u16)>; 2] = [None, None];
+    for slot in 0..panels_set.len() {
+        show_panel(renderer, &mut panels_set[slot], slot, None, true);
+    }
     // Office or game mode: told to the host now and every second after.
     let (mut office_sent, mut mode_sent) = (crate::window::office_mode(), Instant::now() - Duration::from_secs(2));
     // Overlays are drawn over the picture: one that changes is presented even
@@ -558,9 +576,18 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
     // swapchain has room (see `frame_ready`), replaced by a newer one
     // meanwhile.
     let mut pending: Option<(Picture, u64)> = None;
+    // The picture last presented, kept to draw again when an overlay comes
+    // or goes over a still screen (no keyframe asked of the host for it).
+    // Dropped before every decode, so it never holds a decoder's surface
+    // while the decoder works (a picture read in place holds one): with
+    // `pending` and the decode's own, no more than two at a time.
+    let mut on_screen: Option<(Picture, u64)> = None;
+    // Since when a clump of frames has been decoded a slice a pass (see
+    // DECODE_SLICE_US and CATCH_UP_SHOWN_AFTER).
+    let mut catching_up: Option<Instant> = None;
     // The last picture went straight to the screen (`present_nv12`), not
-    // through the framebuffer: an overlay drawn over the framebuffer now
-    // would show an older picture, so a fresh one is asked for.
+    // through the framebuffer: the framebuffer holds an older one (drawn
+    // again from `on_screen` before anything is put over it there).
     let mut framebuffer_stale = false;
     // Until the first picture: how long it's been (said on screen, not a
     // black window), and whether the wait was logged.
@@ -598,6 +625,9 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             // picture for a few seconds (closable meanwhile).
             if shared.takeover.load(Ordering::Relaxed) {
                 tracing::info!("the host took over; telling why, then leaving");
+                if framebuffer_stale {
+                    settle_framebuffer(renderer, pending.take().or_else(|| on_screen.take()), (w, h), &mut rgba);
+                }
                 if let Some((nw, nh, px)) = crate::hyper_overlay::render(&["The host took over this PC".to_string()]) {
                     renderer.update_rect(16, 16, nw, nh, &px);
                     let _ = renderer.present_frame();
@@ -607,7 +637,9 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                     if matches!(window.pump(), Frame::Quit) {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                    // (Woken by messages, not asleep: this thread answers the
+                    // keyboard hook for every key typed on this PC.)
+                    window.wait_for_work(50);
                 }
             }
             tracing::info!("host ended the Hyper stream");
@@ -619,6 +651,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         if size != (w, h) && size.0 > 0 && size.1 > 0 {
             tracing::info!(width = size.0, height = size.1, "host resolution changed");
             (w, h) = size;
+            on_screen = None;
             renderer.ensure_framebuffer(w, h)?;
             decoder = Decoder::new(renderer, w, h, codec)?;
             awaiting_key = true;
@@ -691,6 +724,23 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         if had_input {
             last_activity = Instant::now();
             fine_timer.get_or_insert_with(crate::net_tune::FineTimer::new);
+        }
+        // Input into the window (anything but its focus going): someone is at
+        // it, so it isn't buried under others, whatever the cover check saw
+        // up to half a second ago. The host hears so before the input: input
+        // from a client it holds for hidden wakes it as well, but it pauses
+        // again seconds later while the client goes on saying it's hidden.
+        if raw.iter().any(|r| !matches!(r, RawInput::FocusLost)) {
+            used_at = Some(Instant::now());
+            covered_since = None;
+            if paused && !window.output_hidden() {
+                shared.send(Kind::Control, &Control::Paused { paused: false }.to_bytes());
+                awaiting_key = true;
+                last_key_request = Instant::now() - Duration::from_secs(1);
+                (paused, pause_sent) = (false, Instant::now());
+                // (The holds come back in the re-arm further down.)
+                tracing::info!("input into the stream's window: visible again");
+            }
         }
         for r in raw {
             if matches!(r, RawInput::FocusLost) {
@@ -800,6 +850,10 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                 let on = renderer.device_context_clone().and_then(|(d, _)| rdp_gpu::gpu::device_adapter_luid(&d));
                 if on != rdp_gpu::gpu::chosen_adapter_luid() && renderer.rebuild()? {
                     tracing::info!(display_gpu = rdp_gpu::gpu::prefers_display_adapter(), "power source changed: decoding and presenting moved to the other GPU");
+                    // (The old GPU's picture can't be drawn on the new one,
+                    // and the new renderer holds no panels yet.)
+                    on_screen = None;
+                    panels_set = [None, None];
                     decoder = Decoder::new(renderer, w, h, codec)?;
                     awaiting_key = true;
                     can_repair = false;
@@ -826,6 +880,9 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             last_key_request = Instant::now() - Duration::from_secs(1);
         }
         let mut newest = None;
+        // A clump is decoded a slice at a time (see DECODE_SLICE_US): the
+        // time decoding in this pass, and whether frames are left for the next.
+        let (mut slice_us, mut more) = (0u64, false);
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 Event::Lost { first, last } => {
@@ -841,6 +898,8 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                     if awaiting_key && !f.keyframe && !(f.recovery && can_repair) {
                         continue;
                     }
+                    // (Not held across a decode: see `on_screen`.)
+                    on_screen = None;
                     let t_dec = Instant::now();
                     let result = decoder.decode(&f.data);
                     shared.frames.give(std::mem::take(&mut f.data));
@@ -895,8 +954,21 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                             }
                         }
                     }
+                    // A slice's worth decoded and more waiting: the rest of
+                    // this pass first (input out, the window's messages read
+                    // at the top of the next), which comes back without a wait.
+                    slice_us += dec_us;
+                    if slice_us >= DECODE_SLICE_US && shared.queued.load(Ordering::Relaxed) > 0 {
+                        more = true;
+                        break;
+                    }
                 }
             }
+        }
+        if !more {
+            catching_up = None;
+        } else if catching_up.is_none() {
+            catching_up = Some(Instant::now());
         }
         // (Slower while keyframes keep failing to decode: each costs the host
         // a bitrate spike.)
@@ -917,13 +989,17 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         // the next) but not drawn.
         // …or buried under other windows a while (`coverpause`: looked at
         // twice a second; uncovered, back at once).
+        // (Not while it has had input lately: a window someone types or
+        // clicks into is in view, however much of it the others hide.)
         if cover_checked.elapsed() >= COVER_CHECK_EVERY {
             cover_checked = Instant::now();
-            let now = crate::host_ab::ab("coverpause", true) && window.covered();
+            let used = used_at.is_some_and(|t| t.elapsed() < USED_FOR);
+            let now = !used && crate::host_ab::ab("coverpause", true) && window.covered();
             covered_since = if now { covered_since.or(Some(Instant::now())) } else { None };
         }
         let covered = covered_since.is_some_and(|t| t.elapsed() >= COVERED_FOR);
-        let minimized = window.output_hidden() || covered;
+        let hidden = window.output_hidden();
+        let minimized = hidden || covered;
         // On battery with nothing moving, the stream's holds go back: the PC
         // may sleep and boost may disengage. Input or a moving picture (any
         // activity) re-arms them, as does coming back from hidden. A dying
@@ -941,18 +1017,23 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             tracing::info!("stream holds re-armed");
         }
         if let Some(v) = shared.update_note.lock().unwrap().take() {
-            hint = crate::hyper_overlay::render(&[format!("rdpio {v} downloaded from the host: it installs when you close this window")]);
+            hint = crate::hyper_overlay::panel(&[format!("rdpio {v} downloaded from the host: it installs when you close this window")]);
             hint_until = Instant::now() + Duration::from_secs(6);
         }
         if let Some(text) = shared.notice.lock().unwrap().take() {
-            hint = crate::hyper_overlay::render(&[text]);
+            hint = crate::hyper_overlay::panel(&[text]);
             hint_until = Instant::now() + Duration::from_secs(10);
+        }
+        // Ctrl+Shift+M and Ctrl+Shift+K say on screen what they did.
+        if let Some(text) = crate::hotkeys::toggle_notice(crate::window::capture_mode(), crate::window::system_keys_to_host(), true) {
+            hint = crate::hyper_overlay::panel(&[text.to_string()]);
+            hint_until = Instant::now() + Duration::from_secs(2);
         }
         let office = crate::window::office_mode();
         if office != office_sent || mode_sent.elapsed() > Duration::from_secs(1) {
             if office != office_sent {
                 tracing::info!(office, "stream mode (Ctrl+Shift+O)");
-                hint = crate::hyper_overlay::render(&[if office {
+                hint = crate::hyper_overlay::panel(&[if office {
                     "Office mode: crisp text, 60 fps".to_string()
                 } else {
                     "Game mode: lowest latency".to_string()
@@ -976,7 +1057,9 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                 // and the PC may sleep, this thread is ordinary, the timer
                 // coarse.
                 (wifi, boost, awake, fine_timer) = (None, None, None, None);
-                tracing::info!("stream hidden: paused, Wi-Fi and power settings handed back");
+                // (Why: minimized, another desktop, the screen off or locked
+                // is `hidden`; buried under other windows is `covered`.)
+                tracing::info!(hidden, covered, "stream hidden: paused, Wi-Fi and power settings handed back");
             }
             (paused, pause_sent) = (minimized, Instant::now());
         }
@@ -1003,7 +1086,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         // so on screen, and in the log once.
         if !ever_shown && !minimized && started.elapsed() > Duration::from_secs(3) && Instant::now() >= hint_until {
             let secs = started.elapsed().as_secs();
-            hint = crate::hyper_overlay::render(&[
+            hint = crate::hyper_overlay::panel(&[
                 format!("Signed in to the host - waiting for its picture ({secs} s)..."),
                 "The rdpio window's Activity page shows what's happening.   Ctrl+Shift+Q quits".to_string(),
             ]);
@@ -1018,12 +1101,22 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         if stats_on != stats_were_on || hint_on != hint_was_on {
             overlay_dirty = true;
             if (stats_were_on && !stats_on) || (hint_was_on && !hint_on) {
-                // The next picture paints over it; without one soon (a still
-                // screen), a fresh one is asked for.
+                // The picture on screen is drawn again without it; without
+                // one (none kept, or none yet) and no new one soon, a fresh
+                // one is asked for.
                 repaint_due = Some(Instant::now() + Duration::from_millis(150));
             }
         }
         (stats_were_on, hint_was_on) = (stats_on, hint_on);
+        // The panels over the picture, stats first, the hint below them; one
+        // that changed (new numbers, another notice) is drawn even on a still
+        // screen.
+        let stats_panel = overlay.as_ref().filter(|_| stats_on);
+        let hint_panel = hint.as_ref().filter(|_| hint_on);
+        let hint_y = stats_panel.map_or(16u16, |p| 16u16.saturating_add(p.h).saturating_add(8));
+        if [stats_panel.map(|p| (p.id, 16u16)), hint_panel.map(|p| (p.id, hint_y))] != panels_set {
+            overlay_dirty = true;
+        }
         if minimized {
             repaint_due = None; // (restoring asks for a keyframe anyway)
         } else if repaint_due.is_some_and(|t| Instant::now() >= t) {
@@ -1035,20 +1128,38 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         }
         if minimized {
             pending = None;
+            on_screen = None;
         }
         // Presented when the screen can take it now; never waited for here
         // (that held up decoding and input a refresh or two per frame where
         // Windows composes the window). Else kept, and the wait below wakes
         // for it.
-        let ready = (pending.is_some() || overlay_dirty) && !minimized && renderer.frame_ready();
-        let picture = if ready { pending.take() } else { None };
-        // One pass where it can: a GPU picture shown 1:1 with no overlay goes
-        // straight into the backbuffer.
+        // (In the first moments of catching up on a clump, kept too: a
+        // picture from inside it would take the screen's next refresh from
+        // the newest, which is right behind it.)
+        let mid_clump = more && catching_up.is_some_and(|t| t.elapsed() < CATCH_UP_SHOWN_AFTER);
+        let ready = (pending.is_some() || overlay_dirty) && !minimized && !mid_clump && renderer.frame_ready();
+        // A new picture; else (only an overlay changed) the one on screen again.
+        let (picture, fresh) = match (ready, pending.take()) {
+            (false, kept) => {
+                pending = kept;
+                (None, false)
+            }
+            (true, Some(p)) => (Some(p), true),
+            (true, None) => (on_screen.take(), false),
+        };
+        if ready {
+            show_panel(renderer, &mut panels_set[0], 0, stats_panel.map(|p| (p, 16)), false);
+            show_panel(renderer, &mut panels_set[1], 1, hint_panel.map(|p| (p, hint_y)), false);
+        }
+        // One pass where it can: a GPU picture shown 1:1 goes straight into
+        // the backbuffer, the panels copied over it there.
         let direct = match &picture {
-            Some((Picture::Gpu(t), _)) if ready && !stats_on && !hint_on => {
+            Some((Picture::Gpu(t), _)) => {
                 let t_present = Instant::now();
                 let done = renderer.present_nv12(&t.texture, t.slice, (w, h))?;
-                if done {
+                // (Per picture shown: a redraw under a changed panel isn't one.)
+                if done && fresh {
                     present_us_total += t_present.elapsed().as_micros() as u64;
                 }
                 done
@@ -1056,26 +1167,35 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             _ => false,
         };
         if direct {
-            let capture_us = picture.map_or(0, |(_, c)| c);
             framebuffer_stale = true;
             repaint_due = None;
             overlay_dirty = false;
-            shown += 1;
-            let offset = shared.clock.lock().unwrap().offset_us;
-            let host_now = now_us() as i64 + offset;
-            lat_ms.push((host_now - capture_us as i64) as f64 / 1000.0);
+            if let Some((_, capture_us)) = picture.as_ref().filter(|_| fresh) {
+                shown += 1;
+                let offset = shared.clock.lock().unwrap().offset_us;
+                let host_now = now_us() as i64 + offset;
+                lat_ms.push((host_now - *capture_us as i64) as f64 / 1000.0);
+            }
+            on_screen = picture;
         } else if ready {
             if picture.is_some() {
                 framebuffer_stale = false;
             } else if std::mem::take(&mut framebuffer_stale) {
-                // (An overlay over an older picture: a fresh one follows.)
+                // (An overlay over an older picture, none kept to draw again:
+                // a fresh one follows.)
                 shared.send(Kind::Control, &Control::KeyframeRequest.to_bytes());
             }
-            let captured = picture.and_then(|(p, capture_us)| {
+            let mut captured = None;
+            if let Some((p, capture_us)) = picture {
                 let in_place = matches!(&p, Picture::Gpu(t) if t.held.is_some());
-                let painted = paint(renderer, p, (w, h), &mut rgba);
-                if !painted && in_place && IN_PLACE_FAILED.load(Ordering::Relaxed) {
+                let painted = paint(renderer, &p, (w, h), &mut rgba);
+                if painted {
+                    repaint_due = None;
+                    captured = fresh.then_some(capture_us);
+                    on_screen = Some((p, capture_us));
+                } else if in_place && IN_PLACE_FAILED.load(Ordering::Relaxed) {
                     // A decoder that copies, and a fresh picture for it.
+                    drop(p);
                     match Decoder::new(renderer, w, h, codec) {
                         Ok(d) => decoder = d,
                         Err(e) => tracing::warn!(error = %e, "no new decoder"),
@@ -1084,25 +1204,15 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                     can_repair = false;
                     shared.ltr_decoded.store(u32::MAX, Ordering::Relaxed);
                     last_key_request = Instant::now() - Duration::from_secs(1);
-                } else if !painted && !std::mem::replace(&mut paint_failed_logged, true) {
+                } else if !std::mem::replace(&mut paint_failed_logged, true) {
                     tracing::warn!(width = w, height = h, "a decoded picture couldn't be drawn (said once)");
                 }
-                painted.then_some(capture_us)
-            });
-            if captured.is_some() {
-                repaint_due = None;
             }
-            let mut y = 16u16;
-            if stats_on {
-                if let Some((ow, oh, px)) = &overlay {
-                    renderer.update_rect(16, y, *ow, *oh, px);
-                    y = y.saturating_add(*oh + 8);
-                }
+            if let Some(p) = stats_panel {
+                renderer.update_rect(16, 16, p.w, p.h, &p.px);
             }
-            if hint_on {
-                if let Some((hw, hh, px)) = &hint {
-                    renderer.update_rect(16, y, *hw, *hh, px);
-                }
+            if let Some(p) = hint_panel {
+                renderer.update_rect(16, hint_y, p.w, p.h, &p.px);
             }
             let t_present = Instant::now();
             renderer.present_frame()?;
@@ -1163,7 +1273,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             };
             if let Some(d) = AutoScale::step(&sample, office) {
                 let mode = if office { "Office" } else { "Game" };
-                hint = crate::hyper_overlay::render(&[if d.scale < d.from {
+                hint = crate::hyper_overlay::panel(&[if d.scale < d.from {
                     format!("Slow connection: {mode} mode at {}% (Auto resolution)", d.scale)
                 } else {
                     format!("The connection keeps up: {mode} mode at {}% (Auto resolution)", d.scale)
@@ -1190,7 +1300,7 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
                     Decoder::Gpu(_) => "GPU",
                     Decoder::Cpu(_) => "CPU",
                 };
-                overlay = crate::hyper_overlay::render(&[
+                overlay = crate::hyper_overlay::panel(&[
                     format!(
                         "Hyper {w}x{h} {} ({decode_kind} decode, {} mode)",
                         codec.name().to_uppercase(),
@@ -1216,8 +1326,11 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         // only bounds time-based work: input resends, keyframe requests, an
         // overlay's end, the once-a-second report. Hidden or still, that's
         // a few wakes a second, not twenty.
-        let timeout = if input.unsent().is_some() {
-            // (Motion merged for the next millisecond.)
+        let unsent = input.unsent();
+        let timeout = if unsent == Some(true) {
+            // (Motion merged until it may go: see `motion_every`.)
+            (motion_every.saturating_sub(last_input_send.elapsed()).as_micros().div_ceil(1000) as u32).max(1)
+        } else if unsent.is_some() {
             1
         } else if input.has_pending() {
             5
@@ -1228,14 +1341,28 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
         } else {
             250
         };
-        if pending.is_some() {
-            if window.wait_for_work_or(timeout, renderer.frame_ready_handle()) {
-                renderer.note_frame_ready();
-            }
+        // (No wait while more of a clump is to be decoded: the wake-up that
+        // announced it is spent, so one here could sleep on frames in hand.)
+        if more {
+            continue;
+        }
+        // Only motion waiting: more of it (a message per mouse report, up to
+        // 8000 a second) doesn't wake this thread before it may go; the pump
+        // then reads it all and it goes merged, as it would have anyway.
+        let also = if pending.is_some() { renderer.frame_ready_handle() } else { None };
+        let frame_slot = if unsent == Some(true) {
+            window.wait_for_work_but_motion(timeout, also)
         } else {
-            window.wait_for_work(timeout);
+            window.wait_for_work_or(timeout, also)
+        };
+        if frame_slot {
+            renderer.note_frame_ready();
         }
     };
+    // Lost: the caller says so over the framebuffer while it reconnects.
+    if matches!(ended, Ended::Lost) && framebuffer_stale {
+        settle_framebuffer(renderer, pending.take().or_else(|| on_screen.take()), (w, h), &mut rgba);
+    }
     Ok(ended)
     };
     let result = play();
@@ -1249,9 +1376,12 @@ pub fn run(window: &Window, renderer: &mut Renderer, link: Link) -> Result<Ended
             std::process::exit(0);
         });
     }
-    // (Back in an RDP session, the window has no video layer, and the
-    // command line's upscaler: not the scaled stream's FSR.)
+    // (Back in an RDP session, the window has no video layer, no panels, and
+    // the command line's upscaler: not the scaled stream's FSR.)
     renderer.set_video_layer(false);
+    for slot in 0..panels_set.len() {
+        show_panel(renderer, &mut panels_set[slot], slot, None, true);
+    }
     let base = upscale_for(100, true);
     if let Some((mode, sharpen)) = base.filter(|_| base != upscale_set) {
         renderer.set_upscaler(mode);
@@ -1284,6 +1414,19 @@ static IN_PLACE_FAILED: AtomicBool = AtomicBool::new(false);
 /// laptop's CPU from its deeper sleep on a still screen).
 const FINE_TIMER_IDLE: Duration = Duration::from_secs(2);
 
+/// A clump of frames (off a stalled Wi-Fi or a relay) is decoded this long at
+/// a stretch, in microseconds of decoding; then the loop goes round — input
+/// goes out, the window's messages are read — and comes back for the rest
+/// without a wait. Decoding all of it first held input back for the whole
+/// clump: 60 frames at 1.5 ms on an integrated GPU, 90 ms.
+const DECODE_SLICE_US: u64 = 4_000;
+
+/// Catching up on a clump for this long, the pictures inside it are shown as
+/// the screen takes them (it moves, rather than stand until the last one).
+/// Not sooner: a short clump's newest picture would wait a refresh behind
+/// one shown from inside it.
+const CATCH_UP_SHOWN_AFTER: Duration = Duration::from_millis(30);
+
 /// Battery eco (office mode on battery, see [`eco_mode`]) caps the stream at
 /// this frame rate — 30 made scrolling jitter.
 const ECO_MAX_FPS: u32 = 60;
@@ -1306,6 +1449,11 @@ const MOVING_FPS: f64 = 15.0;
 /// `Window::covered`): an alt-tab glance away and back doesn't pause it.
 const COVERED_FOR: Duration = Duration::from_secs(2);
 const COVER_CHECK_EVERY: Duration = Duration::from_millis(500);
+
+/// Input into the stream's window keeps it from counting as covered for this
+/// long: the host, which wakes a hidden client's stream on input for 5 s,
+/// would otherwise be told "hidden" again and pause it once more.
+const USED_FOR: Duration = Duration::from_secs(5);
 
 /// No video this long: the receive loop wakes less often and the feedback
 /// thins out (nothing to report on a still screen).
@@ -1473,20 +1621,24 @@ fn upscale_for(scale: u32, office: bool) -> Option<(rdp_gpu::Upscaler, f32)> {
 /// How long the hotkeys stay on screen when a stream starts.
 const HINT_FOR: Duration = Duration::from_secs(8);
 
-/// The hotkeys, as shown when a stream starts.
-fn hint_lines(cpu_decode: bool) -> Vec<String> {
-    let mut lines = vec![
-        "Ctrl+Shift+Q   quit".to_string(),
-        "Ctrl+Shift+M   lock the mouse in (games)".to_string(),
-        "Ctrl+Shift+S   stats".to_string(),
-        "Ctrl+Shift+O   office mode (crisp text) / game".to_string(),
-        "Ctrl+Shift+K   Alt+Tab, Win: host / this PC".to_string(),
-        "Ctrl+Shift+F   fullscreen / window".to_string(),
-    ];
+/// The panel shown when a stream of `width` pixels across starts: the
+/// hotkeys for the process's first Hyper stream (not again after a
+/// reconnect), and a missing GPU decoder every time. `None`: nothing to say.
+fn start_hint(cpu_decode: bool, width: u32) -> Option<crate::hyper_overlay::Panel> {
+    // (Panels are drawn in the picture's pixels: sized for this one.)
+    crate::hyper_overlay::set_picture_width(width);
+    let mut lines = if crate::hotkeys::first_time(true) {
+        crate::hotkeys::hint_lines(true, crate::window::embedded())
+    } else {
+        Vec::new()
+    };
     if cpu_decode {
         lines.push("No GPU video decoder: is the GPU driver installed?".to_string());
     }
-    lines
+    if lines.is_empty() {
+        return None;
+    }
+    crate::hyper_overlay::panel(&lines)
 }
 
 /// Put a decoded picture into the framebuffer: colour-converted on the GPU
@@ -1494,8 +1646,9 @@ fn hint_lines(cpu_decode: bool) -> Vec<String> {
 /// GPU driver) has no video processor, and a picture the GPU path declines
 /// must never just be dropped — that was a black screen. `rgba`: the CPU
 /// conversion's buffer, kept between frames. Whether the picture got there.
-fn paint(renderer: &mut Renderer, picture: Picture, (w, h): (u32, u32), rgba: &mut Vec<u8>) -> bool {
-    let (nv12, fw, fh) = match picture {
+fn paint(renderer: &mut Renderer, picture: &Picture, (w, h): (u32, u32), rgba: &mut Vec<u8>) -> bool {
+    let read_back;
+    let (nv12, fw, fh): (&[u8], u32, u32) = match picture {
         Picture::Gpu(tex) => {
             if renderer.blit_texture_slice(0, 0, w, h, &tex.texture, tex.slice, &[]) {
                 return true;
@@ -1509,13 +1662,16 @@ fn paint(renderer: &mut Renderer, picture: Picture, (w, h): (u32, u32), rgba: &m
                 return false;
             }
             match renderer.read_nv12(&tex.texture, w, h) {
-                Some(nv12) => (nv12, w, h),
+                Some(nv12) => {
+                    read_back = nv12;
+                    (read_back.as_slice(), w, h)
+                }
                 None => return false,
             }
         }
-        Picture::Cpu(f) => (f.nv12, f.width, f.height),
+        Picture::Cpu(f) => (f.nv12.as_slice(), f.width, f.height),
     };
-    if fw <= w && fh <= h && renderer.blit_nv12(0, 0, fw, fh, &nv12, &[]) {
+    if fw <= w && fh <= h && renderer.blit_nv12(0, 0, fw, fh, nv12, &[]) {
         return true;
     }
     // (Tightly packed NV12: `fw` is the row pitch; anything past the frame is
@@ -1527,6 +1683,34 @@ fn paint(renderer: &mut Renderer, picture: Picture, (w, h): (u32, u32), rgba: &m
         renderer.update_rect(0, 0, cw as u16, ch as u16, rgba);
     }
     ok
+}
+
+/// The stream is leaving with a notice to put over its picture (the host
+/// took over, the link is lost), and the last pictures went straight to the
+/// screen: the newest one (`picture`) goes into the framebuffer first, so
+/// the notice sits on what was on screen, not on a picture from long before.
+/// Nothing is presented here.
+fn settle_framebuffer(renderer: &mut Renderer, picture: Option<(Picture, u64)>, size: (u32, u32), rgba: &mut Vec<u8>) {
+    if let Some((p, _)) = picture {
+        if !paint(renderer, &p, size, rgba) {
+            tracing::debug!("the last picture couldn't be put under the notice");
+        }
+    }
+}
+
+/// Panel `slot` on the renderer, over the pictures it presents in one pass:
+/// `want` is the panel and how far down it sits, `None` none. Uploaded only
+/// when that differs from what `set` says the renderer has (`force`: in any
+/// case). Direct3D 11 only; the framebuffer path draws panels itself.
+fn show_panel(renderer: &mut Renderer, set: &mut Option<(u64, u16)>, slot: usize, want: Option<(&crate::hyper_overlay::Panel, u16)>, force: bool) {
+    let key = want.map(|(p, y)| (p.id, y));
+    if key == *set && !force {
+        return;
+    }
+    *set = key;
+    if let Renderer::D3D11(r) = renderer {
+        r.set_overlay(slot, want.map(|(p, y)| (16, y, p.w, p.h, p.px.as_slice())));
+    }
 }
 
 /// This process's CPU time so far (kernel + user, µs, all threads).
@@ -1584,10 +1768,17 @@ fn receive_loop(
     // host hears how it's going every 50 ms then, every 100 when it's calm.
     let mut last_trouble = Instant::now();
     let mut camera: Option<crate::hyper_camera::CameraSender> = None;
-    // In office mode, a millisecond's nap after a batch: a frame's datagrams
-    // then come several to a call instead of a wake-up each (through a VPN
-    // they trickle in one by one; on the tablet: the receive thread's CPU
-    // 11% of a core -> 4%), for up to a millisecond on a frame.
+    // In office mode, a millisecond's nap once the socket is read empty: a
+    // frame's datagrams then come several to a call instead of a wake-up each
+    // (through a VPN they trickle in one by one; on the tablet: the receive
+    // thread's CPU 11% of a core -> 4%), for up to a millisecond on a frame.
+    // Only once it's empty: a nap after every call held a burst (a page of
+    // new text, a keyframe) to a call every millisecond or two, some
+    // 5 Mbit/s on any link — the rest waited in the socket's buffer, which
+    // the host read as a queue on the network and cut its bitrate for. And
+    // only while this process holds the 1 ms timer (see FineTimer; it goes on
+    // a still screen): without it, where Windows has no high-resolution
+    // sleep, a nap lasts up to a 15.6 ms tick.
     // (RDPIO_NO_RX_NAP=1: no nap.)
     let nap = std::env::var_os("RDPIO_NO_RX_NAP").is_none();
     // Never while a copy streams in: a nap after each batch of one or two
@@ -1602,14 +1793,18 @@ fn receive_loop(
         // (Not through a probe train: the nap would be timed as the link —
         // 1-2 ms on a few KB read a 300 Mbit/s Wi-Fi link as 1-6.)
         let streaming_in = !nap_bulk && bulk_at.elapsed() < Duration::from_millis(250);
-        if got && nap && !streaming_in && crate::window::office_mode() && !reassembler.train_open() {
+        // (The socket is asked last: a system call, only when a nap is due.)
+        let resting = got && nap && !streaming_in && crate::window::office_mode() && !reassembler.train_open();
+        if resting && crate::net_tune::fine_timer_held() && !receiver.pending(&socket) {
             std::thread::sleep(Duration::from_millis(1));
         }
         let datagrams = receiver.recv(&socket);
         got = datagrams.as_ref().is_ok_and(|d| d.len() > 0);
         for d in datagrams.into_iter().flatten() {
             let n = d.len();
-            if let Ok((kind, body)) = recv.open(d) {
+            // (Opened where it lies in the receive buffer: no copy, no
+            // allocation a packet.)
+            if let Ok((kind, body)) = recv.open_in_place(d) {
                 last_rx = Instant::now();
                 // Started once video comes (a pong or a cursor shape can come
                 // while the host still sets its display up).
@@ -1869,6 +2064,8 @@ fn receive_loop(
                 window_us: last_feedback.elapsed().as_micros() as u32,
                 ltr_frame: Some(shared.ltr_decoded.load(Ordering::Relaxed)).filter(|&v| v != u32::MAX),
                 link_kbps: s.link_kbps,
+                // (Which keyframe has landed, exactly: an older host ignores it.)
+                resolved_frame: reassembler.resolved_through(),
             };
             shared.send(Kind::Control, &Control::Feedback(fb).to_bytes());
             (delay_min, delay_sum, delay_n) = (i64::MAX, 0, 0);
@@ -1991,6 +2188,27 @@ fn window_refresh_hz(window: &Window) -> u32 {
     local_refresh_hz()
 }
 
+/// The refresh rate of the screen that holds `pt` (desktop coordinates), or
+/// of the primary screen if no screen does.
+fn refresh_hz_at(pt: (i32, i32)) -> u32 {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFOEXW, MONITOR_DEFAULTTOPRIMARY};
+    unsafe {
+        let monitor = MonitorFromPoint(windows::Win32::Foundation::POINT { x: pt.0, y: pt.1 }, MONITOR_DEFAULTTOPRIMARY);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool() {
+            return refresh_hz_of(windows::core::PCWSTR(info.szDevice.as_ptr()));
+        }
+    }
+    local_refresh_hz()
+}
+
+/// The middle of a monitor rectangle (right and bottom exclusive): a point
+/// that is on that monitor and no other.
+fn centre_of(r: &rdp_pdu::gcc::VirtualScreenRect) -> (i32, i32) {
+    (r.left + (r.right - r.left) / 2, r.top + (r.bottom - r.top) / 2)
+}
+
 /// The current refresh rate of display `device` (null: the primary).
 fn refresh_hz_of(device: windows::core::PCWSTR) -> u32 {
     use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
@@ -2010,6 +2228,118 @@ fn password_cache_path(host: &str) -> Option<std::path::PathBuf> {
     Some(dir.join(format!("{safe}.bin")))
 }
 
+/// What this PC's video decoders were found to take, saved from one run to
+/// the next (beside the saved passwords): the first line says which GPU,
+/// driver and rdpio build it was probed with, the second whether the GPU
+/// decodes any of the codecs, the third the codecs, best first.
+fn decoder_cache_path() -> Option<std::path::PathBuf> {
+    let local = std::env::var("LOCALAPPDATA").ok()?;
+    Some(std::path::PathBuf::from(local).join("rdpio").join("hyper").join("decoders.txt"))
+}
+
+/// The key [`decoder_cache_path`]'s answer is kept under: the GPU it was
+/// probed on and this build. `None`: not kept (software rendering).
+fn decoder_cache_key() -> Option<String> {
+    Some(format!("{} rdpio {}", rdp_gpu::hyper::decoder_probe_key()?, crate::updater::build()))
+}
+
+/// The saved answer, when it was found under `key`.
+fn read_decoder_cache(key: &str) -> Option<(Vec<String>, bool)> {
+    parse_decoder_cache(&std::fs::read_to_string(decoder_cache_path()?).ok()?, key)
+}
+
+/// A saved answer's text, checked: its key is `key`, and every codec in it
+/// is one this build knows (any doubt: none, and the caller probes).
+fn parse_decoder_cache(text: &str, key: &str) -> Option<(Vec<String>, bool)> {
+    let mut lines = text.lines();
+    if lines.next()? != key {
+        return None;
+    }
+    let gpu = match lines.next()? {
+        "gpu" => true,
+        "cpu" => false,
+        _ => return None,
+    };
+    let codecs: Vec<String> = lines.next()?.split(',').map(String::from).collect();
+    if codecs.iter().any(|c| rdp_gpu::h264::Codec::from_name(c).is_none()) {
+        return None;
+    }
+    Some((codecs, gpu))
+}
+
+fn decoder_cache_text(key: &str, codecs: &[String], gpu: bool) -> String {
+    format!("{key}\n{}\n{}\n", if gpu { "gpu" } else { "cpu" }, codecs.join(","))
+}
+
+/// Save what was probed (whole or not at all: written aside, then moved in).
+fn write_decoder_cache(key: &str, codecs: &[String], gpu: bool) {
+    let Some(path) = decoder_cache_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let aside = path.with_extension("tmp");
+    if std::fs::write(&aside, decoder_cache_text(key, codecs, gpu)).is_err() || std::fs::rename(&aside, &path).is_err() {
+        let _ = std::fs::remove_file(&aside);
+    }
+}
+
+/// Probe afresh at the next start: the saved answer proved wrong (a decoder
+/// it promised couldn't be made) or the GPU may have changed.
+fn forget_decoder_cache() {
+    if let Some(p) = decoder_cache_path() {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Probe the decoders now: the codecs to offer, best first, and whether the
+/// GPU decodes any of them.
+fn probe_decoders(forced: Option<rdp_gpu::h264::Codec>) -> (Vec<String>, bool) {
+    let codecs = rdp_gpu::hyper::client_codecs(forced);
+    let gpu = codecs.iter().any(|c| rdp_gpu::h264::Codec::from_name(c).is_some_and(rdp_gpu::hyper::gpu_can_decode));
+    (codecs, gpu)
+}
+
+/// [`probe_decoders`], from the last run's probe where that was made on this
+/// GPU, with this driver, by this build: probing makes a device and a decoder
+/// per codec, some 0.4 s before the sign-in could go. The third value says
+/// it came from there; then [`refresh_decoder_cache`] should run once the
+/// sign-in is out. A forced codec isn't probed, nor saved.
+fn client_codecs_cached(forced: Option<rdp_gpu::h264::Codec>) -> (Vec<String>, bool, bool) {
+    if forced.is_some() {
+        let (codecs, gpu) = probe_decoders(forced);
+        return (codecs, gpu, false);
+    }
+    let key = decoder_cache_key();
+    if let Some((codecs, gpu)) = key.as_deref().and_then(read_decoder_cache) {
+        tracing::info!(?codecs, gpu, "video decoders as probed last time on this GPU");
+        return (codecs, gpu, true);
+    }
+    let (codecs, gpu) = probe_decoders(None);
+    if let Some(key) = key {
+        write_decoder_cache(&key, &codecs, gpu);
+    }
+    (codecs, gpu, false)
+}
+
+/// Probe the decoders again on a thread of its own and save the answer if it
+/// changed, so a saved answer is never more than one start out of date (an
+/// HEVC extension removed, say). For after the sign-in, while the host sets
+/// up; once a process.
+fn refresh_decoder_cache(was: Vec<String>, was_gpu: bool) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("decoder-probe".into()).spawn(move || {
+        let Some(key) = decoder_cache_key() else { return };
+        let (codecs, gpu) = probe_decoders(None);
+        if (&codecs, gpu) != (&was, was_gpu) {
+            tracing::info!(?codecs, gpu, was = ?was, "video decoders changed since the last probe; saved for next time");
+        }
+        write_decoder_cache(&key, &codecs, gpu);
+    });
+}
+
 /// `host`'s local addresses as its latest offer gave them (beside the saved
 /// password: a line of "addr/prefix" each).
 fn lan_path(host: &str) -> Option<std::path::PathBuf> {
@@ -2018,7 +2348,9 @@ fn lan_path(host: &str) -> Option<std::path::PathBuf> {
 
 /// Sign in directly on the host's local network when this PC is on it (it
 /// skips the VPN's own per-packet work: see `rdp_hyper::lan`), else at `addr`.
-fn connect_via(host: &str, addr: SocketAddr, password: &str, want: rdp_hyper::auth::Want) -> Result<Link, String> {
+/// `secret` is the password's key ([`rdp_hyper::auth::password_secret`]),
+/// derived once by the caller: it takes a CPU's tens of milliseconds.
+fn connect_via(host: &str, addr: SocketAddr, secret: &[u8; 32], want: rdp_hyper::auth::Want) -> Result<Link, String> {
     let remembered: Vec<String> = lan_path(host).and_then(|p| std::fs::read_to_string(p).ok()).map_or_else(Vec::new, |t| t.lines().map(String::from).collect());
     let mine: Vec<(std::net::Ipv4Addr, u8)> =
         crate::launcher::host::addresses().into_iter().filter_map(|a| Some((a.ip.parse().ok()?, a.prefix))).collect();
@@ -2033,8 +2365,10 @@ fn connect_via(host: &str, addr: SocketAddr, password: &str, want: rdp_hyper::au
         }
     };
     if std::env::var_os("RDPIO_NO_LAN_PATH").is_none() {
-        if let Some(direct) = rdp_hyper::lan::direct(&remembered, &mine, addr) {
-            match connect_direct(direct, password, want.clone()) {
+        // (Raced against the address given: a network that only looks like
+        // the host's costs about twice that path's round trip, not 400 ms.)
+        if let Some(direct) = rdp_hyper::lan::direct_or(&remembered, &mine, addr) {
+            match connect_with_secret(direct, secret, want.clone()) {
                 Ok(link) => {
                     tracing::info!(%direct, via = %addr, "Hyper: signed in over the local network, not through the VPN");
                     remember(&link);
@@ -2044,18 +2378,19 @@ fn connect_via(host: &str, addr: SocketAddr, password: &str, want: rdp_hyper::au
             }
         }
     }
-    let link = connect_direct(addr, password, want)?;
+    let link = connect_with_secret(addr, secret, want)?;
     remember(&link);
     Ok(link)
 }
 
-/// This PC's primary screen's display scale, in percent (0 if unknown).
-fn primary_scale_percent() -> u32 {
+/// The display scale of the screen that holds `pt` (desktop coordinates; the
+/// primary screen if none does), in percent (0 if unknown).
+fn scale_percent_at(pt: (i32, i32)) -> u32 {
     use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     let (mut x, mut y) = (0u32, 0u32);
     unsafe {
-        let m = MonitorFromPoint(Default::default(), MONITOR_DEFAULTTOPRIMARY);
+        let m = MonitorFromPoint(windows::Win32::Foundation::POINT { x: pt.0, y: pt.1 }, MONITOR_DEFAULTTOPRIMARY);
         if GetDpiForMonitor(m, MDT_EFFECTIVE_DPI, &mut x, &mut y).is_err() || x == 0 {
             return 0;
         }
@@ -2063,16 +2398,43 @@ fn primary_scale_percent() -> u32 {
     (x * 100 + 48) / 96
 }
 
-/// Whether this PC remembers a Hyper password for `host` (from a direct
-/// sign-in that worked).
-pub fn has_saved_password(host: &str) -> bool {
-    password_cache_path(host).is_some_and(|p| p.exists())
+/// Whether a password that signed in is kept for `host`'s next run (see
+/// [`set_remember_password`]).
+static REMEMBER_PASSWORD: AtomicBool = AtomicBool::new(true);
+
+/// Off for a session the launcher started: the launcher keeps the passwords
+/// it hands over itself (in `launcher.json`, when the user asked it to), so
+/// this run neither reads, writes nor deletes the per-host file. On (the
+/// default) for the command line, which remembers per host.
+pub fn set_remember_password(on: bool) {
+    REMEMBER_PASSWORD.store(on, Ordering::Relaxed);
+}
+
+/// The Hyper password this PC keeps for `host` (from a command-line sign-in
+/// that worked, or from an older rdpio, which kept them for the launcher too).
+pub fn saved_password(host: &str) -> Option<String> {
+    let blob = std::fs::read(password_cache_path(host)?).ok()?;
+    String::from_utf8(crate::token_cache::dpapi_unprotect(&blob).ok()?).ok()
+}
+
+/// Forget the Hyper password kept for `host`, if any.
+pub fn forget_saved_password(host: &str) {
+    if let Some(p) = password_cache_path(host) {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// Sign in to the host's Hyper agent with the Hyper password (SPAKE2).
+/// (The client derives the password's key once and signs in through
+/// [`connect_with_secret`]; this is for the tests.)
+#[cfg(test)]
 pub fn connect_direct(host: SocketAddr, password: &str, want: rdp_hyper::auth::Want) -> Result<Link, String> {
-    use rdp_hyper::auth::{password_secret, AuthMsg, ClientAuth};
-    let secret = password_secret(password);
+    connect_with_secret(host, &rdp_hyper::auth::password_secret(password), want)
+}
+
+/// [`connect_direct`] with the password's key already derived.
+fn connect_with_secret(host: SocketAddr, secret: &[u8; 32], want: rdp_hyper::auth::Want) -> Result<Link, String> {
+    use rdp_hyper::auth::{AuthMsg, ClientAuth};
     let socket = connect_socket(host).map_err(|e| e.to_string())?;
     let mut want = want;
     let mut attempts = 0;
@@ -2084,7 +2446,7 @@ pub fn connect_direct(host: SocketAddr, password: &str, want: rdp_hyper::auth::W
     // +2.3 dB luma at 6-25 Mbps), so it's first everywhere.)
     'attempt: while attempts < 3 {
         attempts += 1;
-        let (auth, hello) = ClientAuth::start(&secret, want.clone());
+        let (auth, hello) = ClientAuth::start(secret, want.clone());
         socket.send(&hello).map_err(|e| e.to_string())?;
         let deadline = Instant::now() + Duration::from_millis(1500);
         let mut buf = [0u8; 2048];
@@ -2199,22 +2561,30 @@ pub fn run_direct(
     }
     let backend = rdp_gpu::Backend::D3D11;
     let addr = resolve(host, port)?;
-    let cache = password_cache_path(host);
-    let cached = cache.as_ref().and_then(|p| std::fs::read(p).ok()).and_then(|b| crate::token_cache::dpapi_unprotect(&b).ok()).and_then(|b| String::from_utf8(b).ok());
-    let from_cache = password.is_none() && cached.is_some();
+    // (A password the launcher handed over is the launcher's to keep: the
+    // per-host file is only for passwords given or typed here.)
+    let remember = REMEMBER_PASSWORD.load(Ordering::Relaxed);
+    let cached = if password.is_none() { saved_password(host) } else { None };
+    let from_cache = cached.is_some();
     let password = match password.or(cached) {
         Some(p) => p,
         None => crate::prompt::read_password(&format!("Hyper password for {host}: "))?,
     };
-    let monitor = crate::window::enumerate_monitors().primary_rect();
+    // The screen the user started from (the pointer's): full screen opens
+    // there, and its size, scale and refresh rate are what the host is asked
+    // for. The point is taken once, so a pointer that moves on during the
+    // sign-in doesn't mix two screens.
+    let monitor = crate::window::enumerate_monitors().launch_rect();
     let (mw, mh) = monitor.map_or((1920, 1080), |p| ((p.right - p.left) as u32, (p.bottom - p.top) as u32));
+    let screen_pt = monitor.as_ref().map_or((0, 0), centre_of);
     // On battery, the GPU the display is on (before asking what it decodes).
     GPU_FOLLOWS_POWER.store(true, Ordering::Relaxed);
     rdp_gpu::gpu::prefer_display_adapter(wants_display_gpu());
-    let codecs = rdp_gpu::hyper::client_codecs(codec);
-    if !codecs.iter().any(|c| rdp_gpu::h264::Codec::from_name(c).is_some_and(rdp_gpu::hyper::gpu_can_decode)) {
+    let (codecs, gpu_decodes, from_last_run) = client_codecs_cached(codec);
+    if !gpu_decodes {
         tracing::warn!(?codecs, "no GPU video decoder (is the GPU driver installed?): decoding on the CPU");
     }
+    let probed = from_last_run.then(|| (codecs.clone(), gpu_decodes));
     // A pinned smaller stream (`--hyper-scale 50`) from the first frame, not
     // after a full-size keyframe and an encoder re-init (Auto starts full).
     let (ww, wh) = match SCALE_PINNED.load(Ordering::Relaxed) {
@@ -2225,7 +2595,7 @@ pub fn run_direct(
         codecs,
         width: ww,
         height: wh,
-        refresh_hz: fps.unwrap_or_else(local_refresh_hz),
+        refresh_hz: fps.unwrap_or_else(|| refresh_hz_at(screen_pt)),
         // One monitor is streamed: see `HyperRedirector::new`.
         monitors: 1,
         // At this screen's size: the host scales its desktop down to it,
@@ -2234,7 +2604,7 @@ pub fn run_direct(
         office,
         fast_text: FAST_TEXT.load(Ordering::Relaxed),
         cookie: None,
-        scale: primary_scale_percent(),
+        scale: scale_percent_at(screen_pt),
         app: crate::updater::version().into(),
         build: crate::updater::build().into(),
         protocols: crate::updater::protocols(),
@@ -2242,12 +2612,14 @@ pub fn run_direct(
     tracing::info!(%addr, fps = want.refresh_hz, "Hyper direct: signing in");
     // An update fetched from the host goes in when this ends.
     let _install = InstallOnExit;
-    let link = match connect_via(host, addr, &password, want.clone()) {
+    // (The password's key once, for this sign-in and every reconnect.)
+    let secret = rdp_hyper::auth::password_secret(&password);
+    let link = match connect_via(host, addr, &secret, want.clone()) {
         Ok(l) => l,
         Err(e) => {
             if e.contains("wrong Hyper password") {
-                if let Some(p) = &cache {
-                    let _ = std::fs::remove_file(p);
+                if remember || from_cache {
+                    forget_saved_password(host);
                 }
                 if from_cache {
                     return Err("the saved Hyper password was rejected (changed on the host?); run again to enter it".into());
@@ -2256,10 +2628,15 @@ pub fn run_direct(
             return Err(e.into());
         }
     };
-    if let (Some(p), false) = (&cache, from_cache) {
-        if let Ok(blob) = crate::token_cache::dpapi_protect(password.as_bytes()) {
+    if remember && !from_cache {
+        if let (Some(p), Ok(blob)) = (password_cache_path(host), crate::token_cache::dpapi_protect(password.as_bytes())) {
             let _ = std::fs::write(p, blob);
         }
+    }
+    // The decoders were taken from the last run's probe: checked now, while
+    // the host sets the stream up.
+    if let Some((was, was_gpu)) = probed {
+        refresh_decoder_cache(was, was_gpu);
     }
     crate::window::init_wake_event();
     crate::window::install_keyboard_hook();
@@ -2318,7 +2695,8 @@ pub fn run_direct(
                 // The GPU may have come or gone (a driver installed or lost):
                 // ask again what it decodes.
                 rdp_gpu::hyper::forget_gpu_decoders();
-                want.codecs = rdp_gpu::hyper::client_codecs(codec);
+                forget_decoder_cache();
+                want.codecs = client_codecs_cached(codec).0;
             }
         }
         // The network dropped: sign in again (the host keeps the session
@@ -2341,20 +2719,28 @@ pub fn run_direct(
             // (The first try at once: the host may only have moved sessions,
             // and it ends a stream we gave up on as our sign-in arrives.)
             let until = Instant::now() + rdp_hyper::liveness::reconnect_wait(attempt, crate::host_ab::ab("fastreconnect", true));
-            while Instant::now() < until {
+            // (To the millisecond: whole 100 ms steps made the first 250 ms
+            // wait 300.)
+            loop {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
                 if matches!(window.pump(), Frame::Quit) {
                     return Ok(());
                 }
                 let _ = window.drain_input(); // nothing to send it to
-                window.wait_for_work(100);
+                window.wait_for_work((left.as_millis() as u32).clamp(1, 100));
             }
             tracing::info!(attempt, "Hyper: reconnecting");
             // Sign in on a worker so the window stays responsive (and
             // closable) for the seconds an attempt can take.
             let (done_tx, done_rx) = mpsc::channel();
-            let (pw, w, h) = (password.clone(), want.clone(), host.to_string());
+            let (w, h) = (want.clone(), host.to_string());
             std::thread::spawn(move || {
-                let _ = done_tx.send(connect_via(&h, addr, &pw, w));
+                let _ = done_tx.send(connect_via(&h, addr, &secret, w));
+                // (The loop below wakes for it at once, not at its next poll.)
+                crate::window::signal_frame();
             });
             let result = loop {
                 if matches!(window.pump(), Frame::Quit) {
@@ -2524,6 +2910,39 @@ mod tests {
     /// limited range, what the encoder takes) and as the RGB to expect.
     const BARS_YUV: [(u8, u8, u8); 4] = [(63, 102, 240), (173, 42, 26), (32, 240, 118), (235, 128, 128)];
     const BARS_RGB: [(u8, u8, u8); 4] = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)];
+
+    /// A saved decoder probe is read back as written, and only under its own
+    /// key: another GPU, driver or build, a torn file or a codec this build
+    /// doesn't know reads as nothing saved (and the decoders are probed).
+    #[test]
+    fn a_saved_decoder_probe_is_used_only_when_it_fits() {
+        use super::{decoder_cache_text, parse_decoder_cache};
+        let key = "10de:2684:16f310de:a1 driver 1f0011000000 display 0 rdpio abc123";
+        let codecs = vec!["hevc".to_string(), "h264".to_string()];
+        let text = decoder_cache_text(key, &codecs, true);
+        assert_eq!(parse_decoder_cache(&text, key), Some((codecs.clone(), true)));
+        assert_eq!(parse_decoder_cache(&decoder_cache_text(key, &codecs[1..], false), key), Some((codecs[1..].to_vec(), false)));
+        assert_eq!(parse_decoder_cache(&text, "10de:2684:16f310de:a1 driver 1f0012000000 display 0 rdpio abc123"), None);
+        assert_eq!(parse_decoder_cache(&text[..key.len() + 2], key), None);
+        assert_eq!(parse_decoder_cache(&format!("{key}\ngpu\nvp9,h264\n"), key), None);
+        assert_eq!(parse_decoder_cache(&format!("{key}\nmaybe\nh264\n"), key), None);
+        assert_eq!(parse_decoder_cache("", key), None);
+    }
+
+    /// The point used to look up a screen's scale and refresh rate lies on
+    /// that screen, also for one left of or above the primary.
+    #[test]
+    fn a_screens_centre_is_on_that_screen() {
+        use rdp_pdu::gcc::VirtualScreenRect;
+        let primary = VirtualScreenRect { left: 0, top: 0, right: 2560, bottom: 1440, primary: true };
+        let left = VirtualScreenRect { left: -1920, top: -200, right: 0, bottom: 880, primary: false };
+        assert_eq!(super::centre_of(&primary), (1280, 720));
+        assert_eq!(super::centre_of(&left), (-960, 340));
+        for r in [primary, left] {
+            let (x, y) = super::centre_of(&r);
+            assert!(x >= r.left && x < r.right && y >= r.top && y < r.bottom);
+        }
+    }
 
     /// A client on a PC without a GPU driver (Windows' software renderer, no
     /// video decoder or video processor): what its CPU decodes reaches the
@@ -2753,7 +3172,7 @@ mod tests {
                 if gpu {
                     assert!(matches!(&p, super::Picture::Gpu(t) if t.held.is_some()), "{}: not read in place", codec.name());
                 }
-                assert!(paint(&mut renderer, p, (w, h), &mut rgba), "{}: a picture wasn't drawn", codec.name());
+                assert!(paint(&mut renderer, &p, (w, h), &mut rgba), "{}: a picture wasn't drawn", codec.name());
                 assert!(gpu || !renderer.gpu_yuv_available(), "the CPU conversion is what's tested");
                 renderer.present_frame().unwrap();
                 eprintln!("{}: painted + presented in {:.2} ms", codec.name(), t.elapsed().as_secs_f64() * 1e3);
@@ -2783,7 +3202,7 @@ mod tests {
         let mut decoder = Decoder::new(&renderer, w, h, codec).unwrap();
         for u in &units {
             if let Some(p) = decoder.decode(&u.data).unwrap() {
-                paint(&mut renderer, p, (w, h), &mut rgba);
+                paint(&mut renderer, &p, (w, h), &mut rgba);
             }
         }
         for _ in 0..3 {
@@ -2896,7 +3315,7 @@ mod tests {
             let picture = decoder.decode(&u.data).unwrap();
             let t1 = std::time::Instant::now();
             if let Some(p) = picture {
-                paint(&mut renderer, p, (w, h), &mut rgba);
+                paint(&mut renderer, &p, (w, h), &mut rgba);
                 let t2 = std::time::Instant::now();
                 renderer.present_frame().unwrap();
                 let t3 = std::time::Instant::now();
@@ -3033,7 +3452,7 @@ mod tests {
             let mut rgba = Vec::new();
             for u in &units {
                 if let Some(p) = decoder.decode(&u.data).unwrap() {
-                    paint(&mut renderer, p, (w, h), &mut rgba);
+                    paint(&mut renderer, &p, (w, h), &mut rgba);
                     renderer.present_frame().unwrap();
                 }
                 let _ = window.pump();

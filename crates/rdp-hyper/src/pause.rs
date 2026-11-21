@@ -12,27 +12,35 @@
 //! encoder session, a few hundred ms at most, while the client still shows
 //! its last picture.
 //!
-//! What's let go: the whole pipeline — the capture's D3D11 device with it,
-//! as [`Released::Pipeline`]. Keeping the device would save only creating it
-//! again (tens of ms; a capture always opens its own) and needs no work to
-//! drop; a live device with nothing to do doesn't hold a P-state, but it does
-//! keep the GPU in use, which Optimus needs gone before it can power the GPU
-//! off. Switch `pausereleasedev=0` keeps the capture and its device and lets
-//! only the encoder session go ([`Released::Encoder`]) — to tell with
-//! nvidia-smi which of the two holds the GPU up. Expected: the NVENC session
-//! (an open one keeps NVIDIA's memory clock up, like a CUDA context); if the
-//! GPU still stays up with everything gone, it's the virtual monitor, whose
-//! desktop the GPU renders.
+//! What's let go depends on the power source ([`release_whole`]). On
+//! battery, the whole pipeline — the capture's D3D11 device with it, as
+//! [`Released::Pipeline`]: a live device with nothing to do doesn't hold a
+//! P-state, but it does keep the GPU in use, which Optimus needs gone before
+//! it can power the GPU off. On mains only the encoder session goes
+//! ([`Released::Encoder`]; an open one keeps NVIDIA's memory clock up, like a
+//! CUDA context) and the capture keeps its device: creating that again was
+//! most of every comeback — measured over 382 comebacks on a desktop host,
+//! 258 ms (p50) of a 297 ms wait for the first picture, where the session
+//! and its keyframe take about 40. A desktop's GPU drives its monitors
+//! anyway. Switch `pausereleasedev=0` keeps the device on battery too — to
+//! tell with nvidia-smi which of the two holds the GPU up.
 
 use std::time::{Duration, Instant};
 
 /// How long a stream is paused before the host lets its GPU pipeline go.
 pub const RELEASE_AFTER: Duration = Duration::from_secs(10);
 
+/// Whether a long pause lets the whole pipeline go (the `whole` of
+/// [`PauseRelease::step`]): only on battery, and not with switch
+/// `pausereleasedev` (`switch`) off.
+pub fn release_whole(switch: bool, on_battery: bool) -> bool {
+    switch && on_battery
+}
+
 /// What a long pause let go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Released {
-    /// The encoder session only (`pausereleasedev=0`).
+    /// The encoder session only (on mains, or `pausereleasedev=0`).
     Encoder,
     /// Encoder, capture, converter and the D3D11 device.
     Pipeline,
@@ -212,5 +220,15 @@ mod tests {
         }
         assert!(released > 10);
         assert_eq!(released, rebuilt);
+    }
+
+    #[test]
+    fn mains_keeps_the_device_and_battery_lets_it_go() {
+        assert!(release_whole(true, true), "on battery: everything");
+        assert!(!release_whole(true, false), "on mains: the encoder session only");
+        assert!(!release_whole(false, true), "pausereleasedev=0: the session only");
+        let (mut p, t0) = (PauseRelease::default(), Instant::now());
+        p.step(true, false, true, release_whole(true, false), t0);
+        assert_eq!(p.step(true, false, true, release_whole(true, false), secs(t0, 10.0)), Step::Release(Released::Encoder));
     }
 }

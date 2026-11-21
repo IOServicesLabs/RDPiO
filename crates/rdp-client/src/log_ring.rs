@@ -11,6 +11,10 @@ use std::sync::{Mutex, OnceLock};
 
 /// Lines kept (all sources together); older ones go first.
 const KEEP: usize = 4000;
+/// The once-a-second stats lines ("perf") are kept apart, about ten minutes'
+/// worth for one session: they would otherwise push every real line out of
+/// [`KEEP`] within the hour.
+const KEEP_PERF: usize = 600;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Line {
@@ -28,9 +32,19 @@ pub struct Line {
     pub text: String,
 }
 
-static LINES: Mutex<VecDeque<Line>> = Mutex::new(VecDeque::new());
+/// Both kinds under one lock, so a line's number and its place in its list are
+/// decided together and the two lists never need two locks at once.
+struct Ring {
+    lines: VecDeque<Line>,
+    perf: VecDeque<Line>,
+}
+
+static RING: Mutex<Ring> = Mutex::new(Ring { lines: VecDeque::new(), perf: VecDeque::new() });
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static ON: AtomicBool = AtomicBool::new(false);
+/// Whether stats lines are wanted (the page's Stats box is ticked): they are
+/// always kept, but only then handed out and announced.
+static WANT_PERF: AtomicBool = AtomicBool::new(false);
 static NOTIFY: OnceLock<fn()> = OnceLock::new();
 /// The launcher's own lines, in a file as well (see [`keep_file`]).
 static FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
@@ -79,12 +93,14 @@ pub fn push_plain(src: &str, name: &str, level: &str, text: &str) {
 }
 
 fn keep(src: &str, name: &str, time: &str, level: &str, target: &str, text: &str) {
+    let perf = target == "perf";
     {
-        let mut lines = LINES.lock().unwrap();
-        if lines.len() >= KEEP {
-            lines.pop_front();
+        let mut ring = RING.lock().unwrap();
+        let (list, cap) = if perf { (&mut ring.perf, KEEP_PERF) } else { (&mut ring.lines, KEEP) };
+        if list.len() >= cap {
+            list.pop_front();
         }
-        lines.push_back(Line {
+        list.push_back(Line {
             seq: SEQ.fetch_add(1, Ordering::Relaxed) + 1,
             src: src.into(),
             name: name.into(),
@@ -94,34 +110,70 @@ fn keep(src: &str, name: &str, time: &str, level: &str, target: &str, text: &str
             text: text.into(),
         });
     }
+    // A stats line nobody looks at wakes nobody.
+    if perf && !WANT_PERF.load(Ordering::Relaxed) {
+        return;
+    }
     if let Some(n) = NOTIFY.get() {
         n();
     }
 }
 
+/// Hand out (and announce) the stats lines too, or stop.
+pub fn want_perf(on: bool) {
+    WANT_PERF.store(on, Ordering::Relaxed);
+}
+
 /// The lines after `seq` (all of them for 0), oldest first, at most `max`
-/// (the newest, when there are more).
+/// (the newest, when there are more). Stats lines only while [`want_perf`].
 pub fn since(seq: u64, max: usize) -> Vec<Line> {
-    let lines = LINES.lock().unwrap();
-    let start = lines.partition_point(|l| l.seq <= seq);
-    let start = start.max(lines.len().saturating_sub(max));
-    lines.range(start..).cloned().collect()
+    let with_perf = WANT_PERF.load(Ordering::Relaxed);
+    let ring = RING.lock().unwrap();
+    let tail = |list: &VecDeque<Line>| {
+        let start = list.partition_point(|l| l.seq <= seq);
+        start.max(list.len().saturating_sub(max))
+    };
+    let a = ring.lines.range(tail(&ring.lines)..);
+    if !with_perf {
+        return a.cloned().collect();
+    }
+    let b = ring.perf.range(tail(&ring.perf)..);
+    // Both are in order: merge them, then keep the newest `max`.
+    let mut out: Vec<&Line> = Vec::with_capacity(a.len() + b.len());
+    let (mut a, mut b) = (a.peekable(), b.peekable());
+    loop {
+        let next = match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) if x.seq < y.seq => a.next(),
+            (Some(_), Some(_)) => b.next(),
+            (Some(_), None) => a.next(),
+            (None, Some(_)) => b.next(),
+            (None, None) => break,
+        };
+        out.extend(next);
+    }
+    let skip = out.len().saturating_sub(max);
+    out[skip..].iter().map(|l| (*l).clone()).collect()
 }
 
 /// The newest line's number (0 before any).
 #[cfg(test)]
 fn last_seq() -> u64 {
-    LINES.lock().unwrap().back().map_or(0, |l| l.seq)
+    let ring = RING.lock().unwrap();
+    let a = ring.lines.back().map_or(0, |l| l.seq);
+    let b = ring.perf.back().map_or(0, |l| l.seq);
+    a.max(b)
 }
 
 /// The last error `src` logged (its text), if any is still kept.
 pub fn last_error(src: &str) -> Option<String> {
-    LINES.lock().unwrap().iter().rev().find(|l| l.src == src && l.level == "ERROR").map(|l| l.text.clone())
+    RING.lock().unwrap().lines.iter().rev().find(|l| l.src == src && l.level == "ERROR").map(|l| l.text.clone())
 }
 
 /// Forget what's kept (numbers go on from where they were).
 pub fn clear() {
-    LINES.lock().unwrap().clear();
+    let mut ring = RING.lock().unwrap();
+    ring.lines.clear();
+    ring.perf.clear();
 }
 
 fn parse(raw: &str) -> (&str, &str, &str, &str) {
@@ -188,7 +240,7 @@ impl Write for Tee {
         }
         if enabled() {
             for line in String::from_utf8_lossy(buf).lines() {
-                push("launcher", "rdpio", line);
+                push("launcher", "This window", line);
             }
         }
         Ok(buf.len())
@@ -224,5 +276,29 @@ mod tests {
         let mine: Vec<_> = got.iter().filter(|l| l.src == "a").map(|l| (l.level.as_str(), l.text.as_str())).collect();
         assert_eq!(mine, [("WARN", "one"), ("ERROR", "two")]);
         assert!(since(last_seq(), 100).is_empty());
+    }
+
+    #[test]
+    fn stats_lines_stay_apart_until_asked_for() {
+        ON.store(true, Ordering::Release);
+        let before = last_seq();
+        push("p", "P", "2026-10-18T09:12:34.123456Z  INFO rdpio::session: connected");
+        for _ in 0..KEEP_PERF + 5 {
+            push("p", "P", "2026-10-18T09:12:35.123456Z  INFO perf: fps=60");
+        }
+        push_plain("p", "P", "ERROR", "lost the link");
+        let mine = |lines: Vec<Line>| lines.into_iter().filter(|l| l.src == "p").map(|l| (l.seq, l.target)).collect::<Vec<_>>();
+        // Stats never push the real lines out, and stay hidden unless wanted.
+        want_perf(false);
+        let real = mine(since(before, 100));
+        assert_eq!(real.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(), ["session", ""]);
+        assert_eq!(last_error("p").as_deref(), Some("lost the link"));
+        want_perf(true);
+        let all = mine(since(before, 10_000));
+        want_perf(false);
+        assert!(all.windows(2).all(|w| w[0].0 < w[1].0), "merged in order");
+        assert_eq!(all.iter().filter(|(_, t)| t == "perf").count(), KEEP_PERF);
+        assert_eq!(all.first().map(|(_, t)| t.as_str()), Some("session"));
+        assert_eq!(all.last().map(|(_, t)| t.as_str()), Some(""));
     }
 }

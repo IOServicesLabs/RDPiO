@@ -89,15 +89,17 @@ impl Sealer {
         if plain.len() + TAG_LEN > MAX_RECORD {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "record too big"));
         }
+        // Built once in the reused buffer and sealed where it lies: a 1 MB
+        // record is one copy of the plaintext, not three and two allocations.
         self.buf.clear();
         self.buf.extend_from_slice(&((plain.len() + TAG_LEN) as u32).to_le_bytes());
         self.buf.extend_from_slice(plain);
-        let mut body = self.buf.split_off(4);
-        self.key
-            .seal_in_place_append_tag(nonce(self.dir, self.lane, self.counter), Aad::empty(), &mut body)
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(nonce(self.dir, self.lane, self.counter), Aad::empty(), &mut self.buf[4..])
             .map_err(|_| io::Error::other("seal"))?;
         self.counter += 1;
-        self.buf.extend_from_slice(&body);
+        self.buf.extend_from_slice(tag.as_ref());
         w.write_all(&self.buf)
     }
 }
@@ -128,22 +130,32 @@ impl Opener {
     /// The next record's plaintext; an error ends the stream (a record that
     /// doesn't open is an attacker's or a bug's — never skipped).
     pub fn read(&mut self, r: &mut impl Read) -> io::Result<Vec<u8>> {
+        let mut body = Vec::new();
+        self.read_into(r, &mut body)?;
+        Ok(body)
+    }
+
+    /// [`Self::read`] into `buf` (its contents replaced by the plaintext),
+    /// reusing its memory: no fresh, zeroed 1 MB buffer per record. On an
+    /// error `buf`'s contents are unspecified.
+    pub fn read_into(&mut self, r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<()> {
         let mut len = [0u8; 4];
         r.read_exact(&mut len)?;
         let len = u32::from_le_bytes(len) as usize;
         if !(TAG_LEN..=MAX_RECORD).contains(&len) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "record length"));
         }
-        let mut body = vec![0u8; len];
-        r.read_exact(&mut body)?;
+        // (Only what it grows by is zeroed; the rest is overwritten.)
+        buf.resize(len, 0);
+        r.read_exact(buf)?;
         let plain = self
             .key
-            .open_in_place(nonce(self.dir, self.lane, self.counter), Aad::empty(), &mut body)
+            .open_in_place(nonce(self.dir, self.lane, self.counter), Aad::empty(), buf)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "record didn't open"))?
             .len();
         self.counter += 1;
-        body.truncate(plain);
-        Ok(body)
+        buf.truncate(plain);
+        Ok(())
     }
 }
 
@@ -186,6 +198,40 @@ mod tests {
         let mut bad = wire.clone();
         bad[6] ^= 1;
         assert!(Opener::new(&k, Dir::HostToClient).read(&mut &bad[..]).is_err());
+    }
+
+    /// The record on the wire: length, then the plaintext sealed with the
+    /// tag appended (as it always was).
+    #[test]
+    fn records_are_the_length_ciphertext_and_tag() {
+        let k = new_key();
+        let mut wire = Vec::new();
+        let mut s = Sealer::lane(&k, Dir::HostToClient, 3);
+        s.skip_one();
+        s.write(&mut wire, b"a record").unwrap();
+        let mut expect = b"a record".to_vec();
+        key(&k).seal_in_place_append_tag(nonce(Dir::HostToClient, 3, 1), Aad::empty(), &mut expect).unwrap();
+        assert_eq!(wire[..4], ((8 + TAG_LEN) as u32).to_le_bytes());
+        assert_eq!(wire[4..], expect[..]);
+    }
+
+    /// One buffer reused for records of every size.
+    #[test]
+    fn read_into_reuses_one_buffer() {
+        let k = new_key();
+        let (mut s, mut o) = (Sealer::new(&k, Dir::ClientToHost), Opener::new(&k, Dir::ClientToHost));
+        let mut wire = Vec::new();
+        let records = [vec![7u8; 1 << 20], b"hello".to_vec(), vec![], vec![9u8; 300_000]];
+        for m in &records {
+            s.write(&mut wire, m).unwrap();
+        }
+        let mut r = &wire[..];
+        let mut buf = vec![1u8; 10];
+        for m in &records {
+            o.read_into(&mut r, &mut buf).unwrap();
+            assert_eq!(&buf, m);
+        }
+        assert!(o.read_into(&mut r, &mut buf).is_err(), "end of stream");
     }
 
     #[test]

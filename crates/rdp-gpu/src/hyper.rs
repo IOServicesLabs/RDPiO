@@ -331,16 +331,37 @@ impl DesktopCapture {
             raise_gpu_priority(&device);
             let d = output.GetDesc()?;
             let opened_as = (rect_size(&d.DesktopCoordinates), d.Rotation);
-            let dup = duplicate(&output, &device)?;
-            let dd = dup.GetDesc();
-            let rotation = dd.Rotation;
+            // Our virtual monitor shares its frames: no duplication needed
+            // (one is made if they turn out unusable, as `dup_acquire` does
+            // for a lost one). Not made at all then — it cost 35 ms (p50) to
+            // 80 ms (p90) of every pipeline opened on the virtual monitor,
+            // only to be dropped. An upright output only: a turned one's
+            // picture comes through the duplication.
+            let driver = if vp_rotation(d.Rotation).is_none() {
+                driver_frames::for_output(device_name)
+            } else {
+                // (Duplicated instead: the driver mustn't wait for a reader.)
+                driver_frames::not_reading(device_name);
+                None
+            };
+            let (dup, rotation, mode) = if driver.is_some() {
+                // (The mode as `fits` will hold a later duplication to: the
+                // desktop's, upright. And this thread onto the input desktop,
+                // as duplicating would have put it.)
+                input_desktop::attach(true);
+                let mode = mode_size(&d.DeviceName).unwrap_or(opened_as.0);
+                (None, d.Rotation, mode)
+            } else {
+                let dup = duplicate(&output, &device)?;
+                let dd = dup.GetDesc();
+                (Some(dup), dd.Rotation, (dd.ModeDesc.Width, dd.ModeDesc.Height))
+            };
             // The desktop as it stands, in real pixels: the display mode
             // (DesktopCoordinates can be DPI-scaled for this process). The
             // duplicated surface is that picture unrotated: a portrait desktop
             // arrives landscape. ModeDesc only stands in for the mode, turned
             // like the desktop: which way round it reports a rotated mode isn't
             // documented (Chromium's capturer finds it as the desktop stands).
-            let mode = (dd.ModeDesc.Width, dd.ModeDesc.Height);
             let desktop = mode_size(&d.DeviceName)
                 .or_else(|| Some(shaped_like(mode, opened_as.0)).filter(|&(w, h)| w > 0 && h > 0))
                 .unwrap_or(opened_as.0);
@@ -360,13 +381,9 @@ impl DesktopCapture {
                 .collect::<WinResult<_>>()?;
             let vp = if rgb { None } else { Some(Converter::new(&device, &context, surface, stream, rotation, &ring)?) };
             let luid = adapter.GetDesc1().map(|d| ((d.AdapterLuid.HighPart as i64) << 32) | d.AdapterLuid.LowPart as i64).unwrap_or(0);
-            // Our virtual monitor shares its frames: no duplication needed
-            // (it comes back if they turn out unusable).
-            let driver = if vp_rotation(rotation).is_none() { driver_frames::for_output(device_name) } else { None };
             if driver.is_some() {
                 tracing::info!(device = device_name, "frames come straight from the rdpio Display driver");
             }
-            let dup = if driver.is_some() { None } else { Some(dup) };
 
             let mut freq = 0i64;
             let _ = windows::Win32::System::Performance::QueryPerformanceFrequency(&mut freq);
@@ -704,6 +721,10 @@ impl DesktopCapture {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!(error = %e, "the driver's frames can't be read; duplicating the output instead");
+                // (Back to full rate in the driver: nobody reads its frames now.)
+                if let Some(d) = &mut self.driver {
+                    d.stop_reading();
+                }
                 self.driver = None;
                 return Ok(None);
             }
@@ -712,6 +733,9 @@ impl DesktopCapture {
         let Some(next) = next else {
             if !self.driver_seen && self.driver_since.elapsed() > DRIVER_GRACE {
                 tracing::warn!("no frame from the rdpio Display driver yet; duplicating the output instead");
+                if let Some(d) = &mut self.driver {
+                    d.stop_reading();
+                }
                 self.driver = None;
             }
             return Ok(None);
@@ -720,6 +744,9 @@ impl DesktopCapture {
         let s = next.state;
         if s.adapter != self.luid {
             tracing::warn!(driver = s.adapter, capture = self.luid, "the driver's frames are on another GPU; duplicating the output instead");
+            if let Some(d) = &mut self.driver {
+                d.stop_reading();
+            }
             self.driver = None;
             return Ok(None);
         }
@@ -1177,6 +1204,26 @@ unsafe fn find_output(device_name: &str) -> WinResult<(IDXGIAdapter1, IDXGIOutpu
         }
     }
     Err(windows::core::Error::new(DXGI_ERROR_NOT_FOUND, format!("no monitor named {device_name}")))
+}
+
+/// Make a D3D11 device on GPU `luid` on a thread of its own and keep it for
+/// `hold`, so the capture's own device, made meanwhile, comes quickly: timed
+/// on a host, D3D11CreateDevice took 124-163 ms with no other device alive in
+/// the process (219 ms cold) against 18-24 ms with one. Started as a stream's
+/// monitor comes up (about a second before its capture opens). Returns at
+/// once; nothing is logged but at debug.
+pub fn warm_device(luid: i64, hold: Duration) {
+    let _ = std::thread::Builder::new().name("gpu-warm".into()).spawn(move || {
+        let t = Instant::now();
+        match battery::device_on(luid) {
+            Ok(device) => {
+                tracing::debug!(ms = t.elapsed().as_millis() as u64, "the stream's GPU warmed up");
+                std::thread::sleep(hold);
+                drop(device);
+            }
+            Err(e) => tracing::debug!(error = %e, "couldn't warm the stream's GPU up"),
+        }
+    });
 }
 
 unsafe fn texture(device: &ID3D11Device, (w, h): (u32, u32), format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, bind: u32) -> WinResult<ID3D11Texture2D> {
@@ -2720,6 +2767,20 @@ static GPU_DECODERS: Mutex<Vec<(crate::h264::Codec, bool, bool)>> = Mutex::new(V
 /// be rebuilt).
 pub fn forget_gpu_decoders() {
     GPU_DECODERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// What [`client_codecs`]' answer depends on, as text: the GPU it would probe
+/// now (ids and driver version, see `adapter_identity`) and whether that's
+/// the display's. A caller that keeps the answer from one run to the next
+/// may reuse it while this stays the same. `None` (rendering in software,
+/// `RDPIO_WARP`, or a GPU that doesn't say): no such reuse.
+pub fn decoder_probe_key() -> Option<String> {
+    if std::env::var_os("RDPIO_WARP").is_some() {
+        return None;
+    }
+    let adapter = crate::d3d11::chosen_adapter()?;
+    let display = crate::d3d11::prefers_display_adapter();
+    Some(format!("{} display {}", crate::d3d11::adapter_identity(&adapter)?, display as u8))
 }
 
 /// A device like the client's renderer makes: on the adapter it would choose

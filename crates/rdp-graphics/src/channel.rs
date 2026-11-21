@@ -279,10 +279,14 @@ impl GraphicsChannel {
                     // caller. Wave PDUs may arrive on the lossy channel while the
                     // formats/training handshake stays on the reliable one; both
                     // feed the same RDPSND state machine.
+                    // Both lines are per fragment / per message of a stream that
+                    // runs at over a hundred fragments a second while any sound
+                    // plays, on the session's network thread: trace only, like
+                    // the graphics line above.
                     let lossy = Some(channel_id) == self.audio_out_lossy_channel_id;
-                    tracing::info!(channel_id, lossy, "AUDIO_PLAYBACK_DVC data PDU");
+                    tracing::trace!(channel_id, lossy, "AUDIO_PLAYBACK_DVC data PDU");
                     if let Some((_id, message)) = self.reassembler.accept(data) {
-                        tracing::info!(
+                        tracing::trace!(
                             bytes = message.len(),
                             msg_type = message.first().copied().unwrap_or(0),
                             lossy,
@@ -392,7 +396,9 @@ impl GraphicsChannel {
     /// isn't open.
     pub fn wrap_audio_output(&self, payload: &[u8]) -> Option<Vec<Vec<u8>>> {
         self.audio_out_channel_id.map(|id| {
-            tracing::info!(
+            // One per reply, and every wave is answered with a confirm: trace,
+            // like the inbound lines in `process`.
+            tracing::trace!(
                 channel_id = id,
                 bytes = payload.len(),
                 msg_type = format!("{:#04x}", payload.first().copied().unwrap_or(0)),
@@ -435,9 +441,10 @@ impl GraphicsChannel {
 
     /// Build a frame-acknowledge to send on the graphics channel (wrapped as a
     /// DRDYNVC data PDU), or `None` if the channel isn't open. `queue_depth` is
-    /// the client's current decode backlog (frames parsed but not yet rendered) —
-    /// the server uses it for flow control, slowing its send rate when the client
-    /// falls behind. `0` means "caught up".
+    /// the client's decode backlog in bytes (received but not yet decoded, per
+    /// MS-RDPEGFX 2.2.2.13) — the server uses it for flow control, slowing its
+    /// send rate when the client falls behind. `0` means "unavailable", which a
+    /// caught-up client also reports; `0xFFFFFFFF` would suspend acks.
     pub fn frame_ack(
         &self,
         frame_id: u32,

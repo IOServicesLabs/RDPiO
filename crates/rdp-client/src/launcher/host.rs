@@ -34,11 +34,16 @@ pub struct Status {
     pub computer: String,
     pub addresses: Vec<Address>,
     pub gpu: Option<String>,
-    /// The virtual display driver: "running", "installed" (not running:
-    /// test signing off, or a restart due), "fallback" (the open-source
-    /// Virtual Display Driver is used instead), "missing"; and whether this
-    /// rdpio carries one to install.
+    /// The virtual display driver: "running", "installed" (there, not
+    /// failed, not answering yet: starting), "failed" (Windows stopped it),
+    /// "disabled" (switched off in Device Manager), "blocked" (Windows won't
+    /// load it: unsigned or test signing off, a restart due, …), "fallback"
+    /// (the open-source Virtual Display Driver is used instead), "missing";
+    /// and whether this rdpio carries one to install.
     pub display: &'static str,
+    /// Device Manager's problem code for "failed", "disabled" and "blocked"
+    /// (43: stopped after an error; 52: unsigned; 14: restart due; 22: off).
+    pub display_problem: Option<u32>,
     pub display_available: bool,
     /// How this PC streams (its This PC page switches).
     pub settings: crate::hyper_direct::HostSettings,
@@ -49,24 +54,21 @@ pub struct Status {
 
 pub fn status() -> Status {
     let service = service_state();
+    let (service_version, outdated) = service_package();
+    let health = crate::virtual_display::health();
+    let fallback = health == crate::virtual_display::Health::Missing && crate::virtual_display::fallback_installed();
+    let (display, display_problem) = display_of(health, fallback);
     Status {
         service,
         password_set: password_set(),
-        outdated: service != "missing" && outdated(),
-        service_version: installed_exe().and_then(|e| crate::updater::package_of(&e).ok()).map(|(_, _, m)| m.version),
+        outdated: service != "missing" && outdated,
+        service_version,
         port: rdp_hyper::DEFAULT_PORT,
         computer: std::env::var("COMPUTERNAME").unwrap_or_default(),
         addresses: addresses(),
         gpu: gpu_name(),
-        display: if crate::virtual_display::running() {
-            "running"
-        } else if crate::virtual_display::installed() {
-            "installed"
-        } else if crate::virtual_display::fallback_installed() {
-            "fallback"
-        } else {
-            "missing"
-        },
+        display,
+        display_problem,
         display_available: std::env::current_exe()
             .ok()
             .and_then(|e| e.parent().map(|d| d.join("rdpio-display").join("rdpio-display.inf")))
@@ -119,17 +121,55 @@ fn installed_exe() -> Option<std::path::PathBuf> {
     exe.exists().then_some(exe)
 }
 
+/// The This PC page's display state and problem code for the rdpio Display
+/// device's `health` (`fallback`: ours isn't installed, the open-source
+/// driver is).
+fn display_of(health: crate::virtual_display::Health, fallback: bool) -> (&'static str, Option<u32>) {
+    use crate::virtual_display::Health;
+    match health {
+        Health::Missing if fallback => ("fallback", None),
+        h => (h.name(), h.problem()),
+    }
+}
+
+/// The installed rdpio.exe as last read: its size and time, the version it
+/// carries, and whether it's outdated. Reading and hashing that file (tens
+/// of MB) is what makes a status slow, and it rarely changes.
+static PACKAGE: std::sync::Mutex<Option<((u64, std::time::SystemTime), Option<String>, bool)>> = std::sync::Mutex::new(None);
+
+/// The service's rdpio version (a signed release's) and whether it's
+/// outdated, read again only when the installed file changed.
+fn service_package() -> (Option<String>, bool) {
+    let Some(installed) = installed_exe() else { return (None, false) };
+    let key = std::fs::metadata(&installed).ok().and_then(|m| Some((m.len(), m.modified().ok()?)));
+    if let Some(key) = key {
+        let hit = PACKAGE.lock().ok().and_then(|c| c.as_ref().filter(|c| c.0 == key).map(|c| (c.1.clone(), c.2)));
+        if let Some(hit) = hit {
+            return hit;
+        }
+    }
+    let package = crate::updater::package_of(&installed);
+    let version = package.as_ref().ok().map(|(_, _, m)| m.version.clone());
+    let outdated = outdated(&installed, &package);
+    if let Some(key) = key {
+        if let Ok(mut c) = PACKAGE.lock() {
+            *c = Some((key, version.clone(), outdated));
+        }
+    }
+    (version, outdated)
+}
+
 /// Whether the service runs an older rdpio than this launcher. (A newer one
 /// — it updated itself — isn't: "updating" it would go back.) Builds that
 /// aren't signed releases compare by their bytes.
-fn outdated() -> bool {
-    let (Some(installed), Ok(me)) = (installed_exe(), std::env::current_exe()) else {
+fn outdated(installed: &std::path::Path, package: &Result<(Vec<u8>, Vec<u8>, rdp_hyper::update::Manifest), String>) -> bool {
+    let Ok(me) = std::env::current_exe() else {
         return false;
     };
-    if crate::hyper_direct::same_contents(&me, &installed) {
+    if crate::hyper_direct::same_contents(&me, installed) {
         return false;
     }
-    match crate::updater::package_of(&installed) {
+    match package {
         Ok((_, _, m)) => !m.newer_than(crate::updater::version(), crate::updater::build()) && rdp_hyper::update::newer((crate::updater::version(), crate::updater::build()), (&m.version, &m.build)),
         Err(_) => true,
     }
@@ -428,6 +468,18 @@ mod tests {
         assert_eq!(kind_of(Ipv4Addr::new(192, 168, 123, 1), "VMware Network Adapter VMnet1", false), "virtual");
         assert_eq!(kind_of(Ipv4Addr::new(172, 20, 0, 1), "vEthernet (WSL)", true), "virtual");
         assert_eq!(kind_of(Ipv4Addr::new(192, 168, 50, 2), "Ethernet 2", false), "virtual");
+    }
+
+    #[test]
+    fn the_display_state_the_page_gets() {
+        use crate::virtual_display::Health;
+        assert_eq!(display_of(Health::Running, false), ("running", None));
+        assert_eq!(display_of(Health::Starting, false), ("installed", None));
+        assert_eq!(display_of(Health::Failed(43), false), ("failed", Some(43)));
+        assert_eq!(display_of(Health::Disabled, false), ("disabled", Some(22)));
+        assert_eq!(display_of(Health::Blocked(52), false), ("blocked", Some(52)));
+        assert_eq!(display_of(Health::Missing, true), ("fallback", None));
+        assert_eq!(display_of(Health::Missing, false), ("missing", None));
     }
 
     /// The launcher's pipe hands its elevated copy the password and reads

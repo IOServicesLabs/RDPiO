@@ -227,6 +227,8 @@ impl ClockSync {
 enum Ended {
     Closed,
     HostLeft,
+    /// Someone at the PC pressed Ctrl+Alt+F12 and took it back.
+    TakenBack,
     Lost,
     NeverStarted,
 }
@@ -425,12 +427,28 @@ struct Live {
     /// Where the video thread gives decoded-from frames' buffers back to the
     /// receive thread's reassembler: about 5x less work a frame there.
     frames: FrameBuffers,
+    /// Someone at the PC took it back (Ctrl+Alt+F12): the stream ends and
+    /// isn't signed into again.
+    takeover: AtomicBool,
+    /// The thread waiting for this stream to end ([`Client::stream`]):
+    /// woken at once when it does, not at its next look.
+    session: std::thread::Thread,
 }
 
 impl Live {
     fn send(&self, kind: Kind, body: &[u8]) {
         let packet = self.send.lock().unwrap().seal(kind, body);
         let _ = self.socket.send(&packet);
+    }
+
+    /// End the stream (`lost`: sign in again), and wake the thread that
+    /// waits for that.
+    fn end(&self, lost: bool) {
+        if lost {
+            self.lost.store(true, Ordering::Relaxed);
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        self.session.unpark();
     }
 }
 
@@ -504,6 +522,9 @@ impl Client {
             match ended {
                 Ended::Closed => return self.set_state("ended: closed"),
                 Ended::HostLeft => return self.set_state("ended: the PC ended the stream"),
+                // (Not signed into again: the person at the PC would lose it
+                // a few seconds after taking it back.)
+                Ended::TakenBack => return self.set_state("ended: someone at the PC took it back"),
                 Ended::NeverStarted => {
                     failures.retain(|t| t.elapsed() < Duration::from_secs(60));
                     if failures.len() >= 3 {
@@ -569,6 +590,8 @@ impl Client {
             reliable: ReliableLink::new(),
             queued: AtomicU32::new(0),
             frames: FrameBuffers::default(),
+            takeover: AtomicBool::new(false),
+            session: std::thread::current(),
         });
         live.reliable.set_bulk_rate(Some(20_000_000));
         *self.link.write().unwrap() = Some(live.clone());
@@ -601,12 +624,14 @@ impl Client {
             },
         ];
         live.send(Kind::Control, &Control::KeyframeRequest.to_bytes());
+        // (Woken by whatever ends it — `Live::end`, `Client::close` — so a
+        // reconnect starts at once; the timeout is only a safety net.)
         while !live.stop.load(Ordering::Relaxed) {
             if self.quit.load(Ordering::Relaxed) {
                 live.stop.store(true, Ordering::Relaxed);
                 break;
             }
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::park_timeout(Duration::from_millis(250));
         }
         // (The video thread may be asleep: it sees the stop at once.)
         self.nudge_video();
@@ -627,6 +652,8 @@ impl Client {
         self.link.write().unwrap().take();
         if quit {
             Ended::Closed
+        } else if live.takeover.load(Ordering::Relaxed) {
+            Ended::TakenBack
         } else if live.lost.load(Ordering::Relaxed) {
             if live.heard.load(Ordering::Relaxed) {
                 Ended::Lost
@@ -715,7 +742,16 @@ impl Client {
                             }
                             Some(Control::Bye) => {
                                 log::info!("the PC ended the stream");
-                                live.stop.store(true, Ordering::Relaxed);
+                                live.end(false);
+                            }
+                            // Someone at the PC pressed Ctrl+Alt+F12 and took it
+                            // back: end like a bye, and stay ended (silence
+                            // would read as a drop, and a sign-in 3 s later
+                            // took the PC from them again).
+                            Some(Control::HostTakeover) => {
+                                log::info!("someone at the PC took it back; the stream ended");
+                                live.takeover.store(true, Ordering::Relaxed);
+                                live.end(false);
                             }
                             // How the PC reaches us (LAN, Tailscale direct or relayed).
                             Some(Control::Path { kind, relay }) => {
@@ -734,8 +770,7 @@ impl Client {
                                 // (Its console moved to another session, its service is restarting,
                                 // or the stream moves to its other GPU: plugged in or out.)
                                 log::info!("the PC asked for a reconnect; reconnecting now");
-                                live.lost.store(true, Ordering::Relaxed);
-                                live.stop.store(true, Ordering::Relaxed);
+                                live.end(true);
                             }
                             Some(Control::Notice { text }) => {
                                 log::info!("notice from the PC: {text}");
@@ -819,8 +854,7 @@ impl Client {
                 match verdict(silent, live.heard.load(Ordering::Relaxed), paused, rtt, crate::tune::ab("fastreconnect", true)) {
                     Verdict::Lost if !live.stop.load(Ordering::Relaxed) => {
                         log::warn!("nothing from the PC for {} ms", silent.as_millis());
-                        live.lost.store(true, Ordering::Relaxed);
-                        live.stop.store(true, Ordering::Relaxed);
+                        live.end(true);
                     }
                     Verdict::Probe => {
                         if !probing {
@@ -875,6 +909,8 @@ impl Client {
                     window_us: last_feedback.elapsed().as_micros() as u32,
                     ltr_frame: Some(self.ltr_decoded.load(Ordering::Relaxed)).filter(|&v| v != u32::MAX),
                     link_kbps: s.link_kbps,
+                    // (Which keyframe has landed, exactly: an older PC ignores it.)
+                    resolved_frame: reassembler.resolved_through(),
                 };
                 live.send(Kind::Control, &Control::Feedback(fb).to_bytes());
                 let (calls, packets) = rx.take_counts();
@@ -1422,6 +1458,10 @@ impl Client {
     pub fn close(&self) {
         self.quit.store(true, Ordering::Relaxed);
         self.input_wake.notify_all();
+        // (The stream's thread waits for it to end: it sees the quit now.)
+        if let Some(live) = self.link.read().unwrap().as_ref() {
+            live.session.unpark();
+        }
     }
 
     /// The Surface to decode onto (`None`: it's going away — returns once the

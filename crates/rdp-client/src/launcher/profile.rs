@@ -53,9 +53,13 @@ pub struct Options {
     pub codec: String,
     /// Frames per second to ask for; 0 = this screen's refresh rate.
     pub fps: u32,
+    /// Hyper: the stream's size as a share of the window, pinned: 100, 75, 50
+    /// or 33 (%); 0 = automatic (it follows the link).
+    pub scale: u32,
     pub fullscreen: bool,
     pub multimon: bool,
-    /// Present without waiting for vblank (tearing, lowest latency).
+    /// RDP: present without waiting for vblank (tearing, lowest latency). A
+    /// Hyper stream presents that way unless `vsync` is on.
     pub low_latency: bool,
     /// Hyper: present on vblank.
     pub vsync: bool,
@@ -85,6 +89,7 @@ impl Default for Options {
             best_text: false,
             codec: "auto".into(),
             fps: 0,
+            scale: 0,
             fullscreen: true,
             multimon: false,
             low_latency: false,
@@ -150,6 +155,10 @@ impl Options {
                 push("--hyper-fps");
                 push(&self.fps.min(480).to_string());
             }
+            if matches!(self.scale, 100 | 75 | 50 | 33) {
+                push("--hyper-scale");
+                push(&self.scale.to_string());
+            }
             if self.vsync {
                 push("--hyper-vsync");
             }
@@ -171,7 +180,9 @@ impl Options {
         if self.multimon && self.transport == Transport::Rdp {
             push("--multimon");
         }
-        if self.low_latency {
+        // (Only RDP's presents follow it: a Hyper stream sets its own, so
+        // Hyper Direct, which has no RDP part, takes no flag.)
+        if self.low_latency && self.transport != Transport::Direct {
             push("--low-latency");
         }
         if self.transport != Transport::Direct {
@@ -292,16 +303,102 @@ mod tests {
 
     #[test]
     fn options_round_trip_and_old_files_load() {
-        let o = Options { transport: Transport::Direct, profile: Profile::Office, fps: 120, ..Options::default() };
+        let o = Options { transport: Transport::Direct, profile: Profile::Office, fps: 120, scale: 50, ..Options::default() };
         let json = serde_json::to_string(&o).unwrap();
         assert_eq!(serde_json::from_str::<Options>(&json).unwrap(), o);
         // A file missing fields (an older launcher's) gets the defaults.
         let old: Options = serde_json::from_str(r#"{"transport":"rdp"}"#).unwrap();
         assert_eq!(old.transport, Transport::Rdp);
         assert_eq!(old.codec, "auto");
+        assert_eq!(old.scale, 0);
         assert!(old.fullscreen);
         let file: LauncherFile = serde_json::from_str("{}").unwrap();
         assert_eq!(file.theme, "system");
+    }
+
+    /// A `launcher.json` as 0.4.1 wrote it: every option it had comes back,
+    /// and the sessions it starts get the command lines they got then.
+    #[test]
+    fn a_file_from_0_4_1_loads_with_every_option() {
+        let json = r#"{
+            "theme": "dark",
+            "defaults": {"transport":"hyper","profile":"game","best_text":false,"codec":"auto","fps":0,"fullscreen":true,"multimon":false,
+                "low_latency":false,"vsync":false,"hyper_port":0,"gpu":"auto","local_keys":false,"printer":false,"drives":false,"teams":false,"insecure":false},
+            "entries": {
+                "11111111-1111-1111-1111-111111111111": {"options": {"transport":"hyper","profile":"office","best_text":true,"codec":"hevc","fps":120,
+                    "fullscreen":false,"multimon":true,"low_latency":true,"vsync":true,"hyper_port":48000,"gpu":"display","local_keys":true,
+                    "printer":true,"drives":true,"teams":true,"insecure":true}, "hyper_password": null, "folder": "Work/Servers"},
+                "22222222-2222-2222-2222-222222222222": {"options": {"transport":"rdp","profile":"game","low_latency":true,"vsync":true}, "folder": ""}
+            },
+            "recent": {"pc.lan:3389|bob": {"transport":"direct","low_latency":true,"vsync":true}},
+            "updates": {"check": false, "from_hosts": true, "channel": "nightly"}
+        }"#;
+        let file: LauncherFile = serde_json::from_str(json).unwrap();
+        assert_eq!(file.theme, "dark");
+        assert_eq!(file.defaults, Options::default());
+        assert_eq!(file.updates, UpdatePrefs { check: false, from_hosts: true, channel: "nightly".into() });
+        let hyper = &file.entries[&"11111111-1111-1111-1111-111111111111".parse().unwrap()];
+        assert_eq!(hyper.folder, "Work/Servers");
+        assert_eq!(
+            hyper.options,
+            Options {
+                transport: Transport::Hyper,
+                profile: Profile::Office,
+                best_text: true,
+                codec: "hevc".into(),
+                fps: 120,
+                scale: 0,
+                fullscreen: false,
+                multimon: true,
+                low_latency: true,
+                vsync: true,
+                hyper_port: 48000,
+                gpu: "display".into(),
+                local_keys: true,
+                printer: true,
+                drives: true,
+                teams: true,
+                insecure: true,
+            }
+        );
+        assert_eq!(
+            hyper.options.to_args(),
+            [
+                "--hyper", "--office", "--hyper-text", "best", "--hyper-codec", "hevc", "--hyper-fps", "120", "--hyper-vsync", "--hyper-port",
+                "48000", "--hyper-local-keys", "--low-latency", "--printer", "--drive", "all", "--insecure"
+            ]
+        );
+        // Both presentation switches on, as that launcher allowed: each still
+        // reaches the part of the session it belongs to.
+        let rdp = &file.entries[&"22222222-2222-2222-2222-222222222222".parse().unwrap()].options;
+        assert!(rdp.low_latency && rdp.vsync);
+        assert_eq!(rdp.to_args(), ["--gaming", "--fullscreen", "--low-latency"]);
+        let direct = &file.recent["pc.lan:3389|bob"];
+        assert!(direct.low_latency && direct.vsync);
+        assert_eq!(direct.to_args(), ["--direct", "--hyper-vsync", "--fullscreen"]);
+        // What this launcher writes, that one reads (it skips the new field).
+        let back: LauncherFile = serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
+        assert_eq!(back, file);
+    }
+
+    #[test]
+    fn a_pinned_stream_size_goes_to_hyper_only() {
+        let o = |transport, scale| Options { transport, scale, fullscreen: false, ..Options::default() };
+        assert_eq!(o(Transport::Direct, 50).to_args(), ["--direct", "--hyper-scale", "50"]);
+        assert_eq!(o(Transport::Hyper, 33).to_args(), ["--hyper", "--hyper-scale", "33"]);
+        // Automatic, and anything the session wouldn't take: no flag.
+        assert_eq!(o(Transport::Hyper, 0).to_args(), ["--hyper"]);
+        assert_eq!(o(Transport::Hyper, 60).to_args(), ["--hyper"]);
+        assert_eq!(o(Transport::Rdp, 50).to_args(), ["--gaming"]);
+    }
+
+    /// `--low-latency` is RDP's: Hyper Direct has no RDP part to use it.
+    #[test]
+    fn low_latency_is_for_the_rdp_part_of_a_session() {
+        let o = |transport| Options { transport, low_latency: true, fullscreen: false, ..Options::default() };
+        assert_eq!(o(Transport::Rdp).to_args(), ["--gaming", "--low-latency"]);
+        assert_eq!(o(Transport::Hyper).to_args(), ["--hyper", "--low-latency"]);
+        assert_eq!(o(Transport::Direct).to_args(), ["--direct"]);
     }
 
     #[test]

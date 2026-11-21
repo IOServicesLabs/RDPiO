@@ -96,7 +96,12 @@ typedef struct _RDPIO_FRAMES {
     UINT32 Format;           // DXGI_FORMAT
     LUID Adapter;            // the GPU they live on
     UINT32 Slot;             // the newest frame (RDPIO_FRAMES_NO_SLOT: none yet)
-    UINT32 Reserved;
+    // Written by the agent (GetTickCount64() / 250, never 0) while it reads
+    // frames. 0 (an older agent, or one that maps the section read-only):
+    // the driver hands over every frame at once, as it always did. A stale
+    // value: nobody reads, so the driver takes frames off the swap-chain at
+    // a few per second until the agent writes again.
+    volatile UINT32 ConsumerTick;
     UINT64 FrameNumber;      // frames published so far
     UINT64 PresentQpc;       // when the newest one was presented (QPC)
 
@@ -112,5 +117,92 @@ typedef struct _RDPIO_FRAMES {
     UINT32 YHot;
     BYTE Shape[RDPIO_CURSOR_MAX * RDPIO_CURSOR_MAX * 4];
 } RDPIO_FRAMES;
+
+#pragma pack(pop)
+
+// ---------------------------------------------------------------- trace
+//
+// A flight recorder, for when Windows ends the driver's host (IddCx's
+// watchdog does that when a call into or out of the driver takes over 10 s,
+// and leaves nothing behind that says which). One per driver host, named
+//   Global\rdpio-display-trace                        section: RDPIO_TRACE
+// The agent maps it while a monitor exists and logs it when the driver dies:
+// the mapping keeps the section after the host is gone. Optional: a driver
+// without it (older builds) has nothing to read. A new host reuses a
+// section the agent still holds, and starts it over with Boot + 1.
+//
+// InCall: what each kind of driver thread is inside right now (Code 0:
+// nothing). Ring: the last RDPIO_TRACE_RING events (starts, failures with
+// their HRESULT/NTSTATUS in Arg), Next counting every one ever added.
+// Plain memory writes, no locks: a reader may see one entry half written.
+
+#define RDPIO_TRACE_VERSION 1
+#define RDPIO_TRACE_RING 64
+
+// InCall slots.
+#define RDPIO_TRACE_SLOT_CALLBACK 0   // OS calls: PnP, power, IOCTLs, modes
+#define RDPIO_TRACE_SLOT_SWAPCHAIN 1  // OS calls: assign/unassign swap-chain
+#define RDPIO_TRACE_SLOT_FRAMES 2     // a monitor's swap-chain thread
+#define RDPIO_TRACE_SLOT_WATCHDOG 3   // the agent-ping watchdog thread
+#define RDPIO_TRACE_SLOTS 4
+
+// Codes (crates/rdp-client/src/virtual_display.rs names them).
+#define RDPIO_TRACE_HOST_START 1          // Arg: Boot
+#define RDPIO_TRACE_DEVICE_ADD 2
+#define RDPIO_TRACE_D0_ENTRY 3
+#define RDPIO_TRACE_IOCTL_INFO 4
+#define RDPIO_TRACE_IOCTL_ADD 5
+#define RDPIO_TRACE_IOCTL_REMOVE 6
+#define RDPIO_TRACE_IOCTL_PING 7
+#define RDPIO_TRACE_ASSIGN_SWAPCHAIN 8    // Arg: monitor id
+#define RDPIO_TRACE_UNASSIGN_SWAPCHAIN 9  // Arg: monitor id
+#define RDPIO_TRACE_PARSE_DESCRIPTION 10
+#define RDPIO_TRACE_DEFAULT_MODES 11
+#define RDPIO_TRACE_TARGET_MODES 12
+#define RDPIO_TRACE_COMMIT_MODES 13
+#define RDPIO_TRACE_ADAPTER_INIT 14
+#define RDPIO_TRACE_D3D_INIT 20           // Arg: HRESULT on failure
+#define RDPIO_TRACE_SET_DEVICE 21
+#define RDPIO_TRACE_ACQUIRE_BUFFER 22
+#define RDPIO_TRACE_PUBLISH 23
+#define RDPIO_TRACE_FINISHED_FRAME 24
+#define RDPIO_TRACE_DELETE_SWAPCHAIN 25
+#define RDPIO_TRACE_SETUP_CURSOR 26
+#define RDPIO_TRACE_QUERY_CURSOR 27
+#define RDPIO_TRACE_STOP_THREAD 28        // waiting for a swap-chain thread
+#define RDPIO_TRACE_DEVICE_REMOVED 29     // Arg: GetDeviceRemovedReason
+#define RDPIO_TRACE_BACKOFF 30            // Arg: ms
+#define RDPIO_TRACE_SHARE_TEXTURES 31     // Arg: HRESULT on failure
+#define RDPIO_TRACE_MONITOR_CREATE 40
+#define RDPIO_TRACE_MONITOR_ARRIVAL 41
+#define RDPIO_TRACE_MONITOR_DEPARTURE 42
+#define RDPIO_TRACE_WATCHDOG_REMOVE 43
+#define RDPIO_TRACE_EXCEPTION 50          // Arg: the code it happened in
+#define RDPIO_TRACE_BUSY 51               // Arg: the IOCTL's code
+#define RDPIO_TRACE_DETACHED 52           // a thread left running; Arg: monitor id
+#define RDPIO_TRACE_NO_READER 53          // Arg: 1 throttled, 0 full rate again
+
+#pragma pack(push, 8)
+
+typedef struct _RDPIO_TRACE_CALL {
+    volatile LONG Code;      // 0: not in a call
+    UINT32 Arg;
+    UINT64 StartMs;          // GetTickCount64() when it began
+} RDPIO_TRACE_CALL;
+
+typedef struct _RDPIO_TRACE_EVENT {
+    UINT64 TickMs;           // GetTickCount64()
+    UINT32 Code;
+    UINT32 Arg;
+} RDPIO_TRACE_EVENT;
+
+typedef struct _RDPIO_TRACE {
+    UINT32 Version;          // RDPIO_TRACE_VERSION
+    UINT32 Boot;             // driver hosts that used this section
+    volatile LONG Next;      // events added so far
+    UINT32 ProcessId;        // the driver host
+    RDPIO_TRACE_CALL InCall[RDPIO_TRACE_SLOTS];
+    RDPIO_TRACE_EVENT Ring[RDPIO_TRACE_RING];
+} RDPIO_TRACE;
 
 #pragma pack(pop)

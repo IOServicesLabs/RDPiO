@@ -1,21 +1,28 @@
-//! Floating auto-hide connection bar (mstsc-style) for the borderless
-//! fullscreen / multi-monitor modes, where the session windows have no frame and
-//! thus no close button.
+//! Floating auto-hide connection bar (mstsc-style) for full-screen sessions,
+//! Remote Desktop and Hyper alike, whose borderless windows have no frame and
+//! thus no close button. One bar per process.
 //!
-//! A small topmost tool window pinned to the top-centre of the primary monitor
-//! with three child buttons: **Pin** (toggle auto-hide), **Save** (opens the
-//! "Save this connection" dialog, prefilled with the active session's details)
-//! and **Disconnect** (ends the session). When unpinned it hides and only reappears while the cursor is at
-//! the top-centre edge of the screen — driven by [`ConnBar::tick`], polled once
-//! per frame from the UI loop (the bar gets no mouse messages while hidden, so we
-//! can't rely on `WM_MOUSELEAVE`). `WS_EX_NOACTIVATE` keeps the session window
-//! focused when its buttons are clicked, so input + the keyboard hook keep working.
+//! A small topmost tool window at the top-centre of the session's screen with
+//! these buttons: **Pin** (toggle auto-hide), **Minimize** (the session goes to
+//! the taskbar), **Window** (a one-window session leaves full screen), **Stats**
+//! (a Hyper stream's stats, as Ctrl+Shift+S), **Save** (opens the "Save this
+//! connection" dialog, prefilled with the active session's details, when it
+//! has them) and **Disconnect** (ends the session). It shows for the session's
+//! first seconds so it's found, then only while the cursor is at the top-centre
+//! edge of the screen; never while the mouse is locked in, another program is
+//! in front or the session is a normal window. That is all driven by [`tick`],
+//! which every pump of a session window calls (the bar gets no mouse messages
+//! while hidden, so we can't rely on `WM_MOUSELEAVE`): it stays off the
+//! picture otherwise, so a full-screen stream keeps its direct path to the
+//! screen. `WS_EX_NOACTIVATE` keeps the session window focused when its
+//! buttons are clicked, so input + the keyboard hook keep working.
 //!
 //! Disconnect just posts `WM_QUIT` to the shared UI thread, which the window
 //! pump already turns into a clean shutdown (same as Ctrl+Shift+Q).
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -29,17 +36,65 @@ use crate::hub::{ConnectionInput, ConnectionStore};
 static PINNED: AtomicBool = AtomicBool::new(false);
 /// Whether the bar window is currently shown (so `tick` only toggles on change).
 static VISIBLE: AtomicBool = AtomicBool::new(false);
-/// The Pin button's HWND (so `WM_COMMAND` can relabel it). One bar per process.
-static PIN_BTN: AtomicIsize = AtomicIsize::new(0);
 /// The active session's connection facts (set once at connect time), used to
 /// prefill the "Save this connection" dialog.
 static SESSION: Mutex<Option<SessionInfo>> = Mutex::new(None);
+/// Whether Save is offered (read without [`SESSION`]'s lock): the session's
+/// details are known and it isn't a saved connection (yet).
+static HAS_INFO: AtomicBool = AtomicBool::new(false);
+/// The bar window (0: none yet).
+static BAR: AtomicIsize = AtomicIsize::new(0);
+/// The bar's buttons, in [`BUTTONS`] order.
+static BUTTON_HWNDS: [AtomicIsize; 6] = [const { AtomicIsize::new(0) }; 6];
+/// The session window the bar belongs to (with several, the first).
+static MAIN: AtomicIsize = AtomicIsize::new(0);
+/// Every session window (for Minimize). Locked only on a click.
+static SESSION_WINDOWS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+/// The session is one window (it can leave full screen, and the bar follows
+/// it to whichever screen it's on).
+static SINGLE: AtomicBool = AtomicBool::new(false);
+/// The screen the bar sits on: left, top, width.
+static MON_LEFT: AtomicI32 = AtomicI32::new(0);
+static MON_TOP: AtomicI32 = AtomicI32::new(0);
+static MON_W: AtomicI32 = AtomicI32::new(0);
+/// The bar's left edge and width as laid out.
+static BAR_LEFT: AtomicI32 = AtomicI32::new(0);
+static BAR_WIDTH: AtomicI32 = AtomicI32::new(0);
+/// The buttons shown (bits in [`BUTTONS`] order; `u32::MAX`: not laid out).
+static LAYOUT: AtomicU32 = AtomicU32::new(u32::MAX);
+/// `window::display_epoch()` when the bar was last placed (`u32::MAX`: never).
+static PLACED_EPOCH: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Until when (ms, see [`now_ms`]) the bar shows on its own, and the last tick.
+static SHOW_UNTIL: AtomicU64 = AtomicU64::new(0);
+static LAST_TICK: AtomicU64 = AtomicU64::new(0);
+/// A session window that goes full screen gets a bar (see [`want`]).
+static WANTED: AtomicBool = AtomicBool::new(false);
+/// Minimize put the session windows in the taskbar (so restoring one
+/// restores all of them).
+static MINIMIZED: AtomicBool = AtomicBool::new(false);
 
 const ID_PIN: usize = 1;
 const ID_DISCONNECT: usize = 2;
 const ID_SAVE: usize = 3;
-const BAR_W: i32 = 260;
+const ID_MINIMIZE: usize = 4;
+const ID_WINDOW: usize = 5;
+const ID_STATS: usize = 6;
+/// The buttons, left to right: id, label, width.
+const BUTTONS: [(usize, PCWSTR, i32); 6] = [
+    (ID_PIN, w!("Pin"), 56),
+    (ID_MINIMIZE, w!("Minimize"), 84),
+    (ID_WINDOW, w!("Window"), 72),
+    (ID_STATS, w!("Stats"), 60),
+    (ID_SAVE, w!("Save"), 56),
+    (ID_DISCONNECT, w!("Disconnect"), 92),
+];
 const BAR_H: i32 = 34;
+/// Space around and between the buttons.
+const GAP: i32 = 4;
+/// How long the bar shows on its own when it's made.
+const SHOW_FIRST_MS: u64 = 3_000;
+/// How often [`tick`] looks at the pointer (it's called on every pump).
+const TICK_MS: u64 = 30;
 
 /// Geometry of the "Save this connection" dialog.
 const SAVE_DLG_W: i32 = 440;
@@ -72,149 +127,297 @@ pub struct SessionInfo {
     pub username: Option<String>,
     pub domain: Option<String>,
     pub password: Option<String>,
+    /// The saved connection this session is (the launcher's `--launcher-id`,
+    /// or what the bar's Save made): there is no Save button then, and a save
+    /// updates that record rather than adding another.
+    pub connection_id: Option<uuid::Uuid>,
 }
 
 /// Attach session metadata to the bar so "Save this connection" can prefill the
-/// dialog. Call once per session, before the bar is first shown. Best-effort: a
-/// poisoned lock just means the dialog opens blank.
-pub fn set_session_info(info: SessionInfo) {
+/// dialog. Called at every (re)connect, before the bar is first shown; a
+/// connection the bar saved earlier in this process stays saved. Best-effort:
+/// a poisoned lock just means the dialog opens blank.
+pub fn set_session_info(mut info: SessionInfo) {
     tracing::debug!(host = %info.host, "connection bar session info set");
     if let Ok(mut s) = SESSION.lock() {
+        if info.connection_id.is_none() {
+            info.connection_id = s.as_ref().filter(|was| was.host == info.host && was.port == info.port).and_then(|was| was.connection_id);
+        }
+        HAS_INFO.store(info.connection_id.is_none(), Ordering::Relaxed);
         *s = Some(info);
     }
 }
 
-/// A floating connection bar bound to the primary monitor.
+/// Milliseconds since this process first asked.
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Give this process's session window a bar once it's full screen (now or
+/// after Ctrl+Shift+F): for sessions whose window is made elsewhere (Hyper).
+pub fn want() {
+    WANTED.store(true, Ordering::Relaxed);
+}
+
+/// Where each button goes for the buttons `shown` (bits in [`BUTTONS`]
+/// order): `(x, width)` or `None`, and the bar's width.
+fn layout(shown: u32) -> ([Option<(i32, i32)>; 6], i32) {
+    let mut at = [None; 6];
+    let mut x = GAP;
+    for (i, (_, _, w)) in BUTTONS.iter().enumerate() {
+        if shown & (1 << i) != 0 {
+            at[i] = Some((x, *w));
+            x += w + GAP;
+        }
+    }
+    (at, x)
+}
+
+/// The buttons this session has now: Window for one window, Stats in a Hyper
+/// stream (also after Remote Desktop handed over to one), Save when the
+/// session's details are known and it isn't a saved connection.
+fn buttons_now() -> u32 {
+    let has = [true, true, SINGLE.load(Ordering::Relaxed), crate::window::in_hyper(), HAS_INFO.load(Ordering::Relaxed), true];
+    has.iter().enumerate().fold(0, |bits, (i, on)| if *on { bits | 1 << i } else { bits })
+}
+
+/// The bar of a Remote Desktop session, which makes its windows itself.
+/// Dropping it removes the bar.
 pub struct ConnBar {
     hwnd: HWND,
-    left: i32,
-    top: i32,
 }
 
 impl ConnBar {
-    /// Create the bar centred at the top of the monitor whose screen rectangle is
-    /// `(left, top)`..`(left + width, ..)`. Shown initially (so it's discoverable);
-    /// it auto-hides on the first `tick` once the cursor moves away (unless pinned).
-    pub fn new(primary_left: i32, primary_top: i32, primary_width: i32) -> windows::core::Result<Self> {
-        unsafe {
-            let module = GetModuleHandleW(None)?;
-            let hinstance = HINSTANCE(module.0);
-            let class_name = w!("rdpioConnBarClass");
-
-            let wc = WNDCLASSEXW {
-                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                lpfnWndProc: Some(connbar_proc),
-                hInstance: hinstance,
-                lpszClassName: class_name,
-                hbrBackground: CreateSolidBrush(COLORREF(0x002B2B2B)),
-                hCursor: LoadCursorW(None, IDC_ARROW)?,
-                ..Default::default()
-            };
-            let _ = RegisterClassExW(&wc);
-
-            let left = primary_left + (primary_width - BAR_W) / 2;
-            let top = primary_top;
-            let hwnd = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                class_name,
-                w!("RDPiO"),
-                WS_POPUP,
-                left,
-                top,
-                BAR_W,
-                BAR_H,
-                None,
-                None,
-                Some(hinstance),
-                None,
-            )?;
-
-            // Three push buttons; clicks arrive as WM_COMMAND with these control
-            // ids: Pin (toggle auto-hide), Save (open the save dialog), and
-            // Disconnect (end the session).
-            let pin = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("BUTTON"),
-                w!("Pin"),
-                WS_CHILD | WS_VISIBLE,
-                4,
-                3,
-                80,
-                BAR_H - 6,
-                Some(hwnd),
-                Some(HMENU(ID_PIN as *mut core::ffi::c_void)),
-                Some(hinstance),
-                None,
-            )?;
-            PIN_BTN.store(pin.0 as isize, Ordering::SeqCst);
-            let _ = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("BUTTON"),
-                w!("Save"),
-                WS_CHILD | WS_VISIBLE,
-                88,
-                3,
-                72,
-                BAR_H - 6,
-                Some(hwnd),
-                Some(HMENU(ID_SAVE as *mut core::ffi::c_void)),
-                Some(hinstance),
-                None,
-            );
-            let _ = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("BUTTON"),
-                w!("Disconnect"),
-                WS_CHILD | WS_VISIBLE,
-                164,
-                3,
-                BAR_W - 168,
-                BAR_H - 6,
-                Some(hwnd),
-                Some(HMENU(ID_DISCONNECT as *mut core::ffi::c_void)),
-                Some(hinstance),
-                None,
-            );
-
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            VISIBLE.store(true, Ordering::SeqCst);
-            Ok(Self { hwnd, left, top })
-        }
+    /// A bar at the top centre of the screen `(left, top, width)` for the
+    /// session windows `sessions` (the first owns the bar); `single`: they are
+    /// one window. It shows for its first seconds, then as [`tick`] says.
+    pub fn new(screen: (i32, i32, i32), sessions: &[isize], single: bool) -> windows::core::Result<Self> {
+        let hwnd = unsafe { create(screen, sessions, single)? };
+        Ok(Self { hwnd })
     }
 
-    /// Poll the cursor and show/hide the bar. Call once per UI-loop iteration.
-    /// Pinned → always shown. Otherwise shown only while the cursor is in the
-    /// top-centre reveal strip above the bar.
+    /// See [`tick`].
     pub fn tick(&self) {
-        unsafe {
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            let reveal = PINNED.load(Ordering::SeqCst)
-                || (pt.y <= self.top + BAR_H
-                    && pt.x >= self.left - 48
-                    && pt.x <= self.left + BAR_W + 48);
-            let visible = VISIBLE.load(Ordering::SeqCst);
-            if reveal && !visible {
-                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-                VISIBLE.store(true, Ordering::SeqCst);
-            } else if !reveal && visible {
-                let _ = ShowWindow(self.hwnd, SW_HIDE);
-                VISIBLE.store(false, Ordering::SeqCst);
-            }
-        }
+        tick(0);
     }
 }
 
 impl Drop for ConnBar {
     fn drop(&mut self) {
+        BAR.store(0, Ordering::Relaxed);
+        VISIBLE.store(false, Ordering::Relaxed);
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
     }
 }
 
-/// Connection-bar window procedure: handle the two buttons; everything else is
-/// default. Pin toggles auto-hide and relabels itself; Disconnect ends the session.
+/// Make the bar (hidden; the first [`tick`] shows it).
+unsafe fn create(screen: (i32, i32, i32), sessions: &[isize], single: bool) -> windows::core::Result<HWND> {
+    let module = GetModuleHandleW(None)?;
+    let hinstance = HINSTANCE(module.0);
+    let class_name = w!("rdpioConnBarClass");
+
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(connbar_proc),
+        hInstance: hinstance,
+        lpszClassName: class_name,
+        hbrBackground: CreateSolidBrush(COLORREF(0x002B2B2B)),
+        hCursor: LoadCursorW(None, IDC_ARROW)?,
+        ..Default::default()
+    };
+    let _ = RegisterClassExW(&wc);
+
+    let main = sessions.first().copied().unwrap_or(0);
+    // Owned by the session window: it goes with it to the taskbar, and with
+    // it in and out of topmost.
+    let owner = (main != 0).then(|| HWND(main as *mut core::ffi::c_void));
+    let hwnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        class_name,
+        w!("RDPiO"),
+        WS_POPUP,
+        screen.0,
+        screen.1,
+        BAR_H * 4,
+        BAR_H,
+        owner,
+        None,
+        Some(hinstance),
+        None,
+    )?;
+    // The buttons, laid out (and shown) by `apply_layout`; clicks arrive as
+    // WM_COMMAND with their ids.
+    for (i, (id, label, w)) in BUTTONS.iter().enumerate() {
+        let b = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("BUTTON"),
+            *label,
+            WS_CHILD,
+            0,
+            3,
+            *w,
+            BAR_H - 6,
+            Some(hwnd),
+            Some(HMENU(*id as *mut core::ffi::c_void)),
+            Some(hinstance),
+            None,
+        )?;
+        BUTTON_HWNDS[i].store(b.0 as isize, Ordering::Relaxed);
+    }
+    if let Ok(mut list) = SESSION_WINDOWS.lock() {
+        *list = sessions.to_vec();
+    }
+    MAIN.store(main, Ordering::Relaxed);
+    SINGLE.store(single, Ordering::Relaxed);
+    MON_LEFT.store(screen.0, Ordering::Relaxed);
+    MON_TOP.store(screen.1, Ordering::Relaxed);
+    MON_W.store(screen.2, Ordering::Relaxed);
+    LAYOUT.store(u32::MAX, Ordering::Relaxed);
+    PLACED_EPOCH.store(u32::MAX, Ordering::Relaxed);
+    VISIBLE.store(false, Ordering::Relaxed);
+    MINIMIZED.store(false, Ordering::Relaxed);
+    SHOW_UNTIL.store(now_ms() + SHOW_FIRST_MS, Ordering::Relaxed);
+    LAST_TICK.store(0, Ordering::Relaxed);
+    BAR.store(hwnd.0 as isize, Ordering::Relaxed);
+    apply_layout(hwnd, buttons_now());
+    tick(0);
+    Ok(hwnd)
+}
+
+/// Show or hide the bar for where the pointer is and what the session is
+/// doing. Called by every pump of a session window (`from`: that window; a
+/// full-screen one gets the bar [`want`] asked for) and by [`ConnBar::tick`];
+/// it looks at most every [`TICK_MS`], and costs two atomic loads when there's
+/// no bar to show.
+pub fn tick(from: isize) {
+    let bar = BAR.load(Ordering::Relaxed);
+    if bar == 0 && !(from != 0 && WANTED.load(Ordering::Relaxed)) {
+        return;
+    }
+    let now = now_ms();
+    if now.saturating_sub(LAST_TICK.load(Ordering::Relaxed)) < TICK_MS {
+        return;
+    }
+    LAST_TICK.store(now, Ordering::Relaxed);
+    unsafe {
+        if bar == 0 {
+            // (A window in a Workspace tab is a child, never a popup.)
+            let session = HWND(from as *mut core::ffi::c_void);
+            if (GetWindowLongPtrW(session, GWL_STYLE) as u32) & WS_POPUP.0 != 0 {
+                WANTED.store(false, Ordering::Relaxed);
+                let screen = crate::window::monitor_rect_of(session).map_or((0, 0, 0), |r| (r.left, r.top, r.right - r.left));
+                match create(screen, &[from], true) {
+                    Ok(_) => tracing::info!("connection bar: point at the top edge of the screen"),
+                    Err(e) => tracing::warn!(error = %e, "no connection bar"),
+                }
+            }
+            return;
+        }
+        update(HWND(bar as *mut core::ffi::c_void), now);
+    }
+}
+
+unsafe fn update(bar: HWND, now: u64) {
+    let main = HWND(MAIN.load(Ordering::Relaxed) as *mut core::ffi::c_void);
+    if !IsWindow(Some(main)).as_bool() {
+        return;
+    }
+    let full = (GetWindowLongPtrW(main, GWL_STYLE) as u32) & WS_POPUP.0 != 0;
+    let iconic = IsIconic(main).as_bool();
+    // Restored from the taskbar after Minimize: the other windows too.
+    if !iconic && MINIMIZED.swap(false, Ordering::Relaxed) {
+        let others: Vec<isize> = SESSION_WINDOWS.lock().map(|l| l.clone()).unwrap_or_default();
+        for h in others.into_iter().filter(|&h| h != main.0 as isize) {
+            let h = HWND(h as *mut core::ffi::c_void);
+            if IsIconic(h).as_bool() {
+                let _ = ShowWindow(h, SW_RESTORE);
+            }
+        }
+    }
+    // One window follows its screen (Ctrl+Shift+F may have made it full
+    // screen on another one).
+    let epoch = crate::window::display_epoch();
+    if SINGLE.load(Ordering::Relaxed) && full && PLACED_EPOCH.swap(epoch, Ordering::Relaxed) != epoch {
+        if let Some(r) = crate::window::monitor_rect_of(main) {
+            MON_LEFT.store(r.left, Ordering::Relaxed);
+            MON_TOP.store(r.top, Ordering::Relaxed);
+            MON_W.store(r.right - r.left, Ordering::Relaxed);
+            LAYOUT.store(u32::MAX, Ordering::Relaxed);
+        }
+    }
+    let shown = buttons_now();
+    if shown != LAYOUT.load(Ordering::Relaxed) {
+        apply_layout(bar, shown);
+    }
+    let reveal = full
+        && !iconic
+        && !crate::window::capture_mode()
+        && ours_in_front()
+        && (PINNED.load(Ordering::Relaxed) || now < SHOW_UNTIL.load(Ordering::Relaxed) || pointer_at_bar());
+    let visible = VISIBLE.load(Ordering::Relaxed);
+    if reveal && !visible {
+        let _ = SetWindowPos(
+            bar,
+            Some(HWND_TOPMOST),
+            BAR_LEFT.load(Ordering::Relaxed),
+            MON_TOP.load(Ordering::Relaxed),
+            BAR_WIDTH.load(Ordering::Relaxed),
+            BAR_H,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        VISIBLE.store(true, Ordering::Relaxed);
+    } else if !reveal && visible {
+        let _ = ShowWindow(bar, SW_HIDE);
+        VISIBLE.store(false, Ordering::Relaxed);
+    }
+}
+
+/// The pointer is in the strip at the top edge above the bar.
+unsafe fn pointer_at_bar() -> bool {
+    let mut pt = POINT::default();
+    if GetCursorPos(&mut pt).is_err() {
+        return false;
+    }
+    let (left, width) = (BAR_LEFT.load(Ordering::Relaxed), BAR_WIDTH.load(Ordering::Relaxed));
+    pt.y <= MON_TOP.load(Ordering::Relaxed) + BAR_H && pt.x >= left - 48 && pt.x <= left + width + 48
+}
+
+/// One of this process's windows is in front (the session, the bar's dialog).
+unsafe fn ours_in_front() -> bool {
+    let fg = GetForegroundWindow();
+    if fg.0.is_null() {
+        return false;
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(fg, Some(&mut pid as *mut u32));
+    pid == std::process::id()
+}
+
+/// Show the buttons `shown`, side by side, and centre the bar on its screen.
+unsafe fn apply_layout(bar: HWND, shown: u32) {
+    let (at, width) = layout(shown);
+    for (i, place) in at.iter().enumerate() {
+        let b = HWND(BUTTON_HWNDS[i].load(Ordering::Relaxed) as *mut core::ffi::c_void);
+        match place {
+            Some((x, w)) => {
+                let _ = SetWindowPos(b, None, *x, 3, *w, BAR_H - 6, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            }
+            None => {
+                let _ = ShowWindow(b, SW_HIDE);
+            }
+        }
+    }
+    let left = MON_LEFT.load(Ordering::Relaxed) + (MON_W.load(Ordering::Relaxed) - width) / 2;
+    BAR_LEFT.store(left, Ordering::Relaxed);
+    BAR_WIDTH.store(width, Ordering::Relaxed);
+    LAYOUT.store(shown, Ordering::Relaxed);
+    let _ = SetWindowPos(bar, None, left, MON_TOP.load(Ordering::Relaxed), width, BAR_H, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+/// Connection-bar window procedure: the buttons; everything else is default.
 unsafe extern "system" fn connbar_proc(
     hwnd: HWND,
     msg: u32,
@@ -226,8 +429,29 @@ unsafe extern "system" fn connbar_proc(
             ID_PIN => {
                 let pinned = !PINNED.load(Ordering::SeqCst);
                 PINNED.store(pinned, Ordering::SeqCst);
-                let btn = HWND(PIN_BTN.load(Ordering::SeqCst) as *mut core::ffi::c_void);
+                let btn = HWND(BUTTON_HWNDS[0].load(Ordering::Relaxed) as *mut core::ffi::c_void);
                 let _ = SetWindowTextW(btn, if pinned { w!("Unpin") } else { w!("Pin") });
+                return LRESULT(0);
+            }
+            ID_MINIMIZE => {
+                // (The windows are copied out: minimizing sends them messages.)
+                let windows: Vec<isize> = SESSION_WINDOWS.lock().map(|l| l.clone()).unwrap_or_default();
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                VISIBLE.store(false, Ordering::Relaxed);
+                for h in windows {
+                    let _ = ShowWindow(HWND(h as *mut core::ffi::c_void), SW_MINIMIZE);
+                }
+                MINIMIZED.store(true, Ordering::Relaxed);
+                return LRESULT(0);
+            }
+            ID_WINDOW => {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                VISIBLE.store(false, Ordering::Relaxed);
+                crate::window::toggle_fullscreen_of(MAIN.load(Ordering::Relaxed));
+                return LRESULT(0);
+            }
+            ID_STATS => {
+                crate::window::toggle_stats();
                 return LRESULT(0);
             }
             ID_DISCONNECT => {
@@ -483,8 +707,10 @@ unsafe fn save_from_dialog(dlg: HWND) {
         }
     };
 
+    // (Copied out: the store's file I/O runs without the lock.)
+    let saved_as = SESSION.lock().ok().and_then(|s| s.as_ref().and_then(|s| s.connection_id));
     let input = ConnectionInput {
-        id: None,
+        id: saved_as,
         display_name: if name.trim().is_empty() {
             host.clone()
         } else {
@@ -507,6 +733,14 @@ unsafe fn save_from_dialog(dlg: HWND) {
     match ConnectionStore::load().and_then(|mut store| store.upsert(input)) {
         Ok(rec) => {
             tracing::info!(id = %rec.id, host = %rec.host, "saved connection from session bar");
+            // Saved now: no Save button from the next tick on, and a later
+            // save (after a reconnect) updates this record.
+            if let Ok(mut s) = SESSION.lock() {
+                if let Some(s) = s.as_mut() {
+                    s.connection_id = Some(rec.id);
+                }
+            }
+            HAS_INFO.store(false, Ordering::Relaxed);
             let _ = DestroyWindow(dlg);
         }
         Err(e) => {
@@ -518,5 +752,59 @@ unsafe fn save_from_dialog(dlg: HWND) {
                 MB_OK | MB_ICONWARNING,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_connection_has_no_save_button() {
+        let info = |host: &str, id: Option<uuid::Uuid>| SessionInfo {
+            display_name: host.into(),
+            host: host.into(),
+            port: 3389,
+            username: None,
+            domain: None,
+            password: None,
+            connection_id: id,
+        };
+        let saved_as = |host| SESSION.lock().unwrap().as_ref().filter(|s| s.host == host).and_then(|s| s.connection_id);
+        // A quick connect can be saved.
+        set_session_info(info("quick.corp", None));
+        assert!(HAS_INFO.load(Ordering::Relaxed));
+        // Once the bar saved it (as save_from_dialog notes it), a reconnect's
+        // facts keep it saved: no second Save, no duplicate.
+        let id = uuid::Uuid::new_v4();
+        SESSION.lock().unwrap().as_mut().unwrap().connection_id = Some(id);
+        set_session_info(info("quick.corp", None));
+        assert!(!HAS_INFO.load(Ordering::Relaxed));
+        assert_eq!(saved_as("quick.corp"), Some(id));
+        // Started from a saved connection: nothing to save.
+        let launched = uuid::Uuid::new_v4();
+        set_session_info(info("saved.corp", Some(launched)));
+        assert!(!HAS_INFO.load(Ordering::Relaxed));
+        assert_eq!(saved_as("saved.corp"), Some(launched));
+        // Another PC is not the one saved before.
+        set_session_info(info("other.corp", None));
+        assert!(HAS_INFO.load(Ordering::Relaxed));
+        assert_eq!(saved_as("other.corp"), None);
+    }
+
+    #[test]
+    fn the_bar_is_as_wide_as_its_buttons() {
+        // Pin, Minimize and Disconnect: a Remote Desktop session over several
+        // screens with nothing to save.
+        let (at, width) = layout(0b100011);
+        assert_eq!(at[0], Some((4, 56)));
+        assert_eq!(at[1], Some((64, 84)));
+        assert_eq!(at[2], None);
+        assert_eq!(at[5], Some((152, 92)));
+        assert_eq!(width, 248);
+        // Everything.
+        let (at, width) = layout(0b111111);
+        assert!(at.iter().all(Option::is_some));
+        assert_eq!(width, GAP + BUTTONS.iter().map(|b| b.2 + GAP).sum::<i32>());
     }
 }

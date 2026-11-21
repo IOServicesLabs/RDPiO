@@ -151,18 +151,29 @@ impl Session {
 
     /// Seal `body` into a datagram of `kind`.
     pub fn seal(&mut self, kind: Kind, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_LEN + body.len() + TAG_LEN);
+        self.seal_into(kind, body, &mut out);
+        out
+    }
+
+    /// [`Session::seal`] appended to `out` (a send batch's buffer, say): the
+    /// same datagram, `HEADER_LEN + body.len() + TAG_LEN` bytes after what
+    /// `out` held, encrypted where it lies — no allocation, one copy of the
+    /// body.
+    pub fn seal_into(&mut self, kind: Kind, body: &[u8], out: &mut Vec<u8>) {
         self.send_seq += 1;
         let seq = self.send_seq;
-        let mut out = Vec::with_capacity(HEADER_LEN + body.len() + TAG_LEN);
+        let start = out.len();
+        out.reserve(HEADER_LEN + body.len() + TAG_LEN);
         out.extend_from_slice(&[MAGIC, self.version, kind as u8, 0]);
         out.extend_from_slice(&seq.to_le_bytes());
-        let header: [u8; HEADER_LEN] = out[..HEADER_LEN].try_into().unwrap();
-        let mut sealed = body.to_vec();
-        self.key
-            .seal_in_place_append_tag(nonce(self.send_dir, seq), Aad::from(header), &mut sealed)
+        let header: [u8; HEADER_LEN] = out[start..start + HEADER_LEN].try_into().unwrap();
+        out.extend_from_slice(body);
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(nonce(self.send_dir, seq), Aad::from(header), &mut out[start + HEADER_LEN..])
             .expect("seal");
-        out.extend_from_slice(&sealed);
-        out
+        out.extend_from_slice(tag.as_ref());
     }
 
     /// Authenticate and decrypt a received datagram.
@@ -320,6 +331,30 @@ mod tests {
         let copy = again.clone();
         client.open_in_place(&mut again).unwrap();
         assert_eq!(client.open(&copy), Err(OpenError::Replay));
+    }
+
+    /// `seal_into` makes the very datagram `seal` does (same sequence number,
+    /// same bytes), appended after what the buffer held; either opens.
+    #[test]
+    fn seals_into_a_buffer_like_seal() {
+        let key = random_key();
+        let mut a = Session::new(&key, Direction::HostToClient);
+        let mut b = Session::new(&key, Direction::HostToClient);
+        let mut client = Session::new(&key, Direction::ClientToHost);
+        let mut batch = vec![0xEE; 5];
+        for body in [&b"frame bytes"[..], &[], &[3u8; MAX_BODY]] {
+            let p = a.seal(Kind::Video, body);
+            let start = batch.len();
+            b.seal_into(Kind::Video, body, &mut batch);
+            assert_eq!(batch[start..], p[..], "byte for byte");
+            assert_eq!(p.len(), OVERHEAD + body.len());
+            assert_eq!(client.open_in_place(&mut batch[start..]).unwrap(), (Kind::Video, body));
+        }
+        assert_eq!(batch[..5], [0xEE; 5], "what was there stays");
+        // And the other way: a sealed-into packet opens with `open`.
+        let mut out = Vec::new();
+        b.seal_into(Kind::Audio, b"pcm", &mut out);
+        assert_eq!(client.open(&out).unwrap(), (Kind::Audio, b"pcm".to_vec()));
     }
 
     /// A/B: `cargo test -p rdp-hyper --release -- --ignored --nocapture open_bench`.

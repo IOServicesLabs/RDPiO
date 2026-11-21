@@ -20,7 +20,7 @@ both speak, and a host hands its newer rdpio to the devices that connect (see
 
 ## The launcher
 
-Start `rdpio.exe` with no arguments for the launcher. It has three pages:
+Start `rdpio.exe` with no arguments for the launcher. It has five pages:
 
 - **Connections:** quick connect, saved connections and recent ones. Each
   saved connection has its own options:
@@ -30,15 +30,21 @@ Start `rdpio.exe` with no arguments for the launcher. It has three pages:
 
   Passwords are kept encrypted for your Windows account. A session that
   fails says why.
+- **Workspace:** saved connections in folders, and sessions side by side in
+  tabs inside the launcher window.
 - **This PC:** sets this PC up as a Hyper host. It installs the service,
   sets the Hyper password, adds the virtual display, and lists the addresses
   to connect to (the Tailscale one works from anywhere). Windows asks for
   administrator permission for these steps.
+- **Activity:** what the launcher and every session are logging, live.
 - **Settings:** theme, whether the launcher stays open after connecting,
-  what new connections start with, and the in-session keys.
+  what new connections start with, updates, and the keyboard shortcuts.
 
-Each session runs in its own process. `--classic-hub` opens the older window,
-and rdpio falls back to it on PCs without the WebView2 runtime.
+Each session runs in its own process. The launcher needs the Microsoft Edge
+WebView2 Runtime (part of Windows 11, installable on Windows 10); without it
+rdpio says so in a message box, and sessions still start from a terminal
+(`rdpio --host <pc> …`). The older `--classic-hub` window is gone: the flag now
+opens the launcher.
 
 ## Host setup (the gaming PC), once
 
@@ -102,22 +108,60 @@ Enter the Hyper password once; it is remembered for that host (encrypted with
 your Windows account). If the PC is locked you see the lock screen in the
 stream — sign in there as usual.
 
-The keys below are shown on screen for the first seconds of every stream.
+From the launcher, a Hyper Direct connection asks for the password itself and
+remembers it only when you tick **Remember it on this PC** (on a saved
+connection; its editor's **Forget the saved Hyper password** forgets it again).
+A password the host turns down is forgotten, and the next Connect asks for it.
+A password an older rdpio remembered for the host is taken over by the saved
+connection the first time it connects.
+
+The keys below are shown on screen for the first seconds of a session (not
+again after a reconnect): a Remote Desktop session shows Ctrl+Shift+Q,
+Ctrl+Shift+M and Ctrl+Alt+End; a Hyper stream all seven, without
+Ctrl+Shift+F in a Workspace tab. Ctrl+Shift+M, Ctrl+Shift+K and Ctrl+Shift+O
+say on screen for a moment what they did. The launcher's Settings page
+lists the same keys.
 
 | Key | Action |
 |---|---|
 | Ctrl+Shift+Q | Disconnect (the host locks) |
 | Ctrl+Shift+M | Lock the mouse in (relative aiming for games). Again to release |
-| Ctrl+Shift+K | Win, Alt+Tab, Alt+F4, Ctrl+Esc: to the host (the default) or to the laptop (Hyper only) |
-| Ctrl+Shift+S | Stats overlay: fps, latency, round trip, bitrate, loss (Hyper only; in plain RDP it reaches the remote app) |
-| Ctrl+Shift+O | Office mode on/off: crisp text (see below) or game mode (Hyper only) |
-| Ctrl+Shift+F | Fullscreen or a window, on the screen the window is on (Hyper only; the stream fits the window) |
 | Ctrl+Alt+End | Ctrl+Alt+Del on the host (lock screen, security options) |
+| Ctrl+Shift+K | Win, Alt+Tab, Alt+F4, Ctrl+Esc: to the host (the default) or to the laptop (Hyper only) |
+| Ctrl+Shift+O | Office mode on/off: crisp text (see below) or game mode (Hyper only) |
+| Ctrl+Shift+S | Stats overlay: fps, latency, round trip, bitrate, loss (Hyper only; in plain RDP it reaches the remote app) |
+| Ctrl+Shift+F | Fullscreen or a window, on the screen the window is on (Hyper only, not in a Workspace tab; the stream fits the window) |
 
-While the stream's window is in front, Win, Alt+Tab, Alt+F4 and Ctrl+Esc act
-on the host, as if you sat at it. To use them on the laptop, press
-Ctrl+Shift+K (again to give them back), or click another window. Ctrl+Alt+Del
-always stays on the laptop, so there's always a way out.
+At the host's own keyboard:
+
+| Key | Action |
+|---|---|
+| Ctrl+Alt+F12 | Take the PC back: the stream ends and its own keyboard and screen have it again |
+
+In the launcher window:
+
+| Key | Action |
+|---|---|
+| Ctrl+N | New connection |
+| Ctrl+F | Find a PC (on Activity: filter the log) |
+| Ctrl+Tab | Workspace: the next tab (with Shift, the one before) |
+| Ctrl+W | Workspace: close the tab |
+| Ctrl+B | Workspace: hide the list, so the session gets the window (again to show it) |
+
+While the stream's window is in front (or, in a Workspace tab, while the
+session has the keyboard), Win, Alt+Tab, Alt+F4 and Ctrl+Esc act on the
+host, as if you sat at it. To use them on the laptop, press Ctrl+Shift+K
+(again to give them back), or click another window. Ctrl+Alt+Del always
+stays on the laptop, so there's always a way out.
+
+A full-screen session (Remote Desktop or Hyper) has a bar at the top centre
+of its screen: it shows for the first 3 seconds, then whenever the pointer
+touches the top edge there (never while the mouse is locked in). Its
+buttons: **Pin** (keep it shown), **Minimize**, **Window** (leave full
+screen; one-window sessions), **Stats** (Hyper), **Save** (keep this
+connection; not in Hyper Direct) and **Disconnect**. Full screen opens on
+the screen the pointer is on, which is the launcher's when you connect from
+it.
 
 **On battery** the client saves power where you won't see it:
 
@@ -834,7 +878,7 @@ to `main` refreshes the nightly the same way. To sign a local build by hand
 |---|---|
 | "no answer from a Hyper host" | Service not installed/running, UDP 47998 blocked, or an older rdpio on one side. |
 | "the host runs a different rdpio version" | Install the same rdpio on both PCs (then re-run the host install). |
-| "wrong Hyper password" | Re-run; the saved one is cleared. |
+| "wrong Hyper password" | Re-run (or Connect again in the launcher); the saved one is cleared, so it asks. |
 | "refusing sign-ins … try again in N s" | Too many wrong passwords from this address. |
 | "decoding on the CPU", "No GPU video decoder" | The client's GPU driver is missing — install it (the stream still works, on the CPU). |
 | Choppy under heavy GPU load | Cap the game's frame rate (see Latency notes). |

@@ -60,6 +60,77 @@ pub fn direct(lan: &[String], mine: &[(Ipv4Addr, u8)], via: SocketAddr) -> Optio
     candidates(lan, mine, via).into_iter().find(|&a| answers(a, Duration::from_millis(400)))
 }
 
+/// How long a candidate gets at most (as [`direct`] gives each).
+const DIRECT_WAIT_MS: u64 = 400;
+/// Once the host has answered through `via` after `t`, a candidate gets
+/// `2t` plus this from the start (ms).
+const DIRECT_MARGIN_MS: u64 = 30;
+/// Hellos repeat this often (ms) to whoever hasn't answered.
+const HELLO_EVERY_MS: u64 = 100;
+
+/// [`direct`], without waiting long on a network that only looks like the
+/// host's: the cookieless hello goes to every one of [`candidates`] and to
+/// `via` at the same moment. A candidate that answers wins at once. Once the
+/// host has answered through `via` (after `t`), the candidates get until
+/// `2t + 30 ms` from the start, never past 400 ms; then `None`: sign in
+/// through `via`. A host really on this network answers sooner than through
+/// a VPN running over that same network; one at home while this device is
+/// on a same-numbered network elsewhere cost a flat 400 ms per candidate on
+/// every connect and every reconnect.
+pub fn direct_or(lan: &[String], mine: &[(Ipv4Addr, u8)], via: SocketAddr) -> Option<SocketAddr> {
+    let candidates = candidates(lan, mine, via);
+    if candidates.is_empty() {
+        return None;
+    }
+    race(&candidates, via, Duration::from_millis(DIRECT_WAIT_MS))
+}
+
+/// The race of [`direct_or`]: the first of `candidates` to answer, unless
+/// `via` answers well before any of them (or `most` passes).
+fn race(candidates: &[SocketAddr], via: SocketAddr, most: Duration) -> Option<SocketAddr> {
+    let open = |addr: SocketAddr| {
+        let socket = UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).ok()?;
+        socket.connect(addr).ok()?;
+        socket.set_nonblocking(true).ok()?;
+        Some(socket)
+    };
+    // (Index 0 is `via`; a socket that couldn't open never answers.)
+    let sockets: Vec<Option<UdpSocket>> = std::iter::once(via).chain(candidates.iter().copied()).map(open).collect();
+    let (_, hello) = ClientAuth::start(&[0; 32], Want::default());
+    let start = Instant::now();
+    let (mut deadline, mut via_answered) = (most, false);
+    let mut last_hello: Option<Instant> = None;
+    let mut buf = [0u8; 2048];
+    loop {
+        if last_hello.is_none_or(|t| t.elapsed() >= Duration::from_millis(HELLO_EVERY_MS)) {
+            for s in sockets.iter().flatten() {
+                let _ = s.send(&hello);
+            }
+            last_hello = Some(Instant::now());
+        }
+        for (i, s) in sockets.iter().enumerate() {
+            let Some(s) = s else { continue };
+            while let Ok(n) = s.recv(&mut buf) {
+                if !matches!(AuthMsg::parse(&buf[..n]), Some(AuthMsg::Cookie { .. } | AuthMsg::Denied { .. })) {
+                    continue;
+                }
+                if i > 0 {
+                    return Some(candidates[i - 1]);
+                }
+                if !via_answered {
+                    via_answered = true;
+                    deadline = most.min(start.elapsed() * 2 + Duration::from_millis(DIRECT_MARGIN_MS));
+                }
+                break;
+            }
+        }
+        if start.elapsed() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// Whether `client` is on one of the host's local networks (`lan`, as in
 /// [`crate::auth::Offer::lan`]).
 pub fn on_lan(lan: &[String], client: IpAddr) -> bool {
@@ -153,5 +224,53 @@ mod tests {
         t.join().unwrap();
         let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
         assert!(!answers(silent.local_addr().unwrap(), Duration::from_millis(200)));
+    }
+
+    /// A host on loopback answering every hello after `delay`, for `for_ms`.
+    fn host_answering(delay: Duration, for_ms: u64) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        let host = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = host.local_addr().unwrap();
+        host.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let t = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_millis(for_ms);
+            let mut buf = [0u8; 2048];
+            while Instant::now() < until {
+                if let Ok((_, from)) = host.recv_from(&mut buf) {
+                    std::thread::sleep(delay);
+                    let _ = host.send_to(&AuthMsg::Cookie { cookie: [7; 16] }.to_datagram(), from);
+                }
+            }
+        });
+        (addr, t)
+    }
+
+    #[test]
+    fn a_local_host_wins_the_race() {
+        let (via, a) = host_answering(Duration::from_millis(60), 1_000);
+        let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (local, b) = host_answering(Duration::ZERO, 1_000);
+        let candidates = [silent.local_addr().unwrap(), local];
+        assert_eq!(race(&candidates, via, Duration::from_millis(400)), Some(local));
+        a.join().unwrap();
+        b.join().unwrap();
+    }
+
+    /// The host answers through `via` at once and no candidate does: the
+    /// candidates don't get the full 400 ms.
+    #[test]
+    fn a_same_numbered_network_elsewhere_costs_little() {
+        let (via, a) = host_answering(Duration::ZERO, 1_000);
+        let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let t = Instant::now();
+        assert_eq!(race(&[silent.local_addr().unwrap()], via, Duration::from_millis(400)), None);
+        assert!(t.elapsed() < Duration::from_millis(250), "{:?}", t.elapsed());
+        a.join().unwrap();
+        // Nobody answers anywhere: the full wait, as before.
+        let quiet_via = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let t = Instant::now();
+        assert_eq!(race(&[silent.local_addr().unwrap()], quiet_via.local_addr().unwrap(), Duration::from_millis(200)), None);
+        assert!(t.elapsed() >= Duration::from_millis(200));
+        // No candidates on this network: no wait at all.
+        assert_eq!(direct_or(&[], &[], quiet_via.local_addr().unwrap()), None);
     }
 }

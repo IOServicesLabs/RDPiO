@@ -8,6 +8,10 @@
 //!
 //! Compressed formats (AAC/HE-AAC advertised by the RDPSND channel) are decoded
 //! to PCM through a Media Foundation transform before playback.
+//!
+//! [`WasapiAudio`] is the sink a session normally uses: 16-bit PCM goes to
+//! the WASAPI player and its jitter buffer, and anything else (or a player
+//! that won't open) to `waveOut`. `RDPIO_RDPSND=waveout` forces `waveOut`.
 
 use rdp_channels::rdpsnd::{AudioFormat, AudioSink};
 use windows::core::PSTR;
@@ -487,5 +491,259 @@ impl AudioSink for Win32Audio {
 impl Drop for Win32Audio {
     fn drop(&mut self) {
         unsafe { self.close() }
+    }
+}
+
+/// Queue depth the WASAPI path holds for RDP sound (ms): room for the gaps
+/// between a server's waves, which arrive behind graphics on the same link.
+const RDPSND_TARGET_MS: u32 = 60;
+
+/// A dead player (the device went away, or the default output changed) is
+/// reopened at most this often.
+const REOPEN_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The rdpsnd sink for a session: the WASAPI player with its jitter buffer,
+/// or `waveOut` ([`Win32Audio`]) when the environment says
+/// `RDPIO_RDPSND=waveout`.
+pub fn rdpsnd_sink() -> Box<dyn AudioSink + Send> {
+    if std::env::var("RDPIO_RDPSND").is_ok_and(|v| v.eq_ignore_ascii_case("waveout")) {
+        tracing::info!("RDP sound: waveOut (RDPIO_RDPSND=waveout)");
+        Box::new(Win32Audio::new())
+    } else {
+        Box::new(WasapiAudio::new())
+    }
+}
+
+/// Converts 16-bit little-endian PCM to `f32` samples, replacing `out`.
+fn s16_to_f32(pcm: &[u8], out: &mut Vec<f32>) {
+    out.clear();
+    out.extend(pcm.chunks_exact(2).map(|s| i16::from_le_bytes([s[0], s[1]]) as f32 / 32768.0));
+}
+
+/// RDP sound through the WASAPI player ([`crate::wasapi::Player`]): a steady
+/// jitter buffer in place of `waveOut`'s queue, and output that follows a new
+/// default device. The player is opened on a helper thread (a stuck driver
+/// can hold an open for seconds) and waves are dropped until it is ready.
+/// Anything it can't play (not 16-bit PCM, more than two channels, a
+/// compressed format) or a player that fails to open goes to [`Win32Audio`]
+/// instead.
+pub struct WasapiAudio {
+    /// `(channels, samples_per_sec)` of the current 16-bit PCM format.
+    format: Option<(u16, u32)>,
+    player: Option<crate::wasapi::Player>,
+    /// A player being opened on a helper thread, and the format it is for.
+    opening: Option<((u16, u32), std::sync::mpsc::Receiver<windows::core::Result<crate::wasapi::Player>>)>,
+    last_open: Option<std::time::Instant>,
+    last_play: std::time::Instant,
+    /// Samples converted for `push`, reused.
+    samples: Vec<f32>,
+    /// The `waveOut` path, once something has gone to it.
+    fallback: Option<Win32Audio>,
+    /// The fallback plays the current format (rather than the player).
+    on_fallback: bool,
+    /// The player failed to open: `waveOut` plays from then on.
+    player_failed: bool,
+}
+
+impl WasapiAudio {
+    pub fn new() -> Self {
+        Self {
+            format: None,
+            player: None,
+            opening: None,
+            last_open: None,
+            last_play: std::time::Instant::now(),
+            samples: Vec::new(),
+            fallback: None,
+            on_fallback: false,
+            player_failed: false,
+        }
+    }
+
+    fn fallback(&mut self) -> &mut Win32Audio {
+        self.fallback.get_or_insert_with(Win32Audio::new)
+    }
+
+    /// Let go of the player without waiting here for its render thread to
+    /// end.
+    fn drop_player(&mut self) {
+        if let Some(player) = self.player.take() {
+            let underruns = player.underruns();
+            tracing::debug!(underruns, "RDP sound: output closed");
+            let _ = std::thread::Builder::new()
+                .name("rdpsnd-close".into())
+                .spawn(move || drop(player));
+        }
+    }
+
+    /// Start opening a player for `format` on a helper thread, at most once a
+    /// second.
+    fn start_open(&mut self, format: (u16, u32)) {
+        if self.opening.is_some() || self.last_open.is_some_and(|t| t.elapsed() < REOPEN_EVERY) {
+            return;
+        }
+        self.last_open = Some(std::time::Instant::now());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("rdpsnd-open".into()).spawn(move || {
+            let player = crate::wasapi::Player::with_rate(None, format.0 as usize, format.1);
+            if let Ok(p) = &player {
+                p.set_target_ms(RDPSND_TARGET_MS);
+            }
+            let _ = tx.send(player);
+        });
+        match spawned {
+            Ok(_) => self.opening = Some((format, rx)),
+            Err(e) => self.use_fallback(format, &e.to_string()),
+        }
+    }
+
+    /// The player failed: play the current format through `waveOut` from now
+    /// on.
+    fn use_fallback(&mut self, (channels, rate): (u16, u32), why: &str) {
+        tracing::warn!(error = why, "RDP sound: WASAPI output didn't open; using waveOut");
+        self.player_failed = true;
+        self.on_fallback = true;
+        self.fallback().set_format(channels, rate, 16);
+    }
+
+    /// Pick up a player the helper thread has finished opening.
+    fn poll_open(&mut self) {
+        let Some((format, rx)) = &self.opening else {
+            return;
+        };
+        let format = *format;
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(windows::core::Error::new(E_FAIL, "audio output thread ended"))
+            }
+        };
+        self.opening = None;
+        let current = !self.on_fallback && self.format == Some(format);
+        match result {
+            Ok(player) if current => {
+                tracing::info!(channels = format.0, rate = format.1, "RDP sound: WASAPI output opened");
+                self.player = Some(player);
+            }
+            // The format changed while it opened; the next wave opens one
+            // in the new format.
+            Ok(player) => {
+                self.player = Some(player);
+                self.drop_player();
+                self.last_open = None;
+            }
+            Err(e) if current => self.use_fallback(format, &e.to_string()),
+            Err(_) => {}
+        }
+    }
+}
+
+impl Default for WasapiAudio {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AudioSink for WasapiAudio {
+    fn set_format(&mut self, channels: u16, samples_per_sec: u32, bits_per_sample: u16) {
+        self.last_play = std::time::Instant::now();
+        let usable = bits_per_sample == 16 && (1..=2).contains(&channels) && samples_per_sec > 0;
+        if !usable || self.player_failed {
+            self.drop_player();
+            self.format = None;
+            self.on_fallback = true;
+            self.fallback().set_format(channels, samples_per_sec, bits_per_sample);
+            return;
+        }
+        if self.on_fallback {
+            // Back from waveOut (a compressed or odd format before): release
+            // its device.
+            self.on_fallback = false;
+            self.fallback = None;
+        }
+        let format = (channels, samples_per_sec);
+        if self.format == Some(format) && (self.player.is_some() || self.opening.is_some()) {
+            return;
+        }
+        self.drop_player();
+        self.format = Some(format);
+        self.last_open = None;
+        self.start_open(format);
+    }
+
+    fn play(&mut self, pcm: &[u8]) {
+        if pcm.is_empty() {
+            return;
+        }
+        self.last_play = std::time::Instant::now();
+        if !self.on_fallback {
+            self.poll_open();
+        }
+        // On waveOut, including a player that just failed to open.
+        if self.on_fallback {
+            self.fallback().play(pcm);
+            return;
+        }
+        let Some(format) = self.format else {
+            return;
+        };
+        if self.player.as_ref().is_some_and(|p| !p.is_alive()) {
+            // The device went away or the default output changed.
+            self.drop_player();
+        }
+        let Some(player) = &self.player else {
+            // Closed for silence, dead, or still opening: open (again) and
+            // drop this wave.
+            self.start_open(format);
+            return;
+        };
+        s16_to_f32(pcm, &mut self.samples);
+        player.push(&self.samples);
+    }
+
+    fn set_compressed_format(&mut self, format: &AudioFormat) {
+        self.drop_player();
+        self.format = None;
+        self.on_fallback = true;
+        self.fallback().set_compressed_format(format);
+    }
+
+    fn play_compressed(&mut self, format: &AudioFormat, payload: &[u8]) {
+        self.last_play = std::time::Instant::now();
+        if self.on_fallback {
+            self.fallback().play_compressed(format, payload);
+        }
+    }
+
+    fn idle(&mut self) {
+        if let Some(fallback) = &mut self.fallback {
+            fallback.idle();
+        }
+        if !self.on_fallback {
+            self.poll_open();
+        }
+        if self.player.is_some() && self.last_play.elapsed() >= IDLE_CLOSE {
+            self.drop_player();
+            // Reopened by the next sound, without the once-a-second wait.
+            self.last_open = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::s16_to_f32;
+
+    #[test]
+    fn pcm_converts_to_unit_range_floats() {
+        let pcm: Vec<u8> = [0i16, 16384, -16384, i16::MAX, i16::MIN]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .chain([0x7f]) // a stray odd byte is ignored
+            .collect();
+        let mut out = vec![9.0; 3];
+        s16_to_f32(&pcm, &mut out);
+        assert_eq!(out, [0.0, 0.5, -0.5, 32767.0 / 32768.0, -1.0]);
     }
 }

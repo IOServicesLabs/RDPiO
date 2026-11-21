@@ -423,6 +423,10 @@ fn simulate(arm: Arm, load: Load, path: Path, secs: u64, seed: u64) -> Tally {
                         ltr.acked(id);
                     }
                     r.update(&fb, 50, now_ms);
+                    // (The newest frame lost in part, then nothing: repaired.)
+                    if r.tail_unresolved(now_ms) {
+                        recover = true;
+                    }
                 }
                 Msg::Key => {
                     if !r.collapse_keyframe_request(now_ms) {
@@ -691,6 +695,8 @@ fn simulate(arm: Arm, load: Load, path: Path, secs: u64, seed: u64) -> Tally {
                 win.delay_avg_us = delay_sum / delay_n;
             }
             win.window_us = 50_000;
+            // (Every frame before `next_resolve` is shown or given up on.)
+            win.resolved_frame = next_resolve.checked_sub(1).map(|id| id as u32);
             to_host.push_back((t + path.one_way_us, Msg::Feedback(win)));
             (win, delay_sum, delay_n, window_start) = (Feedback::default(), 0, 0, t);
         }
@@ -815,6 +821,23 @@ mod tests {
         let (_, _, a, b) = runs.iter().find(|r| r.0 == Load::Game && r.1.name == Path::WIFI_BURSTY.name).unwrap();
         assert!(b.keyframes * 3 < a.keyframes, "game, bursty: keyframes {} → {}", a.keyframes, b.keyframes);
         assert!(b.bytes_per_shown() < a.bytes_per_shown() * 0.995, "game, bursty: bytes a frame {:.0} → {:.0}", a.bytes_per_shown(), b.bytes_per_shown());
+    }
+
+    /// The client's word for which frame it has (`exactack`), with the tail
+    /// repair and one cut per keyframe's queue that rest on it (`tailrepair`,
+    /// `keyqonce`), against counting frames as an older client's feedback
+    /// has the host do.
+    #[test]
+    fn fecsim_exact_ack() {
+        let on = Switches::default();
+        let off = Switches { exact_ack: false, tail_repair: false, key_queue_once: false, ..on };
+        let mut cases: Vec<(Load, Path)> = PATHS.iter().map(|&p| (Load::Office, p)).collect();
+        cases.extend([(Load::Glances, Path::WIFI_BURSTY), (Load::Glances, Path::WIFI_FADES)]);
+        cases.extend([(Load::Game, Path::CLEAN_LAN), (Load::Game, Path::WIFI_BURSTY), (Load::Game, Path::SLOW)]);
+        let runs = ab("exactack", off, on, &cases);
+        for (load, path, a, b) in &runs {
+            no_worse(*load, *path, a, b);
+        }
     }
 
     /// The baseline: what every path and load costs today.

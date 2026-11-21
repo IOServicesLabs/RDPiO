@@ -4,8 +4,8 @@
 //! window. The page draws everything; this side owns the data and the
 //! actions, and the two talk over WebView2's message channel:
 //!
-//! - the page sends `{id, cmd, ...}` (`window.chrome.webview.postMessage`) and
-//!   gets `{id, ok, data | error}` back;
+//! - the page sends `{rid, cmd, ...}` (`window.chrome.webview.postMessage`) and
+//!   gets `{id: rid, ok, data | error}` back;
 //! - this side also sends `{event, ...}` on its own (a session started,
 //!   ended, failed; an administrator action finished).
 //!
@@ -30,7 +30,8 @@
 //! says so ([`crate::window::WM_RDPIO_EMBEDDED`]), and this side puts it
 //! where the page's tab is, hiding the ones whose tab isn't in front.
 //!
-//! Without the WebView2 runtime, [`run`] fails and `main` opens the hub.
+//! Without the WebView2 runtime, [`run`] fails and `main` says so in a
+//! message box.
 
 pub(crate) mod host;
 pub mod profile;
@@ -58,7 +59,7 @@ use windows::core::{w, Interface, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::hub::{ConnectionInput, ConnectionStore, MruStore, ProtectedPassword};
+use crate::hub::{ConnectionInput, ConnectionRecord, ConnectionStore, MruStore, ProtectedPassword};
 use profile::{Options, Transport};
 
 const PAGE: &str = include_str!("launcher.html");
@@ -130,6 +131,8 @@ struct Session {
     embedded: bool,
     /// …and its window, once it said so (`WM_RDPIO_EMBEDDED`).
     child: Option<isize>,
+    /// The host of a Hyper Direct session (whose Hyper password it was given).
+    direct_host: Option<String>,
 }
 
 /// Where the Workspace's tab in front is (this window's client pixels), and
@@ -168,6 +171,41 @@ struct State {
     /// The newest log line the page has.
     log_sent: Cell<u64>,
     embed: Embed,
+    /// The last few saved connections deleted, newest last, for Undo: each
+    /// record (password blob and all), where it was in the list, and its
+    /// launcher entry. Only in memory, until exit; see [`Deleted`].
+    deleted: Deleted,
+}
+
+/// One deleted connection kept for Undo.
+type DeletedOne = (ConnectionRecord, usize, Option<profile::Entry>);
+
+/// The deleted connections that can still be brought back, by id, newest
+/// last. Each Delete toast's Undo names its own connection, so a later delete
+/// must not take the place of an earlier one still on screen.
+#[derive(Default)]
+struct Deleted(Vec<DeletedOne>);
+
+impl Deleted {
+    /// How many are kept: far more than toasts on screen at once.
+    const KEEP: usize = 16;
+
+    /// Keep `one` for Undo, in place of an older copy with its id, dropping the
+    /// oldest beyond [`KEEP`](Self::KEEP).
+    fn push(&mut self, one: DeletedOne) {
+        self.0.retain(|(r, ..)| r.id != one.0.id);
+        self.0.push(one);
+        if self.0.len() > Self::KEEP {
+            let extra = self.0.len() - Self::KEEP;
+            self.0.drain(..extra);
+        }
+    }
+
+    /// Take the one with `id` out, leaving the others.
+    fn take(&mut self, id: &uuid::Uuid) -> Option<DeletedOne> {
+        let at = self.0.iter().position(|(r, ..)| &r.id == id)?;
+        Some(self.0.remove(at))
+    }
 }
 
 impl State {
@@ -187,6 +225,9 @@ static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 static LOGS_DUE: AtomicBool = AtomicBool::new(false);
 /// The page is in sight: sessions' logs are read often (else now and then).
 static PAGE_SHOWN: AtomicBool = AtomicBool::new(true);
+/// The launcher is the window in front (behind a session's window, its logs
+/// can be read less often).
+static ACTIVE: AtomicBool = AtomicBool::new(true);
 
 /// A log line was kept (any thread): the page gets it soon.
 fn notify_logs() {
@@ -270,6 +311,7 @@ pub fn run() -> Result<(), LauncherError> {
             minimized: false,
             log_sent: Cell::new(0),
             embed: Embed::default(),
+            deleted: Deleted::default(),
         })
     });
     HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
@@ -784,6 +826,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // (a live session's pulsing dot) while another window has the
                 // user's attention.
                 let active = (wparam.0 & 0xFFFF) != 0;
+                ACTIVE.store(active, Ordering::Relaxed);
                 with_state(|st| send(st, &json!({ "event": "active", "on": active })));
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
@@ -865,7 +908,9 @@ fn on_message(text: &str) {
     let Ok(req) = serde_json::from_str::<Value>(text) else {
         return;
     };
-    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    // The page numbers its requests in `rid` ("id" is a request's own field: the
+    // connection a `delete` or a `connect` is about).
+    let id = req.get("rid").cloned().unwrap_or(Value::Null);
     let cmd = req.get("cmd").and_then(Value::as_str).unwrap_or("").to_string();
     with_state(|st| {
         let reply = match handle(st, &cmd, &req) {
@@ -886,8 +931,71 @@ fn handle(st: &mut State, cmd: &str, req: &Value) -> Result<Value, String> {
         "save" => save(st, req),
         "delete" => {
             let id = parse_id(req)?;
+            // (As the file is now: a session may have saved one since. A file
+            // that can't be read stops the delete rather than writing over it.)
+            st.connections.reload_strict().map_err(|e| e.to_string())?;
+            let kept = st.connections.get(&id).cloned().zip(st.connections.position(&id));
             st.connections.delete(&id).map_err(|e| e.to_string())?;
-            if st.prefs.file.entries.remove(&id).is_some() {
+            let mut entry = st.prefs.file.entries.remove(&id);
+            if entry.is_some() {
+                st.prefs.save().map_err(|e| e.to_string())?;
+            }
+            // A Hyper Direct connection's password kept for its host outside
+            // the launcher goes with it (into the Undo, with the rest), unless
+            // another saved connection is to that host.
+            let direct = entry.as_ref().map_or(st.prefs.file.defaults.transport, |e| e.options.transport) == Transport::Direct;
+            if let Some((record, _)) = kept.as_ref().filter(|_| direct) {
+                let shared = st.connections.list().iter().any(|r| r.host.eq_ignore_ascii_case(&record.host));
+                if !shared {
+                    if !entry.as_ref().is_some_and(|e| e.hyper_password.is_some()) {
+                        if let Some(pw) = crate::hyper_client::saved_password(&record.host).and_then(|p| ProtectedPassword::protect(&p).ok()) {
+                            let mut e = entry.unwrap_or_else(|| st.prefs.entry(&id));
+                            e.hyper_password = Some(pw);
+                            entry = Some(e);
+                        }
+                    }
+                    crate::hyper_client::forget_saved_password(&record.host);
+                }
+            }
+            if let Some((record, at)) = kept {
+                st.deleted.push((record, at, entry));
+            }
+            Ok(state_json(st))
+        }
+        "undelete" => {
+            // Undo the delete of the connection with this id: the record as it
+            // was, passwords included.
+            let id = parse_id(req)?;
+            let (record, at, entry) = st.deleted.take(&id).ok_or("That one can't be undone any more.")?;
+            if let Err(e) = st.connections.restore(record.clone(), at) {
+                // Still there to try again.
+                st.deleted.push((record, at, entry));
+                return Err(e.to_string());
+            }
+            if let Some(entry) = entry {
+                st.prefs.file.entries.insert(id, entry);
+                st.prefs.save().map_err(|e| e.to_string())?;
+            }
+            Ok(state_json(st))
+        }
+        "set_folders" => {
+            // `{folders: {id: path}}`: many connections moved in one write.
+            let folders = req.get("folders").and_then(Value::as_object).ok_or("no folders")?;
+            let mut changed = false;
+            for (id, path) in folders {
+                let Ok(id) = id.parse::<uuid::Uuid>() else { continue };
+                if st.connections.get(&id).is_none() {
+                    continue;
+                }
+                let folder = folder_path(path.as_str().unwrap_or(""));
+                let mut entry = st.prefs.entry(&id);
+                if entry.folder != folder {
+                    entry.folder = folder;
+                    st.prefs.file.entries.insert(id, entry);
+                    changed = true;
+                }
+            }
+            if changed {
                 st.prefs.save().map_err(|e| e.to_string())?;
             }
             Ok(state_json(st))
@@ -990,7 +1098,22 @@ fn handle(st: &mut State, cmd: &str, req: &Value) -> Result<Value, String> {
         "logs" => {
             // (The page starting: everything kept; after that, what's new.)
             let since = req.get("since").and_then(Value::as_u64).unwrap_or(0);
+            if since == 0 {
+                // A page that starts (or reloads) starts with Stats unticked.
+                crate::log_ring::want_perf(false);
+            }
             let lines = crate::log_ring::since(since, 4000);
+            if let Some(last) = lines.last() {
+                st.log_sent.set(st.log_sent.get().max(last.seq));
+            }
+            Ok(json!({ "lines": lines }))
+        }
+        "logs_perf" => {
+            // Stats ticked or unticked: the page swaps its whole list for one
+            // with (or without) the kept stats lines.
+            let on = req.get("on").and_then(Value::as_bool).unwrap_or(false);
+            crate::log_ring::want_perf(on);
+            let lines = crate::log_ring::since(0, 4000);
             if let Some(last) = lines.last() {
                 st.log_sent.set(st.log_sent.get().max(last.seq));
             }
@@ -1126,7 +1249,13 @@ fn state_json(st: &State) -> Value {
         "build": env!("RDPIO_BUILD"),
         "computer": std::env::var("COMPUTERNAME").unwrap_or_default(),
         "user": std::env::var("USERNAME").unwrap_or_default(),
+        "hotkeys": crate::hotkeys::json(),
     })
+}
+
+/// A folder as the page typed it, tidied: "Work / Servers" → "Work/Servers".
+fn folder_path(f: &str) -> String {
+    f.split('/').map(str::trim).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("/")
 }
 
 /// `{conn: {id?, name, host, port, user, domain, password, clear_password,
@@ -1163,11 +1292,13 @@ fn save(st: &mut State, req: &Value) -> Result<Value, String> {
     let mut entry = st.prefs.entry(&record.id);
     entry.options = options;
     if let Some(f) = c.get("folder").and_then(Value::as_str) {
-        // ("Work / Servers" → "Work/Servers".)
-        entry.folder = f.split('/').map(str::trim).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("/");
+        entry.folder = folder_path(f);
     }
     if c.get("clear_hyper_password").and_then(Value::as_bool).unwrap_or(false) {
         entry.hyper_password = None;
+        // (And one kept for the host outside the launcher, which a Connect
+        // would otherwise take up again.)
+        crate::hyper_client::forget_saved_password(&record.host);
     }
     if let Some(hp) = c.get("hyper_password").and_then(Value::as_str).filter(|p| !p.is_empty()) {
         entry.hyper_password = Some(ProtectedPassword::protect(hp).map_err(|e| e.to_string())?);
@@ -1217,14 +1348,34 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
         (s(t, "name").unwrap_or_else(|| host.clone()), host, port, s(t, "user"), s(t, "domain"), None, None, options, None)
     };
     let password = given_pw.clone().or(saved_pw);
-    let hyper_password = given_hyper.clone().or(saved_hyper);
+    let mut hyper_password = given_hyper.clone().or(saved_hyper);
+    if options.transport == Transport::Direct && hyper_password.is_none() {
+        // A Hyper password kept per host (by an older rdpio, which kept them
+        // for the launcher's sessions too, or by the command line): a saved
+        // connection takes it into its own entry, the one place the launcher
+        // keeps them, so Forget and a rejection clear it; a quick connect uses
+        // it as it is.
+        if let Some(p) = crate::hyper_client::saved_password(&host) {
+            if let Some(id) = id {
+                if let Ok(kept) = ProtectedPassword::protect(&p) {
+                    let mut e = st.prefs.entry(&id);
+                    e.hyper_password = Some(kept);
+                    st.prefs.file.entries.insert(id, e);
+                    if st.prefs.save().is_ok() {
+                        crate::hyper_client::forget_saved_password(&host);
+                    }
+                }
+            }
+            hyper_password = Some(p);
+        }
+    }
     // Ask the page for what the session would otherwise prompt for.
     if cloud.is_some() {
         if password.as_deref().unwrap_or("").is_empty() {
             return Ok(json!({ "need": "w365_password" }));
         }
     } else if options.transport == Transport::Direct {
-        if hyper_password.is_none() && !crate::hyper_client::has_saved_password(&host) {
+        if hyper_password.is_none() {
             return Ok(json!({ "need": "hyper_password" }));
         }
     } else if password.is_none() && user.is_some() {
@@ -1346,7 +1497,17 @@ fn connect(st: &mut State, req: &Value) -> Result<Value, String> {
     });
     st.sessions.insert(
         pid,
-        Session { key: key.clone(), name: name.clone(), started: Instant::now(), recorded: false, record, log, embedded: embed.is_some(), child: None },
+        Session {
+            key: key.clone(),
+            name: name.clone(),
+            started: Instant::now(),
+            recorded: false,
+            record,
+            log,
+            embedded: embed.is_some(),
+            child: None,
+            direct_host: (options.transport == Transport::Direct).then(|| host.clone()),
+        },
     );
     // (A session in a tab is in this window: it stays.)
     if !st.keep_open && embed.is_none() {
@@ -1542,7 +1703,14 @@ fn tail_log(path: &std::path::Path, src: &str, name: &str, ended: &AtomicBool) {
             crate::log_ring::push(src, name, &String::from_utf8_lossy(&partial));
             return;
         }
-        std::thread::sleep(if PAGE_SHOWN.load(Ordering::Relaxed) { Duration::from_millis(250) } else { Duration::from_secs(2) });
+        // Often while the user looks at the launcher, less while a session's
+        // window is in front of it, rarely while it's out of sight.
+        let wait = match (PAGE_SHOWN.load(Ordering::Relaxed), ACTIVE.load(Ordering::Relaxed)) {
+            (true, true) => Duration::from_millis(250),
+            (true, false) => Duration::from_secs(1),
+            (false, _) => Duration::from_secs(2),
+        };
+        std::thread::sleep(wait);
     }
 }
 
@@ -1580,6 +1748,12 @@ fn bring_forward(pid: u32) {
             let _ = SetForegroundWindow(w);
         }
     }
+}
+
+/// Whether a Hyper Direct session ended because the host turned its Hyper
+/// password down (its last words, as `hyper_client::run_direct` puts them).
+fn hyper_password_rejected(reason: &str) -> bool {
+    reason.contains("wrong Hyper password") || reason.contains("saved Hyper password was rejected")
 }
 
 /// Events from the worker threads, on the UI thread.
@@ -1621,9 +1795,7 @@ fn on_event(e: Value) {
                 }
             }
             // (The child records RDP sessions in the history itself.)
-            if let Ok(m) = MruStore::load() {
-                st.mru = m;
-            }
+            st.mru.reload();
             send(st, &json!({ "event": "state", "state": state_json(st) }));
         }
         "_ended" => {
@@ -1640,12 +1812,23 @@ fn on_event(e: Value) {
             let code = e.get("code").and_then(Value::as_i64).unwrap_or(-1);
             let quick = sess.started.elapsed() < STARTUP;
             let failed = code != 0 && quick;
-            if let Ok(m) = MruStore::load() {
-                st.mru = m;
-            }
+            // (What the session saved from its connection bar shows up now.)
+            st.mru.reload();
+            st.connections.reload();
             let (session, reason) = (e.get("name").and_then(Value::as_str).unwrap_or(""), e.get("reason").and_then(Value::as_str).unwrap_or(""));
             let seconds = e.get("seconds").and_then(Value::as_u64).unwrap_or(0);
             tracing::info!(session, code, seconds, reason, "session ended");
+            // The host turned the Hyper password down (changed there?): forget
+            // it, so the next Connect asks for it instead of sending it again.
+            if let Some(host) = sess.direct_host.as_deref().filter(|_| hyper_password_rejected(reason)) {
+                if let Ok(id) = sess.key.parse::<uuid::Uuid>() {
+                    if st.prefs.file.entries.get_mut(&id).is_some_and(|en| en.hyper_password.take().is_some()) {
+                        let _ = st.prefs.save();
+                    }
+                }
+                crate::hyper_client::forget_saved_password(host);
+                tracing::info!(session, "the host rejected the Hyper password; forgot it, the next Connect asks");
+            }
             if st.hidden && st.sessions.is_empty() {
                 if failed {
                     st.hidden = false;
@@ -1897,18 +2080,20 @@ fn install_update(hwnd: HWND) {
 }
 
 /// `{action: "install" | "update" | "uninstall" | "password", password?}`.
-fn host_action(st: &mut State, req: &Value) -> Result<Value, String> {
-    let action = s(req, "action").ok_or("no action")?;
-    let password = req.get("password").and_then(Value::as_str).map(String::from);
-    let args: Vec<String> = match action.as_str() {
+/// The elevated rdpio command line of a This PC action.
+fn host_action_args(action: &str, req: &Value) -> Result<Vec<String>, String> {
+    Ok(match action {
         "install" | "update" => vec!["--hyper-service-install".into()],
         "uninstall" => vec!["--hyper-service-uninstall".into()],
         "password" => vec!["--hyper-set-password".into()],
         "display_install" => vec!["--hyper-display-install".into()],
         "display_uninstall" => vec!["--hyper-display-uninstall".into()],
+        // The display driver is there but Windows isn't running it: started again.
+        "display_repair" => vec!["--hyper-display-repair".into()],
         // `{settings: {name: bool}}`: only the known names, as 0/1 — and
         // `host_gpu`, one of its three names (nothing else reaches the
-        // elevated command line).
+        // elevated command line). Several at once are one command, so one
+        // administrator prompt.
         "settings" => {
             let given = req.get("settings").and_then(Value::as_object).ok_or("no settings")?;
             let mut spec: Vec<String> = ["virtual_display", "match_resolution", "fast_refresh", "keep_monitors", "auto_update", "nightly"]
@@ -1925,7 +2110,13 @@ fn host_action(st: &mut State, req: &Value) -> Result<Value, String> {
             vec!["--hyper-host-settings".into(), spec.join(",")]
         }
         _ => return Err(format!("unknown action {action:?}")),
-    };
+    })
+}
+
+fn host_action(st: &mut State, req: &Value) -> Result<Value, String> {
+    let action = s(req, "action").ok_or("no action")?;
+    let password = req.get("password").and_then(Value::as_str).map(String::from);
+    let args = host_action_args(&action, req)?;
     if action == "password" && password.is_none() {
         return Err("no password".into());
     }
@@ -1965,6 +2156,60 @@ mod tests {
         assert_eq!(on_connect_again(true, true), Again::ShowTab);
     }
 
+    /// The words a Hyper Direct session ends with when the host turns its
+    /// password down (`hyper_client::run_direct`, `connect_with_secret`) make
+    /// the launcher forget it; other failures don't.
+    #[test]
+    fn a_rejected_hyper_password_is_recognised() {
+        assert!(hyper_password_rejected("wrong Hyper password"));
+        assert!(hyper_password_rejected("the saved Hyper password was rejected (changed on the host?); run again to enter it"));
+        assert!(!hyper_password_rejected("Hyper: the host didn't answer"));
+        assert!(!hyper_password_rejected(""));
+        let src = include_str!("../hyper_client.rs");
+        assert!(src.contains("\"wrong Hyper password\""), "the session's words changed: change hyper_password_rejected too");
+        assert!(src.contains("the saved Hyper password was rejected"));
+    }
+
+    /// Undo on an older Delete toast brings back the connection it names, and
+    /// the newer one's Undo still works after it.
+    #[test]
+    fn each_undo_brings_back_its_own_connection() {
+        let rec = |name: &str| ConnectionRecord {
+            id: uuid::Uuid::new_v4(),
+            display_name: name.into(),
+            host: format!("{name}.example"),
+            port: 3389,
+            username: None,
+            domain: None,
+            saved_password: ProtectedPassword::from_blob(&[1, 2, 3]),
+            created_at: 1,
+            updated_at: 1,
+        };
+        let (a, b) = (rec("a"), rec("b"));
+        let mut deleted = Deleted::default();
+        deleted.push((a.clone(), 0, None));
+        deleted.push((b.clone(), 1, None));
+        assert_eq!(deleted.take(&a.id).map(|(r, at, _)| (r.id, at)), Some((a.id, 0)));
+        assert!(deleted.take(&a.id).is_none(), "taken once");
+        assert_eq!(deleted.take(&b.id).map(|(r, ..)| r.id), Some(b.id));
+        assert!(deleted.take(&uuid::Uuid::new_v4()).is_none());
+
+        // Only the newest few are kept.
+        let many: Vec<_> = (0..Deleted::KEEP + 2).map(|i| rec(&format!("c{i}"))).collect();
+        for r in &many {
+            deleted.push((r.clone(), 0, None));
+        }
+        assert!(deleted.take(&many[0].id).is_none());
+        assert!(deleted.take(&many[Deleted::KEEP + 1].id).is_some());
+    }
+
+    #[test]
+    fn folders_are_tidied_the_same_way_everywhere() {
+        assert_eq!(folder_path(" Work / Servers /"), "Work/Servers");
+        assert_eq!(folder_path("//"), "");
+        assert_eq!(folder_path("Home"), "Home");
+    }
+
     #[test]
     fn host_and_port_split_from_one_box() {
         assert_eq!(split_host_port("pc.lan", None), ("pc.lan".into(), 3389));
@@ -1979,6 +2224,34 @@ mod tests {
     fn log_names_stay_in_their_folder() {
         assert_eq!(safe_file_name(r"..\..\evil:host"), ".._.._evil_host");
         assert!(!safe_file_name(r"a\b/c").contains(['\\', '/']));
+    }
+
+    /// What the This PC page asks for is what an elevated rdpio is started
+    /// with: nothing but the known flags and setting names gets through.
+    #[test]
+    fn host_actions_make_the_elevated_command_line() {
+        let none = json!({});
+        assert_eq!(host_action_args("install", &none).unwrap(), ["--hyper-service-install"]);
+        assert_eq!(host_action_args("display_install", &none).unwrap(), ["--hyper-display-install"]);
+        assert_eq!(host_action_args("display_repair", &none).unwrap(), ["--hyper-display-repair"]);
+        assert!(host_action_args("display_reboot", &none).is_err());
+        // Several settings changed together are one command (one prompt).
+        let req = json!({ "settings": { "match_resolution": true, "virtual_display": false, "keep_monitors": true, "host_gpu": "fastest", "evil": true } });
+        assert_eq!(
+            host_action_args("settings", &req).unwrap(),
+            ["--hyper-host-settings", "virtual_display=0,match_resolution=1,keep_monitors=1,host_gpu=fastest"]
+        );
+        assert!(host_action_args("settings", &json!({ "settings": { "host_gpu": "x,nightly=1" } })).is_err());
+        assert!(host_action_args("settings", &json!({ "settings": {} })).is_err());
+    }
+
+    /// Every shortcut sits in a place the Settings page has a heading for
+    /// (`KEY_PLACES`).
+    #[test]
+    fn every_shortcut_has_a_heading_on_the_page() {
+        for k in crate::hotkeys::TABLE {
+            assert!(PAGE.contains(&format!("[\"{}\", ", k.scope.name())), "{}", k.keys);
+        }
     }
 
     /// The page is self-contained: nothing loaded from the network.

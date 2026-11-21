@@ -10,14 +10,16 @@
   --font: "Geomisans", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --font-display: "SanDiego", "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
   --font-mono: "GelatoTypewriter", "Cascadia Mono", "Consolas", monospace;
+  /* Addresses, keys and log lines: a monospace that keeps every character apart. */
+  --font-code: "Cascadia Mono", "Consolas", monospace;
   --radius: 4px;
   --radius-lg: 6px;
   --ease: cubic-bezier(.4, 0, .2, 1);
 
   --bg: #fafafa;
-  --bg-solid: #fafafa;
+  /* The pages' own background (the nav sits on --bg beside it). */
+  --main: #ffffff;
   --surface: #ffffff;
-  --surface-solid: #ffffff;
   --surface-2: #f5f5f5;
   --surface-hover: #f0f0f0;
   --raised: #ffffff;
@@ -25,30 +27,29 @@
   --stroke-strong: #d4d4d4;
   --text: #141414;
   --text-2: #5c5c5c;
-  --text-3: #808080;
+  /* 4.5:1 or more on every light surface (WCAG AA for the 12 px lines). */
+  --text-3: #6b6b6b;
   --accent: #0b7a55;
   --accent-hover: #096a4a;
   --accent-text: #fafafa;
   --accent-soft: rgba(11, 122, 85, .09);
   --ok: #0b7a55;
   --ok-soft: rgba(11, 122, 85, .09);
-  --warn: #a15c00;
-  --warn-soft: rgba(161, 92, 0, .1);
+  --warn: #8f5200;
+  --warn-soft: rgba(143, 82, 0, .1);
   --bad: #c42020;
   --bad-soft: rgba(196, 32, 32, .08);
   --shadow: 0 1px 3px rgba(0, 0, 0, .06), 0 1px 2px -1px rgba(0, 0, 0, .06);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, .1), 0 4px 6px -4px rgba(0, 0, 0, .1);
   --scrim: rgba(10, 10, 10, .4);
   --input: #ffffff;
-  --input-focus: #ffffff;
   --logo-fill: #ffffff;
   color-scheme: light;
 }
 :root[data-theme="dark"] {
   --bg: #0a0a0a;
-  --bg-solid: #0a0a0a;
+  --main: #0d0d0d;
   --surface: #0f0f0f;
-  --surface-solid: #0f0f0f;
   --surface-2: #141414;
   --surface-hover: #1a1a1a;
   --raised: #121212;
@@ -56,7 +57,7 @@
   --stroke-strong: #2e2e2e;
   --text: #fafafa;
   --text-2: #a3a3a3;
-  --text-3: #808080;
+  --text-3: #8a8a8a;
   --accent: #22c38e;
   --accent-hover: #3bd19f;
   --accent-text: #0a0a0a;
@@ -71,7 +72,6 @@
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, .6), 0 4px 6px -4px rgba(0, 0, 0, .6);
   --scrim: rgba(0, 0, 0, .6);
   --input: #0a0a0a;
-  --input-focus: #0a0a0a;
   --logo-fill: #0a0a0a;
   color-scheme: dark;
 }
@@ -109,6 +109,7 @@ nav {
 }
 .brand { display: flex; flex-direction: column; gap: 10px; padding: 6px 12px 22px; margin-bottom: 8px; border-bottom: 1px solid var(--stroke); }
 .brand svg.logo { width: 54px; height: 16px; color: var(--text); }
+.brand svg.logo-mark { display: none; width: 16px; height: 16px; color: var(--text); }
 .brand b { display: block; font: 600 20px/1 var(--font-display); letter-spacing: -.02em; }
 .brand span { display: block; margin-top: 6px; color: var(--text-3); font: 11px/1 var(--font-mono); text-transform: uppercase; letter-spacing: .1em; }
 .logo-bar, .logo-o { fill: var(--logo-fill); stroke: currentColor; }
@@ -118,10 +119,9 @@ nav {
   height: 38px; padding: 0 12px;
   border: 0; border-radius: var(--radius);
   background: transparent; text-align: left;
-  color: var(--text); cursor: default;
+  color: var(--text-2); cursor: default;
   transition: background .12s;
 }
-.nav-item { color: var(--text-2); }
 .nav-item:hover { background: var(--surface-hover); color: var(--text); }
 .nav-item[aria-current="page"] { background: var(--surface); color: var(--text); box-shadow: inset 0 0 0 1px var(--stroke); }
 .nav-item[aria-current="page"]::before {
@@ -133,6 +133,18 @@ nav {
 .nav-item svg { width: 18px; height: 18px; flex: none; }
 .nav-item .badge { margin-left: auto; }
 .nav-foot { margin-top: auto; padding: 8px 12px 0; color: var(--text-3); font: 11px/16px var(--font-mono); text-transform: uppercase; letter-spacing: .08em; }
+/* The nav as a rail of icons: in a narrow window (`narrow`, see `syncRail`),
+   and beside a Workspace whose list is folded away (`ws-wide`). The labels stay
+   for screen readers; a badge becomes a dot on its icon. */
+.narrow nav, .on-ws.ws-wide nav { width: 64px; }
+:is(.narrow, .on-ws.ws-wide) .brand { padding: 6px 0 22px; align-items: center; }
+:is(.narrow, .on-ws.ws-wide) .brand svg.logo, :is(.narrow, .on-ws.ws-wide) .brand b, :is(.narrow, .on-ws.ws-wide) .brand span, :is(.narrow, .on-ws.ws-wide) .nav-foot { display: none; }
+:is(.narrow, .on-ws.ws-wide) .brand svg.logo-mark { display: block; }
+:is(.narrow, .on-ws.ws-wide) .nav-item { justify-content: center; padding: 0; }
+:is(.narrow, .on-ws.ws-wide) .nav-item .lbl { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+:is(.narrow, .on-ws.ws-wide) .nav-item .badge { position: absolute; top: 7px; left: calc(50% + 5px); width: 8px; height: 8px; padding: 0; border: 0; border-radius: 50%; font-size: 0; }
+:is(.narrow, .on-ws.ws-wide) .nav-item .badge.accent { background: var(--accent); }
+:is(.narrow, .on-ws.ws-wide) .nav-item .badge.warn { background: var(--warn); }
 
 /* ---------------------------------------------------------------- main */
 main {
@@ -140,13 +152,11 @@ main {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  background: var(--bg-solid);
+  background: var(--main);
   border-left: 1px solid var(--stroke);
   margin-top: 0;
   overflow: hidden;
 }
-:root[data-theme="dark"] main { background: #0d0d0d; }
-:root:not([data-theme="dark"]) main { background: #ffffff; }
 :root:not([data-theme="dark"]) main .card { background: #fafafa; }
 .page { display: none; flex: 1; overflow: auto; padding: 28px 36px 40px; animation: rise .22s var(--ease); }
 .page.active { display: block; }
@@ -164,7 +174,7 @@ p.lead { color: var(--text-2); margin: -12px 0 20px; max-width: 70ch; }
   min-height: 32px; padding: 5px 12px;
   border-radius: var(--radius);
   border: 1px solid var(--stroke-strong);
-  background: var(--surface-solid);
+  background: var(--surface);
   color: var(--text);
   cursor: default;
   white-space: nowrap;
@@ -199,7 +209,7 @@ p.lead { color: var(--text-2); margin: -12px 0 20px; max-width: 70ch; }
   transition: background .1s;
 }
 .input:hover { background: var(--surface-hover); }
-.input:focus { background: var(--input-focus); border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.input:focus { background: var(--input); border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .input::placeholder { color: var(--text-3); }
 select.input { appearance: none; padding-right: 32px;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%23888' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
@@ -214,9 +224,10 @@ select.input option { background: var(--raised); color: var(--text); }
 .search .input { padding-left: 34px; }
 
 .seg { display: inline-flex; padding: 2px; gap: 2px; border-radius: var(--radius); background: var(--surface-2); border: 1px solid var(--stroke); }
-.seg button { border: 0; background: transparent; padding: 5px 14px; border-radius: 2px; cursor: default; color: var(--text-2); transition: background .12s, color .12s; }
+.seg button { border: 0; background: transparent; padding: 5px 14px; border-radius: 2px; cursor: default; color: var(--text-2); white-space: nowrap; transition: background .12s, color .12s; }
 .seg button:hover { color: var(--text); }
-.seg button[aria-pressed="true"] { background: var(--text); color: var(--bg-solid); }
+.seg button[aria-pressed="true"] { background: var(--text); color: var(--bg); }
+.seg button:disabled { opacity: .45; pointer-events: none; }
 
 .switch { display: flex; align-items: center; gap: 12px; padding: 12px 16px; justify-content: space-between; }
 .switch + .switch { border-top: 1px solid var(--stroke); }
@@ -245,17 +256,29 @@ select.input option { background: var(--raised); color: var(--text); }
 .badge.ok { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
 .badge.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
 .badge.bad { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: none; }
-.dot.live { box-shadow: 0 0 0 0 currentColor; animation: pulse 1.8s infinite; }
-@keyframes pulse { 70% { box-shadow: 0 0 0 6px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+/* A session's state, as a dot: grey (not running), `on` / `live`, `connecting`,
+   `ended`. Inside a badge it takes the badge's colour and pulses. */
+.st { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--stroke-strong); }
+.st.on, .st.live { background: var(--ok); }
+.st.connecting { background: var(--warn); }
+.st.ended { background: var(--bad); }
+/* (The pulse is a ring that grows and fades: transform and opacity only, which
+   the compositor draws without repainting the page each frame.) */
+.badge .st { position: relative; background: currentColor; }
+.badge .st::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: currentColor; opacity: 0; animation: pulse 1.8s infinite; }
+@keyframes pulse { 0% { opacity: .5; transform: scale(1); } 70%, 100% { opacity: 0; transform: scale(2.5); } }
 
-/* ---------------------------------------------------------------- quick connect */
+/* ---------------------------------------------------------------- the box: find a saved PC, or type one */
 .quick {
-  display: flex; align-items: center; gap: 10px; padding: 14px; flex-wrap: wrap;
+  display: flex; flex-direction: column; gap: 8px; padding: 14px;
   background: var(--surface); border-left: 2px solid var(--accent);
 }
-.quick .input { flex: 1; min-width: 200px; height: 40px; font-size: 15px; }
+.quick-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.quick .search { flex: 1; min-width: 200px; width: auto; }
+.quick .search svg { top: 12px; }
+.quick .input { height: 40px; font-size: 15px; }
 .quick .btn.lg { min-width: 120px; }
+.quick .hint { padding-left: 2px; }
 
 /* ---------------------------------------------------------------- connection cards */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 12px; }
@@ -264,22 +287,24 @@ select.input option { background: var(--raised); color: var(--text); }
   display: flex; flex-direction: column; gap: 12px;
   padding: 16px;
   transition: background .12s, transform .15s var(--ease), box-shadow .15s;
-  animation: rise .25s var(--ease) both;
 }
+/* The cards rise in when the page is opened, not each time a list is redrawn
+   (`enter` is on #saved only for a moment, see `enterCards`). */
+.grid.enter > .conn { animation: rise .25s var(--ease) both; }
 .conn:hover { background: var(--surface-hover); box-shadow: var(--shadow); }
 .conn-top { display: flex; gap: 12px; align-items: center; min-width: 0; }
+.conn-top > .badge { flex: none; margin-left: auto; align-self: flex-start; }
 .avatar {
   width: 40px; height: 40px; flex: none; border-radius: var(--radius);
   display: grid; place-items: center;
-  font: 600 16px/1 var(--font-display); color: var(--bg-solid);
+  font: 600 16px/1 var(--font-display); color: var(--bg);
   background: var(--text);
 }
 .conn-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .conn-sub { color: var(--text-3); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .conn-meta { display: flex; flex-wrap: wrap; gap: 6px; min-height: 20px; }
-.conn-actions { display: flex; gap: 6px; align-items: center; }
-.conn-actions .btn.primary { flex: 1; }
-.conn .live-tag { position: absolute; top: 14px; right: 14px; }
+.conn-actions { display: flex; gap: 6px; align-items: center; margin-top: auto; }
+.conn-actions [data-act="connect"] { flex: 1; }
 
 .list { display: flex; flex-direction: column; }
 .item {
@@ -328,15 +353,18 @@ select.input option { background: var(--raised); color: var(--text); }
 .dialog header p { margin: 4px 0 0; color: var(--text-2); }
 .dialog .body { padding: 18px 24px 24px; overflow: auto; }
 .dialog footer { display: flex; gap: 8px; justify-content: flex-end; padding: 18px 24px; background: var(--surface-2); border-top: 1px solid var(--stroke); }
-:root[data-theme="dark"] .dialog footer { background: var(--surface-2); }
 .dialog footer .btn { min-width: 110px; }
 .tabs { display: flex; gap: 4px; padding: 14px 24px 0; border-bottom: 1px solid var(--stroke); }
 .tabs button { position: relative; border: 0; background: none; padding: 8px 12px 12px; color: var(--text-2); cursor: default; border-radius: 0; font: 12px/16px var(--font-mono); text-transform: uppercase; letter-spacing: .08em; }
 .tabs button:hover { color: var(--text); }
 .tabs button[aria-selected="true"] { color: var(--text); }
 .tabs button[aria-selected="true"]::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 2px; border-radius: 0; background: var(--accent); }
-.tabpane { display: none; }
-.tabpane.active { display: flex; animation: rise .18s var(--ease); }
+/* The editor's panes share one cell, so the dialog is as tall as the tallest
+   and doesn't jump between tabs; the hidden ones are out of the tab order. */
+#edit .body { display: grid; grid-template-columns: minmax(0, 1fr); }
+.tabpane { grid-area: 1 / 1; visibility: hidden; }
+.tabpane.active { visibility: visible; animation: rise .18s var(--ease); }
+#edit-error { grid-area: 2 / 1; margin-top: 12px; }
 
 .choices { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .choice {
@@ -350,11 +378,12 @@ select.input option { background: var(--raised); color: var(--text); }
   transition: border-color .12s, background .12s;
 }
 .choice:hover { background: var(--surface-hover); }
-.choice b { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.choice b { font-weight: 600; font-family: var(--font-display); display: flex; align-items: center; gap: 6px; }
 .choice span { font-size: 12px; color: var(--text-3); line-height: 16px; }
 .choice[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
-.choice b { font-family: var(--font-display); }
 .choice svg { width: 18px; height: 18px; color: var(--accent); }
+.choice:disabled { opacity: .5; pointer-events: none; }
+.choice b .badge { margin-left: auto; font-weight: 400; }
 .choices.two { grid-template-columns: repeat(2, 1fr); }
 
 .pw { position: relative; }
@@ -411,16 +440,40 @@ select.input option { background: var(--raised); color: var(--text); }
 .hero h3 { margin: 0; font: 600 22px/28px var(--font-display); letter-spacing: -.01em; }
 .hero p { margin: 2px 0 0; color: var(--text-2); }
 .hero .acts { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
-.kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
-.kv .card { padding: 14px 16px; }
-.kv .k { font: 11px/16px var(--font-mono); text-transform: uppercase; letter-spacing: .08em; color: var(--text-3); }
-.kv .v { font-weight: 600; margin-top: 2px; word-break: break-word; }
-.addr { font-family: "Cascadia Mono", "Consolas", monospace; font-size: 13px; user-select: text; }
+.hero .what { flex: 1; min-width: 220px; }
+.hero p.facts { margin-top: 8px; color: var(--text-3); font: 11px/16px var(--font-mono); letter-spacing: .04em; word-break: break-word; user-select: text; }
+.host-note { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 10px 2px 0; color: var(--text-2); font-size: 13px; }
+/* A part of a card that isn't one switch row: a heading, its controls, a note. */
+.block { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px 16px; }
+.block + .switch { border-top: 1px solid var(--stroke); }
+.block-head { display: flex; align-items: center; gap: 12px; justify-content: space-between; flex-wrap: wrap; }
+.block-head .txt { display: flex; flex-direction: column; }
+.block-head .txt span { font-size: 12px; color: var(--text-3); line-height: 16px; }
+.block-head .acts { display: flex; gap: 8px; flex-wrap: wrap; }
+.note { display: flex; gap: 8px; align-items: flex-start; margin: 0; font-size: 12px; line-height: 16px; color: var(--text-2); user-select: text; }
+.note.warn { padding: 10px 12px; border-radius: var(--radius); background: var(--warn-soft); color: var(--text); }
+.note.warn svg { color: var(--warn); margin-top: 0; }
+.apply-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 16px; border-top: 1px solid var(--stroke); background: var(--accent-soft); font-size: 13px; }
+.card-cap { display: flex; align-items: center; gap: 8px; padding: 10px 16px 0; color: var(--text-3); font: 11px/16px var(--font-mono); text-transform: uppercase; letter-spacing: .08em; }
+.card-cap .spin { width: 12px; height: 12px; }
+.card + .card.group { margin-top: 12px; }
+details.fold { margin-top: 32px; }
+details.fold > summary { display: flex; align-items: center; gap: 8px; padding: 12px 16px; list-style: none; cursor: default; font: 12px/16px var(--font-mono); text-transform: uppercase; letter-spacing: .1em; color: var(--text-2); }
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary:hover { color: var(--text); }
+details.fold > summary svg { width: 14px; height: 14px; color: var(--text-3); transition: transform .12s; }
+details.fold[open] > summary svg { transform: rotate(90deg); }
+details.fold > .steps { padding: 4px 20px 18px; }
+.addr { font-family: var(--font-code); font-size: 13px; user-select: text; }
 .steps { counter-reset: s; display: flex; flex-direction: column; gap: 12px; margin: 0; padding: 0; list-style: none; }
 .steps li { counter-increment: s; display: flex; gap: 12px; align-items: flex-start; color: var(--text-2); }
-.steps li::before { content: counter(s, decimal-leading-zero); width: 28px; height: 24px; border-radius: 2px; background: var(--text); color: var(--bg-solid); display: grid; place-items: center; font: 11px/1 var(--font-mono); flex: none; }
-.steps code, kbd { font-family: "Cascadia Mono", "Consolas", monospace; font-size: 12px; padding: 1px 6px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--stroke); color: var(--text); user-select: text; }
+.steps li::before { content: counter(s, decimal-leading-zero); width: 28px; height: 24px; border-radius: 2px; background: var(--text); color: var(--bg); display: grid; place-items: center; font: 11px/1 var(--font-mono); flex: none; }
+.steps code, kbd { font-family: var(--font-code); font-size: 12px; padding: 1px 6px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--stroke); color: var(--text); user-select: text; }
 .keys { display: grid; grid-template-columns: auto 1fr; gap: 10px 16px; align-items: center; padding: 16px; }
+.keys kbd { justify-self: start; }
+.keys .cap { grid-column: 1 / -1; color: var(--text-3); font: 11px/16px var(--font-mono); text-transform: uppercase; letter-spacing: .08em; }
+.keys .cap:not(:first-child) { margin-top: 8px; padding-top: 14px; border-top: 1px solid var(--stroke); }
+.keys span .badge { margin-right: 8px; }
 .update-bar { display: flex; align-items: center; gap: 14px; padding: 10px 36px; border-bottom: 1px solid var(--stroke); background: var(--surface); flex-wrap: wrap; }
 .switch .txt span.upd-title { font-size: 14px; color: var(--text); line-height: 20px; }
 .update-bar .tag { font: 11px/1 var(--font-mono); text-transform: uppercase; letter-spacing: .1em; color: var(--accent); }
@@ -430,14 +483,14 @@ select.input option { background: var(--raised); color: var(--text); }
 .keys span { color: var(--text-2); }
 
 /* Behind another window, the endless animations rest (see the "active" event). */
-body.idle .dot.live, body.idle .skeleton, body.idle .spin { animation-play-state: paused; }
+body.idle .badge .st::after, body.idle .skeleton, body.idle .spin { animation-play-state: paused; }
 .skeleton { background: linear-gradient(90deg, var(--surface-2), var(--surface-hover), var(--surface-2)); background-size: 200% 100%; animation: shimmer 1.2s infinite; border-radius: 6px; }
 @keyframes shimmer { to { background-position: -200% 0; } }
 .spin { width: 16px; height: 16px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: rot .7s linear infinite; }
 @keyframes rot { to { transform: rotate(360deg); } }
 
 /* ---------------------------------------------------------------- console (Activity, Workspace) */
-.console { font: 12px/18px "Cascadia Mono", "Consolas", monospace; background: var(--surface-2); border: 1px solid var(--stroke); border-radius: var(--radius); overflow: auto; padding: 6px 0; user-select: text; }
+.console { font: 12px/18px var(--font-code); background: var(--surface-2); border: 1px solid var(--stroke); border-radius: var(--radius); overflow: auto; padding: 6px 0; user-select: text; }
 .console .ln { display: grid; grid-template-columns: 64px 128px 44px minmax(0, 1fr); gap: 10px; padding: 0 12px; white-space: pre-wrap; word-break: break-word; }
 .console.one .ln { grid-template-columns: 64px 44px minmax(0, 1fr); }
 .console.one .ln .s { display: none; }
@@ -462,13 +515,15 @@ body.idle .dot.live, body.idle .skeleton, body.idle .spin { animation-play-state
 .ws-side { width: 264px; flex: none; display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--stroke); background: var(--surface); }
 .ws-side-head { display: flex; gap: 6px; padding: 12px 12px 8px; }
 .ws-side-head .search { width: auto; flex: 1; }
-.ws-quick { display: flex; gap: 6px; padding: 0 12px 10px; border-bottom: 1px solid var(--stroke); }
-.ws-quick .input { height: 30px; font-size: 13px; min-width: 0; }
-.ws-quick select.input { width: 88px; flex: none; }
+.ws-hint { padding: 0 14px 8px; }
 .tree { flex: 1; overflow: auto; padding: 6px 4px 12px; }
 .tn { display: flex; align-items: center; gap: 6px; height: 28px; padding-right: 8px; border-radius: var(--radius); white-space: nowrap; cursor: default; }
 .tn:hover { background: var(--surface-hover); }
 .tn.sel { background: var(--accent-soft); }
+/* The tree takes the keyboard as a whole; the row it's on shows the ring. */
+#ws-tree:focus-visible { outline: none; }
+#ws-tree:focus-visible .tn.sel { box-shadow: inset 0 0 0 2px var(--accent); }
+body.ws-wide .ws-side { display: none; }
 .tn .caret { width: 14px; height: 14px; color: var(--text-3); transition: transform .12s; }
 .tn.open > .caret { transform: rotate(90deg); }
 .tn .nm { overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
@@ -476,28 +531,37 @@ body.idle .dot.live, body.idle .skeleton, body.idle .spin { animation-play-state
 .tn.folder > svg:not(.caret) { color: var(--text-3); }
 .tn .sub { color: var(--text-3); font: 11px/1 var(--font-mono); text-transform: uppercase; letter-spacing: .04em; }
 .tn.drop { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
-.st { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--stroke-strong); }
-.st.on, .st.live { background: var(--ok); }
-.st.connecting { background: var(--warn); }
-.st.ended { background: var(--bad); }
-.ws-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.ws-tabs { display: flex; align-items: flex-end; gap: 2px; padding: 8px 8px 0; min-height: 41px; flex: none; overflow-x: auto; border-bottom: 1px solid var(--stroke); background: var(--surface); }
+.tn .more { display: none; width: 22px; height: 22px; padding: 0; margin-right: -4px; border: 0; border-radius: 3px; background: none; color: var(--text-3); place-items: center; flex: none; }
+.tn:hover .more, .tn.sel .more, .tn .more:focus-visible { display: grid; }
+.tn .more:hover { background: var(--stroke); color: var(--text); }
+.tn:hover .more + .sub, .tn.sel .more + .sub { display: none; }
+.ws-main { flex: 1; min-width: 0; display: flex; flex-direction: column; container-type: inline-size; }
+.ws-fold { align-self: center; margin: 0 4px 8px 0; flex: none; width: 28px; min-height: 28px; }
+.ws-fold svg { transition: transform .12s; }
+body.ws-wide .ws-fold svg { transform: scaleX(-1); }
+.ws-strip { display: flex; align-items: flex-end; min-height: 41px; flex: none; padding-left: 8px; border-bottom: 1px solid var(--stroke); background: var(--surface); }
+.ws-tabs { display: flex; align-items: flex-end; gap: 2px; padding: 8px 8px 0 0; flex: 1; min-width: 0; align-self: stretch; overflow-x: auto; }
 .ws-tabs::-webkit-scrollbar { height: 4px; }
 .ws-tabs-empty { align-self: center; padding: 0 8px 8px; color: var(--text-3); font-size: 13px; }
 .ws-tab { display: flex; align-items: center; gap: 8px; height: 32px; max-width: 220px; padding: 0 4px 0 12px; flex: none; border: 1px solid transparent; border-bottom: 0; border-radius: var(--radius) var(--radius) 0 0; color: var(--text-2); cursor: default; }
 .ws-tab:hover { background: var(--surface-hover); color: var(--text); }
 .ws-tab[aria-selected="true"] { color: var(--text); border-color: var(--stroke); height: 33px; margin-bottom: -1px; }
-:root[data-theme="dark"] .ws-tab[aria-selected="true"], :root[data-theme="dark"] .ws-bar { background: #0d0d0d; }
-:root:not([data-theme="dark"]) .ws-tab[aria-selected="true"], :root:not([data-theme="dark"]) .ws-bar { background: #ffffff; }
+.ws-tab[aria-selected="true"], .ws-bar { background: var(--main); }
 .ws-tab .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws-tab .x { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 3px; background: none; color: var(--text-3); display: grid; place-items: center; }
 .ws-tab .x:hover { background: var(--surface-hover); color: var(--text); }
 .ws-tab .x svg { width: 12px; height: 12px; }
 .ws-bar { display: flex; align-items: center; gap: 6px; min-height: 45px; padding: 6px 10px; flex: none; border-bottom: 1px solid var(--stroke); }
-.ws-bar .what { flex: 1; min-width: 0; color: var(--text-2); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-bar .what { flex: 1; min-width: 80px; color: var(--text-2); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws-bar .what b { color: var(--text); }
 .ws-bar .btn { min-height: 30px; padding: 4px 10px; }
 .ws-bar .btn[aria-pressed="true"] { background: var(--surface-hover); box-shadow: inset 0 0 0 1px var(--stroke-strong); }
+/* A narrow session area: the bar's buttons keep their icons (and their names,
+   for screen readers and as tooltips). */
+@container (max-width: 520px) {
+  .ws-bar .btn .t { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  .ws-bar .btn { width: 30px; padding: 0; }
+}
 .ws-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .ws-view { flex: 1; min-height: 120px; display: flex; align-items: center; justify-content: center; overflow: hidden; background: var(--surface-2); }
 .ws-status { display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: 640px; width: 100%; padding: 24px; text-align: center; }
@@ -509,10 +573,12 @@ body.idle .dot.live, body.idle .skeleton, body.idle .spin { animation-play-state
 .ws-split:hover { background: var(--accent); }
 .ws-log { height: 200px; flex: none; border-radius: 0; border-width: 0; }
 body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
+/* (A session's window covers the page under it: with the list folded away,
+   toasts go over the tab strip and the bar instead.) */
+body.on-ws.ws-wide .toasts { top: 4px; bottom: auto; left: auto; right: 8px; max-width: min(360px, calc(100% - 96px)); }
 
+/* (The nav's own narrow look is the rail above: `narrow` follows this width.) */
 @media (max-width: 860px) {
-  nav { width: 64px; }
-  .brand b, .brand span, .nav-item .lbl, .nav-foot, .nav-item .badge { display: none; }
   .page { padding: 20px; }
   .choices { grid-template-columns: 1fr; }
 }
@@ -524,6 +590,8 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
 <body>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
   <symbol id="i-logo" viewBox="0 0 108 32"><rect class="logo-bar" x="1" y="8.75" width="69" height="15.5" rx=".6" stroke-width="1.5"/><circle class="logo-o" cx="91" cy="16.5" r="15.25" stroke-width="1.5"/></symbol>
+  <symbol id="i-logo-mark" viewBox="75 0.5 32 32"><circle class="logo-o" cx="91" cy="16.5" r="15.25" stroke-width="1.5"/></symbol>
+  <symbol id="i-side" viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M6 2.5v11M10.5 6.5 9 8l1.5 1.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <symbol id="i-conn" viewBox="0 0 20 20"><rect x="2.5" y="3.5" width="15" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7 16.5h6M10 13.5v3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
   <symbol id="i-host" viewBox="0 0 20 20"><rect x="4" y="2.5" width="12" height="15" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7 6h6M7 9h6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="10" cy="13.5" r="1.2" fill="currentColor"/></symbol>
   <symbol id="i-cloud" viewBox="0 0 20 20"><path d="M6 15.5h8a3.5 3.5 0 0 0 .6-6.95A5 5 0 0 0 5 9.1a3.25 3.25 0 0 0 1 6.4Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></symbol>
@@ -557,12 +625,12 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
 </svg>
 
 <nav aria-label="rdpio">
-  <div class="brand"><svg class="logo" aria-hidden="true"><use href="#i-logo"/></svg><div><b>rdpio</b><span id="brand-sub">by IO Services</span></div></div>
-  <button class="nav-item" data-page="connections" aria-current="page"><svg><use href="#i-conn"/></svg><span class="lbl">Connections</span><span class="badge accent" id="nav-live" hidden></span></button>
-  <button class="nav-item" data-page="workspace" title="Sessions side by side in tabs, connections in folders"><svg><use href="#i-tabs"/></svg><span class="lbl">Workspace</span><span class="badge accent" id="nav-tabs" hidden></span></button>
-  <button class="nav-item" data-page="host"><svg><use href="#i-host"/></svg><span class="lbl">This PC</span><span class="badge" id="nav-host" hidden></span></button>
-  <button class="nav-item" data-page="activity" title="What rdpio and its sessions are doing"><svg><use href="#i-log"/></svg><span class="lbl">Activity</span><span class="badge warn" id="nav-act" hidden></span></button>
-  <button class="nav-item" data-page="settings"><svg><use href="#i-gear"/></svg><span class="lbl">Settings</span></button>
+  <div class="brand"><svg class="logo" aria-hidden="true"><use href="#i-logo"/></svg><svg class="logo-mark" aria-hidden="true"><use href="#i-logo-mark"/></svg><div><b>rdpio</b><span id="brand-sub">by IO Services</span></div></div>
+  <button class="nav-item" data-page="connections" aria-current="page" title="Connections: saved PCs, Cloud PCs and recent ones"><svg aria-hidden="true"><use href="#i-conn"/></svg><span class="lbl">Connections</span><span class="badge accent" id="nav-live" hidden></span></button>
+  <button class="nav-item" data-page="workspace" title="Workspace: sessions side by side in tabs, connections in folders"><svg aria-hidden="true"><use href="#i-tabs"/></svg><span class="lbl">Workspace</span><span class="badge accent" id="nav-tabs" hidden></span></button>
+  <button class="nav-item" data-page="host" title="This PC: stream it to your other devices"><svg aria-hidden="true"><use href="#i-host"/></svg><span class="lbl">This PC</span><span class="badge" id="nav-host" hidden></span></button>
+  <button class="nav-item" data-page="activity" title="Activity: what rdpio and its sessions are doing"><svg aria-hidden="true"><use href="#i-log"/></svg><span class="lbl">Activity</span><span class="badge warn" id="nav-act" hidden></span></button>
+  <button class="nav-item" data-page="settings" title="Settings"><svg aria-hidden="true"><use href="#i-gear"/></svg><span class="lbl">Settings</span></button>
   <div class="nav-foot" id="version"></div>
 </nav>
 
@@ -573,18 +641,22 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
     <div class="page-head">
       <h1>Connections</h1>
       <div class="spacer"></div>
-      <label class="search"><svg><use href="#i-search"/></svg><span class="sr">Search</span><input class="input" id="search" placeholder="Search connections" autocomplete="off" spellcheck="false"></label>
       <button class="btn primary" id="new-btn"><svg><use href="#i-plus"/></svg>New connection</button>
     </div>
 
+    <!-- The one box of this page: it filters the lists below, and Enter
+         connects to what it names (a saved PC, or the address typed). -->
     <form class="card quick" id="quick" autocomplete="off">
-      <input class="input" id="quick-host" placeholder="PC name or address — e.g. gaming-pc, 100.101.5.9" spellcheck="false">
-      <div class="seg" id="quick-mode" role="group" aria-label="How">
-        <button type="button" data-v="rdp" title="Plain Remote Desktop">RDP</button>
-        <button type="button" data-v="hyper" title="Sign in over RDP, then switch to the Hyper stream">Hyper</button>
-        <button type="button" data-v="direct" title="Hyper with the Hyper password (no RDP)">Direct</button>
+      <div class="quick-row">
+        <label class="search"><svg><use href="#i-search"/></svg><span class="sr">Find a saved PC, or type a name or address</span><input class="input" id="quick-host" placeholder="Find a saved PC, or type a name or address" spellcheck="false" aria-describedby="quick-hint"></label>
+        <div class="seg" id="quick-mode" role="group" aria-label="How to connect to an address typed here">
+          <button type="button" data-v="rdp" title="A typed address: plain Remote Desktop">RDP</button>
+          <button type="button" data-v="hyper" title="A typed address: sign in over RDP, then switch to the Hyper stream">Hyper</button>
+          <button type="button" data-v="direct" title="A typed address: Hyper with the Hyper password (no RDP)">Direct</button>
+        </div>
+        <button class="btn primary lg" type="submit"><svg><use href="#i-play"/></svg>Connect</button>
       </div>
-      <button class="btn primary lg" type="submit"><svg><use href="#i-play"/></svg>Connect</button>
+      <div class="hint" id="quick-hint" aria-live="polite" hidden></div>
     </form>
 
     <div id="saved-wrap">
@@ -603,26 +675,26 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
       <svg viewBox="0 0 120 90" fill="none"><rect x="14" y="10" width="92" height="58" rx="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/><path d="M48 80h24M60 68v12" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"/><path d="m52 30 14 9-14 9" stroke="var(--accent)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <b>No connections yet</b>
       <span>Type a PC's name or address above to connect, or save one with its own settings.</span>
-      <button class="btn primary" id="empty-new"><svg><use href="#i-plus"/></svg>New connection</button>
+      <button class="btn" id="empty-new"><svg><use href="#i-plus"/></svg>New connection</button>
+      <button type="button" class="inline-link" id="empty-w365">Have a Cloud PC? Sign in to Windows 365</button>
     </div>
-    <div class="empty" id="no-match" hidden><b>Nothing matches</b><span>Press Enter in the search box to connect to it.</span></div>
   </section>
 
   <!-- ======================================================== workspace -->
   <section class="page ws" id="page-workspace">
     <aside class="ws-side">
       <div class="ws-side-head">
-        <label class="search"><svg><use href="#i-search"/></svg><span class="sr">Filter</span><input class="input" id="ws-q" placeholder="Filter" autocomplete="off" spellcheck="false"></label>
+        <label class="search"><svg><use href="#i-search"/></svg><span class="sr">Find a saved PC, or type a name or address</span><input class="input" id="ws-q" placeholder="Find or type a PC" autocomplete="off" spellcheck="false" title="Filters the list; Enter opens what it names in a tab" aria-describedby="ws-hint"></label>
         <button class="btn icon" id="ws-new" title="New connection (Ctrl+N)"><svg><use href="#i-plus"/></svg></button>
       </div>
-      <form class="ws-quick" id="ws-quick" autocomplete="off">
-        <input class="input" id="ws-host" placeholder="Quick connect" spellcheck="false" title="A PC's name or address; Enter opens it in a tab">
-        <select class="input" id="ws-mode" title="How"><option value="rdp">RDP</option><option value="hyper">Hyper</option><option value="direct">Direct</option></select>
-      </form>
-      <div class="tree" id="ws-tree" role="tree"></div>
+      <div class="hint ws-hint" id="ws-hint" aria-live="polite" hidden></div>
+      <div class="tree" id="ws-tree" role="tree" aria-label="Saved connections" tabindex="0"></div>
     </aside>
     <div class="ws-main">
-      <div class="ws-tabs" id="ws-tabs" role="tablist"></div>
+      <div class="ws-strip">
+        <button type="button" class="btn ghost icon ws-fold" id="ws-fold" aria-pressed="false" title="Hide the list (Ctrl+B)"><svg aria-hidden="true"><use href="#i-side"/></svg><span class="sr">Hide the list</span></button>
+        <div class="ws-tabs" id="ws-tabs" role="tablist" aria-label="Sessions"></div>
+      </div>
       <div class="ws-bar" id="ws-bar"></div>
       <div class="ws-body">
         <div class="ws-view" id="ws-view"></div>
@@ -634,30 +706,27 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
 
   <!-- ======================================================== this PC -->
   <section class="page" id="page-host">
-    <div class="page-head"><h1>This PC</h1><div class="spacer"></div><button class="btn ghost" id="host-refresh"><svg><use href="#i-refresh"/></svg>Refresh</button></div>
+    <div class="page-head"><h1>This PC</h1><div class="spacer"></div>
+      <button class="btn ghost" id="host-logs" title="The Hyper service's logs on this PC"><svg><use href="#i-folder"/></svg>Host logs</button>
+      <button class="btn ghost" id="host-refresh"><svg><use href="#i-refresh"/></svg>Refresh</button></div>
     <p class="lead">Let your other devices stream this PC with Hyper: low-latency, GPU-encoded, at their own screen's resolution.</p>
     <div class="card hero" id="host-hero">
       <div class="big-ico off"><svg><use href="#i-power"/></svg></div>
       <div><h3 class="skeleton" style="width:220px;height:24px"></h3><p class="skeleton" style="width:300px;height:16px;margin-top:8px"></p></div>
     </div>
-    <h2>Details</h2>
-    <div class="kv" id="host-kv"></div>
-    <h2>Exact-resolution display</h2>
-    <div class="card group" id="host-display"></div>
-    <h2>While streaming</h2>
-    <div class="card group" id="host-stream"></div>
-    <h2>Updates</h2>
-    <div class="card group" id="host-updates"></div>
+    <p class="host-note" id="host-note" hidden><span id="host-note-text"></span><button type="button" class="inline-link" id="host-upd-link">Change in Settings</button></p>
     <h2>Reach this PC at</h2>
     <div class="card list" id="host-addrs"></div>
-    <h2>Connect from another device</h2>
-    <div class="card" style="padding:18px 20px">
+    <h2>While streaming</h2>
+    <div class="card group" id="host-stream"></div>
+    <details class="card fold" id="host-how">
+      <summary><svg><use href="#i-caret"/></svg>Connect from another device</summary>
       <ol class="steps">
-        <li><span>Install rdpio on the other device (this PC has <span id="host-ver"></span>). From then on it keeps up with this PC: an older rdpio is updated by it when it connects.</span></li>
+        <li><span>Install rdpio on the other device. From then on it keeps up with this PC: an older rdpio is updated by it when it connects.</span></li>
         <li><span>Add a connection to <b id="host-name-hint">this PC</b> with <b>Hyper Direct</b>, using the Hyper password set here.</span></li>
         <li><span>Away from home, use this PC's Tailscale address. In the session, <kbd>Ctrl+Shift+Q</kbd> disconnects and locks this PC.</span></li>
       </ol>
-    </div>
+    </details>
   </section>
 
   <!-- ======================================================== activity -->
@@ -667,9 +736,9 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
       <div class="spacer"></div>
       <div class="log-tools">
         <select class="input" id="log-src" title="Whose lines"><option value="">Everything</option></select>
-        <div class="seg" id="log-level"><button data-v="all" aria-pressed="true">All</button><button data-v="warn" aria-pressed="false">Problems</button></div>
+        <div class="seg" id="log-level" role="group" aria-label="Which lines"><button data-v="all" aria-pressed="true">All</button><button data-v="warn" aria-pressed="false">Problems</button></div>
         <label class="search"><svg><use href="#i-search"/></svg><span class="sr">Filter</span><input class="input" id="log-q" placeholder="Filter" autocomplete="off" spellcheck="false"></label>
-        <label class="check" title="The once-a-second frame rate, latency and bitrate lines"><input type="checkbox" id="log-perf">Stats</label>
+        <label class="check" title="The once-a-second frame rate, latency and bitrate lines (the last ten minutes or so are kept)"><input type="checkbox" id="log-perf">Stats</label>
         <button class="btn icon" id="log-copy" title="Copy what's shown"><svg><use href="#i-copy"/></svg></button>
         <button class="btn icon" id="log-clear" title="Clear"><svg><use href="#i-trash"/></svg></button>
         <button class="btn" id="log-folder"><svg><use href="#i-folder"/></svg>Log files</button>
@@ -685,91 +754,81 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
     <h2>Appearance</h2>
     <div class="card group">
       <div class="switch"><div class="txt">Theme<span>Follow Windows, or always light or dark.</span></div>
-        <div class="seg" id="theme-seg"><button data-v="system">System</button><button data-v="light">Light</button><button data-v="dark">Dark</button></div></div>
+        <div class="seg" id="theme-seg" role="group" aria-label="Theme"><button data-v="system">System</button><button data-v="light">Light</button><button data-v="dark">Dark</button></div></div>
     </div>
-    <h2>Launching</h2>
+    <h2>Connecting</h2>
     <div class="card group">
       <label class="switch"><div class="txt">Keep this window open after connecting<span>Off: rdpio hides while the session runs and closes with it (it comes back if the connection fails).</span></div>
         <span class="toggle"><input type="checkbox" id="keep-open"><i></i></span></label>
-    </div>
-    <h2>New connections start with</h2>
-    <div class="card" style="padding:16px">
-      <div class="stack">
-        <div class="field"><span class="label">Connection</span><div class="choices" id="def-transport"></div></div>
-        <div class="field"><span class="label">Tuned for</span><div class="choices two" id="def-profile"></div></div>
-        <label class="check"><input type="checkbox" id="def-fullscreen">Full screen</label>
-      </div>
-    </div>
-    <h2>In a session</h2>
-    <div class="card keys">
-      <kbd>Ctrl+Shift+Q</kbd><span>Disconnect (a Hyper host locks itself)</span>
-      <kbd>Ctrl+Shift+M</kbd><span>Lock the mouse in for games — Win, Alt+Tab and Ctrl+Esc then go to the remote PC. Again to release</span>
-      <kbd>Ctrl+Shift+K</kbd><span>Hyper: Win, Alt+Tab, Alt+F4 to the host (the default) or to this PC</span>
-      <kbd>Ctrl+Shift+O</kbd><span>Hyper: office mode on or off (crisp text) </span>
-      <kbd>Ctrl+Shift+S</kbd><span>Hyper: stats — frame rate, latency, bitrate, loss</span>
-      <kbd>Ctrl+Shift+F</kbd><span>Hyper: full screen or a window</span>
-      <kbd>Ctrl+Alt+End</kbd><span>Ctrl+Alt+Del on the remote PC</span>
+      <div class="switch"><div class="txt">New connections start with<span>What a typed address and a new connection begin from. A saved connection keeps its own.</span><div class="conn-meta" id="def-chips"></div></div>
+        <button class="btn" id="def-change">Change…</button></div>
     </div>
     <h2>Updates</h2>
     <div class="card group">
+      <div class="card-cap">This app</div>
       <div class="switch"><div class="txt"><span id="upd-version" class="upd-title">rdpio</span><span id="upd-status">Up to date.</span></div><button class="btn" id="upd-check"><svg><use href="#i-refresh"/></svg>Check now</button></div>
       <label class="switch"><div class="txt">Check for updates automatically<span>When this window opens, rdpio looks for a newer release on GitHub and offers it. Nothing installs without you.</span></div>
         <span class="toggle"><input type="checkbox" id="upd-auto"><i></i></span></label>
       <label class="switch"><div class="txt">Update from the PCs I connect to<span>A Hyper PC with a newer rdpio hands it to this one while you're connected. It's checked against rdpio's release signature, and it installs when the session ends (or at once, when this rdpio is too old to stream from it).</span></div>
         <span class="toggle"><input type="checkbox" id="upd-hosts"><i></i></span></label>
       <div class="switch"><div class="txt">Channel<span>Releases, or nightly builds: every change, as soon as it's built.</span></div>
-        <div class="seg" id="upd-channel"><button data-v="stable">Releases</button><button data-v="nightly">Nightly</button></div></div>
+        <div class="seg" id="upd-channel" role="group" aria-label="Channel"><button data-v="stable">Releases</button><button data-v="nightly">Nightly</button></div></div>
     </div>
-    <h2>Troubleshooting</h2>
-    <div class="card group">
-      <div class="switch"><div class="txt">Session logs<span>One per PC you connect to, from the last session.</span></div><button class="btn" id="open-client-logs"><svg><use href="#i-folder"/></svg>Open</button></div>
-      <div class="switch"><div class="txt">About<span id="about"></span></div></div>
-    </div>
+    <!-- The Hyper service's own updates (see `renderHostUpdates`): here, with
+         the app's, and nowhere else. -->
+    <div class="card group" id="host-updates" hidden></div>
+    <h2>Shortcuts</h2>
+    <div class="card keys" id="keys"></div>
   </section>
 </main>
 
 <!-- ======================================================== edit dialog -->
 <div class="scrim" id="edit-scrim">
-  <form class="dialog" id="edit" autocomplete="off" novalidate>
+  <form class="dialog" id="edit" autocomplete="off" novalidate role="dialog" aria-modal="true" aria-labelledby="edit-title" aria-describedby="edit-sub">
     <header><h3 id="edit-title">New connection</h3><p id="edit-sub">Where to connect, and how.</p></header>
-    <div class="tabs" role="tablist">
-      <button type="button" role="tab" data-tab="general" aria-selected="true">General</button>
-      <button type="button" role="tab" data-tab="stream" aria-selected="false">Stream</button>
-      <button type="button" role="tab" data-tab="display" aria-selected="false">Display &amp; devices</button>
+    <div class="tabs" role="tablist" aria-label="Settings of this connection">
+      <button type="button" role="tab" id="tab-general" aria-controls="pane-general" data-tab="general" aria-selected="true">General</button>
+      <button type="button" role="tab" id="tab-stream" aria-controls="pane-stream" data-tab="stream" aria-selected="false">Stream</button>
+      <button type="button" role="tab" id="tab-display" aria-controls="pane-display" data-tab="display" aria-selected="false">Display &amp; devices</button>
     </div>
     <div class="body">
-      <div class="tabpane stack active" data-pane="general">
-        <div class="row two">
-          <div class="field"><label for="f-host">PC name or address</label><input class="input" id="f-host" placeholder="gaming-pc, 192.168.1.20, 100.101.5.9" spellcheck="false"></div>
-          <div class="field"><label for="f-port">RDP port</label><input class="input" id="f-port" inputmode="numeric" placeholder="3389"></div>
-        </div>
-        <div class="row">
-          <div class="field"><label for="f-name">Display name</label><input class="input" id="f-name" placeholder="Same as the PC name"></div>
-          <div class="field"><label for="f-folder">Folder</label><input class="input" id="f-folder" list="folder-list" placeholder="None — e.g. Work/Servers" spellcheck="false"></div>
-        </div>
-        <div class="row">
-          <div class="field"><label for="f-user">User name</label><input class="input" id="f-user" placeholder="Optional" spellcheck="false"></div>
-          <div class="field"><label for="f-domain">Domain</label><input class="input" id="f-domain" placeholder="Optional" spellcheck="false"></div>
-        </div>
-        <div class="field" id="f-pw-field"><label for="f-pw">Windows password</label>
-          <div class="pw"><input class="input" id="f-pw" type="password" placeholder="Saved on this PC for you only"><button type="button" class="reveal" tabindex="-1" title="Show"><svg><use href="#i-eye"/></svg></button></div>
-          <span class="hint" id="f-pw-hint"></span>
+      <div class="tabpane stack active" data-pane="general" id="pane-general" role="tabpanel" aria-labelledby="tab-general">
+        <!-- How it connects comes first: it decides which of the fields under it apply. -->
+        <div class="field"><span class="label">Connection</span><div class="choices" id="f-transport"></div></div>
+        <div class="stack" id="f-identity">
+          <div class="row two" id="f-host-row">
+            <div class="field"><label for="f-host">PC name or address</label><input class="input" id="f-host" placeholder="gaming-pc, 192.168.1.20, 100.101.5.9" spellcheck="false"></div>
+            <div class="field" id="f-port-field"><label for="f-port">RDP port</label><input class="input" id="f-port" inputmode="numeric" placeholder="3389"></div>
+          </div>
+          <div class="row">
+            <div class="field"><label for="f-name">Display name</label><input class="input" id="f-name" placeholder="Same as the PC name"></div>
+            <div class="field"><label for="f-folder">Folder</label><input class="input" id="f-folder" list="folder-list" placeholder="None — e.g. Work/Servers" spellcheck="false"></div>
+          </div>
+          <div class="row" id="f-user-row">
+            <div class="field"><label for="f-user">User name</label><input class="input" id="f-user" placeholder="Optional" spellcheck="false"></div>
+            <div class="field"><label for="f-domain">Domain</label><input class="input" id="f-domain" placeholder="Optional" spellcheck="false"></div>
+          </div>
+          <div class="field" id="f-pw-field"><label for="f-pw">Windows password</label>
+            <div class="pw"><input class="input" id="f-pw" type="password" placeholder="Saved on this PC for you only"><button type="button" class="reveal" aria-pressed="false" aria-label="Show password" title="Show password"><svg aria-hidden="true"><use href="#i-eye"/></svg></button></div>
+            <span class="hint" id="f-pw-hint"></span>
+          </div>
+          <div class="field" id="f-hpw-field"><label for="f-hpw">Hyper password</label>
+            <div class="pw"><input class="input" id="f-hpw" type="password" placeholder="The one set on the other PC"><button type="button" class="reveal" aria-pressed="false" aria-label="Show password" title="Show password"><svg aria-hidden="true"><use href="#i-eye"/></svg></button></div>
+            <span class="hint" id="f-hpw-hint"></span>
+          </div>
         </div>
       </div>
 
-      <div class="tabpane stack" data-pane="stream">
-        <div class="field"><span class="label">Connection</span><div class="choices" id="f-transport"></div></div>
-        <div class="field" id="f-hpw-field"><label for="f-hpw">Hyper password</label>
-          <div class="pw"><input class="input" id="f-hpw" type="password" placeholder="The one set on the other PC"><button type="button" class="reveal" tabindex="-1" title="Show"><svg><use href="#i-eye"/></svg></button></div>
-          <span class="hint" id="f-hpw-hint"></span>
-        </div>
-        <div class="field" id="f-profile-field"><span class="label">Tuned for</span><div class="choices two" id="f-profile"></div></div>
+      <div class="tabpane stack" data-pane="stream" id="pane-stream" role="tabpanel" aria-labelledby="tab-stream">
+        <div class="field" id="f-profile-field"><span class="label">Mode</span><div class="choices two" id="f-profile"></div></div>
         <label class="check" id="f-fast-field"><input type="checkbox" id="f-fast">Sharpest office text at once — ~8 ms more latency on every frame (otherwise still text sharpens within half a second)</label>
         <div class="row" id="f-hyper-row">
           <div class="field"><label for="f-codec">Video codec</label>
             <select class="input" id="f-codec"><option value="auto">Automatic</option><option value="hevc">HEVC (H.265)</option><option value="h264">H.264</option></select></div>
           <div class="field"><label for="f-fps">Frame rate</label>
             <select class="input" id="f-fps"><option value="0">Match this screen</option><option>30</option><option>60</option><option>90</option><option>120</option><option>144</option><option>165</option><option>240</option></select></div>
+          <div class="field"><label for="f-scale">Stream size</label>
+            <select class="input" id="f-scale" title="A smaller picture, scaled up here, stays sharp on a slow link"><option value="0">Automatic</option><option value="100">100%</option><option value="75">75%</option><option value="50">50%</option><option value="33">33%</option></select></div>
           <div class="field"><label for="f-hport">Hyper port</label><input class="input" id="f-hport" inputmode="numeric" placeholder="Default"></div>
         </div>
         <div class="field" id="f-gpu-field"><label for="f-gpu">Graphics chip (laptops with two)</label>
@@ -781,12 +840,14 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
           <span class="hint">On battery the faster chip can switch off completely. Plugging in or out switches mid-stream.</span></div>
       </div>
 
-      <div class="tabpane stack" data-pane="display">
+      <div class="tabpane stack" data-pane="display" id="pane-display" role="tabpanel" aria-labelledby="tab-display">
         <div class="card group">
-          <label class="switch"><div class="txt">Full screen<span>Borderless on this screen. Ctrl+Shift+Q leaves; in Hyper, Ctrl+Shift+F switches to a window.</span></div><span class="toggle"><input type="checkbox" id="f-fullscreen"><i></i></span></label>
+          <label class="switch"><div class="txt">Full screen<span>Borderless, on this window's screen. Point at the top edge for Minimize, Window and Disconnect; Ctrl+Shift+Q leaves.</span></div><span class="toggle"><input type="checkbox" id="f-fullscreen"><i></i></span></label>
           <label class="switch" id="f-multimon-row"><div class="txt">Use all my monitors<span>RDP: the remote desktop spans every screen.</span></div><span class="toggle"><input type="checkbox" id="f-multimon"><i></i></span></label>
-          <label class="switch"><div class="txt">Lowest latency<span>Show each frame the moment it's ready (may tear).</span></div><span class="toggle"><input type="checkbox" id="f-lowlat"><i></i></span></label>
-          <label class="switch" id="f-vsync-row"><div class="txt">Smooth presentation<span>Hyper: wait for this screen's refresh (no tearing, a little more latency).</span></div><span class="toggle"><input type="checkbox" id="f-vsync"><i></i></span></label>
+          <!-- One choice for how frames reach the screen; what it sets depends
+               on the connection (see `syncPresent`). -->
+          <div class="switch"><div class="txt">Presentation<span id="f-present-note"></span></div>
+            <div class="seg" id="f-present" role="group" aria-label="Presentation"><button type="button" data-v="fast">Lowest latency</button><button type="button" data-v="smooth">Smooth</button></div></div>
           <label class="switch" id="f-keys-row"><div class="txt">Windows keys go to the remote PC<span>Hyper: Win, Alt+Tab, Alt+F4 and Ctrl+Esc act there. Ctrl+Shift+K switches in a session; Ctrl+Alt+Del always stays here.</span></div><span class="toggle"><input type="checkbox" id="f-keys"><i></i></span></label>
         </div>
         <div class="card group" id="f-devices">
@@ -809,22 +870,22 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
 
 <!-- ======================================================== password prompt -->
 <div class="scrim" id="pw-scrim">
-  <form class="dialog sm" id="pw-form" autocomplete="off">
+  <form class="dialog sm" id="pw-form" autocomplete="off" role="dialog" aria-modal="true" aria-labelledby="pw-title" aria-describedby="pw-sub">
     <header><h3 id="pw-title">Password</h3><p id="pw-sub"></p></header>
     <div class="body stack">
-      <div class="pw"><input class="input" id="pw-input" type="password"><button type="button" class="reveal" tabindex="-1" title="Show"><svg><use href="#i-eye"/></svg></button></div>
+      <div class="pw"><input class="input" id="pw-input" type="password" aria-labelledby="pw-title"><button type="button" class="reveal" aria-pressed="false" aria-label="Show password" title="Show password"><svg aria-hidden="true"><use href="#i-eye"/></svg></button></div>
       <label class="check" id="pw-remember-row"><input type="checkbox" id="pw-remember" checked>Remember it on this PC (for you only)</label>
     </div>
-    <footer><button type="button" class="btn" id="pw-cancel">Cancel</button><button type="submit" class="btn primary">Connect</button></footer>
+    <footer><button type="button" class="btn" id="pw-cancel">Cancel</button><button type="submit" class="btn primary" id="pw-ok" disabled>Connect</button></footer>
   </form>
 </div>
 
 <!-- ======================================================== Hyper password (host) -->
 <div class="scrim" id="hpw-scrim">
-  <form class="dialog sm" id="hpw-form" autocomplete="off">
-    <header><h3 id="hpw-title">Hyper password</h3><p>Other devices sign in to this PC's Hyper stream with it. Any length works — but anyone who can reach this PC and knows it can control it.</p></header>
+  <form class="dialog sm" id="hpw-form" autocomplete="off" role="dialog" aria-modal="true" aria-labelledby="hpw-title" aria-describedby="hpw-sub">
+    <header><h3 id="hpw-title">Hyper password</h3><p id="hpw-sub">Other devices sign in to this PC's Hyper stream with it. Any length works — but anyone who can reach this PC and knows it can control it.</p></header>
     <div class="body stack">
-      <div class="field"><label for="hpw-1">New password</label><div class="pw"><input class="input" id="hpw-1" type="password"><button type="button" class="reveal" tabindex="-1" title="Show"><svg><use href="#i-eye"/></svg></button></div></div>
+      <div class="field"><label for="hpw-1">New password</label><div class="pw"><input class="input" id="hpw-1" type="password"><button type="button" class="reveal" aria-pressed="false" aria-label="Show password" title="Show password"><svg aria-hidden="true"><use href="#i-eye"/></svg></button></div></div>
       <div class="field"><label for="hpw-2">Again</label><input class="input" id="hpw-2" type="password"></div>
       <div class="error-text" id="hpw-error" role="alert"></div>
       <span class="hint">Windows will ask for permission: setting up the host needs an administrator.</span>
@@ -835,9 +896,9 @@ body.on-ws .toasts { left: 20px; right: auto; max-width: 228px; }
 
 <!-- ======================================================== a line of text -->
 <div class="scrim" id="txt-scrim">
-  <form class="dialog sm" id="txt-form" autocomplete="off">
+  <form class="dialog sm" id="txt-form" autocomplete="off" role="dialog" aria-modal="true" aria-labelledby="txt-title" aria-describedby="txt-sub">
     <header><h3 id="txt-title"></h3><p id="txt-sub"></p></header>
-    <div class="body stack"><input class="input" id="txt-input" list="folder-list" spellcheck="false"></div>
+    <div class="body stack"><input class="input" id="txt-input" list="folder-list" spellcheck="false" aria-labelledby="txt-title"></div>
     <footer><button type="button" class="btn" id="txt-cancel">Cancel</button><button type="submit" class="btn primary" id="txt-ok">OK</button></footer>
   </form>
 </div>
@@ -860,7 +921,8 @@ function call(cmd, args = {}) {
     if (!bridge) { reject(new Error("not running inside rdpio")); return; }
     const id = nextId++;
     pending.set(id, { resolve, reject });
-    bridge.postMessage({ id, cmd, ...args });
+    // (`rid`, not `id`: a request's own `id` is the connection it's about.)
+    bridge.postMessage({ ...args, cmd, rid: id });
   });
 }
 if (bridge) bridge.addEventListener("message", ev => {
@@ -876,13 +938,23 @@ if (bridge) bridge.addEventListener("message", ev => {
 // ------------------------------------------------------------ helpers
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const icon = (name, cls = "") => `<svg class="${cls}"><use href="#i-${name}"/></svg>`;
-function hue(s) { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h % 360; }
 function avatar(name) {
   const words = String(name || "?").replace(/[^\p{L}\p{N} .-]/gu, "").split(/[\s.-]+/).filter(Boolean);
   const init = ((words[0] || "?")[0] + (words.length > 1 ? words[1][0] : (words[0] || "")[1] || "")).toUpperCase();
-  const h = hue(name);
-  return `<div class="avatar">${esc(init)}</div>`;
+  return `<div class="avatar" aria-hidden="true">${esc(init)}</div>`;
 }
+// A container's markup, replaced only when it changed: a state push that
+// changes nothing leaves the lists (their focus, hover and scroll) alone.
+// `key` adds what else the drawing depends on. Code that changes such a
+// container's DOM in place must call `setHTML.forget(el)`.
+function setHTML(el, html, key = "") {
+  const k = html + "\u0000" + key;
+  if (el.__html === k) return false;
+  el.__html = k;
+  el.innerHTML = html;
+  return true;
+}
+setHTML.forget = el => { el.__html = null; };
 function ago(unix) {
   if (!unix) return "";
   const s = Math.max(0, Date.now() / 1000 - unix);
@@ -897,24 +969,41 @@ const TRANSPORTS = {
   hyper: { name: "RDP + Hyper", short: "Hyper", icon: "bolt", desc: "Sign in with Remote Desktop, then switch to the GPU stream when the PC runs Hyper." },
   direct: { name: "Hyper Direct", short: "Direct", icon: "direct", desc: "Straight to the GPU stream with the Hyper password. Fastest; needs Hyper on the PC." },
 };
+// (The same two names as in a session: Ctrl+Shift+O switches between them.)
 const PROFILES = {
-  game: { name: "Games & motion", icon: "game", desc: "Lowest latency. Fast-moving pictures first." },
-  office: { name: "Work & text", icon: "text", desc: "Crisp text at your screen's resolution; video still smooth." },
+  game: { name: "Game mode", short: "Game", icon: "game", desc: "Games and motion: lowest latency." },
+  office: { name: "Office mode", short: "Office", icon: "text", desc: "Work and text: crisp at your screen's resolution." },
 };
+// A connection's options at a glance (cards, the defaults in Settings).
 function chips(o) {
   const out = [];
+  const hyperish = o.transport !== "rdp";
   const t = TRANSPORTS[o.transport] || TRANSPORTS.hyper;
-  out.push(`<span class="badge ${o.transport === "rdp" ? "" : "accent"}">${icon(t.icon)}${t.short}</span>`);
-  if (o.transport !== "rdp" || o.profile === "office") out.push(`<span class="badge">${o.profile === "office" ? "Office" : "Game"}</span>`);
-  if (o.fps) out.push(`<span class="badge">${o.fps} fps</span>`);
-  if (o.codec && o.codec !== "auto") out.push(`<span class="badge">${o.codec.toUpperCase()}</span>`);
+  out.push(`<span class="badge ${hyperish ? "accent" : ""}">${icon(t.icon)}${t.short}</span>`);
+  if (hyperish || o.profile === "office") out.push(`<span class="badge">${(PROFILES[o.profile] || PROFILES.game).short}</span>`);
+  if (hyperish && o.fps) out.push(`<span class="badge">${esc(o.fps)} fps</span>`);
+  if (hyperish && o.codec && o.codec !== "auto") out.push(`<span class="badge">${esc(String(o.codec).toUpperCase())}</span>`);
+  if (hyperish && o.scale) out.push(`<span class="badge">${esc(o.scale)}%</span>`);
   if (!o.fullscreen) out.push(`<span class="badge">Window</span>`);
   return out.join("");
+}
+// The pieces every list of PCs is made of: written once, so a card, a Recent
+// row and a Cloud PC can't come to look or behave differently.
+const liveBadge = () => `<span class="badge ok"><span class="st live"></span>Connected</span>`;
+const connectBtn = (running, cls = "", name = "") => `<button class="btn ${cls}" data-act="connect"${name ? ` aria-label="${esc(`${running ? "Show" : "Connect to"} ${name}`)}"` : ""}>${icon("play")}${running ? "Show" : "Connect"}</button>`;
+const whereOf = c => `${c.user ? `${c.user} @ ` : ""}${c.host}${c.port && c.port !== 3389 ? `:${c.port}` : ""}`;
+// One row of a list card (Recent, Windows 365). `attrs`, `lead`, `acts` and
+// `primary` are markup (escaped by the caller); the rest is text. `when`: a
+// time (Unix seconds), shown as "5 min ago" and kept current (see `tickTimes`).
+function rowHtml({ attrs = "", lead, title, live = false, sub, subTitle = "", when = 0, acts = "", primary = "" }) {
+  return `<div class="item" ${attrs}>${lead}
+    <div class="grow"><div class="conn-name">${esc(title)}${live ? ` ${liveBadge()}` : ""}</div><div class="conn-sub" title="${esc(subTitle)}">${esc(sub)}</div></div>
+    ${when ? `<span class="when" data-when="${+when}">${esc(ago(when))}</span>` : ""}${acts ? `<div class="acts">${acts}</div>` : ""}${primary}</div>`;
 }
 function toast(kind, title, text, ms = 6000, actions = []) {
   const el = document.createElement("div");
   el.className = `toast ${kind}`;
-  el.innerHTML = `<div class="ico">${kind === "ok" ? "✓" : kind === "bad" ? "!" : "i"}</div><div><b>${esc(title)}</b><span>${esc(text || "")}</span>${actions.length ? `<div class="t-acts">${actions.map((a, i) => `<button class="btn" data-i="${i}">${esc(a.label)}</button>`).join("")}</div>` : ""}</div><button class="x" title="Close">${icon("x")}</button>`;
+  el.innerHTML = `<div class="ico" aria-hidden="true">${kind === "ok" ? "✓" : kind === "bad" ? "!" : "i"}</div><div><b>${esc(title)}</b><span>${esc(text || "")}</span>${actions.length ? `<div class="t-acts">${actions.map((a, i) => `<button class="btn" data-i="${i}">${esc(a.label)}</button>`).join("")}</div>` : ""}</div><button class="x" title="Close" aria-label="Close">${icon("x")}</button>`;
   const close = () => { el.classList.add("out"); setTimeout(() => el.remove(), 200); };
   $(".x", el).onclick = close;
   $$(".t-acts .btn", el).forEach(b => b.onclick = () => { close(); actions[+b.dataset.i].run(); });
@@ -927,12 +1016,15 @@ function fail(e) { toast("bad", "Something went wrong", e && e.message ? e.messa
 // ------------------------------------------------------------ theme
 let state = null;
 let systemDark = matchMedia("(prefers-color-scheme: dark)").matches;
+// (The title bar follows the theme: told only when it changes.)
+let themeSent = null;
 function applyTheme() {
   const pref = state ? state.settings.theme : "system";
   const dark = pref === "dark" || (pref === "system" && systemDark);
   document.documentElement.dataset.theme = dark ? "dark" : "light";
-  document.documentElement.dataset.mica = state && state.mica ? "1" : "0";
-  call("theme_applied", { dark }).catch(() => {});
+  if (dark === themeSent) return;
+  themeSent = dark;
+  call("theme_applied", { dark }).catch(() => { themeSent = null; });
 }
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", e => { systemDark = e.matches; applyTheme(); });
 
@@ -941,169 +1033,314 @@ function show(page) {
   $$(".nav-item").forEach(b => b.setAttribute("aria-current", b.dataset.page === page ? "page" : "false"));
   $$(".page").forEach(p => p.classList.toggle("active", p.id === `page-${page}`));
   document.body.classList.toggle("on-ws", page === "workspace");
-  if (page === "host") refreshHost();
+  if (page === "connections") { enterCards(); tickTimes(); }
+  if (page === "host" && !hostLooking) refreshHost();
   if (page === "activity") renderActivity();
   if (page === "workspace") { renderTree(); renderTabs(); renderWsView(); }
   syncEmbed();
 }
 const pageIs = page => $(`#page-${page}`).classList.contains("active");
 $$(".nav-item").forEach(b => b.onclick = () => show(b.dataset.page));
+// A narrow window: the nav becomes a rail of icons (see the `.narrow` rules).
+const narrowMq = matchMedia("(max-width: 860px)");
+function syncRail() { document.body.classList.toggle("narrow", narrowMq.matches); }
+narrowMq.addEventListener("change", syncRail);
+syncRail();
 
 // ------------------------------------------------------------ connections page
 function render() {
   if (!state) return;
-  const q = $("#search").value.trim().toLowerCase();
-  const match = c => !q || [c.name, c.host, c.user, c.domain].some(v => v && String(v).toLowerCase().includes(q));
-  const saved = state.connections.filter(match).sort((a, b) => a.name.localeCompare(b.name));
+  const q = $("#quick-host").value.trim().toLowerCase();
+  const saved = state.connections.filter(c => connMatches(c, q)).sort((a, b) => a.name.localeCompare(b.name));
   const savedIds = new Set(state.connections.map(c => c.id));
-  const recent = state.recent.filter(r => !(r.connection_id && savedIds.has(r.connection_id) && !q)).filter(match);
+  // (A saved PC's own recents: its card already stands for it.)
+  const recent = state.recent.filter(r => !(r.connection_id && savedIds.has(r.connection_id))).filter(r => connMatches(r, q));
 
-  $("#saved").innerHTML = saved.map((c, i) => `
-    <article class="card conn" data-id="${esc(c.id)}" style="animation-delay:${Math.min(i, 12) * 25}ms">
-      ${c.running ? `<span class="badge ok live-tag"><span class="dot live"></span>Connected</span>` : ""}
+  // (Each card's Connect is a plain button: the page's one emerald action is
+  // the box's Connect, beside New connection.)
+  setHTML($("#saved"), saved.map((c, i) => `
+    <article class="card conn" data-id="${esc(c.id)}" aria-label="${esc(c.name)}" style="animation-delay:${Math.min(i, 12) * 25}ms">
       <div class="conn-top">${avatar(c.name)}<div style="min-width:0"><div class="conn-name" title="${esc(c.name)}">${esc(c.name)}</div>
-        <div class="conn-sub">${esc(c.user ? `${c.user} @ ` : "")}${esc(c.host)}${c.port !== 3389 ? `:${c.port}` : ""}</div></div></div>
+        <div class="conn-sub">${esc(whereOf(c))}</div></div>${c.running ? liveBadge() : ""}</div>
       <div class="conn-meta">${chips(c.options)}</div>
       <div class="conn-actions">
-        <button class="btn primary" data-act="connect">${icon("play")}${c.running ? "Show" : "Connect"}</button>
-        <button class="btn icon" data-act="edit" title="Edit">${icon("edit")}</button>
-        <button class="btn icon" data-act="more" title="More">${icon("more")}</button>
+        ${connectBtn(c.running, "", c.name)}
+        <button class="btn icon" data-act="edit" title="Edit" aria-label="Edit ${esc(c.name)}">${icon("edit")}</button>
+        <button class="btn icon" data-act="more" title="More" aria-label="More for ${esc(c.name)}" aria-haspopup="menu">${icon("more")}</button>
       </div>
-    </article>`).join("");
+    </article>`).join(""));
   $("#saved-count").textContent = state.connections.length ? String(state.connections.length) : "";
   $("#saved-wrap").hidden = saved.length === 0;
 
-  $("#recent").innerHTML = recent.map((r, i) => `
-    <div class="item" data-i="${state.recent.indexOf(r)}" tabindex="-1">
-      ${avatar(r.name)}
-      <div class="grow"><div class="conn-name">${esc(r.name)}${r.running ? ` <span class="badge ok" style="margin-left:6px"><span class="dot live"></span>Connected</span>` : ""}</div>
-        <div class="conn-sub">${esc(r.user ? `${r.user} @ ` : "")}${esc(r.host)}${r.port !== 3389 ? `:${r.port}` : ""} · ${TRANSPORTS[r.options.transport]?.short || ""}</div></div>
-      <span class="when">${esc(ago(r.when))}</span>
-      <div class="acts">
-        ${r.connection_id ? "" : `<button class="btn ghost icon" data-act="save" title="Save">${icon("save")}</button>`}
-        <button class="btn ghost icon" data-act="forget" title="Remove from Recent">${icon("x")}</button>
-      </div>
-      <button class="btn" data-act="connect">${icon("play")}${r.running ? "Show" : "Connect"}</button>
-    </div>`).join("");
+  setHTML($("#recent"), recent.map(r => rowHtml({
+    attrs: `data-i="${state.recent.indexOf(r)}" tabindex="-1"`,
+    lead: avatar(r.name), title: r.name, live: r.running,
+    sub: `${whereOf(r)} · ${TRANSPORTS[r.options.transport]?.short || ""}`,
+    when: r.when,
+    acts: `${r.connection_id ? "" : `<button class="btn ghost icon" data-act="save" title="Save" aria-label="Save ${esc(r.name)}">${icon("save")}</button>`}<button class="btn ghost icon" data-act="forget" title="Remove from Recent" aria-label="Remove ${esc(r.name)} from Recent">${icon("x")}</button>`,
+    primary: connectBtn(r.running, "", r.name),
+  })).join(""));
   $("#recent-count").textContent = "";
   $("#recent-wrap").hidden = recent.length === 0;
-  const nothing = state.connections.length === 0 && state.recent.length === 0;
-  $("#empty").hidden = !nothing;
-  const cloud = renderW365(q);
-  $("#no-match").hidden = nothing || saved.length + recent.length + cloud > 0;
+  const firstRun = state.connections.length === 0 && state.recent.length === 0 && !(w365.signed_in && w365.pcs.length);
+  $("#empty").hidden = !firstRun;
+  renderW365(q, firstRun);
+  renderQuickHint();
 
-  const live = state.connections.filter(c => c.running).length + state.recent.filter(r => r.running && !r.connection_id).length;
+  // (A session in a Workspace tab is counted there, once.)
+  const live = state.sessions.filter(s => !s.embedded).length;
   $("#nav-live").hidden = live === 0;
   $("#nav-live").textContent = live ? `${live} live` : "";
 }
+// The saved cards rise in once, when the page is opened.
+let enterTimer = 0;
+function enterCards() {
+  const grid = $("#saved");
+  grid.classList.add("enter");
+  clearTimeout(enterTimer);
+  enterTimer = setTimeout(() => grid.classList.remove("enter"), 600);
+}
+// "5 min ago" moves on by itself: only those words, once a minute, while the
+// page is in front (nothing else is drawn again).
+function tickTimes() {
+  $$("#page-connections .when[data-when]").forEach(el => { el.textContent = ago(+el.dataset.when); });
+}
+setInterval(() => { if (pageIs("connections") && !document.body.classList.contains("idle")) tickTimes(); }, 60000);
 
-// Windows 365: the signed-in account's Cloud PCs. Returns how many match `q`.
+// Windows 365: the signed-in account's Cloud PCs (those matching `q`).
 let w365 = { loading: true, busy: false, signed_in: false, pcs: [] };
-function renderW365(q) {
-  const pcs = w365.pcs.filter(p => !q || p.name.toLowerCase().includes(q));
-  $("#w365-wrap").hidden = !!q && pcs.length === 0;
+function renderW365(q, firstRun) {
+  const pcs = w365.pcs.filter(p => connMatches(p, q));
+  const listed = w365.signed_in && !w365.busy;
+  // Signed in, the Cloud PCs come right after the saved ones; otherwise the
+  // sign-in row waits after Recent, and on the first run the empty state
+  // offers it instead.
+  const wrap = $("#w365-wrap");
+  const after = listed ? $("#saved-wrap") : $("#recent-wrap");
+  if (after.nextElementSibling !== wrap) after.after(wrap);
+  wrap.hidden = (!!q && pcs.length === 0) || (firstRun && !listed && !w365.busy);
+  $("#empty-w365").hidden = w365.signed_in || w365.busy;
   $("#w365-account").textContent = w365.signed_in && w365.account ? w365.account : "";
   $("#w365-out").hidden = !w365.signed_in;
-  const note = (title, sub, button) => `
-    <div class="item"><div class="avatar">${icon("cloud")}</div>
-      <div class="grow"><div class="conn-name">${esc(title)}</div><div class="conn-sub" title="${esc(sub)}">${esc(sub)}</div></div>${button}</div>`;
-  if (w365.busy) $("#w365").innerHTML = note("Signing in…", "Finish in Microsoft's sign-in window.", "");
-  else if (w365.loading) $("#w365").innerHTML = note("Windows 365", "Looking for your Cloud PCs…", "");
-  else if (!w365.signed_in) $("#w365").innerHTML = note("Sign in with your work account", "Your Cloud PCs show up here, ready to connect.", `<button class="btn primary" data-act="sign-in">${icon("cloud")}Sign in</button>`);
-  else if (w365.error) $("#w365").innerHTML = note("Couldn't list your Cloud PCs", w365.error, `<button class="btn" data-act="refresh">${icon("refresh")}Try again</button>`);
-  else if (!w365.pcs.length) $("#w365").innerHTML = note("No Cloud PCs on this account", "Sign out to use another account.", `<button class="btn" data-act="refresh">${icon("refresh")}Refresh</button>`);
-  else $("#w365").innerHTML = pcs.map(p => {
-    const running = state && state.sessions.some(s => s.key === `w365:${p.id}`);
-    return `
-    <div class="item" data-id="${esc(p.id)}" tabindex="-1">
-      ${avatar(p.name)}
-      <div class="grow"><div class="conn-name">${esc(p.name)}${running ? ` <span class="badge ok" style="margin-left:6px"><span class="dot live"></span>Connected</span>` : ""}</div>
-        <div class="conn-sub" title="Clipboard, sound, microphone, camera, all this PC's drives, printers and COM ports, and Teams calls">Cloud PC · RDP · all redirects on</div></div>
-      <div class="acts"><button class="btn ghost icon" data-act="password" title="Enter the Cloud PC's password again">${icon("edit")}</button></div>
-      <button class="btn" data-act="connect">${icon("play")}${running ? "Show" : "Connect"}</button>
-    </div>`; }).join("");
-  return pcs.length;
+  const note = (title, sub, primary = "") => rowHtml({ lead: `<div class="avatar" aria-hidden="true">${icon("cloud")}</div>`, title, sub, subTitle: sub, primary });
+  const html = w365.busy ? note("Signing in…", "Finish in Microsoft's sign-in window.")
+    : w365.loading ? note("Windows 365", "Looking for your Cloud PCs…")
+    : !w365.signed_in ? note("Sign in with your work account", "Your Cloud PCs show up here, ready to connect.", `<button class="btn" data-act="sign-in">${icon("cloud")}Sign in</button>`)
+    : w365.error ? note("Couldn't list your Cloud PCs", w365.error, `<button class="btn" data-act="refresh">${icon("refresh")}Try again</button>`)
+    : !w365.pcs.length ? note("No Cloud PCs on this account", "Sign out to use another account.", `<button class="btn" data-act="refresh">${icon("refresh")}Refresh</button>`)
+    : pcs.map(p => {
+      const running = !!state && state.sessions.some(s => s.key === `w365:${p.id}`);
+      return rowHtml({
+        attrs: `data-id="${esc(p.id)}" tabindex="-1"`,
+        lead: avatar(p.name), title: p.name, live: running,
+        sub: "Cloud PC · RDP · all redirects on",
+        subTitle: "Clipboard, sound, microphone, camera, all this PC's drives, printers and COM ports, and Teams calls",
+        acts: `<button class="btn ghost icon" data-act="password" title="Enter the Cloud PC's password again" aria-label="Enter the password of ${esc(p.name)} again">${icon("key")}</button>`,
+        primary: connectBtn(running, "", p.name),
+      });
+    }).join("");
+  setHTML($("#w365"), html);
 }
+function w365SignIn() { w365.busy = true; render(); call("w365_sign_in").catch(e => { w365.busy = false; render(); fail(e); }); }
+$("#empty-w365").onclick = w365SignIn;
+const w365Req = p => [{ w365: { id: p.id, name: p.name, account: w365.account } }, { name: p.name, user: w365.account }];
 async function w365Connect(p, askAgain) {
-  const what = { name: p.name, user: w365.account };
-  const req = { w365: { id: p.id, name: p.name, account: w365.account } };
+  const [req, what] = w365Req(p);
   if (!askAgain) return connect(req, what);
   const pw = await askPassword("w365_password", what, false);
   if (pw) return connect(req, what, { password: pw.value });
 }
+const w365At = el => { const row = el.closest(".item"); return row && w365.pcs.find(x => x.id === row.dataset.id); };
 $("#w365").addEventListener("click", e => {
   const btn = e.target.closest("[data-act]"); if (!btn) return;
-  const row = e.target.closest(".item");
-  const p = row && w365.pcs.find(x => x.id === row.dataset.id);
-  if (btn.dataset.act === "sign-in") { w365.busy = true; render(); call("w365_sign_in").catch(e => { w365.busy = false; render(); fail(e); }); }
+  const p = w365At(e.target);
+  if (btn.dataset.act === "sign-in") w365SignIn();
   if (btn.dataset.act === "refresh") { w365.loading = true; w365.error = null; w365.signed_in = false; render(); call("w365_status").catch(fail); }
   if (btn.dataset.act === "connect" && p) w365Connect(p, false);
   if (btn.dataset.act === "password" && p) w365Connect(p, true);
 });
 $("#w365").addEventListener("dblclick", e => {
-  const row = e.target.closest(".item"); if (!row || e.target.closest("button")) return;
-  const p = w365.pcs.find(x => x.id === row.dataset.id); if (p) w365Connect(p, false);
+  const p = !e.target.closest("button") && w365At(e.target); if (p) w365Connect(p, false);
+});
+$("#w365").addEventListener("contextmenu", e => {
+  const p = w365At(e.target); if (!p) return;
+  e.preventDefault();
+  openMenu(menuAt(e), cloudMenu(p));
 });
 $("#w365-out").onclick = () => call("w365_sign_out").catch(fail);
 
-$("#search").addEventListener("input", render);
-$("#search").addEventListener("keydown", e => {
-  if (e.key === "Enter") {
-    const first = $("#saved .conn") || $("#w365 .item[data-id]") || $("#recent .item");
-    if (first) first.querySelector('[data-act="connect"]').click();
-    else if ($("#search").value.trim()) { $("#quick-host").value = $("#search").value.trim(); $("#quick").requestSubmit(); }
-  }
-  if (e.key === "Escape") { $("#search").value = ""; render(); }
-});
-
+const savedAt = el => { const card = el.closest(".conn"); return card && state.connections.find(x => x.id === card.dataset.id); };
 $("#saved").addEventListener("click", e => {
-  const btn = e.target.closest("[data-act]"); const card = e.target.closest(".conn");
-  if (!card) return;
-  const c = state.connections.find(x => x.id === card.dataset.id);
-  if (!c) return;
-  if (!btn) return;
+  const btn = e.target.closest("[data-act]"); const c = savedAt(e.target);
+  if (!c || !btn) return;
   if (btn.dataset.act === "connect") connect({ id: c.id }, c);
   if (btn.dataset.act === "edit") openEdit(c);
-  if (btn.dataset.act === "more") openMenu(btn, [
-    { label: "Connect", icon: "play", run: () => connect({ id: c.id }, c) },
-    { label: "Open in a Workspace tab", icon: "tabs", run: () => { show("workspace"); requestAnimationFrame(() => wsOpen({ id: c.id }, c)); } },
-    { label: "Edit", icon: "edit", run: () => openEdit(c) },
-    { label: "Duplicate", icon: "copy", run: () => openEdit({ ...c, id: null, name: `${c.name} (copy)`, has_password: false, has_hyper_password: false }) },
-    "-",
-    { label: "Delete", icon: "trash", danger: true, run: () => del(c) },
-  ]);
+  if (btn.dataset.act === "more") openMenu(btn, connMenu(c, "card"));
 });
 $("#saved").addEventListener("dblclick", e => {
-  const card = e.target.closest(".conn");
-  if (card && !e.target.closest("button")) { const c = state.connections.find(x => x.id === card.dataset.id); if (c) connect({ id: c.id }, c); }
+  const c = !e.target.closest("button") && savedAt(e.target); if (c) connect({ id: c.id }, c);
 });
+$("#saved").addEventListener("contextmenu", e => {
+  const c = savedAt(e.target); if (!c) return;
+  e.preventDefault();
+  openMenu(menuAt(e), connMenu(c, "card"));
+});
+const recentAt = el => { const row = el.closest(".item"); return row && state.recent[+row.dataset.i]; };
+const saveRecent = r => openEdit({ id: null, name: r.name, host: r.host, port: r.port, user: r.user, domain: r.domain, options: r.options });
+const forgetRecent = r => call("forget_recent", { host: r.host, port: r.port, user: r.user }).then(setState).catch(fail);
 $("#recent").addEventListener("click", e => {
-  const row = e.target.closest(".item"); if (!row) return;
-  const r = state.recent[+row.dataset.i]; if (!r) return;
+  const r = recentAt(e.target); if (!r) return;
   const btn = e.target.closest("[data-act]"); if (!btn) return;
-  if (btn.dataset.act === "connect") connectRecent(r);
-  if (btn.dataset.act === "forget") call("forget_recent", { host: r.host, port: r.port, user: r.user }).then(setState).catch(fail);
-  if (btn.dataset.act === "save") openEdit({ id: null, name: r.name, host: r.host, port: r.port, user: r.user, domain: r.domain, options: r.options });
+  if (btn.dataset.act === "connect") connect(...recentReq(r));
+  if (btn.dataset.act === "forget") forgetRecent(r);
+  if (btn.dataset.act === "save") saveRecent(r);
 });
 $("#recent").addEventListener("dblclick", e => {
-  const row = e.target.closest(".item"); if (!row || e.target.closest("button")) return;
-  const r = state.recent[+row.dataset.i]; if (r) connectRecent(r);
+  const r = !e.target.closest("button") && recentAt(e.target); if (r) connect(...recentReq(r));
 });
-function connectRecent(r) {
-  if (r.connection_id) { const c = state.connections.find(x => x.id === r.connection_id); if (c) return connect({ id: c.id }, c); }
-  connect({ target: { host: r.host, port: r.port, user: r.user, domain: r.domain, name: r.name, options: r.options } }, r);
+$("#recent").addEventListener("contextmenu", e => {
+  const r = recentAt(e.target); if (!r) return;
+  e.preventDefault();
+  openMenu(menuAt(e), recentMenu(r));
+});
+// A Recent entry's request: the saved connection it came from while that
+// still exists (its own password and options), else the address as it was used.
+function recentReq(r) {
+  const c = r.connection_id && state.connections.find(x => x.id === r.connection_id);
+  if (c) return [{ id: c.id }, c];
+  return [{ target: { host: r.host, port: r.port, user: r.user, domain: r.domain, name: r.name, options: r.options } }, r];
 }
 
-// quick connect
+// ------------------------------------------------------------ one menu per kind of PC
+// Wherever a PC is shown (a card, a Workspace tree row, a list row) its menu
+// comes from here: the same items in the same order. `origin` only decides
+// which way of opening comes first: "card" (Connections) or "tree" (Workspace).
+function openInTab(req, what) {
+  if (pageIs("workspace")) return wsOpen(req, what);
+  show("workspace");
+  // (The session area has its size only once the page is laid out.)
+  requestAnimationFrame(() => wsOpen(req, what));
+}
+const duplicateConn = c => openEdit({ ...c, id: null, name: `${c.name} (copy)`, has_password: false, has_hyper_password: false });
+async function moveConn(c) {
+  const f = await askText("Move to folder", `Where ${c.name} is filed. Empty: no folder. "Work/Servers" nests.`, c.folder, "Move");
+  if (f !== null) moveConns([c], () => f);
+}
+function openItems(req, what, running, origin) {
+  const items = [
+    { label: running ? "Show" : origin === "tree" ? "Open in its own window" : "Connect", icon: origin === "tree" ? "popout" : "play", run: () => connect(req, what) },
+    { label: origin === "tree" ? "Open in a tab" : "Open in a Workspace tab", icon: "tabs", run: () => openInTab(req, what) },
+  ];
+  return origin === "tree" && !running ? items.reverse() : items;
+}
+// What can be done to a saved connection itself (also in its tab's menu).
+const connItems = c => [
+  { label: "Edit", icon: "edit", run: () => openEdit(c) },
+  { label: "Duplicate", icon: "copy", run: () => duplicateConn(c) },
+  { label: "Move to folder…", icon: "folder", run: () => moveConn(c) },
+  { label: "Show its log", icon: "log", run: () => showLog(c.id) },
+];
+function connMenu(c, origin) {
+  return [
+    ...openItems({ id: c.id }, c, c.running, origin),
+    "-",
+    ...connItems(c),
+    "-",
+    { label: "Delete", icon: "trash", danger: true, run: () => del(c) },
+  ];
+}
+function recentMenu(r) {
+  const [req, what] = recentReq(r);
+  return [
+    ...openItems(req, what, r.running, "card"),
+    "-",
+    ...(req.id ? [] : [{ label: "Save…", icon: "save", run: () => saveRecent(r) }]),
+    { label: "Remove from Recent", icon: "x", run: () => forgetRecent(r) },
+  ];
+}
+function cloudMenu(p) {
+  const running = !!state && state.sessions.some(s => s.key === `w365:${p.id}`);
+  return [
+    ...openItems(...w365Req(p), running, "card"),
+    "-",
+    { label: "Enter the password again", icon: "key", run: () => w365Connect(p, true) },
+  ];
+}
+
+// ------------------------------------------------------------ one box: find a saved PC, or type one
+// Connections and Workspace each have a single box. It filters the list
+// under it, and Enter opens what it names: a PC that's already there with
+// that PC's own password and settings, anything else as a typed address.
+const connMatches = (c, q) => !q || [c.name, c.host, c.user, c.domain, c.folder].some(v => v && String(v).toLowerCase().includes(q));
+// A whole address is only ever itself: "10.0.0.8" must not open the saved "10.0.0.81".
+const wholeAddress = t => /^(\d{1,3}\.){3}\d{1,3}(:\d+)?$/.test(t) || /^\[[0-9a-f:.%]+\](:\d+)?$/i.test(t);
+// What `text` means among `pool` (entries `{kind, name, host, port, …, req, what}`):
+// `one` is the entry Enter opens (named exactly, or the only one left by the
+// filter), `matches` everything the filter leaves.
+function resolveBox(text, pool) {
+  const q = text.trim().toLowerCase();
+  if (!q) return { q, one: null, matches: [] };
+  const called = c => [c.name, c.host, c.host && `${c.host}:${c.port || 3389}`].some(v => v && String(v).toLowerCase() === q);
+  const matches = pool.filter(c => connMatches(c, q));
+  const exact = pool.filter(called);
+  const one = exact.length === 1 ? exact[0] : !exact.length && matches.length === 1 && !wholeAddress(q) ? matches[0] : null;
+  return { q, one, matches };
+}
+const savedEntries = () => state.connections.map(c => ({ ...c, kind: "saved", req: { id: c.id }, what: c }));
+// Everything the Connections page lists.
+function listedEntries() {
+  const saved = savedEntries();
+  const ids = new Set(saved.map(c => c.id));
+  return [
+    ...saved,
+    ...w365.pcs.map(p => { const [req, what] = w365Req(p); return { kind: "cloud", name: p.name, req, what }; }),
+    ...state.recent.filter(r => !(r.connection_id && ids.has(r.connection_id))).map(r => { const [req, what] = recentReq(r); return { ...r, kind: "recent", req, what }; }),
+  ];
+}
+// A typed address, started with `transport` and otherwise the defaults.
+function quickTarget(host, transport) {
+  const options = { ...(state ? state.settings.defaults : {}), transport };
+  return [{ target: { host, options } }, { name: host, host, options }];
+}
+// What Enter will do, said under the box (`verb`: "connects to" / "opens").
+function boxHint(text, plan, verb, transport) {
+  if (!plan.q) return "";
+  const kind = { saved: "the saved", cloud: "the Cloud PC", recent: "the recent" };
+  if (plan.one) return `Enter ${verb} ${kind[plan.one.kind]} "${plan.one.name}".`;
+  const literal = `"${text.trim()}" over ${(TRANSPORTS[transport] || TRANSPORTS.hyper).name}`;
+  if (plan.matches.length) return `${plan.matches.length} match: pick one, or Ctrl+Enter ${verb} ${literal}.`;
+  return `Nothing saved matches: Enter ${verb} ${literal}.`;
+}
+function setHint(el, text) { el.textContent = text; el.hidden = !text; }
+
 let quickMode = "hyper";
-function setQuickMode(v) { quickMode = v; $$("#quick-mode button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.v === v))); }
+function setQuickMode(v) {
+  quickMode = v;
+  $$("#quick-mode button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.v === v)));
+  renderQuickHint();
+}
 $$("#quick-mode button").forEach(b => b.onclick = () => setQuickMode(b.dataset.v));
-$("#quick").addEventListener("submit", e => {
-  e.preventDefault();
-  const host = $("#quick-host").value.trim();
-  if (!host) { $("#quick-host").focus(); return; }
-  const options = { ...(state ? state.settings.defaults : {}), transport: quickMode };
-  connect({ target: { host, options } }, { name: host, host, options });
+function renderQuickHint() {
+  if (!state) return;
+  const text = $("#quick-host").value;
+  setHint($("#quick-hint"), boxHint(text, resolveBox(text, listedEntries()), "connects to", quickMode));
+}
+const firstListed = () => $('#saved .conn [data-act="connect"], #w365 .item[data-id] [data-act="connect"], #recent .item [data-act="connect"]');
+// Enter, or the Connect button. `literal`: the text as an address, whatever's saved.
+function quickGo(literal) {
+  const box = $("#quick-host"), text = box.value.trim();
+  if (!text || !state) { box.focus(); return; }
+  const plan = resolveBox(text, listedEntries());
+  if (!literal && plan.one) return connect(plan.one.req, plan.one.what);
+  if (!literal && plan.matches.length) { const b = firstListed(); if (b) b.focus(); return; }
+  connect(...quickTarget(text, quickMode));
+}
+$("#quick").addEventListener("submit", e => { e.preventDefault(); quickGo(false); });
+$("#quick-host").addEventListener("input", render);
+$("#quick-host").addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); quickGo(e.ctrlKey); }
+  if (e.key === "Escape" && e.target.value) { e.stopPropagation(); e.target.value = ""; render(); }
+  if (e.key === "ArrowDown") { const b = firstListed(); if (b) { e.preventDefault(); b.focus(); } }
 });
 
 // ------------------------------------------------------------ connecting
@@ -1147,13 +1384,17 @@ function askPassword(need, what, canRemember) {
     : cloud ? `${what.name} signs in with the password of ${what.user || "your work account"}. It's kept encrypted on this PC, for you only, until you sign out.`
     : `Windows password for ${what.user || "your account"} on ${what.name || what.host}.`;
   $("#pw-input").value = "";
+  $("#pw-ok").disabled = true;
   $("#pw-remember-row").hidden = !canRemember;
   openScrim("#pw-scrim");
   setTimeout(() => $("#pw-input").focus(), 30);
   return new Promise(res => { pwResolve = res; });
 }
+// (An empty password would only start a session that's turned away.)
+$("#pw-input").addEventListener("input", e => { $("#pw-ok").disabled = !e.target.value; });
 $("#pw-form").addEventListener("submit", e => {
   e.preventDefault();
+  if (!$("#pw-input").value) return;
   closeScrim("#pw-scrim");
   if (pwResolve) pwResolve({ value: $("#pw-input").value, remember: $("#pw-remember").checked && !$("#pw-remember-row").hidden });
   pwResolve = null;
@@ -1161,30 +1402,60 @@ $("#pw-form").addEventListener("submit", e => {
 $("#pw-cancel").onclick = () => { closeScrim("#pw-scrim"); if (pwResolve) pwResolve(null); pwResolve = null; };
 
 // ------------------------------------------------------------ edit dialog
+// The dialog edits a connection, or (`{defaults: true, options}`) what new
+// connections start with: the same form, so the two can't drift apart.
 let editing = null;
 let fTransport = "hyper", fProfile = "game";
+// How frames reach the screen, as the two options a session takes.
+let fLowLat = false, fVsync = false;
+// A grid of choices, one pressed. An entry of `table`: `{name, desc}`, and
+// optionally `icon`, `badge: [class, text]`, `disabled`.
 function choiceButtons(el, table, current, onPick) {
-  el.innerHTML = Object.entries(table).map(([k, v]) => `<button type="button" class="choice" data-v="${k}" aria-pressed="${k === current}"><b>${icon(v.icon)}${esc(v.name)}</b><span>${esc(v.desc)}</span></button>`).join("");
+  el.innerHTML = Object.entries(table).map(([k, v]) => `<button type="button" class="choice" data-v="${esc(k)}" aria-pressed="${k === current}" ${v.disabled ? "disabled" : ""}><b>${v.icon ? icon(v.icon) : ""}${esc(v.name)}${v.badge ? `<span class="badge ${v.badge[0]}">${esc(v.badge[1])}</span>` : ""}</b><span>${esc(v.desc)}</span></button>`).join("");
   $$("button", el).forEach(b => b.onclick = () => { $$("button", el).forEach(x => x.setAttribute("aria-pressed", String(x === b))); onPick(b.dataset.v); });
 }
 function syncEditVisibility() {
-  const hyperish = fTransport !== "rdp";
-  $("#f-hpw-field").hidden = fTransport !== "direct";
+  const hyperish = fTransport !== "rdp", direct = fTransport === "direct";
+  // Hyper Direct signs in with the Hyper password alone: no RDP port, no Windows account.
+  $("#f-port-field").hidden = direct;
+  $("#f-host-row").classList.toggle("two", !direct);
+  $("#f-user-row").hidden = direct;
+  $("#f-pw-field").hidden = direct;
+  $("#f-hpw-field").hidden = !direct;
   $("#f-hyper-row").hidden = !hyperish;
   $("#f-fast-field").hidden = !(hyperish && fProfile === "office");
-  $("#f-vsync-row").hidden = !hyperish;
   $("#f-keys-row").hidden = !hyperish;
-  $("#f-gpu-field").hidden = fTransport !== "direct";
-  $("#f-multimon-row").hidden = fTransport !== "rdp";
-  $("#f-teams-row").hidden = fTransport !== "rdp";
-  $("#f-devices").hidden = fTransport === "direct";
-  $("#f-pw-field").hidden = fTransport === "direct";
+  $("#f-gpu-field").hidden = !direct;
+  $("#f-multimon-row").hidden = hyperish;
+  $("#f-teams-row").hidden = hyperish;
+  $("#f-devices").hidden = direct;
+  syncPresent();
 }
+// The Presentation choice. Remote Desktop waits for the screen's refresh
+// unless told otherwise (`low_latency`); a Hyper stream shows each frame at
+// once unless told to wait (`vsync`). So the choice reads and sets the one
+// option the connection's kind goes by, and leaves the other as it was saved.
+function syncPresent() {
+  const rdp = fTransport === "rdp";
+  const fast = rdp ? fLowLat : !fVsync;
+  $$("#f-present button").forEach(b => b.setAttribute("aria-pressed", String((b.dataset.v === "fast") === fast)));
+  $("#f-present-note").textContent = fast
+    ? `Each frame shows the moment it's ${rdp ? "ready" : "decoded"}. It can tear.`
+    : `Frames wait for this screen's refresh: no tearing${rdp ? "" : ", a little more latency"}.`;
+}
+$$("#f-present button").forEach(b => b.onclick = () => {
+  const fast = b.dataset.v === "fast";
+  if (fTransport === "rdp") fLowLat = fast; else fVsync = !fast;
+  syncPresent();
+});
 function openEdit(c) {
   editing = { ...(c || {}) };
+  const defaults = !!editing.defaults;
   const o = { ...(state ? state.settings.defaults : {}), ...((c && c.options) || {}) };
-  $("#edit-title").textContent = c && c.id ? `Edit ${c.name}` : "New connection";
-  $("#edit-sub").textContent = c && c.id ? `${c.host}${c.port && c.port !== 3389 ? ":" + c.port : ""}` : "Where to connect, and how.";
+  editing.options = o;
+  $("#edit-title").textContent = defaults ? "Defaults for new connections" : c && c.id ? `Edit ${c.name}` : "New connection";
+  $("#edit-sub").textContent = defaults ? "What a typed address and a new connection start with." : c && c.id ? `${c.host}${c.port && c.port !== 3389 ? ":" + c.port : ""}` : "Where to connect, and how.";
+  $("#f-identity").hidden = defaults;
   $("#f-host").value = (c && c.host) || "";
   $("#f-port").value = c && c.port && c.port !== 3389 ? c.port : "";
   $("#f-name").value = c && c.name && c.name !== c.host ? c.name : "";
@@ -1203,34 +1474,49 @@ function openEdit(c) {
   $("#f-fast").checked = !!o.best_text;
   $("#f-codec").value = o.codec || "auto";
   $("#f-fps").value = String(o.fps || 0);
+  $("#f-scale").value = [100, 75, 50, 33].includes(o.scale) ? String(o.scale) : "0";
   $("#f-hport").value = o.hyper_port ? o.hyper_port : "";
   $("#f-fullscreen").checked = o.fullscreen !== false;
   $("#f-multimon").checked = !!o.multimon;
-  $("#f-lowlat").checked = !!o.low_latency;
-  $("#f-vsync").checked = !!o.vsync;
+  fLowLat = !!o.low_latency; fVsync = !!o.vsync;
   $("#f-gpu").value = ["performance", "display"].includes(o.gpu) ? o.gpu : "auto";
   $("#f-keys").checked = !o.local_keys;
   $("#f-printer").checked = !!o.printer;
   $("#f-drives").checked = !!o.drives;
   $("#f-teams").checked = !!o.teams;
   $("#f-insecure").checked = !!o.insecure;
-  $("#edit-delete").hidden = !(c && c.id);
+  $("#edit-delete").hidden = defaults || !(c && c.id);
+  $("#edit-save-connect").hidden = defaults;
   $("#edit-error").textContent = "";
   editing.clearPw = false; editing.clearHpw = false;
   selectTab("general");
   syncEditVisibility();
   openScrim("#edit-scrim");
-  setTimeout(() => (c && c.host ? $("#f-name") : $("#f-host")).focus(), 30);
+  setTimeout(() => (defaults ? $('#f-transport [aria-pressed="true"]') : c && c.host ? $("#f-name") : $("#f-host")).focus(), 30);
 }
 $("#edit").addEventListener("click", e => {
   if (e.target.id === "forget-pw") { editing.clearPw = true; e.target.replaceWith(Object.assign(document.createElement("span"), { textContent: "The saved password will be forgotten when you save." })); }
   if (e.target.id === "forget-hpw") { editing.clearHpw = true; e.target.replaceWith(Object.assign(document.createElement("span"), { textContent: "The saved Hyper password will be forgotten when you save." })); }
 });
 function selectTab(name) {
-  $$(".tabs button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.tab === name)));
+  $$(".tabs button").forEach(b => {
+    const on = b.dataset.tab === name;
+    b.setAttribute("aria-selected", String(on));
+    b.tabIndex = on ? 0 : -1;
+  });
   $$(".tabpane").forEach(p => p.classList.toggle("active", p.dataset.pane === name));
 }
 $$(".tabs button").forEach(b => b.onclick = () => selectTab(b.dataset.tab));
+// The editor's tabs: one stop for Tab, the arrow keys between them.
+$(".tabs").addEventListener("keydown", e => {
+  const all = $$(".tabs button"), i = all.indexOf(document.activeElement);
+  if (i < 0) return;
+  const to = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: all.length - 1 }[e.key];
+  if (to === undefined) return;
+  e.preventDefault();
+  const b = all[(to + all.length) % all.length];
+  selectTab(b.dataset.tab); b.focus();
+});
 function collect() {
   const num = (v, d) => { const n = parseInt(String(v).trim(), 10); return Number.isFinite(n) ? n : d; };
   return {
@@ -1246,14 +1532,17 @@ function collect() {
     hyper_password: $("#f-hpw").value,
     clear_hyper_password: !!(editing && editing.clearHpw) && !$("#f-hpw").value,
     options: {
+      // (What the form has no control for stays as it was.)
+      ...((editing && editing.options) || {}),
       transport: fTransport, profile: fProfile,
       best_text: $("#f-fast").checked,
       codec: $("#f-codec").value,
       fps: num($("#f-fps").value, 0),
+      scale: num($("#f-scale").value, 0),
       fullscreen: $("#f-fullscreen").checked,
       multimon: $("#f-multimon").checked,
-      low_latency: $("#f-lowlat").checked,
-      vsync: $("#f-vsync").checked,
+      low_latency: fLowLat,
+      vsync: fVsync,
       hyper_port: num($("#f-hport").value, 0),
       gpu: $("#f-gpu").value,
       local_keys: !$("#f-keys").checked,
@@ -1266,6 +1555,14 @@ function collect() {
 }
 async function saveEdit(andConnect) {
   const conn = collect();
+  if (editing && editing.defaults) {
+    try {
+      setState(await call("settings", { defaults: conn.options }));
+      closeScrim("#edit-scrim");
+      toast("ok", "Saved", "New connections start with these.", 2500);
+    } catch (e) { $("#edit-error").textContent = e.message; }
+    return;
+  }
   if (!conn.host) { selectTab("general"); $("#edit-error").textContent = "Enter the PC's name or address."; $("#f-host").focus(); return; }
   if (!(conn.port >= 1 && conn.port <= 65535)) { selectTab("general"); $("#edit-error").textContent = "The port must be 1–65535."; $("#f-port").focus(); return; }
   try {
@@ -1283,20 +1580,28 @@ $("#edit-delete").onclick = () => { const c = editing; closeScrim("#edit-scrim")
 $("#new-btn").onclick = () => openEdit(null);
 $("#empty-new").onclick = () => openEdit(null);
 
-let undoTimer = null;
+// Deleted at once, with a few seconds to take it back: rdpio keeps the last
+// few deleted connections (passwords and all) by id, so each toast's Undo
+// brings back the one it names.
 async function del(c) {
   try {
     setState(await call("delete", { id: c.id }));
-    toast("info", `Deleted ${c.name}`, "", 3500);
+    toast("info", `Deleted ${c.name}`, "", 8000, [{ label: "Undo", run: () => call("undelete", { id: c.id }).then(s => { setState(s); toast("ok", `${c.name} is back`, "", 2500); }).catch(fail) }]);
   } catch (e) { fail(e); }
 }
 
 // ------------------------------------------------------------ menu / dialogs
-// (`anchor`: an element, or a point {x, y} for a right-click.)
-let menuCovers = false;
-function openMenu(anchor, items) {
+// (`anchor`: an element, or a point {x, y} for a right-click.) Closed, the
+// menu gives the keyboard back to `back`: by default the anchor, or whatever
+// had it when a right-click opened the menu.
+let menuCovers = false, menuReturn = null;
+// Where a contextmenu event's menu goes: the pointer, or (from the keyboard's
+// menu key, which has no pointer) the element it came from.
+const menuAt = e => e.clientX || e.clientY ? { x: e.clientX, y: e.clientY } : e.target;
+function openMenu(anchor, items, back = null) {
   const m = $("#menu");
-  m.innerHTML = items.map((it, i) => it === "-" ? "<hr>" : `<button data-i="${i}" class="${it.danger ? "danger" : ""}">${icon(it.icon)}${esc(it.label)}</button>`).join("");
+  menuReturn = back || (anchor instanceof Element ? anchor : document.activeElement);
+  m.innerHTML = items.map((it, i) => it === "-" ? `<hr role="separator">` : `<button role="menuitem" tabindex="-1" data-i="${i}" class="${it.danger ? "danger" : ""}">${icon(it.icon)}${esc(it.label)}</button>`).join("");
   $$("button", m).forEach(b => b.onclick = () => { closeMenu(); items[+b.dataset.i].run(); });
   m.classList.add("open");
   const r = anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : { left: anchor.x, right: anchor.x, top: anchor.y, bottom: anchor.y };
@@ -1312,12 +1617,52 @@ function openMenu(anchor, items) {
   setTimeout(() => $("button", m) && $("button", m).focus(), 0);
 }
 function closeMenu() {
-  $("#menu").classList.remove("open");
+  const m = $("#menu");
+  if (!m.classList.contains("open")) return;
+  const hadFocus = m.contains(document.activeElement);
+  m.classList.remove("open");
   if (menuCovers) { menuCovers = false; syncEmbed(); }
+  if (hadFocus && menuReturn && menuReturn.isConnected) menuReturn.focus();
+  menuReturn = null;
 }
 document.addEventListener("mousedown", e => { if (!e.target.closest("#menu")) closeMenu(); });
-function openScrim(sel) { $(sel).classList.add("open"); syncEmbed(); }
-function closeScrim(sel) { $(sel).classList.remove("open"); syncEmbed(); }
+$("#menu").addEventListener("keydown", e => {
+  const items = $$("#menu button"), i = items.indexOf(document.activeElement);
+  if (e.key === "Tab") { e.preventDefault(); return closeMenu(); }
+  const to = { ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: items.length - 1 }[e.key];
+  if (to === undefined || !items.length) return;
+  e.preventDefault();
+  items[(to + items.length) % items.length].focus();
+});
+// Dialogs: while one is open, everything under it is `inert` (out of reach of
+// Tab, clicks and screen readers), and closed, it gives the keyboard back to
+// whatever had it before.
+const scrimStack = [];
+function syncInert() {
+  const top = scrimStack.length ? scrimStack[scrimStack.length - 1].el : null;
+  for (const el of [$("nav"), $("main"), ...$$(".scrim")]) el.inert = !!top && el !== top;
+}
+function openScrim(sel) {
+  const el = $(sel);
+  if (!el.classList.contains("open")) {
+    scrimStack.push({ el, back: document.activeElement });
+    // (A password shown last time is hidden again.)
+    $$(".pw input", el).forEach(i => { i.type = "password"; });
+    $$(".reveal", el).forEach(b => b.setAttribute("aria-pressed", "false"));
+  }
+  el.classList.add("open");
+  syncInert();
+  syncEmbed();
+}
+function closeScrim(sel) {
+  const el = $(sel);
+  el.classList.remove("open");
+  const i = scrimStack.findIndex(s => s.el === el);
+  const back = i >= 0 ? scrimStack.splice(i, 1)[0].back : null;
+  syncInert();
+  syncEmbed();
+  if (back && back.isConnected && back !== document.body) back.focus();
+}
 // (A dialog with a Cancel button closes through it: whoever waits hears "no".)
 function cancelScrim(s) { const c = $('[id$="-cancel"]', s); c ? c.click() : closeScrim(`#${s.id}`); }
 $$(".scrim").forEach(s => s.addEventListener("mousedown", e => { if (e.target === s) { s.dataset.down = "1"; } }));
@@ -1328,13 +1673,16 @@ $$(".scrim").forEach(s => s.addEventListener("mouseup", e => {
 document.addEventListener("keydown", e => {
   if (e.key === "Escape") {
     if ($("#menu").classList.contains("open")) return closeMenu();
-    const open = $$(".scrim.open").pop();
+    const open = scrimStack.length && scrimStack[scrimStack.length - 1].el;
     if (open) { cancelScrim(open); return; }
   }
   if (e.ctrlKey && e.key.toLowerCase() === "n" && !$(".scrim.open")) { e.preventDefault(); openEdit(null); }
+  if (e.ctrlKey && e.key.toLowerCase() === "b" && pageIs("workspace") && !$(".scrim.open")) { e.preventDefault(); setWsWide(!wsWide); }
   if (e.ctrlKey && e.key.toLowerCase() === "f" && !$(".scrim.open")) {
     e.preventDefault();
-    if (pageIs("workspace")) $("#ws-q").focus(); else if (pageIs("activity")) $("#log-q").focus(); else { show("connections"); $("#search").focus(); }
+    if (pageIs("workspace") && wsWide) setWsWide(false);
+    const box = pageIs("workspace") ? $("#ws-q") : pageIs("activity") ? $("#log-q") : (show("connections"), $("#quick-host"));
+    box.focus(); box.select();
   }
   // Workspace: Ctrl+Tab between tabs, Ctrl+W closes one.
   if (pageIs("workspace") && e.ctrlKey && !$(".scrim.open")) {
@@ -1369,19 +1717,81 @@ document.addEventListener("click", e => {
   const b = e.target.closest(".reveal"); if (!b) return;
   const input = b.parentElement.querySelector("input");
   input.type = input.type === "password" ? "text" : "password";
-  input.focus();
+  b.setAttribute("aria-pressed", String(input.type === "text"));
+  // (A click goes back to typing; from the keyboard, the button keeps focus.)
+  if (e.detail) input.focus();
 });
 document.addEventListener("contextmenu", e => { if (!e.target.closest("input, textarea")) e.preventDefault(); });
 
 // ------------------------------------------------------------ this PC
 let hostStatus = null;
 let hostBusy = null;
-function refreshHost() { call("host_status").catch(fail); }
-$("#host-refresh").onclick = refreshHost;
+// Changes to "While streaming" wait here for one Apply: one administrator
+// prompt for all of them. `hostSent`: the settings an elevated rdpio is saving.
+let hostPending = {};
+let hostSent = null;
+let hostHowSet = false;
+let hostSettle = 0, hostSettleTimer = 0;
+// (Refresh turns while the status is being read: that takes a moment.)
+let hostLooking = false;
+function syncHostRefresh() {
+  const b = $("#host-refresh");
+  b.setAttribute("aria-busy", String(hostLooking));
+  b.innerHTML = `${hostLooking ? `<span class="spin" aria-hidden="true"></span>` : icon("refresh")}Refresh`;
+}
+function refreshHost() {
+  hostLooking = true; syncHostRefresh();
+  call("host_status").catch(e => { hostLooking = false; syncHostRefresh(); fail(e); });
+}
+$("#host-refresh").onclick = () => { if (!hostLooking) refreshHost(); };
+$("#host-logs").onclick = () => call("open", { what: "host_logs" }).catch(fail);
+$("#host-upd-link").onclick = () => { show("settings"); requestAnimationFrame(() => $("#host-updates").scrollIntoView({ block: "center" })); };
+
+// How a device gets its resolution: one choice out of two host settings (a
+// display of its own takes both).
+const resModeOf = hs => !hs.match_resolution ? "scaled" : hs.virtual_display ? "own" : "switch";
+const RES_SET = {
+  scaled: { match_resolution: false },
+  switch: { match_resolution: true, virtual_display: false },
+  own: { match_resolution: true, virtual_display: true },
+};
+// The display driver's state in words: the badge on "A display of its own"
+// and the sentence under the choice; `broken`: Windows has the driver but
+// devices can't get a display from it; `repair`: Repair can do something
+// about it; `present`: rdpio's own driver is installed (it can be removed).
+function displayInfo(s) {
+  const code = s.display_problem ? ` (code ${s.display_problem})` : "";
+  const meanwhile = "Until it runs, devices get this PC's own screen instead of a display of their own.";
+  switch (s.display) {
+    case "running": return { cls: "ok", badge: "Ready", present: true, note: "" };
+    case "fallback": return { cls: "ok", badge: "Virtual Display Driver", note: "Made by the open-source Virtual Display Driver installed here, which rdpio turns on only while a device streams. rdpio's own driver takes over once it's installed and signed." };
+    case "installed": return { cls: "warn", badge: "Starting", repair: true, present: true, note: "rdpio Display is installed but isn't answering yet. If it stays like this, Repair starts it again." };
+    case "failed": return { cls: "warn", badge: "Stopped", broken: true, repair: true, present: true, note: `Windows stopped rdpio Display${code}, usually after a graphics driver update. ${meanwhile} Repair starts it again.` };
+    case "disabled": return { cls: "warn", badge: "Turned off", broken: true, repair: true, present: true, note: `rdpio Display is switched off in Device Manager. ${meanwhile} Repair switches it back on.` };
+    case "blocked": {
+      // (A restart, or test signing, is nothing Repair can do.)
+      const why = s.display_problem === 52 ? "a test build needs test signing on (bcdedit /set testsigning on) and a restart."
+        : s.display_problem === 14 ? "this PC needs a restart first."
+        : "Repair installs it again.";
+      return { cls: "warn", badge: "Blocked", broken: true, repair: ![52, 14].includes(s.display_problem), present: true, note: `Windows won't load rdpio Display${code}: ${why} ${meanwhile}` };
+    }
+    default: return { cls: "", badge: "Not installed", missing: true, note: s.display_available
+      ? "A display of its own needs rdpio Display: install it, and each device gets its exact resolution instead of this PC's screen. Until rdpio's driver is signed, the open-source Virtual Display Driver (signed; winget install VirtualDrivers.Virtual-Display-Driver) works too."
+      : "A display of its own needs a display driver: install the open-source Virtual Display Driver (winget install VirtualDrivers.Virtual-Display-Driver) and rdpio uses it." };
+  }
+}
 function renderHost() {
   const s = hostStatus;
   const hero = $("#host-hero");
-  if (!s) return;
+  if (!s || !state) return;
+  const saved = s.settings || {};
+  const hs = { ...saved, ...hostPending };
+  const disp = displayInfo(s);
+  // Devices are meant to get a display of their own, and can't.
+  const dispBroken = s.service === "running" && !!disp.broken && resModeOf(saved) === "own";
+  const repairBtn = disp.repair ? `<button class="btn ${disp.broken ? "primary" : ""}" data-host="display_repair">Repair</button>` : "";
+  const pwBtn = primary => `<button class="btn ${primary ? "primary" : ""}" data-host="password">${icon("key")}${s.password_set ? "Change password" : "Set password"}</button>`;
+  const removeBtn = `<button class="btn" data-host="uninstall">Remove</button>`;
   let cls, ico, title, sub, acts = "";
   const busy = hostBusy ? `<button class="btn" disabled><span class="spin"></span>Waiting for Windows…</button>` : "";
   if (s.service === "missing") {
@@ -1391,46 +1801,51 @@ function renderHost() {
   } else if (s.outdated) {
     cls = "warn"; ico = "warn"; title = "Hyper needs an update";
     sub = `The Hyper service here runs ${s.service_version ? "rdpio " + s.service_version : "another rdpio build"}; this window is ${state.version}. Update it so devices get the newest.`;
-    acts = busy || `<button class="btn primary" data-host="update">Update</button><button class="btn" data-host="uninstall">Remove</button>`;
+    acts = busy || `<button class="btn primary" data-host="update">Update</button>${removeBtn}`;
+  } else if (s.service === "running" && !s.password_set) {
+    cls = "warn"; ico = "warn"; title = "Running: set a Hyper password";
+    sub = "Devices sign in to Hyper with a password set here.";
+    acts = busy || pwBtn(true) + removeBtn;
+  } else if (dispBroken) {
+    cls = "warn"; ico = "warn"; title = "Ready, but the display driver isn't running";
+    sub = `Devices connect, but get this PC's own screen instead of a display of their own.${disp.repair ? "" : " Why is under While streaming."}`;
+    acts = busy || repairBtn + pwBtn(false) + removeBtn;
   } else if (s.service === "running") {
-    cls = s.password_set ? "ok" : "warn"; ico = s.password_set ? "shield" : "warn";
-    title = s.password_set ? "Ready for your devices" : "Running — set a Hyper password";
-    sub = s.password_set ? `Hyper is running and listening on UDP ${s.port}.` : "Devices sign in to Hyper with a password set here.";
-    acts = busy || `<button class="btn ${s.password_set ? "" : "primary"}" data-host="password">${icon("key")}${s.password_set ? "Change password" : "Set password"}</button><button class="btn" data-host="uninstall">Remove</button>`;
+    cls = "ok"; ico = "shield"; title = "Ready for your devices";
+    sub = "Hyper is running. Devices sign in with the Hyper password.";
+    acts = busy || pwBtn(false) + removeBtn;
   } else {
     cls = "warn"; ico = "warn"; title = s.service === "starting" ? "Hyper is starting…" : "Hyper is installed but not running";
     sub = s.service === "starting" ? "Give it a moment." : "Reinstalling starts it again (and keeps your password).";
-    acts = busy || `<button class="btn primary" data-host="update">Start again</button><button class="btn" data-host="uninstall">Remove</button>`;
+    acts = busy || `<button class="btn primary" data-host="update">Start again</button>${removeBtn}`;
   }
-  hero.innerHTML = `<div class="big-ico ${cls}"><svg><use href="#i-${ico}"/></svg></div><div><h3>${esc(title)}</h3><p>${esc(sub)}</p></div><div class="acts">${acts}</div>`;
-  $("#host-kv").innerHTML = [
-    ["This PC", s.computer || "—"],
-    ["Graphics", s.gpu || "—"],
-    ["Hyper service", { running: "Running", stopped: "Stopped", starting: "Starting", stopping: "Stopping", missing: "Not installed", unknown: "Unknown" }[s.service]],
-    ["Hyper password", s.password_set ? "Set" : "Not set"],
-    ["Hyper version", s.service_version || (s.service === "missing" ? "—" : "Local build")],
-    ["Port", `UDP ${s.port}`],
-  ].map(([k, v]) => `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join("");
+  // (What used to be a grid of cards: the facts that aren't in the title.)
+  const facts = [s.computer, s.gpu, ...(s.service === "missing" ? [] : [`UDP ${s.port}`, s.service_version ? `rdpio ${s.service_version}` : "local build"])].filter(Boolean).join(" · ");
+  setHTML(hero, `<div class="big-ico ${cls}" aria-hidden="true"><svg><use href="#i-${ico}"/></svg></div><div class="what"><h3>${esc(title)}</h3><p>${esc(sub)}</p><p class="facts">${esc(facts)}</p></div><div class="acts">${acts}</div>`);
+  $("#host-note").hidden = s.service === "missing";
+  $("#host-note-text").textContent = saved.auto_update ? `Hyper keeps itself up to date (${saved.nightly ? "nightly builds" : "releases"}).` : "Hyper doesn't update itself.";
+
   const label = { tailscale: ["accent", "Tailscale — from anywhere"], lan: ["", "Home network"], zerotier: ["", "ZeroTier"], other: ["", "Network"] };
-  $("#host-addrs").innerHTML = s.addresses.length ? s.addresses.map(a => `
+  setHTML($("#host-addrs"), s.addresses.length ? s.addresses.map(a => `
     <div class="item"><div class="grow"><div class="addr">${esc(a.ip)}</div><div class="conn-sub">${esc(a.name)}</div></div>
-      <span class="badge ${label[a.kind][0]}">${esc(label[a.kind][1])}</span>
-      <button class="btn ghost icon" data-copy="${esc(a.ip)}" title="Copy">${icon("copy")}</button></div>`).join("")
-    : `<div class="item"><span class="conn-sub">No network connection.</span></div>`;
-  const disp = {
-    running: ["ok", "On", "Each device gets a display of its own made at its exact resolution and refresh rate — no scaling, no black bars. This PC's own screens rest while it streams."],
-    fallback: ["ok", "Using Virtual Display Driver", "The open-source Virtual Display Driver installed here makes each device a display at its exact resolution and refresh rate. rdpio turns it on only while a device streams. rdpio's own driver takes over once it's installed and signed."],
-    installed: ["warn", "Installed, not running", "Windows hasn't started it: a test build needs test signing on (bcdedit /set testsigning on) and a restart."],
-    missing: ["", "Not installed", s.display_available ? "Install it so devices get their own resolution instead of this PC's screen scaled to fit. Until rdpio's driver is signed, the open-source Virtual Display Driver (signed; winget install VirtualDrivers.Virtual-Display-Driver) works too." : "Install the open-source Virtual Display Driver (winget install VirtualDrivers.Virtual-Display-Driver) and rdpio uses it to give each device its exact resolution."],
-  }[s.display];
-  const dispBtn = hostBusy || s.display === "fallback" ? "" : s.display === "missing"
-    ? (s.display_available ? `<button class="btn primary" data-host="display_install">Install</button>` : "")
-    : `<button class="btn" data-host="display_uninstall">Remove</button>`;
-  $("#host-display").innerHTML = `<div class="switch"><div class="txt">rdpio Display <span class="badge ${disp[0]}" style="display:inline-flex;margin-left:8px">${esc(disp[1])}</span><span>${esc(disp[2])}</span></div>${dispBtn}</div>`;
-  const hs = s.settings || {};
+      <span class="badge ${(label[a.kind] || label.other)[0]}">${esc((label[a.kind] || label.other)[1])}</span>
+      <button class="btn ghost icon" data-copy="${esc(a.ip)}" title="Copy" aria-label="Copy ${esc(a.ip)}">${icon("copy")}</button></div>`).join("")
+    : `<div class="item"><span class="conn-sub">No network connection.</span></div>`);
+
+  // While streaming: drawn from the saved settings with the pending changes
+  // over them. (Whatever had the keyboard keeps it across the redraw.)
+  const stream = $("#host-stream");
+  const held = stream.contains(document.activeElement) ? document.activeElement : null;
+  const holdSel = held && (held.dataset.hs ? `[data-hs="${held.dataset.hs}"]` : held.dataset.v ? `[data-v="${held.dataset.v}"]` : held.dataset.apply ? `[data-apply="${held.dataset.apply}"]` : "");
+  const off = hostBusy ? "disabled" : "";
+  const mode = resModeOf(hs);
+  // (With no driver at all, the monitor switching is what "its own" comes to.)
+  const shown = mode === "own" && disp.missing ? "switch" : mode;
+  const driverBtns = hostBusy ? "" : disp.missing
+    ? (s.display_available ? `<button class="btn primary" data-host="display_install">Install the driver</button>` : "")
+    : `${repairBtn}${disp.present ? `<button class="btn ghost" data-host="display_uninstall">Remove the driver</button>` : ""}`;
+  const warn = disp.cls === "warn" && mode === "own";
   const streamRows = [
-    ["virtual_display", "Give each device its own display", "With the display driver above: a display made at the device's resolution and refresh rate. This PC's screens rest meanwhile."],
-    ["match_resolution", "Match each device's screen", "Without a display of its own, this PC's monitor switches to the device's resolution (or the closest) while it streams. Off: the monitor stays as it is and the picture is scaled to fit."],
     ["fast_refresh", "Fastest refresh rate while streaming", "The monitor runs at its fastest rate that suits the stream (240 Hz for 120 fps), so each frame is ready sooner."],
     ["keep_monitors", "Keep my other monitors on", "Off: this PC's other monitors go dark while it streams, so nothing opens where the device can't see it."],
   ];
@@ -1438,35 +1853,102 @@ function renderHost() {
   // (elsewhere there's nothing to choose between).
   const gpuNote = { auto: "Integrated on battery, so the other GPU can power off; the fastest plugged in. A stream switches about 10 s after you plug in or out (a few seconds' pause).", fastest: "Always the fastest GPU.", power_saving: "Always the integrated GPU, plugged in too: H.264, at most 60 fps." }[hs.host_gpu || "auto"];
   const gpuRow = s.integrated_gpu ? `<div class="switch"><div class="txt">Host GPU<span>${esc(gpuNote)} Integrated here: ${esc(s.integrated_gpu)}.</span></div>
-    <div class="seg" id="host-gpu">${[["auto", "Auto"], ["fastest", "Fastest"], ["power_saving", "Power saving"]].map(([v, t]) => `<button data-v="${v}" aria-pressed="${(hs.host_gpu || "auto") === v}" ${hostBusy ? "disabled" : ""}>${t}</button>`).join("")}</div></div>` : "";
-  $("#host-stream").innerHTML = streamRows.map(([k, t, d]) => `<label class="switch"><div class="txt">${esc(t)}<span>${esc(d)}</span></div><span class="toggle"><input type="checkbox" data-hs="${k}" ${hs[k] ? "checked" : ""} ${hostBusy ? "disabled" : ""}><i></i></span></label>`).join("") + gpuRow;
-  const updRows = [
-    ["auto_update", "Keep Hyper up to date", "The Hyper service installs new rdpio releases from GitHub by itself, between streams, and passes them on to the devices that connect."],
-    ["nightly", "Nightly builds", "Every change as soon as it's built, instead of releases."],
-  ];
-  $("#host-updates").innerHTML = s.service === "missing" ? `<div class="switch"><div class="txt">Set up Hyper first<span>Then it keeps itself up to date.</span></div></div>` : updRows.map(([k, t, d]) => `<label class="switch"><div class="txt">${esc(t)}<span>${esc(d)}</span></div><span class="toggle"><input type="checkbox" data-hs="${k}" ${hs[k] ? "checked" : ""} ${hostBusy || (k === "nightly" && !hs.auto_update) ? "disabled" : ""}><i></i></span></label>`).join("");
+    <div class="seg" id="host-gpu" role="group" aria-label="Host GPU">${[["auto", "Auto"], ["fastest", "Fastest"], ["power_saving", "Power saving"]].map(([v, t]) => `<button data-v="${v}" aria-pressed="${(hs.host_gpu || "auto") === v}" ${off}>${t}</button>`).join("")}</div></div>` : "";
+  const changed = Object.keys(hostPending);
+  const n = changed.filter(k => !(k in RES_SET.own)).length + (changed.some(k => k in RES_SET.own) ? 1 : 0);
+  const applyBar = n ? `<div class="apply-bar"><span>${n === 1 ? "1 change" : `${n} changes`} not applied yet. Windows asks for permission once.</span><span class="spacer"></span>${hostBusy ? `<span class="spin"></span>` : `<button class="btn" data-apply="discard">Discard</button><button class="btn primary" data-apply="apply">Apply</button>`}</div>` : "";
+  const resChoices = {
+    scaled: { name: "This PC's resolution", desc: "Nothing changes here: the picture is scaled to fit the device's screen.", disabled: !!hostBusy },
+    switch: { name: "This PC's monitor switches", desc: "To the device's resolution, or the closest it has, while it streams.", disabled: !!hostBusy },
+    own: { name: "A display of its own", badge: [disp.cls, disp.badge], desc: "Made at the device's exact resolution and refresh rate: no scaling, no black bars. This PC's screens rest meanwhile.", disabled: !!hostBusy || !!disp.missing },
+  };
+  // (Drawn again only when something in it changed: see `setHTML`.)
+  const redrawn = setHTML(stream, `
+    <div class="block">
+      <div class="block-head"><div class="txt" id="host-res-label">Resolution while streaming<span>What a device gets when it connects.</span></div><div class="acts">${driverBtns}</div></div>
+      <div class="choices" id="host-res" role="group" aria-labelledby="host-res-label"></div>
+      ${disp.note ? `<p class="note ${warn ? "warn" : ""}">${warn ? icon("warn") : ""}<span>${esc(disp.note)}</span></p>` : ""}
+    </div>`
+    + streamRows.map(([k, t, d]) => `<label class="switch"><div class="txt">${esc(t)}<span>${esc(d)}</span></div><span class="toggle"><input type="checkbox" data-hs="${k}" ${hs[k] ? "checked" : ""} ${off}><i></i></span></label>`).join("")
+    + gpuRow + applyBar, JSON.stringify([resChoices, shown]));
+  if (!redrawn) return renderHostTail(s, dispBroken);
+  choiceButtons($("#host-res"), resChoices, shown, v => {
+    const rest = { ...hostPending };
+    for (const k in RES_SET.own) delete rest[k];
+    setHostPending({ ...rest, ...RES_SET[v] });
+  });
+  const hold = holdSel && $(holdSel, stream);
+  if (hold) hold.focus();
+  renderHostTail(s, dispBroken);
+}
+// The rest of This PC that follows its status: the steps, the nav's mark, and
+// a driver that's still starting looked at again.
+function renderHostTail(s, dispBroken) {
   $("#host-name-hint").textContent = s.computer || "this PC";
-  const n = $("#nav-host");
-  // A dot on "This PC" while Hyper is installed here but not ready.
-  n.hidden = s.service === "missing" || (s.service === "running" && s.password_set && !s.outdated);
-  n.className = "badge warn"; n.textContent = "!";
+  // (The steps are for setting up: folded away once a password is set.)
+  if (!hostHowSet) { hostHowSet = true; $("#host-how").open = !s.password_set; }
+  const nb = $("#nav-host");
+  // A mark on "This PC" while Hyper is installed here but not ready, or the
+  // display driver devices count on isn't running.
+  nb.hidden = s.service === "missing" || (s.service === "running" && s.password_set && !s.outdated && !dispBroken);
+  nb.className = "badge warn"; nb.textContent = "!"; nb.title = "Needs a look";
+  // A driver just installed or repaired takes a moment to answer: looked at
+  // again, a few times at most.
+  if (s.display !== "installed") hostSettle = 0;
+  else if (!hostBusy && !hostSettleTimer && hostSettle < 3) hostSettleTimer = setTimeout(() => { hostSettleTimer = 0; hostSettle++; refreshHost(); }, 3000);
+  renderHostUpdates();
+}
+// The Hyper service's own updates: a card of the Settings page, beside the app's.
+function renderHostUpdates() {
+  const el = $("#host-updates"), s = hostStatus;
+  el.hidden = !s || s.service === "missing";
+  if (el.hidden) return;
+  const hs = s.settings || {};
+  const held = el.contains(document.activeElement) ? document.activeElement : null;
+  const holdSel = held && (held.dataset.hs ? `[data-hs="${held.dataset.hs}"]` : held.dataset.v ? `[data-v="${held.dataset.v}"]` : "");
+  if (!setHTML(el, `<div class="card-cap">Hyper on this PC${hostBusy ? `<span class="spin"></span>` : ""}</div>
+    <label class="switch"><div class="txt">Keep Hyper up to date<span>The Hyper service installs new rdpio builds from GitHub by itself, between streams, and passes them on to the devices that connect.</span></div>
+      <span class="toggle"><input type="checkbox" data-hs="auto_update" ${hs.auto_update ? "checked" : ""} ${hostBusy ? "disabled" : ""}><i></i></span></label>
+    <div class="switch"><div class="txt">Channel<span>Releases, or nightly builds: every change, as soon as it's built. Windows asks for permission when either of these changes.</span></div>
+      <div class="seg" id="host-channel" role="group" aria-label="Hyper's channel">${[["0", "Releases"], ["1", "Nightly"]].map(([v, t]) => `<button data-v="${v}" aria-pressed="${!!hs.nightly === (v === "1")}" ${hostBusy || !hs.auto_update ? "disabled" : ""}>${t}</button>`).join("")}</div></div>`)) return;
+  const hold = holdSel && $(holdSel, el);
+  if (hold) hold.focus();
+}
+// A change to "While streaming" (`next`: all that would be pending): kept
+// only where it differs from what's saved.
+function setHostPending(next) {
+  const saved = (hostStatus && hostStatus.settings) || {};
+  hostPending = Object.fromEntries(Object.entries(next).filter(([k, v]) => v !== saved[k]));
+  renderHost();
+}
+// Host settings saved by an elevated rdpio: however many, one prompt.
+function hostSave(settings) {
+  hostBusy = "settings"; hostSent = settings; renderHost();
+  call("host_action", { action: "settings", settings }).catch(e => { hostBusy = null; hostSent = null; renderHost(); fail(e); });
 }
 $("#host-addrs").addEventListener("click", e => {
   const b = e.target.closest("[data-copy]"); if (!b) return;
   navigator.clipboard.writeText(b.dataset.copy).then(() => toast("ok", "Copied", b.dataset.copy, 2000)).catch(fail);
 });
-for (const id of ["#host-stream", "#host-updates"]) $(id).addEventListener("change", e => {
-  const k = e.target.dataset.hs; if (!k) return;
-  hostBusy = "settings"; renderHost();
-  call("host_action", { action: "settings", settings: { [k]: e.target.checked } }).catch(err => { hostBusy = null; renderHost(); fail(err); });
+$("#host-stream").addEventListener("change", e => {
+  const k = e.target.dataset.hs; if (k) setHostPending({ ...hostPending, [k]: e.target.checked });
 });
 $("#host-stream").addEventListener("click", e => {
-  const b = e.target.closest("#host-gpu button"); if (!b || hostBusy || b.getAttribute("aria-pressed") === "true") return;
-  hostBusy = "settings"; renderHost();
-  call("host_action", { action: "settings", settings: { host_gpu: b.dataset.v } }).catch(err => { hostBusy = null; renderHost(); fail(err); });
-});
-$("#host-display").addEventListener("click", e => {
+  if (hostBusy) return;
+  const gpu = e.target.closest("#host-gpu button");
+  if (gpu) return setHostPending({ ...hostPending, host_gpu: gpu.dataset.v });
+  const bar = e.target.closest("[data-apply]");
+  if (bar && bar.dataset.apply === "discard") { hostPending = {}; return renderHost(); }
+  if (bar) return hostSave({ ...hostPending });
   const b = e.target.closest("[data-host]"); if (b) runHost(b.dataset.host);
+});
+// (These two apply at once: they're on another page than the rest.)
+$("#host-updates").addEventListener("change", e => {
+  const k = e.target.dataset.hs; if (k) hostSave({ [k]: e.target.checked });
+});
+$("#host-updates").addEventListener("click", e => {
+  const b = e.target.closest("#host-channel button");
+  if (b && !hostBusy && b.getAttribute("aria-pressed") !== "true") hostSave({ nightly: b.dataset.v === "1" });
 });
 $("#host-hero").addEventListener("click", e => {
   const b = e.target.closest("[data-host]"); if (!b) return;
@@ -1500,12 +1982,10 @@ function renderSettings() {
   const s = state.settings;
   $$("#theme-seg button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.v === s.theme)));
   $("#keep-open").checked = !!s.keep_open;
-  choiceButtons($("#def-transport"), TRANSPORTS, s.defaults.transport, v => saveDefaults({ transport: v }));
-  choiceButtons($("#def-profile"), PROFILES, s.defaults.profile, v => saveDefaults({ profile: v }));
-  $("#def-fullscreen").checked = s.defaults.fullscreen !== false;
-  $("#about").textContent = `rdpio ${state.version} · build ${state.build} · IO Services`;
+  setHTML($("#def-chips"), chips(s.defaults));
   $("#version").textContent = `Version ${state.version}`;
-  $("#host-ver").textContent = state.version;
+  renderKeys();
+  renderHostUpdates();
   const u = s.updates || { check: true, from_hosts: true, channel: "stable" };
   $("#upd-auto").checked = !!u.check;
   $("#upd-hosts").checked = !!u.from_hosts;
@@ -1539,15 +2019,16 @@ function renderUpdate(u) {
       html = `<span class="tag">Update</span><span class="msg">Installing… rdpio reopens in a moment.</span><span class="spin"></span>`;
       break;
   }
-  bar.innerHTML = html;
+  setHTML(bar, html);
   bar.hidden = !html;
   const status = {
     idle: "", checking: "Checking…", current: "Up to date.", available: `${v} is available.`,
     downloading: `Downloading ${v}: ${Math.round((u.progress || 0) * 100)}%`, ready: `${v} is ready to install.`,
     restart: `${v} is installed: restart to use it.`, installing: "Installing…", error: u.error || "The check didn't work.",
   }[u.state] ?? "";
-  $("#upd-version").textContent = `rdpio ${state.version || ""}`;
-  $("#upd-status").textContent = status || `Build ${state.build}`;
+  // (The one place that says which rdpio this is, build included.)
+  $("#upd-version").textContent = `rdpio ${state.version || ""} · build ${state.build || ""}`;
+  $("#upd-status").textContent = status || "Not checked yet.";
   $("#upd-check").disabled = ["checking", "downloading", "installing"].includes(u.state);
 }
 $("#update-bar").addEventListener("click", e => {
@@ -1564,9 +2045,19 @@ let quickModeSet = false;
 $$("#quick-mode button").forEach(b => b.addEventListener("click", () => { quickModeSet = true; }));
 $$("#theme-seg button").forEach(b => b.onclick = () => call("settings", { theme: b.dataset.v }).then(setState).catch(fail));
 $("#keep-open").onchange = e => call("settings", { keep_open: e.target.checked }).then(setState).catch(fail);
-$("#def-fullscreen").onchange = e => saveDefaults({ fullscreen: e.target.checked });
-function saveDefaults(patch) { call("settings", { defaults: { ...state.settings.defaults, ...patch } }).then(setState).catch(fail); }
-$("#open-client-logs").onclick = () => call("open", { what: "client_logs" }).catch(fail);
+$("#def-change").onclick = () => openEdit({ defaults: true, options: state.settings.defaults });
+// The shortcuts, from the list the sessions themselves go by (`state.hotkeys`).
+const KEY_PLACES = [["all", "In a session"], ["hyper", "In a Hyper stream"], ["host", "At the PC being streamed"], ["launcher", "In this window"]];
+let keysDrawn = false;
+function renderKeys() {
+  const keys = state.hotkeys || [];
+  if (keysDrawn || !keys.length) return;
+  keysDrawn = true;
+  $("#keys").innerHTML = KEY_PLACES.map(([scope, cap]) => {
+    const rows = keys.filter(k => k.scope === scope);
+    return rows.length ? `<div class="cap">${esc(cap)}</div>${rows.map(k => `<kbd>${esc(k.keys)}</kbd><span>${esc(k.what)}</span>`).join("")}` : "";
+  }).join("");
+}
 
 // ------------------------------------------------------------ the log (Activity, Workspace)
 const LOG_KEEP = 4000;
@@ -1638,8 +2129,24 @@ function renderActivity() {
 function showLog(src) { actFilter.src = src || ""; show("activity"); }
 $("#log-src").onchange = e => { actFilter.src = e.target.value; renderActivity(); };
 $$("#log-level button").forEach(b => b.onclick = () => { actFilter.level = b.dataset.v; renderActivity(); });
-$("#log-q").addEventListener("input", e => { actFilter.q = e.target.value.trim().toLowerCase(); renderActivity(); });
-$("#log-perf").onchange = e => { actFilter.perf = e.target.checked; renderActivity(); };
+// (Typing in the filter redraws once it pauses, not on every key.)
+let logQTimer = 0;
+$("#log-q").addEventListener("input", e => {
+  clearTimeout(logQTimer);
+  logQTimer = setTimeout(() => { actFilter.q = e.target.value.trim().toLowerCase(); renderActivity(); }, 120);
+});
+// Stats lines are kept apart by rdpio and only sent while this is ticked:
+// ticking it swaps the whole list for one with them in it (and back).
+$("#log-perf").onchange = e => {
+  const on = e.target.checked;
+  call("logs_perf", { on }).then(r => {
+    logs = r.lines || [];
+    if (logs.length) logSeq = Math.max(logSeq, logs[logs.length - 1].seq);
+    for (const l of logs) if (!logNames.has(l.src)) logNames.set(l.src, l.src === "launcher" ? "This window" : l.name);
+    actFilter.perf = on;
+    renderActivity();
+  }).catch(err => { e.target.checked = !on; fail(err); });
+};
 $("#log-copy").onclick = () => {
   const text = logs.filter(actMatch).map(l => `${l.time} ${l.level.padEnd(5)} [${l.name}] ${l.target ? l.target + ": " : ""}${l.text}`).join("\n");
   navigator.clipboard.writeText(text).then(() => toast("ok", "Copied", `${logs.filter(actMatch).length} lines`, 2000)).catch(fail);
@@ -1653,7 +2160,10 @@ $("#log-folder").onclick = () => call("open", { what: "client_logs" }).catch(fai
 const tabs = []; // {key, name, req, what, state: "connecting" | "live" | "ended", reason, failed}
 let activeTab = null;
 let wsLogOpen = false;
-let wsSel = null;
+// The tree's row the keyboard is on (and the one last clicked): "c:<id>" for a
+// connection, "f:<path>" for a folder.
+let wsCur = null;
+const curConn = () => wsCur && wsCur.startsWith("c:") && state ? state.connections.find(c => c.id === wsCur.slice(2)) : null;
 const openFolders = new Set();
 function folderTree(conns) {
   const root = { name: "", path: "", kids: new Map(), conns: [] };
@@ -1681,25 +2191,47 @@ function fillFolderList() { $("#folder-list").innerHTML = allFolders().map(f => 
 function renderTree() {
   if (!state) return;
   const q = $("#ws-q").value.trim().toLowerCase();
-  const match = c => !q || [c.name, c.host, c.user, c.folder].some(v => v && String(v).toLowerCase().includes(q));
-  const root = folderTree(state.connections.filter(match).sort((a, b) => a.name.localeCompare(b.name)));
+  const root = folderTree(state.connections.filter(c => connMatches(c, q)).sort((a, b) => a.name.localeCompare(b.name)));
   const out = [];
+  let n = 0, curId = "";
+  // (Rows are numbered for `aria-activedescendant`: the tree keeps the focus,
+  // the row the keyboard is on is named to screen readers through it.)
+  const rowId = key => { const id = `tn-${n++}`; if (key === wsCur) curId = id; return id; };
   const walk = (node, depth) => {
     for (const k of [...node.kids.values()].sort((a, b) => a.name.localeCompare(b.name))) {
-      const open = !!q || openFolders.has(k.path);
-      out.push(`<div class="tn folder ${open ? "open" : ""}" data-folder="${esc(k.path)}" role="treeitem" aria-expanded="${open}" style="padding-left:${6 + depth * 14}px"><svg class="caret"><use href="#i-caret"/></svg>${icon("folder")}<span class="nm">${esc(k.name)}</span><span class="sub">${countConns(k)}</span></div>`);
+      const open = !!q || openFolders.has(k.path), key = `f:${k.path}`;
+      out.push(`<div class="tn folder ${open ? "open" : ""} ${wsCur === key ? "sel" : ""}" id="${rowId(key)}" data-folder="${esc(k.path)}" role="treeitem" aria-level="${depth + 1}" aria-expanded="${open}" aria-selected="${wsCur === key}" style="padding-left:${6 + depth * 14}px"><svg class="caret" aria-hidden="true"><use href="#i-caret"/></svg>${icon("folder")}<span class="nm">${esc(k.name)}</span><span class="sub" aria-label="${countConns(k)} connections">${countConns(k)}</span></div>`);
       if (open) walk(k, depth + 1);
     }
     for (const c of node.conns) {
-      out.push(`<div class="tn leaf ${wsSel === c.id ? "sel" : ""}" data-id="${esc(c.id)}" draggable="true" role="treeitem" title="${esc(`${c.user ? c.user + " @ " : ""}${c.host}`)}" style="padding-left:${26 + depth * 14}px"><span class="st ${c.running ? "on" : ""}"></span><span class="nm">${esc(c.name)}</span><span class="sub">${esc(TRANSPORTS[c.options.transport]?.short || "")}</span></div>`);
+      const key = `c:${c.id}`;
+      out.push(`<div class="tn leaf ${wsCur === key ? "sel" : ""}" id="${rowId(key)}" data-id="${esc(c.id)}" draggable="true" role="treeitem" aria-level="${depth + 1}" aria-selected="${wsCur === key}" title="${esc(`${c.user ? c.user + " @ " : ""}${c.host}`)}" style="padding-left:${26 + depth * 14}px"><span class="st ${c.running ? "on" : ""}"></span><span class="nm">${esc(c.name)}${c.running ? `<span class="sr"> (connected)</span>` : ""}</span><button class="more" data-act="more" tabindex="-1" title="More" aria-hidden="true">${icon("more")}</button><span class="sub">${esc(TRANSPORTS[c.options.transport]?.short || "")}</span></div>`);
     }
   };
   walk(root, 0);
-  $("#ws-tree").innerHTML = out.join("") || `<div class="empty-log">${state.connections.length ? "Nothing matches." : "No saved connections yet: add one with +, or quick connect above."}</div>`;
+  const tree = $("#ws-tree");
+  setHTML(tree, out.join("") || `<div class="empty-log">${state.connections.length ? "No saved PC matches." : "No saved connections yet: add one with +, or type a PC above and press Enter."}</div>`);
+  if (curId) tree.setAttribute("aria-activedescendant", curId); else tree.removeAttribute("aria-activedescendant");
+  renderWsHint();
+}
+// The tree's rows as drawn, and moving the keyboard's row among them.
+const treeRows = () => $$("#ws-tree .tn");
+const rowKey = el => el.dataset.folder !== undefined ? `f:${el.dataset.folder}` : `c:${el.dataset.id}`;
+function treeGo(el) {
+  if (!el) return;
+  wsCur = rowKey(el);
+  renderTree();
+  const row = $("#ws-tree .tn.sel");
+  if (row) row.scrollIntoView({ block: "nearest" });
+}
+function renderWsHint() {
+  const text = $("#ws-q").value;
+  setHint($("#ws-hint"), boxHint(text, resolveBox(text, savedEntries()), "opens", state.settings.defaults.transport));
 }
 function renderTabs() {
-  $("#ws-tabs").innerHTML = tabs.map(t => `<div class="ws-tab" role="tab" data-key="${esc(t.key)}" aria-selected="${t.key === activeTab}" title="${esc(t.name)}"><span class="st ${t.state}"></span><span class="nm">${esc(t.name)}</span><button class="x" data-act="close" title="${t.state === "ended" ? "Close (Ctrl+W)" : "Disconnect (Ctrl+W)"}">${icon("x")}</button></div>`).join("")
-    || `<div class="ws-tabs-empty">Double-click a connection to open it here.</div>`;
+  // (One stop for Tab: the tab in front; the arrow keys move between them.)
+  setHTML($("#ws-tabs"), tabs.map(t => `<div class="ws-tab" role="tab" id="wst-${esc(t.key)}" aria-controls="ws-view" tabindex="${t.key === activeTab ? 0 : -1}" data-key="${esc(t.key)}" aria-selected="${t.key === activeTab}" title="${esc(t.name)}"><span class="st ${t.state}"></span><span class="nm">${esc(t.name)}</span><button class="x" data-act="close" tabindex="-1" aria-hidden="true" title="${t.state === "ended" ? "Close (Ctrl+W)" : "Disconnect (Ctrl+W)"}">${icon("x")}</button></div>`).join("")
+    || `<div class="ws-tabs-empty">Double-click a connection to open it here.</div>`);
   const n = tabs.filter(t => t.state !== "ended").length;
   $("#nav-tabs").hidden = !n;
   $("#nav-tabs").textContent = String(n);
@@ -1708,23 +2240,28 @@ function renderWsView() {
   const t = tabs.find(x => x.key === activeTab);
   const view = $("#ws-view");
   if (!t) {
-    $("#ws-bar").innerHTML = `<span class="what">No session open</span>`;
-    view.innerHTML = `<div class="ws-status">${icon("tabs")}<h3>Workspace</h3><p>Sessions open here, side by side in tabs. Double-click a saved connection, or quick connect at the top left. Right-click a connection or a folder for more; drag connections onto folders to file them.</p></div>`;
+    setHTML($("#ws-bar"), `<span class="what">No session open</span>`);
+    view.innerHTML = `<div class="ws-status">${icon("tabs")}<h3>Workspace</h3><p>Sessions open here, side by side in tabs. Double-click a saved connection, or type a PC in the box at the top left and press Enter. Right-click a connection or a folder for more (or use the arrow keys and the menu key); drag connections onto folders to file them.</p></div>`;
     $("#ws-log").hidden = $("#ws-split").hidden = true;
     return;
   }
-  const status = { connecting: "Connecting…", live: "Connected", ended: t.failed ? "Couldn't connect" : "Disconnected" }[t.state];
-  $("#ws-bar").innerHTML = `<span class="st ${t.state}"></span><span class="what"><b>${esc(t.name)}</b> · ${esc(status)}</span>
-    <button class="btn ghost" data-ws="log" aria-pressed="${wsLogOpen}" title="This session's log, under it">${icon("log")}Log</button>
-    <button class="btn ghost icon" data-ws="file" title="Open the log file">${icon("folder")}</button>
-    ${t.state === "live" ? `<button class="btn ghost" data-ws="popout" title="Out of the tab, into a window of its own">${icon("popout")}Pop out</button>` : ""}
+  const status = t.reconnect ? "Reconnecting…" : { connecting: "Connecting…", live: "Connected", ended: t.failed ? "Couldn't connect" : "Disconnected" }[t.state];
+  // (A button's words go when the session area is narrow: see `.ws-bar .btn .t`.)
+  const btn = (cls, act, ico, text, title = text, extra = "") => `<button class="btn ${cls}" data-ws="${act}" title="${esc(title)}" ${extra}>${icon(ico)}<span class="t">${esc(text)}</span></button>`;
+  setHTML($("#ws-bar"), `<span class="st ${t.state}"></span><span class="what"><b>${esc(t.name)}</b> · ${esc(status)}</span>
+    ${btn("ghost", "log", "log", "Log", "This session's log, under it", `aria-pressed="${wsLogOpen}"`)}
+    ${btn("ghost", "file", "folder", "Log file", "Open the log file")}
+    ${t.state === "live" ? btn("ghost", "popout", "popout", "Pop out", "Out of the tab, into a window of its own") : ""}
     ${t.state === "ended"
-      ? `<button class="btn primary" data-ws="reconnect">${icon("refresh")}Reconnect</button>`
-      : `<button class="btn" data-ws="reconnect">${icon("refresh")}Reconnect</button><button class="btn danger" data-ws="disconnect">${icon("x")}Disconnect</button>`}`;
+      ? btn("primary", "reconnect", "refresh", "Reconnect")
+      : btn("", "reconnect", "refresh", "Reconnect", "Reconnect", t.reconnect ? "disabled" : "") + btn("danger", "disconnect", "x", "Disconnect", "Disconnect (Ctrl+W)")}`);
   const lines = logs.filter(l => l.src === t.key && l.target !== "perf");
+  // Live, the session's own window covers all this: nothing here moves (an
+  // endless spinner under it would keep the page drawing for hours). It shows
+  // only while a menu or a dialog has the session step aside.
   view.innerHTML = t.state === "live"
-    ? `<div class="ws-status"><span class="spin"></span><p>Showing ${esc(t.name)}…</p></div>`
-    : `<div class="ws-status">${t.state === "connecting" ? `<span class="spin"></span><h3>Connecting to ${esc(t.name)}…</h3>` : `<h3>${esc(status)}</h3><p>${esc(t.reason || "The session ended.")}</p>`}<div class="console one" id="ws-mini"></div></div>`;
+    ? `<div class="ws-status">${icon("tabs")}<p><b>${esc(t.name)}</b> is shown here.</p><p class="hint">If you see this instead of the session, click its tab.</p></div>`
+    : `<div class="ws-status">${t.state === "connecting" ? `<span class="spin"></span><h3>${t.reconnect ? "Reconnecting to" : "Connecting to"} ${esc(t.name)}…</h3>` : `<h3>${esc(status)}</h3><p>${esc(t.reason || "The session ended.")}</p>`}${wsLogOpen ? "" : `<div class="console one" id="ws-mini"></div>`}</div>`;
   const mini = $("#ws-mini");
   if (mini) fillLog(mini, lines.slice(-14), true, "Starting the session…");
   $("#ws-log").hidden = $("#ws-split").hidden = !wsLogOpen;
@@ -1816,50 +2353,118 @@ function syncEmbed() {
 new ResizeObserver(syncEmbed).observe($("#ws-view"));
 addEventListener("resize", syncEmbed);
 
+// The list folded away (Ctrl+B): the nav becomes a rail and the session gets
+// nearly the whole window (it follows through the ResizeObserver above).
+// Remembered for this run of the window.
+let wsWide = false;
+function setWsWide(on) {
+  wsWide = on;
+  const b = $("#ws-fold");
+  // (The keyboard doesn't vanish with the list.)
+  if (on && $(".ws-side").contains(document.activeElement)) b.focus();
+  document.body.classList.toggle("ws-wide", on);
+  b.setAttribute("aria-pressed", String(on));
+  b.title = on ? "Show the list (Ctrl+B)" : "Hide the list (Ctrl+B)";
+  try { sessionStorage.setItem("rdpio.wsWide", on ? "1" : ""); } catch { /* (no storage: forgotten) */ }
+}
+$("#ws-fold").onclick = () => setWsWide(!wsWide);
+try { if (sessionStorage.getItem("rdpio.wsWide") === "1") setWsWide(true); } catch { /* (no storage) */ }
+
 $("#ws-q").addEventListener("input", renderTree);
+// Enter: the saved PC the box names, in a tab; anything else as an address,
+// with the defaults for new connections (their connection kind too).
+$("#ws-q").addEventListener("keydown", e => {
+  const box = e.target, text = box.value.trim();
+  if (e.key === "Enter" && text && state) {
+    e.preventDefault();
+    const plan = resolveBox(text, savedEntries());
+    if (!e.ctrlKey && plan.one) { wsCur = `c:${plan.one.id}`; renderTree(); return wsOpen(plan.one.req, plan.one.what); }
+    if (!e.ctrlKey && plan.matches.length) { $("#ws-tree").focus(); return; }
+    wsOpen(...quickTarget(text, state.settings.defaults.transport));
+    box.value = ""; renderTree();
+  }
+  if (e.key === "Escape" && box.value) { e.stopPropagation(); box.value = ""; renderTree(); }
+  if (e.key === "ArrowDown") { e.preventDefault(); $("#ws-tree").focus(); }
+});
 $("#ws-new").onclick = () => openEdit(null);
-$("#ws-quick").addEventListener("submit", e => {
-  e.preventDefault();
-  const host = $("#ws-host").value.trim();
-  if (!host) return;
-  const options = { ...(state ? state.settings.defaults : {}), transport: $("#ws-mode").value };
-  wsOpen({ target: { host, options } }, { name: host, host, options });
-  $("#ws-host").value = "";
-});
 const wsConn = el => { const n = el.closest(".tn.leaf"); return n && state.connections.find(c => c.id === n.dataset.id); };
-$("#ws-tree").addEventListener("click", e => {
+const tree = $("#ws-tree");
+function toggleFolder(p) { openFolders.has(p) ? openFolders.delete(p) : openFolders.add(p); renderTree(); }
+tree.addEventListener("click", e => {
   const f = e.target.closest(".tn.folder");
-  if (f) { const p = f.dataset.folder; openFolders.has(p) ? openFolders.delete(p) : openFolders.add(p); renderTree(); return; }
+  if (f) { wsCur = `f:${f.dataset.folder}`; toggleFolder(f.dataset.folder); return; }
   const c = wsConn(e.target);
-  if (c) { wsSel = c.id; $$("#ws-tree .tn.sel").forEach(n => n.classList.remove("sel")); e.target.closest(".tn.leaf").classList.add("sel"); }
+  if (c) {
+    // (Marked in place, not drawn again: a double-click needs the same row twice.)
+    wsCur = `c:${c.id}`;
+    $$("#ws-tree .tn.sel").forEach(n => { n.classList.remove("sel"); n.setAttribute("aria-selected", "false"); });
+    const row = e.target.closest(".tn.leaf");
+    row.classList.add("sel"); row.setAttribute("aria-selected", "true");
+    tree.setAttribute("aria-activedescendant", row.id);
+    setHTML.forget(tree);
+  }
+  const more = c && e.target.closest('[data-act="more"]');
+  if (more) openMenu(more, connMenu(c, "tree"), tree);
 });
-$("#ws-tree").addEventListener("dblclick", e => { const c = wsConn(e.target); if (c) wsOpen({ id: c.id }, c); });
-$("#ws-tree").addEventListener("keydown", e => {
-  const c = state && state.connections.find(x => x.id === wsSel);
-  if (e.key === "Enter" && c) wsOpen({ id: c.id }, c);
-  if (e.key === "Delete" && c) del(c);
+tree.addEventListener("dblclick", e => { const c = wsConn(e.target); if (c) wsOpen({ id: c.id }, c); });
+// The keyboard in the tree: arrows move (Right/Left open and close a folder),
+// Enter opens, F2 edits or renames, Delete deletes (with Undo), the menu key or
+// Shift+F10 shows the row's menu.
+let treeKeyMenu = 0;
+// (Tabbed into with no row marked: the first one. A click marks its own.)
+tree.addEventListener("focus", () => {
+  if (!tree.matches(":focus-visible") || $("#ws-tree .tn.sel")) return;
+  const first = treeRows()[0]; if (first) treeGo(first);
 });
-$("#ws-tree").tabIndex = 0;
-$("#ws-tree").addEventListener("contextmenu", e => {
+tree.addEventListener("keydown", e => {
+  const rows = treeRows(), row = $("#ws-tree .tn.sel"), i = rows.indexOf(row);
+  const folder = row && row.dataset.folder !== undefined ? row.dataset.folder : null;
+  const c = curConn();
+  const key = e.key;
+  if (key === "ContextMenu" || (key === "F10" && e.shiftKey)) {
+    e.preventDefault();
+    if (!row) return;
+    treeKeyMenu = Date.now();
+    return folder !== null ? folderMenu(row, folder) : c && openMenu(row, connMenu(c, "tree"), tree);
+  }
+  const move = { ArrowDown: i + 1, ArrowUp: Math.max(0, i - 1), Home: 0, End: rows.length - 1 }[key];
+  if (move !== undefined) { e.preventDefault(); return treeGo(rows[Math.min(move, rows.length - 1)]); }
+  if (key === "ArrowRight" && folder !== null) {
+    e.preventDefault();
+    return openFolders.has(folder) || $("#ws-q").value.trim() ? treeGo(rows[i + 1]) : toggleFolder(folder);
+  }
+  if (key === "ArrowLeft" && row) {
+    e.preventDefault();
+    if (folder !== null && openFolders.has(folder)) return toggleFolder(folder);
+    // (Else up to the folder it's in.)
+    const level = +row.getAttribute("aria-level");
+    for (let j = i - 1; j >= 0; j--) if (+rows[j].getAttribute("aria-level") < level) return treeGo(rows[j]);
+    return;
+  }
+  if (key === "Enter" && row) { e.preventDefault(); return folder !== null ? toggleFolder(folder) : c && wsOpen({ id: c.id }, c); }
+  if (key === "F2" && row) { e.preventDefault(); return folder !== null ? renameFolder(folder) : c && openEdit(c); }
+  if (key === "Delete" && c) { e.preventDefault(); del(c); }
+});
+tree.addEventListener("contextmenu", e => {
   e.preventDefault();
+  // (The menu key: its menu is already open, by the row the keyboard is on.)
+  if (Date.now() - treeKeyMenu < 1500) return;
   const at = { x: e.clientX, y: e.clientY };
   const f = e.target.closest(".tn.folder");
-  if (f) return folderMenu(at, f.dataset.folder);
+  if (f) { wsCur = `f:${f.dataset.folder}`; renderTree(); return folderMenu(at, f.dataset.folder); }
   const c = wsConn(e.target);
-  if (!c) return openMenu(at, [{ label: "New connection", icon: "plus", run: () => openEdit(null) }]);
-  wsSel = c.id; renderTree();
-  openMenu(at, [
-    { label: c.running ? "Show" : "Open in a tab", icon: "tabs", run: () => wsOpen({ id: c.id }, c) },
-    { label: "Open in its own window", icon: "popout", run: () => connect({ id: c.id }, c) },
-    "-",
-    { label: "Edit", icon: "edit", run: () => openEdit(c) },
-    { label: "Move to folder…", icon: "folder", run: async () => { const f = await askText("Move to folder", `Where ${c.name} is filed. Empty: no folder. "Work/Servers" nests.`, c.folder, "Move"); if (f !== null) moveConns([c], () => f); } },
-    { label: "Duplicate", icon: "copy", run: () => openEdit({ ...c, id: null, name: `${c.name} (copy)`, has_password: false, has_hyper_password: false }) },
-    { label: "Show its log", icon: "log", run: () => showLog(c.id) },
-    "-",
-    { label: "Delete", icon: "trash", danger: true, run: () => del(c) },
-  ]);
+  if (!c) return openMenu(at, [{ label: "New connection", icon: "plus", run: () => openEdit(null) }], tree);
+  wsCur = `c:${c.id}`; renderTree();
+  openMenu(at, connMenu(c, "tree"), tree);
 });
+async function renameFolder(path) {
+  const inside = c => c.folder === path || (c.folder || "").startsWith(`${path}/`);
+  const name = await askText("Rename folder", `The connections in it move along.`, path, "Rename");
+  if (name === null || name === path) return;
+  moveConns(state.connections.filter(inside), c => name + (c.folder || "").slice(path.length));
+  if (openFolders.delete(path)) openFolders.add(name);
+  wsCur = `f:${name}`;
+}
 function folderMenu(at, path) {
   const inside = c => c.folder === path || (c.folder || "").startsWith(`${path}/`);
   const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
@@ -1867,24 +2472,15 @@ function folderMenu(at, path) {
     { label: "New connection here", icon: "plus", run: () => openEdit({ folder: path }) },
     { label: "Open all in tabs", icon: "tabs", run: async () => { for (const c of state.connections.filter(inside)) await wsOpen({ id: c.id }, c); } },
     "-",
-    { label: "Rename…", icon: "edit", run: async () => {
-      const name = await askText("Rename folder", `The connections in it move along.`, path, "Rename");
-      if (name === null || name === path) return;
-      moveConns(state.connections.filter(inside), c => name + (c.folder || "").slice(path.length));
-      if (openFolders.delete(path)) openFolders.add(name);
-    } },
+    { label: "Rename…", icon: "edit", run: () => renameFolder(path) },
     { label: "Ungroup", icon: "x", run: () => moveConns(state.connections.filter(inside), c => parent + (c.folder || "").slice(path.length).replace(/^\//, parent ? "/" : "")) },
-  ]);
+  ], tree);
 }
-// File connections under another folder (`to(c)`): saved one by one.
-async function moveConns(list, to) {
-  try {
-    let r = null;
-    for (const c of list) {
-      r = await call("save", { conn: { id: c.id, name: c.name, host: c.host, port: c.port, user: c.user || "", domain: c.domain || "", options: c.options, folder: to(c) } });
-    }
-    if (r) setState(r.state);
-  } catch (e) { fail(e); }
+// File connections under another folder (`to(c)`): all of them in one request
+// (one write: a folder is never left half moved).
+function moveConns(list, to) {
+  if (!list.length) return;
+  call("set_folders", { folders: Object.fromEntries(list.map(c => [c.id, to(c)])) }).then(setState).catch(fail);
 }
 // Drag connections onto folders (or the empty space: no folder).
 $("#ws-tree").addEventListener("dragstart", e => { const n = e.target.closest(".tn.leaf"); if (n) e.dataTransfer.setData("text/rdpio-conn", n.dataset.id); });
@@ -1908,15 +2504,27 @@ $("#ws-tabs").addEventListener("click", e => {
   if (e.target.closest('[data-act="close"]')) return wsClose(tab.dataset.key);
   wsActivate(tab.dataset.key);
 });
+// The keyboard on the tabs: Left/Right (Home/End) bring another to the front,
+// Delete closes (or disconnects) the one in front.
+$("#ws-tabs").addEventListener("keydown", e => {
+  const i = tabs.findIndex(t => t.key === activeTab);
+  if (i < 0 || !e.target.closest(".ws-tab")) return;
+  const to = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
+  const focusFront = () => { const el = $(`#ws-tabs .ws-tab[aria-selected="true"]`); if (el) el.focus(); };
+  if (to !== undefined) { e.preventDefault(); wsActivate(tabs[(to + tabs.length) % tabs.length].key); return focusFront(); }
+  if (e.key === "Delete") { e.preventDefault(); wsClose(activeTab); }
+});
 $("#ws-tabs").addEventListener("auxclick", e => { const tab = e.target.closest(".ws-tab"); if (tab && e.button === 1) wsClose(tab.dataset.key); });
 $("#ws-tabs").addEventListener("contextmenu", e => {
   const tab = e.target.closest(".ws-tab"); if (!tab) return;
   e.preventDefault();
   const t = tabs.find(x => x.key === tab.dataset.key); if (!t) return;
+  const c = t.req && t.req.id && state.connections.find(x => x.id === t.req.id);
   openMenu({ x: e.clientX, y: e.clientY }, [
     ...(t.state === "live" ? [{ label: "Pop out", icon: "popout", run: () => wsAct("popout", t) }] : []),
     { label: "Reconnect", icon: "refresh", run: () => wsAct("reconnect", t) },
-    { label: "Show its log", icon: "log", run: () => showLog(t.key) },
+    "-",
+    ...(c ? connItems(c) : [{ label: "Show its log", icon: "log", run: () => showLog(t.key) }]),
     "-",
     { label: t.state === "ended" ? "Close" : "Disconnect", icon: "x", danger: t.state !== "ended", run: () => wsClose(t.key) },
   ]);
@@ -1929,7 +2537,11 @@ function wsAct(act, t) {
   if (act === "reconnect") {
     if (!t.req) return toast("bad", "Can't reconnect this one", "Open it again from the list.");
     if (t.state === "ended") wsOpen(t.req, t.what);
-    else { t.reconnect = true; call("disconnect", { key: t.key }).catch(fail); }
+    else {
+      t.reconnect = true;
+      if (activeTab === t.key) renderWsView();
+      call("disconnect", { key: t.key }).catch(e => { t.reconnect = false; if (activeTab === t.key) renderWsView(); fail(e); });
+    }
   }
 }
 $("#ws-bar").addEventListener("click", e => {
@@ -1953,6 +2565,8 @@ function setState(s) {
   applyTheme();
   render();
   renderSettings();
+  // (This PC's status can come before the first state: drawn once both are here.)
+  if (hostStatus && $("#host-hero .skeleton")) renderHost();
   wsReconcile(s);
 }
 function onEvent(m) {
@@ -1960,7 +2574,7 @@ function onEvent(m) {
     case "state": setState(m.state); break;
     case "system_theme": systemDark = !!m.dark; applyTheme(); break;
     case "active": document.body.classList.toggle("idle", !m.on); break;
-    case "host_status": hostStatus = m.status; renderHost(); break;
+    case "host_status": hostStatus = m.status; hostLooking = false; syncHostRefresh(); renderHost(); break;
     case "update":
       renderUpdate(m.update);
       if (m.update.state === "error") toast("bad", "Update", m.update.error, 10000);
@@ -1969,7 +2583,10 @@ function onEvent(m) {
       break;
     case "host_action_done":
       hostBusy = null;
-      if (m.ok) toast("ok", { install: "Hyper is set up", update: "Hyper updated", uninstall: "Hyper removed", password: "Hyper password changed", display_install: "rdpio Display installed", display_uninstall: "rdpio Display removed", settings: "Saved" }[m.action] || "Done");
+      // Saved: those changes aren't pending any more (failed: they stay, to try again).
+      if (m.ok && m.action === "settings" && hostSent) for (const k in hostSent) if (hostPending[k] === hostSent[k]) delete hostPending[k];
+      hostSent = null;
+      if (m.ok) toast("ok", { install: "Hyper is set up", update: "Hyper updated", uninstall: "Hyper removed", password: "Hyper password changed", display_install: "rdpio Display installed", display_uninstall: "rdpio Display removed", display_repair: "rdpio Display is running", settings: "Saved" }[m.action] || "Done");
       else toast("bad", "That didn't work", m.message, 12000);
       renderHost();
       break;
@@ -1982,7 +2599,7 @@ function onEvent(m) {
         const pc = w365.pcs.find(p => `w365:${p.id}` === m.key);
         toast("bad", m.seconds < 12 ? `Couldn't connect to ${m.name}` : `Disconnected from ${m.name}`, why, 15000, [
           ...(pc ? [{ label: "Enter the password again", run: () => w365Connect(pc, true) }] : []),
-          { label: "Show the log", run: () => showLog(m.key) },
+          { label: "Show its log", run: () => showLog(m.key) },
         ]);
       }
       break;
@@ -2008,10 +2625,11 @@ function onEvent(m) {
   }
 }
 
-call("state").then(s => { setState(s); $("#quick-host").focus(); }).catch(fail);
+call("state").then(s => { setState(s); if (pageIs("connections")) enterCards(); $("#quick-host").focus(); }).catch(fail);
 call("logs", { since: 0 }).then(r => addLines(r.lines)).catch(() => {});
 call("w365_status").catch(() => {});
-setInterval(render, 60000); // ("5 min ago" stays current)
+// (So the mark on "This PC" is right from the start, not only once it's opened.)
+refreshHost();
 </script>
 </body>
 </html>

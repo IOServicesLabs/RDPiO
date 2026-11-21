@@ -30,9 +30,12 @@ Options per PC:
 - **Office mode:** crisp text at 60 fps instead of the lowest latency. Switch
   live with Ctrl+Shift+O.
 - **Frame rate:** your screen's fastest by default (144 Hz on a OnePlus Pad 2).
-- **Resolution:** your screen's own by default. With the rdpio Display driver
-  the PC makes a monitor exactly this size; otherwise it scales its desktop
-  down to fit (never up).
+- **PC display size:** what the PC renders at; your screen's own by default.
+  With the rdpio Display driver the PC makes a monitor exactly this size;
+  otherwise it scales its desktop down to fit (never up). To send fewer
+  pixels on a slow connection use Menu → Game/Office resolution instead (Auto
+  by default); the stream is the smaller of the two, and a stream smaller
+  than the screen is upscaled here either way.
 - **Text size on the PC:** the Windows display scale for that monitor.
 - **Codec:** HEVC where the tablet decodes it, else H.264.
 
@@ -89,12 +92,15 @@ Always on:
   nobody's touching it); the stats line logged every 10 s, not every second.
 - **Game mode:** unbuffered touch and mouse input (each event at once);
   the receive, decode and picture threads kept on the big cores.
-  Menu → Game resolution (100 / 75 / 50%): the PC sends fewer pixels, and
+  Menu → Game resolution (100 / 75 / 50%; the menu shows the stream's real
+  size beside it): the PC sends fewer pixels, and
   the tablet makes them full size again with **Snapdragon Game Super
   Resolution** on the GPU (Qualcomm's single-pass upscaler for Adreno: a
   Lanczos-like filter with adaptive sharpening; the stats line shows its
-  sizes and cost). Menu → Upscaler → Display hands the scaling to the
-  display's own scaler instead (no GPU work, softer).
+  sizes and cost), whenever the stream is smaller than the screen, whether
+  from this menu or the connect screen's PC display size. Menu → Upscaler →
+  Display hands the scaling to the display's own scaler instead (no GPU
+  work, softer).
 - **Office resolution** (100 / 75 / 50 / 33%, Hyper only): the same for
   office mode, for a weak connection: at 50% the PC encodes a quarter of the
   pixels, so a page of text costs about a quarter of the data, and the
@@ -218,7 +224,7 @@ Touch, a trackpad and a mouse all work at the same time:
 
 | Device | What it does |
 |---|---|
-| Fingers on the screen | **Windows touch**: tap, flick to scroll, press and hold, pinch, edge swipes. Menu → "Fingers: touch / mouse" makes them a mouse instead (tap = click, hold = right click, drag = drag, two fingers = scroll, two-finger tap = right click). |
+| Fingers on the screen | **Windows touch**: tap, flick to scroll, press and hold, pinch, edge swipes. Menu → "Fingers" (Touch or Mouse) makes them a mouse instead (tap = click, hold = right click, drag = drag, two fingers = scroll, two-finger tap = right click). |
 | Trackpad (keyboard cover) | Android's pointer, drawn with the PC's cursor. Click and tap-to-click, right click, **two-finger scroll** (smooth, like a precision touchpad), **pinch to zoom** (Ctrl + wheel). |
 | Mouse | Pointer, all five buttons, the wheel (and tilt). |
 | Ctrl+Shift+M | Locks the mouse to the stream for games (raw relative motion, no acceleration). Press again to free it. |
@@ -226,14 +232,15 @@ Touch, a trackpad and a mouse all work at the same time:
 | On-screen keyboard | Menu → Keyboard. Typed as characters, so any language works. |
 
 Shortcuts: **Ctrl+Shift+Q** disconnect, **Ctrl+Shift+S** stats, **Ctrl+Shift+O**
-game/office, **Ctrl+Shift+M** lock the mouse. The round button over the stream
+game/office, **Ctrl+Shift+M** lock the mouse, **Ctrl+Shift+Tab** the other
+open session, **Ctrl+Alt+End** Ctrl+Alt+Del. The round button over the stream
 (or the back gesture, or **Shift+Esc** on a keyboard) opens the menu; drag the
 button anywhere and it stays on that side next time. A keyboard's Esc always
 goes to the PC, also from keyboards that send it as Android's Back key.
 
 ### Hardware keyboards
 
-Two modes (Menu → "Keys: PC / tablet layout"; remembered):
+Two modes (Menu → "Keyboard layout": PC or Tablet; remembered):
 
 - **PC layout** (the default, Windows App's "scancode" mode): every key goes
   by its position, as if the keyboard were plugged into the PC. The PC's

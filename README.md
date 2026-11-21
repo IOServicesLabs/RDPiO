@@ -254,7 +254,7 @@ is silent — check the startup log if a flag seems to have no effect.
 | --- | --- |
 | `--multimon`, `-m` | Span the desktop across all local monitors |
 | `--per-monitor`, `--multimon-windows` | Span all monitors, but one borderless window per monitor so remote windows respect the seams |
-| `--fullscreen`, `-f` | Borderless fullscreen on the primary monitor |
+| `--fullscreen`, `-f` | Borderless fullscreen on the monitor the pointer is on. A bar at the top edge of the screen minimizes, leaves full screen (one window), shows Hyper's stats, saves or disconnects |
 | `--width N`, `--height N`, `--size WxH` | Requested desktop size (ignored under `--multimon`/`--fullscreen`) |
 | `--bpp 16\|24\|32` | Session color depth |
 

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::allocator;
@@ -29,6 +29,88 @@ pub struct Metrics {
     blits_submitted: AtomicU64,
     network_bytes_rx: AtomicU64,
     network_bytes_tx: AtomicU64,
+    /// Most frames waiting for the decode thread at any frame-ack in this
+    /// window (the RDP graphics path's decode backlog).
+    decode_backlog_peak: AtomicU64,
+
+    /// What the RDP network thread has handed the decode thread and what the
+    /// decode thread has finished; flow control reads it (see [`DecodeQueue`]).
+    pub decode_queue: DecodeQueue,
+}
+
+/// Graphics work handed from the RDP network thread to its decode thread and
+/// not yet decoded, kept as monotonic counters on both sides (atomics only:
+/// the network thread adds when it queues a batch, the decode thread adds
+/// when it has rendered one), so neither side ever waits for the other.
+#[derive(Default)]
+pub struct DecodeQueue {
+    /// Set by the decode loop that keeps `frames_decoded`/`bytes_decoded`.
+    /// Until it is, nothing may be held for decode progress (a decode loop
+    /// that never reports would otherwise look permanently behind).
+    tracked: AtomicBool,
+    frames_queued: AtomicU64,
+    frames_decoded: AtomicU64,
+    bytes_queued: AtomicU64,
+    bytes_decoded: AtomicU64,
+    /// The network thread holds frame acks until decode catches up; the
+    /// decode thread wakes it when this is set.
+    acks_held: AtomicBool,
+}
+
+impl DecodeQueue {
+    /// Zero the counters for a new connection. Called by the network thread
+    /// before it queues anything, while the decode thread is idle.
+    pub fn reset(&self) {
+        self.frames_queued.store(0, Ordering::Relaxed);
+        self.frames_decoded.store(0, Ordering::Relaxed);
+        self.bytes_queued.store(0, Ordering::Relaxed);
+        self.bytes_decoded.store(0, Ordering::Relaxed);
+        self.acks_held.store(false, Ordering::Relaxed);
+    }
+
+    pub fn set_tracked(&self, on: bool) {
+        self.tracked.store(on, Ordering::Release);
+    }
+
+    pub fn tracked(&self) -> bool {
+        self.tracked.load(Ordering::Acquire)
+    }
+
+    /// The network thread queued `frames` complete frames, `bytes` of payload.
+    pub fn queued(&self, frames: u64, bytes: u64) {
+        self.frames_queued.fetch_add(frames, Ordering::Relaxed);
+        self.bytes_queued.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The decode thread finished `frames` frames, `bytes` of payload.
+    /// Returns true when the network thread is holding acks for it.
+    ///
+    /// SeqCst here and in [`set_acks_held`](Self::set_acks_held) /
+    /// [`frames_in_flight`](Self::frames_in_flight): the network thread sets the
+    /// flag and then re-reads progress, the decode thread adds progress and then
+    /// reads the flag, so at least one of them sees the other and a held ack
+    /// is never left waiting for a wake that does not come.
+    pub fn decoded(&self, frames: u64, bytes: u64) -> bool {
+        self.bytes_decoded.fetch_add(bytes, Ordering::Relaxed);
+        self.frames_decoded.fetch_add(frames, Ordering::SeqCst);
+        self.acks_held.load(Ordering::SeqCst)
+    }
+
+    /// Frames queued and not yet decoded.
+    pub fn frames_in_flight(&self) -> u64 {
+        let done = self.frames_decoded.load(Ordering::SeqCst);
+        self.frames_queued.load(Ordering::Relaxed).saturating_sub(done)
+    }
+
+    /// Payload bytes queued and not yet decoded.
+    pub fn bytes_in_flight(&self) -> u64 {
+        let done = self.bytes_decoded.load(Ordering::Relaxed);
+        self.bytes_queued.load(Ordering::Relaxed).saturating_sub(done)
+    }
+
+    pub fn set_acks_held(&self, held: bool) {
+        self.acks_held.store(held, Ordering::SeqCst);
+    }
 }
 
 impl Metrics {
@@ -66,6 +148,12 @@ impl Metrics {
 
     pub fn record_rtt_us(&self, us: u64) {
         self.rtt_us.lock().unwrap().push(us);
+    }
+
+    /// Frames waiting for the decode thread when a frame ack was due; the
+    /// window keeps the peak.
+    pub fn record_decode_backlog(&self, frames: u64) {
+        self.decode_backlog_peak.fetch_max(frames, Ordering::Relaxed);
     }
 
     pub fn record_blit(&self, _bytes: u64) {
@@ -109,6 +197,7 @@ impl Metrics {
             rtt_p99: percentile(&rtt, 0.99),
             network_rx_bytes: self.network_bytes_rx.swap(0, Ordering::Relaxed),
             network_tx_bytes: self.network_bytes_tx.swap(0, Ordering::Relaxed),
+            decode_backlog_peak: self.decode_backlog_peak.swap(0, Ordering::Relaxed),
         }
     }
 }
@@ -135,6 +224,8 @@ pub struct MetricsReport {
     pub rtt_p99: u64,
     pub network_rx_bytes: u64,
     pub network_tx_bytes: u64,
+    /// Peak frames waiting for the decode thread (0 while decode keeps up).
+    pub decode_backlog_peak: u64,
 }
 
 impl MetricsReport {
@@ -159,7 +250,7 @@ impl MetricsReport {
             0.0
         };
         format!(
-            "metrics: host_fps={host_fps:.1} shown_fps={shown_fps:.1} fps={fps:.1} dec={}/{}/{}us present={}/{}/{}us interval={}/{}us blits={} allocs={}/{}MB gpu={}/{}us rtt={}/{}us net={}/{}MB",
+            "metrics: host_fps={host_fps:.1} shown_fps={shown_fps:.1} fps={fps:.1} dec={}/{}/{}us present={}/{}/{}us interval={}/{}us backlog={} blits={} allocs={}/{}MB gpu={}/{}us rtt={}/{}us net={}/{}MB",
             self.decode_p50,
             self.decode_p99,
             self.decode_p999,
@@ -168,6 +259,7 @@ impl MetricsReport {
             self.present_p999,
             self.frame_interval_p50,
             self.frame_interval_p99,
+            self.decode_backlog_peak,
             self.blits_submitted,
             self.allocations,
             self.bytes_allocated / 1_000_000,

@@ -7,6 +7,7 @@
 EXTERN_C const GUID GUID_DEVINTERFACE_RDPIO_DISPLAY = { 0x6d3b1a7e, 0x2c41, 0x4f0e, { 0x9a, 0x51, 0x3e, 0x8b, 0x7c, 0x21, 0x5d, 0x94 } };
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cwchar>
 #include <sddl.h>
@@ -26,6 +27,133 @@ static void Log(const wchar_t* Format, ...)
     OutputDebugStringW(L"rdpio-display: ");
     OutputDebugStringW(Line);
     OutputDebugStringW(L"\n");
+}
+
+// SYSTEM, Administrators, and us (the driver host's account).
+static const wchar_t* kShareSddl = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)";
+
+struct ShareSecurity
+{
+    SECURITY_ATTRIBUTES Sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE };
+    ShareSecurity()
+    {
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(kShareSddl, SDDL_REVISION_1, &Sa.lpSecurityDescriptor, nullptr))
+            Sa.lpSecurityDescriptor = nullptr;
+    }
+    ~ShareSecurity()
+    {
+        if (Sa.lpSecurityDescriptor)
+            LocalFree(Sa.lpSecurityDescriptor);
+    }
+    SECURITY_ATTRIBUTES* Get() { return Sa.lpSecurityDescriptor ? &Sa : nullptr; }
+};
+
+// The flight recorder. Set once, before any callback, and never unmapped:
+// it lives as long as the driver host.
+static RDPIO_TRACE* g_Trace = nullptr;
+
+void rdpio::TraceOpen() noexcept
+{
+    if (g_Trace)
+        return;
+    ShareSecurity Security;
+    if (!Security.Get())
+        return;
+    HANDLE Section = CreateFileMappingW(INVALID_HANDLE_VALUE, Security.Get(), PAGE_READWRITE, 0, sizeof(RDPIO_TRACE),
+        L"Global\\rdpio-display-trace");
+    if (!Section)
+    {
+        Log(L"no trace section (%u)", GetLastError());
+        return;
+    }
+    auto* View = (RDPIO_TRACE*)MapViewOfFile(Section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(RDPIO_TRACE));
+    if (!View)
+    {
+        Log(L"no trace view (%u)", GetLastError());
+        CloseHandle(Section);
+        return;
+    }
+    // (The section handle stays open with the view, for the host's life.)
+    // An agent may still hold the last host's section: start it over.
+    const UINT32 Boot = (View->Version == RDPIO_TRACE_VERSION) ? View->Boot + 1 : 1;
+    memset(View, 0, sizeof(RDPIO_TRACE));
+    View->Boot = Boot;
+    View->ProcessId = GetCurrentProcessId();
+    MemoryBarrier();
+    View->Version = RDPIO_TRACE_VERSION;
+    g_Trace = View;
+    TraceEvent(RDPIO_TRACE_HOST_START, Boot);
+}
+
+void rdpio::TraceEvent(UINT32 Code, UINT32 Arg) noexcept
+{
+    if (!g_Trace)
+        return;
+    const LONG n = InterlockedIncrement(&g_Trace->Next) - 1;
+    RDPIO_TRACE_EVENT& E = g_Trace->Ring[(ULONG)n % RDPIO_TRACE_RING];
+    E.TickMs = GetTickCount64();
+    E.Arg = Arg;
+    E.Code = Code;
+}
+
+TraceCall::TraceCall(UINT32 Slot, UINT32 Code, UINT32 Arg) noexcept : m_Slot(Slot), m_Code((LONG)Code)
+{
+    if (!g_Trace || Slot >= RDPIO_TRACE_SLOTS)
+        return;
+    RDPIO_TRACE_CALL& C = g_Trace->InCall[Slot];
+    m_SavedCode = C.Code;
+    m_SavedArg = C.Arg;
+    m_SavedStart = C.StartMs;
+    C.StartMs = GetTickCount64();
+    C.Arg = Arg;
+    InterlockedExchange(&C.Code, m_Code);
+}
+
+TraceCall::~TraceCall()
+{
+    if (!g_Trace || m_Slot >= RDPIO_TRACE_SLOTS)
+        return;
+    RDPIO_TRACE_CALL& C = g_Trace->InCall[m_Slot];
+    // (Another thread of the same kind may have taken the slot meanwhile:
+    // then it's theirs.)
+    if (C.Code != m_Code)
+        return;
+    C.StartMs = m_SavedStart;
+    C.Arg = m_SavedArg;
+    InterlockedExchange(&C.Code, m_SavedCode);
+}
+
+DWORD rdpio::DeviceBackoffMs(UINT32 Failures) noexcept
+{
+    static const DWORD Steps[] = { 0, 100, 250, 500, 1000 };
+    if (Failures == 0)
+        return 0;
+    return Steps[std::min<UINT32>(Failures - 1, (UINT32)ARRAYSIZE(Steps) - 1)];
+}
+
+bool rdpio::ConsumerGone(UINT32 ConsumerTick, UINT32 NowTick) noexcept
+{
+    // 8 ticks of 250 ms: the agent writes about every 250 ms while it reads,
+    // and looks at least every 100 ms even on a still screen. (A tick a
+    // little ahead of ours, written just after we looked, is fresh.)
+    return ConsumerTick != 0 && (INT32)(NowTick - ConsumerTick) > 8;
+}
+
+// Each callback runs inside this: a C++ exception (an allocation failing)
+// must not leave it, which would end the driver host.
+template <typename F>
+static NTSTATUS Guarded(UINT32 Code, F&& Body) noexcept
+{
+    try
+    {
+        return Body();
+    }
+    catch (...)
+    {
+        TraceEvent(RDPIO_TRACE_EXCEPTION, Code);
+        Log(L"exception in call %u", Code);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 }
 
 static void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, DWORD Width, DWORD Height, DWORD VSync, bool bMonitorMode)
@@ -190,7 +318,12 @@ struct DeviceContextWrapper
     DeviceContext* pContext;
     void Cleanup()
     {
-        delete pContext;
+        // Bounded: a watchdog thread stuck in a call to Windows keeps its
+        // context, which is then never freed (the host is going anyway).
+        if (pContext && pContext->StopWatchdog(2000))
+            delete pContext;
+        else if (pContext)
+            Log(L"the watchdog thread didn't end; its context is left behind");
         pContext = nullptr;
     }
 };
@@ -234,14 +367,25 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pR
     WDF_OBJECT_ATTRIBUTES Attributes;
     WDF_OBJECT_ATTRIBUTES_INIT(&Attributes);
     WDF_DRIVER_CONFIG_INIT(&Config, RdpioDeviceAdd);
+    TraceOpen();
     return WdfDriverCreate(pDriverObject, pRegistryPath, &Attributes, &Config, WDF_NO_HANDLE);
 }
+
+static NTSTATUS DeviceAdd(PWDFDEVICE_INIT pDeviceInit);
 
 _Use_decl_annotations_
 NTSTATUS RdpioDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
 {
     UNREFERENCED_PARAMETER(Driver);
+    TraceCall Call(RDPIO_TRACE_SLOT_CALLBACK, RDPIO_TRACE_DEVICE_ADD);
+    const NTSTATUS Status = Guarded(RDPIO_TRACE_DEVICE_ADD, [&] { return DeviceAdd(pDeviceInit); });
+    if (!NT_SUCCESS(Status))
+        TraceEvent(RDPIO_TRACE_DEVICE_ADD, (UINT32)Status);
+    return Status;
+}
 
+static NTSTATUS DeviceAdd(PWDFDEVICE_INIT pDeviceInit)
+{
     WDF_PNPPOWER_EVENT_CALLBACKS PnpPowerCallbacks;
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&PnpPowerCallbacks);
     PnpPowerCallbacks.EvtDeviceD0Entry = RdpioDeviceD0Entry;
@@ -298,9 +442,13 @@ _Use_decl_annotations_
 NTSTATUS RdpioDeviceD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
 {
     UNREFERENCED_PARAMETER(PreviousState);
-    auto* pContext = WdfObjectGet_DeviceContextWrapper(Device);
-    pContext->pContext->InitAdapter();
-    return STATUS_SUCCESS;
+    TraceCall Call(RDPIO_TRACE_SLOT_CALLBACK, RDPIO_TRACE_D0_ENTRY);
+    return Guarded(RDPIO_TRACE_D0_ENTRY, [&] {
+        auto* pContext = WdfObjectGet_DeviceContextWrapper(Device);
+        if (pContext && pContext->pContext)
+            pContext->pContext->InitAdapter();
+        return STATUS_SUCCESS;
+    });
 }
 
 #pragma endregion
@@ -319,86 +467,234 @@ HRESULT Direct3DDevice::Init()
         D3D11_SDK_VERSION, &Device, nullptr, &DeviceContext);
 }
 
-SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, IDDCX_MONITOR Monitor, std::shared_ptr<Direct3DDevice> Device,
-    std::shared_ptr<FrameShare> Share, LUID RenderAdapter, HANDLE NewFrameEvent)
-    : m_hSwapChain(hSwapChain), m_Monitor(Monitor), m_Device(std::move(Device)), m_Share(std::move(Share)),
-      m_RenderAdapter(RenderAdapter), m_hAvailableBufferEvent(NewFrameEvent)
+// How long an OS callback waits for a swap-chain thread to end. Far inside
+// IddCx's 10 s limit on every call into the driver.
+static const DWORD kStopWaitMs = 2000;
+
+std::shared_ptr<SwapChainProcessor> SwapChainProcessor::Start(IDDCX_SWAPCHAIN hSwapChain, IDDCX_MONITOR Monitor,
+    std::shared_ptr<FrameShare> Share, UINT32 Epoch, LUID RenderAdapter, HANDLE NewFrameEvent)
 {
-    m_hTerminateEvent.Attach(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+    const UINT32 Id = Share->Id();
+    std::shared_ptr<SwapChainProcessor> Me;
+    std::shared_ptr<SwapChainProcessor>* ForThread = nullptr;
+    try
+    {
+        Me.reset(new SwapChainProcessor(hSwapChain, Monitor, std::move(Share), Epoch, RenderAdapter, NewFrameEvent));
+        ForThread = new std::shared_ptr<SwapChainProcessor>(Me);
+    }
+    catch (...)
+    {
+        TraceEvent(RDPIO_TRACE_EXCEPTION, RDPIO_TRACE_ASSIGN_SWAPCHAIN);
+    }
+    if (ForThread && Me->m_hTerminateEvent.IsValid() && Me->m_hCursorEvent.IsValid())
+    {
+        // Keeps the handle valid for the thread even if IddCx deletes the
+        // swap-chain (with its monitor) while the thread is still in a call.
+        WdfObjectReferenceWithTag((WDFOBJECT)hSwapChain, (PVOID)Me.get());
+        Me->m_hThread.Attach(CreateThread(nullptr, 0, RunThread, ForThread, 0, nullptr));
+        if (Me->m_hThread.IsValid())
+            return Me;
+        WdfObjectDereferenceWithTag((WDFOBJECT)hSwapChain, (PVOID)Me.get());
+    }
+    Log(L"monitor %u: couldn't start a swap-chain thread (%u)", Id, GetLastError());
+    TraceEvent(RDPIO_TRACE_ASSIGN_SWAPCHAIN, (UINT32)E_OUTOFMEMORY);
+    delete ForThread;
+    // The OS makes a new swap-chain and tries again.
+    WdfObjectDelete((WDFOBJECT)hSwapChain);
+    return nullptr;
+}
+
+SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, IDDCX_MONITOR Monitor, std::shared_ptr<FrameShare> Share,
+    UINT32 Epoch, LUID RenderAdapter, HANDLE NewFrameEvent)
+    : m_hSwapChain(hSwapChain), m_Monitor(Monitor), m_Share(std::move(Share)), m_Epoch(Epoch), m_RenderAdapter(RenderAdapter),
+      m_hAvailableBufferEvent(NewFrameEvent)
+{
+    // Manual reset: every wait on the thread sees it.
+    m_hTerminateEvent.Attach(CreateEventW(nullptr, TRUE, FALSE, nullptr));
     m_hCursorEvent.Attach(CreateEventW(nullptr, FALSE, FALSE, nullptr));
-    m_hThread.Attach(CreateThread(nullptr, 0, RunThread, this, 0, nullptr));
 }
 
 SwapChainProcessor::~SwapChainProcessor()
 {
+    // Nothing to wait for: the thread holds a reference, so this runs once
+    // it has ended (or never started).
+}
+
+bool SwapChainProcessor::Stop(DWORD Ms)
+{
+    LONG Expected = Running;
+    m_State.compare_exchange_strong(Expected, StopAsked);
     SetEvent(m_hTerminateEvent.Get());
-    if (m_hThread.Get())
-        WaitForSingleObject(m_hThread.Get(), INFINITE);
+    if (!m_hThread.IsValid())
+        return true;
+    {
+        TraceCall Call(RDPIO_TRACE_SLOT_SWAPCHAIN, RDPIO_TRACE_STOP_THREAD, m_Share->Id());
+        if (WaitForSingleObject(m_hThread.Get(), Ms) == WAIT_OBJECT_0)
+            return true;
+    }
+    Expected = StopAsked;
+    if (m_State.compare_exchange_strong(Expected, Detached))
+        TraceEvent(RDPIO_TRACE_DETACHED, m_Share->Id());
+    // (Else it was just ending, and deletes its swap-chain itself.)
+    return false;
 }
 
 DWORD CALLBACK SwapChainProcessor::RunThread(LPVOID Argument)
 {
-    reinterpret_cast<SwapChainProcessor*>(Argument)->Run();
+    // The thread's own reference: the processor lives until this returns.
+    std::unique_ptr<std::shared_ptr<SwapChainProcessor>> Me(static_cast<std::shared_ptr<SwapChainProcessor>*>(Argument));
+    (*Me)->Run();
     return 0;
 }
 
 void SwapChainProcessor::Run()
 {
+    const UINT32 Id = m_Share->Id();
     // Frames are what the stream is made of: this thread gets the scheduling
     // a game's present thread would.
     DWORD AvTask = 0;
     HANDLE AvTaskHandle = AvSetMmThreadCharacteristicsW(L"Games", &AvTask);
     if (AvTaskHandle)
         AvSetMmThreadPriority(AvTaskHandle, AVRT_PRIORITY_HIGH);
-    RunCore();
-    // Deleting the swap-chain makes the OS hand over a new one if needed.
-    WdfObjectDelete((WDFOBJECT)m_hSwapChain);
+    Direct3DDevice Device(m_RenderAdapter);
+    bool DeviceFailed = false;
+    try
+    {
+        // Made here rather than in the OS's AssignSwapChain call: on a GPU
+        // that's resetting or being updated this can take long, and nothing
+        // waits on this thread but the bounded Stop.
+        HRESULT hr;
+        {
+            TraceCall Call(RDPIO_TRACE_SLOT_FRAMES, RDPIO_TRACE_D3D_INIT, Id);
+            hr = Device.Init();
+        }
+        if (FAILED(hr))
+        {
+            Log(L"monitor %u: no D3D device on the render adapter (0x%08x)", Id, hr);
+            TraceEvent(RDPIO_TRACE_D3D_INIT, (UINT32)hr);
+            DeviceFailed = true;
+        }
+        else if (!Stopping())
+        {
+            DeviceFailed = RunCore(Device);
+        }
+    }
+    catch (...)
+    {
+        TraceEvent(RDPIO_TRACE_EXCEPTION, RDPIO_TRACE_ACQUIRE_BUFFER);
+        Log(L"monitor %u: exception on the swap-chain thread", Id);
+    }
+    // A device that keeps failing (a GPU resetting): wait a little before the
+    // OS hands over the next swap-chain, so the two of us don't spin.
+    if (DeviceFailed && !Stopping())
+    {
+        const DWORD Ms = m_Share->NoteDeviceFailure();
+        if (Ms)
+        {
+            TraceEvent(RDPIO_TRACE_BACKOFF, Ms);
+            WaitForSingleObject(m_hTerminateEvent.Get(), Ms);
+        }
+    }
+    // Deleting the swap-chain makes the OS hand over a new one if needed. A
+    // thread Stop gave up on leaves it to IddCx: by now its monitor may be
+    // gone, and the swap-chain with it.
+    if (m_State.exchange(Ended) != Detached)
+    {
+        TraceCall Call(RDPIO_TRACE_SLOT_FRAMES, RDPIO_TRACE_DELETE_SWAPCHAIN, Id);
+        WdfObjectDelete((WDFOBJECT)m_hSwapChain);
+    }
+    WdfObjectDereferenceWithTag((WDFOBJECT)m_hSwapChain, (PVOID)this);
     m_hSwapChain = nullptr;
     if (AvTaskHandle)
         AvRevertMmThreadCharacteristics(AvTaskHandle);
 }
 
-void SwapChainProcessor::RunCore()
+bool SwapChainProcessor::RunCore(Direct3DDevice& Device)
 {
+    const UINT32 Id = m_Share->Id();
     ComPtr<IDXGIDevice> DxgiDevice;
-    HRESULT hr = m_Device->Device.As(&DxgiDevice);
+    HRESULT hr = Device.Device.As(&DxgiDevice);
     if (FAILED(hr))
-        return;
+    {
+        TraceEvent(RDPIO_TRACE_SET_DEVICE, (UINT32)hr);
+        return true;
+    }
     IDARG_IN_SWAPCHAINSETDEVICE SetDevice = {};
     SetDevice.pDevice = DxgiDevice.Get();
-    hr = IddCxSwapChainSetDevice(m_hSwapChain, &SetDevice);
+    {
+        TraceCall Call(RDPIO_TRACE_SLOT_FRAMES, RDPIO_TRACE_SET_DEVICE, Id);
+        hr = IddCxSwapChainSetDevice(m_hSwapChain, &SetDevice);
+    }
+    if (Stopping())
+        return false;
     if (FAILED(hr))
-        return;
+    {
+        Log(L"monitor %u: the swap-chain didn't take the device (0x%08x)", Id, hr);
+        TraceEvent(RDPIO_TRACE_SET_DEVICE, (UINT32)hr);
+        return true;
+    }
     SetupCursor();
 
+    FrameRing Ring(m_Share, m_Epoch);
     bool First = true;
+    bool DeviceWorks = false;
+    bool Throttled = false;
     UINT LastFrameNumber = 0;
+    // The wait for a frame. Frames, the pointer and a stop each have their
+    // own event, so the timeout is only a safety net: on a still screen it
+    // grows to 250 ms instead of waking 60 times a second.
+    DWORD IdleWait = 16;
+    UINT IdleTimeouts = 0;
     for (;;)
     {
+        if (Stopping())
+            return false;
         if (m_HardwareCursor && WaitForSingleObject(m_hCursorEvent.Get(), 0) == WAIT_OBJECT_0)
             QueryCursor();
 
         ComPtr<IDXGIResource> AcquiredBuffer;
         IDARG_OUT_RELEASEANDACQUIREBUFFER Buffer = {};
-        hr = IddCxSwapChainReleaseAndAcquireBuffer(m_hSwapChain, &Buffer);
+        {
+            TraceCall Call(RDPIO_TRACE_SLOT_FRAMES, RDPIO_TRACE_ACQUIRE_BUFFER, Id);
+            hr = IddCxSwapChainReleaseAndAcquireBuffer(m_hSwapChain, &Buffer);
+        }
+        if (SUCCEEDED(hr))
+            AcquiredBuffer.Attach(Buffer.MetaData.pSurface);
+        if (Stopping())
+            return false;
         if (hr == E_PENDING)
         {
             HANDLE WaitHandles[] = { m_hAvailableBufferEvent, m_hTerminateEvent.Get(), m_hCursorEvent.Get() };
-            DWORD WaitResult = WaitForMultipleObjects(ARRAYSIZE(WaitHandles), WaitHandles, FALSE, 16);
+            const DWORD WaitResult = WaitForMultipleObjects(ARRAYSIZE(WaitHandles), WaitHandles, FALSE, IdleWait);
+            if (WaitResult == WAIT_TIMEOUT)
+            {
+                if (++IdleTimeouts > 4)
+                    IdleWait = std::min<DWORD>(IdleWait * 2, 250);
+                continue;
+            }
+            IdleTimeouts = 0;
+            IdleWait = 16;
             if (WaitResult == WAIT_OBJECT_0 + 2)
             {
                 if (m_HardwareCursor)
                     QueryCursor();
                 continue;
             }
-            if (WaitResult == WAIT_OBJECT_0 || WaitResult == WAIT_TIMEOUT)
+            if (WaitResult == WAIT_OBJECT_0)
                 continue;
-            break; // terminate (or a failed wait)
+            if (WaitResult != WAIT_OBJECT_0 + 1)
+                TraceEvent(RDPIO_TRACE_ACQUIRE_BUFFER, GetLastError());
+            return false; // stopped (or a failed wait)
         }
         if (FAILED(hr))
-            break; // the swap-chain was abandoned (e.g. a mode change)
+        {
+            // The swap-chain was abandoned (e.g. a mode change).
+            TraceEvent(RDPIO_TRACE_ACQUIRE_BUFFER, (UINT32)hr);
+            return false;
+        }
+        IdleTimeouts = 0;
+        IdleWait = 16;
 
-        AcquiredBuffer.Attach(Buffer.MetaData.pSurface);
         const auto& Meta = Buffer.MetaData;
         // A repeat of the last picture (no dirty rects, same number) needs no
         // copy; a protected one can't be copied.
@@ -406,21 +702,76 @@ void SwapChainProcessor::RunCore()
             Meta.MoveRegionCount == 0;
         if (!Repeat && !Meta.HwProtectedSurface)
         {
-            ComPtr<ID3D11Texture2D> Surface;
-            if (SUCCEEDED(AcquiredBuffer.As(&Surface)))
+            // A device the GPU removed never recovers: give the swap-chain
+            // up, and the next one gets a new device.
+            const HRESULT Removed = Device.Device->GetDeviceRemovedReason();
+            if (Removed != S_OK)
             {
+                Log(L"monitor %u: the D3D device was removed (0x%08x)", Id, Removed);
+                TraceEvent(RDPIO_TRACE_DEVICE_REMOVED, (UINT32)Removed);
+                return true;
+            }
+            ComPtr<ID3D11Texture2D> Surface;
+            hr = AcquiredBuffer.As(&Surface);
+            if (SUCCEEDED(hr))
+            {
+                if (!DeviceWorks)
+                {
+                    DeviceWorks = true;
+                    m_Share->NoteFrame();
+                }
                 // Queued on the GPU: the copy is done before the OS reuses the
                 // surface, and composition never waits on us.
-                m_Share->Publish(m_Device->Device.Get(), m_Device->DeviceContext.Get(), Surface.Get(), Meta.PresentDisplayQPCTime,
-                    m_RenderAdapter);
+                TraceCall Call(RDPIO_TRACE_SLOT_FRAMES, RDPIO_TRACE_PUBLISH, Id);
+                Ring.Publish(Device.Device.Get(), Device.DeviceContext.Get(), Surface.Get(), Meta.PresentDisplayQPCTime, m_RenderAdapter);
+            }
+            else
+            {
+                TraceEvent(RDPIO_TRACE_PUBLISH, (UINT32)hr);
             }
         }
         First = false;
         LastFrameNumber = Meta.PresentationFrameNumber;
+        // The copy can stall with the GPU long enough for Stop to give up on
+        // this thread; a detached thread makes no further IddCx call, as the
+        // swap-chain may be unassigned or deleted by now.
+        if (Stopping())
+            return false;
         AcquiredBuffer.Reset();
-        hr = IddCxSwapChainFinishedProcessingFrame(m_hSwapChain);
+        {
+            TraceCall Call(RDPIO_TRACE_SLOT_FRAMES, RDPIO_TRACE_FINISHED_FRAME, Id);
+            hr = IddCxSwapChainFinishedProcessingFrame(m_hSwapChain);
+        }
+        if (Stopping())
+            return false;
         if (FAILED(hr))
-            break;
+        {
+            TraceEvent(RDPIO_TRACE_FINISHED_FRAME, (UINT32)hr);
+            return false;
+        }
+
+        // Nobody reads the frames (an agent that says so through
+        // ConsumerTick stopped): take them off the swap-chain at about two a
+        // second until it's back, each still copied, so the newest picture
+        // is there the moment it looks again. Back to full rate within 50 ms.
+        if (m_Share->NoReader())
+        {
+            if (!Throttled)
+            {
+                Throttled = true;
+                TraceEvent(RDPIO_TRACE_NO_READER, 1);
+            }
+            for (int Slice = 0; Slice < 10 && m_Share->NoReader(); Slice++)
+            {
+                if (WaitForSingleObject(m_hTerminateEvent.Get(), 50) != WAIT_TIMEOUT)
+                    break;
+            }
+        }
+        else if (Throttled)
+        {
+            Throttled = false;
+            TraceEvent(RDPIO_TRACE_NO_READER, 0);
+        }
     }
 }
 
@@ -435,13 +786,22 @@ void SwapChainProcessor::SetupCursor()
     Cursor.CursorInfo.MaxX = RDPIO_CURSOR_MAX;
     Cursor.CursorInfo.MaxY = RDPIO_CURSOR_MAX;
     Cursor.hNewCursorDataAvailable = m_hCursorEvent.Get();
-    const NTSTATUS Status = IddCxMonitorSetupHardwareCursor(m_Monitor, &Cursor);
+    NTSTATUS Status;
+    {
+        TraceCall Call(RDPIO_TRACE_SLOT_FRAMES, RDPIO_TRACE_SETUP_CURSOR, m_Share->Id());
+        Status = IddCxMonitorSetupHardwareCursor(m_Monitor, &Cursor);
+    }
+    if (Stopping())
+        return;
     m_HardwareCursor = NT_SUCCESS(Status);
     if (!m_HardwareCursor)
+    {
         Log(L"no hardware cursor (0x%08x): the pointer stays in the frames", Status);
+        TraceEvent(RDPIO_TRACE_SETUP_CURSOR, (UINT32)Status);
+    }
     m_CursorShape.assign(RDPIO_CURSOR_MAX * RDPIO_CURSOR_MAX * 4, 0);
     m_LastShapeId = 0;
-    m_Share->SetHardwareCursor(m_HardwareCursor);
+    m_Share->SetHardwareCursor(m_Epoch, m_HardwareCursor);
     if (m_HardwareCursor)
         QueryCursor();
 }
@@ -453,12 +813,26 @@ void SwapChainProcessor::QueryCursor()
     In.ShapeBufferSizeInBytes = (UINT)m_CursorShape.size();
     In.pShapeBuffer = m_CursorShape.data();
     IDARG_OUT_QUERY_HWCURSOR Out = {};
-    if (!NT_SUCCESS(IddCxMonitorQueryHardwareCursor(m_Monitor, &In, &Out)))
+    NTSTATUS Status;
+    {
+        TraceCall Call(RDPIO_TRACE_SLOT_FRAMES, RDPIO_TRACE_QUERY_CURSOR, m_Share->Id());
+        Status = IddCxMonitorQueryHardwareCursor(m_Monitor, &In, &Out);
+    }
+    if (Stopping())
         return;
+    if (!NT_SUCCESS(Status))
+    {
+        // (Once per kind of failure: the pointer moves often.)
+        if (Status != m_CursorFailure)
+            TraceEvent(RDPIO_TRACE_QUERY_CURSOR, (UINT32)Status);
+        m_CursorFailure = Status;
+        return;
+    }
+    m_CursorFailure = 0;
     const bool Updated = Out.IsCursorShapeUpdated && Out.CursorShapeInfo.Width && Out.CursorShapeInfo.Height;
     if (Out.IsCursorShapeUpdated)
         m_LastShapeId = Out.CursorShapeInfo.ShapeId;
-    m_Share->PublishCursor(Out.IsCursorVisible != FALSE, Updated ? &Out.CursorShapeInfo : nullptr, m_CursorShape.data());
+    m_Share->PublishCursor(m_Epoch, Out.IsCursorVisible != FALSE, Updated ? &Out.CursorShapeInfo : nullptr, m_CursorShape.data());
 }
 
 #pragma endregion
@@ -467,51 +841,36 @@ void SwapChainProcessor::QueryCursor()
 
 MonitorContext::~MonitorContext()
 {
-    m_ProcessingThread.reset();
+    StopProcessor();
+}
+
+void MonitorContext::StopProcessor() noexcept
+{
+    if (!m_Processor)
+        return;
+    if (!m_Processor->Stop(kStopWaitMs))
+        Log(L"monitor %u: its swap-chain thread is stuck in a call to Windows; it ends by itself", m_Id);
+    m_Processor.reset();
 }
 
 void MonitorContext::AssignSwapChain(IDDCX_SWAPCHAIN SwapChain, LUID RenderAdapter, HANDLE NewFrameEvent)
 {
-    m_ProcessingThread.reset();
-    m_Share->Reset();
-    auto Device = std::make_shared<Direct3DDevice>(RenderAdapter);
-    if (FAILED(Device->Init()))
-    {
-        // The OS makes a new swap-chain and tries again.
-        WdfObjectDelete(SwapChain);
-        return;
-    }
-    m_ProcessingThread.reset(new SwapChainProcessor(SwapChain, m_Monitor, Device, m_Share, RenderAdapter, NewFrameEvent));
+    StopProcessor();
+    const UINT32 Epoch = m_Share->Reset();
+    // Only starts the thread: it makes the D3D device itself, and this call
+    // returns at once whatever the GPU is doing.
+    m_Processor = SwapChainProcessor::Start(SwapChain, m_Monitor, m_Share, Epoch, RenderAdapter, NewFrameEvent);
 }
 
 void MonitorContext::UnassignSwapChain()
 {
-    m_ProcessingThread.reset();
+    StopProcessor();
     m_Share->Reset();
 }
 
 #pragma endregion
 
 #pragma region FrameShare
-
-// SYSTEM, Administrators, and us (the driver host's account).
-static const wchar_t* kShareSddl = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)";
-
-struct ShareSecurity
-{
-    SECURITY_ATTRIBUTES Sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE };
-    ShareSecurity()
-    {
-        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(kShareSddl, SDDL_REVISION_1, &Sa.lpSecurityDescriptor, nullptr))
-            Sa.lpSecurityDescriptor = nullptr;
-    }
-    ~ShareSecurity()
-    {
-        if (Sa.lpSecurityDescriptor)
-            LocalFree(Sa.lpSecurityDescriptor);
-    }
-    SECURITY_ATTRIBUTES* Get() { return Sa.lpSecurityDescriptor ? &Sa : nullptr; }
-};
 
 FrameShare::FrameShare(UINT32 MonitorId) : m_Id(MonitorId)
 {
@@ -544,7 +903,6 @@ FrameShare::FrameShare(UINT32 MonitorId) : m_Id(MonitorId)
 
 FrameShare::~FrameShare()
 {
-    ReleaseTextures();
     if (m_View)
         UnmapViewOfFile(m_View);
     if (m_Section)
@@ -553,7 +911,85 @@ FrameShare::~FrameShare()
         CloseHandle(m_Ready);
 }
 
-void FrameShare::ReleaseTextures()
+bool FrameShare::BeginWrite(UINT32 Epoch)
+{
+    if (!m_View || Epoch != m_Epoch.load())
+        return false;
+    // Held only for memory writes, so a short wait is enough. Bounded all
+    // the same: a frame thread skips the write, which only drops a frame.
+    for (int Try = 0; Try < 20000; Try++)
+    {
+        LONG Free = 0;
+        if (m_Writing.compare_exchange_weak(Free, 1, std::memory_order_acquire))
+        {
+            if (Epoch == m_Epoch.load())
+                return true;
+            EndWrite();
+            return false;
+        }
+        if (Try < 1000)
+            YieldProcessor();
+        else
+            SwitchToThread();
+    }
+    return false;
+}
+
+UINT32 FrameShare::Reset()
+{
+    const UINT32 Epoch = ++m_Epoch;
+    if (BeginWrite(Epoch))
+    {
+        InterlockedIncrement(&m_View->FrameLock);
+        m_View->Generation = 0;
+        m_View->Slot = RDPIO_FRAMES_NO_SLOT;
+        InterlockedIncrement(&m_View->FrameLock);
+        EndWrite();
+    }
+    return Epoch;
+}
+
+bool FrameShare::Announce(UINT32 Epoch, UINT32 Generation, const D3D11_TEXTURE2D_DESC& Desc, LUID Adapter)
+{
+    if (!BeginWrite(Epoch))
+        return false;
+    InterlockedIncrement(&m_View->FrameLock);
+    m_View->Generation = Generation;
+    m_View->Width = Desc.Width;
+    m_View->Height = Desc.Height;
+    m_View->Format = Desc.Format;
+    m_View->Adapter = Adapter;
+    m_View->Slot = RDPIO_FRAMES_NO_SLOT;
+    InterlockedIncrement(&m_View->FrameLock);
+    EndWrite();
+    return true;
+}
+
+UINT32 FrameShare::NewestSlot() const
+{
+    return m_View ? m_View->Slot : RDPIO_FRAMES_NO_SLOT;
+}
+
+bool FrameShare::Publish(UINT32 Epoch, UINT32 Slot, UINT64 PresentQpc)
+{
+    if (!BeginWrite(Epoch))
+        return false;
+    InterlockedIncrement(&m_View->FrameLock);
+    m_View->Slot = Slot;
+    m_View->FrameNumber++;
+    m_View->PresentQpc = PresentQpc;
+    InterlockedIncrement(&m_View->FrameLock);
+    EndWrite();
+    SetEvent(m_Ready);
+    return true;
+}
+
+bool FrameShare::NoReader() const
+{
+    return m_View && ConsumerGone(m_View->ConsumerTick, (UINT32)(GetTickCount64() / 250));
+}
+
+void FrameRing::Release()
 {
     for (auto& S : m_Slots)
     {
@@ -564,20 +1000,10 @@ void FrameShare::ReleaseTextures()
     m_TexturesDevice = nullptr;
 }
 
-void FrameShare::Reset()
+bool FrameRing::MakeTextures(ID3D11Device* Device, const D3D11_TEXTURE2D_DESC& Like, LUID Adapter)
 {
-    ReleaseTextures();
-    if (!m_View)
-        return;
-    InterlockedIncrement(&m_View->FrameLock);
-    m_View->Generation = 0;
-    m_View->Slot = RDPIO_FRAMES_NO_SLOT;
-    InterlockedIncrement(&m_View->FrameLock);
-}
-
-bool FrameShare::MakeTextures(ID3D11Device* Device, const D3D11_TEXTURE2D_DESC& Like, LUID Adapter)
-{
-    ReleaseTextures();
+    Release();
+    const UINT32 Id = m_Share->Id();
     ShareSecurity Security;
     D3D11_TEXTURE2D_DESC Desc = {};
     Desc.Width = Like.Width;
@@ -590,8 +1016,9 @@ bool FrameShare::MakeTextures(ID3D11Device* Device, const D3D11_TEXTURE2D_DESC& 
     // What the agent's video processor and copies want of a source.
     Desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     Desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
-    // A new name each time: the agent may still hold the old textures open.
-    const UINT32 Generation = ++m_Generation;
+    // A new name each time (one counter per monitor, so two rings never
+    // share one): the agent may still hold the old textures open.
+    const UINT32 Generation = m_Share->NextGeneration();
     for (UINT32 i = 0; i < RDPIO_FRAMES_SLOTS; i++)
     {
         Slot& S = m_Slots[i];
@@ -600,45 +1027,43 @@ bool FrameShare::MakeTextures(ID3D11Device* Device, const D3D11_TEXTURE2D_DESC& 
         if (SUCCEEDED(hr))
             hr = S.Texture.As(&Resource);
         wchar_t Name[96];
-        swprintf_s(Name, L"Global\\rdpio-display-%u-%u-%u", m_Id, Generation, i);
+        swprintf_s(Name, L"Global\\rdpio-display-%u-%u-%u", Id, Generation, i);
         if (SUCCEEDED(hr))
             hr = Resource->CreateSharedHandle(Security.Get(), DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, Name, &S.Shared);
         if (SUCCEEDED(hr))
             hr = S.Texture.As(&S.Mutex);
         if (FAILED(hr))
         {
-            Log(L"monitor %u: shared texture %u failed 0x%08x", m_Id, i, hr);
-            ReleaseTextures();
+            Log(L"monitor %u: shared texture %u failed 0x%08x", Id, i, hr);
+            TraceEvent(RDPIO_TRACE_SHARE_TEXTURES, (UINT32)hr);
+            Release();
             return false;
         }
+    }
+    if (!m_Share->Announce(m_Epoch, Generation, Desc, Adapter))
+    {
+        Release();
+        return false;
     }
     m_TexturesDevice = Device;
     m_Desc = Like;
     m_Next = 0;
-    InterlockedIncrement(&m_View->FrameLock);
-    m_View->Generation = Generation;
-    m_View->Width = Desc.Width;
-    m_View->Height = Desc.Height;
-    m_View->Format = Desc.Format;
-    m_View->Adapter = Adapter;
-    m_View->Slot = RDPIO_FRAMES_NO_SLOT;
-    InterlockedIncrement(&m_View->FrameLock);
-    Log(L"monitor %u: sharing %ux%u frames (generation %u)", m_Id, Desc.Width, Desc.Height, Generation);
+    Log(L"monitor %u: sharing %ux%u frames (generation %u)", Id, Desc.Width, Desc.Height, Generation);
     return true;
 }
 
-void FrameShare::Publish(ID3D11Device* Device, ID3D11DeviceContext* Context, ID3D11Texture2D* Surface, UINT64 PresentQpc, LUID Adapter)
+bool FrameRing::Publish(ID3D11Device* Device, ID3D11DeviceContext* Context, ID3D11Texture2D* Surface, UINT64 PresentQpc, LUID Adapter)
 {
-    if (!m_View)
-        return;
+    if (!m_Share->Shares())
+        return false;
     D3D11_TEXTURE2D_DESC Desc;
     Surface->GetDesc(&Desc);
     if (m_TexturesDevice != Device || Desc.Width != m_Desc.Width || Desc.Height != m_Desc.Height || Desc.Format != m_Desc.Format)
     {
         if (!MakeTextures(Device, Desc, Adapter))
-            return;
+            return false;
     }
-    const UINT32 Newest = m_View->Slot;
+    const UINT32 Newest = m_Share->NewestSlot();
     for (UINT32 Try = 0; Try < RDPIO_FRAMES_SLOTS; Try++)
     {
         const UINT32 i = (m_Next + Try) % RDPIO_FRAMES_SLOTS;
@@ -646,37 +1071,44 @@ void FrameShare::Publish(ID3D11Device* Device, ID3D11DeviceContext* Context, ID3
             continue; // the agent may be about to read it
         Slot& S = m_Slots[i];
         // S_OK only: WAIT_TIMEOUT (a success code) means the agent has it.
-        if (S.Mutex->AcquireSync(0, 0) != S_OK)
+        HRESULT hr = S.Mutex->AcquireSync(0, 0);
+        if (hr != S_OK)
+        {
+            TraceFailed(RDPIO_TRACE_PUBLISH, hr);
             continue;
+        }
         Context->CopyResource(S.Texture.Get(), Surface);
-        S.Mutex->ReleaseSync(0);
+        hr = S.Mutex->ReleaseSync(0);
+        if (FAILED(hr))
+        {
+            TraceEvent(RDPIO_TRACE_PUBLISH, (UINT32)hr);
+            return false;
+        }
         m_Next = (i + 1) % RDPIO_FRAMES_SLOTS;
-        InterlockedIncrement(&m_View->FrameLock);
-        m_View->Slot = i;
-        m_View->FrameNumber++;
-        m_View->PresentQpc = PresentQpc;
-        InterlockedIncrement(&m_View->FrameLock);
-        SetEvent(m_Ready);
-        return;
+        return m_Share->Publish(m_Epoch, i, PresentQpc);
     }
     // Every other slot is held: the agent's behind, and this frame is dropped.
+    return false;
 }
 
-void FrameShare::SetHardwareCursor(bool On)
+void FrameShare::SetHardwareCursor(UINT32 Epoch, bool On)
 {
-    if (!m_View)
+    if (!BeginWrite(Epoch))
         return;
     InterlockedIncrement(&m_View->CursorLock);
     m_View->HardwareCursor = On ? 1 : 0;
     InterlockedIncrement(&m_View->CursorLock);
+    EndWrite();
     SetEvent(m_Ready);
 }
 
-void FrameShare::PublishCursor(bool Visible, const IDDCX_CURSOR_SHAPE_INFO* Shape, const BYTE* Data)
+void FrameShare::PublishCursor(UINT32 Epoch, bool Visible, const IDDCX_CURSOR_SHAPE_INFO* Shape, const BYTE* Data)
 {
     // Only visibility and shape matter (the client draws the pointer where
     // its mouse is): plain moves wake nobody.
     if (!m_View || (!Shape && Visible == m_CursorVisible))
+        return;
+    if (!BeginWrite(Epoch))
         return;
     m_CursorVisible = Visible;
     InterlockedIncrement(&m_View->CursorLock);
@@ -697,6 +1129,7 @@ void FrameShare::PublishCursor(bool Visible, const IDDCX_CURSOR_SHAPE_INFO* Shap
         }
     }
     InterlockedIncrement(&m_View->CursorLock);
+    EndWrite();
     SetEvent(m_Ready);
 }
 
@@ -710,11 +1143,17 @@ DeviceContext::DeviceContext(WDFDEVICE WdfDevice) : m_WdfDevice(WdfDevice)
     m_hWatchdog.Attach(CreateThread(nullptr, 0, WatchdogThread, this, 0, nullptr));
 }
 
-DeviceContext::~DeviceContext()
+// How long the agent's ADD or REMOVE waits for one already under way before
+// it's answered STATUS_DEVICE_BUSY: inside the agent's own limits on those
+// calls (2 s for a removal), and far inside IddCx's 10 s.
+static const std::chrono::milliseconds kRequestLockWait(1500);
+
+bool DeviceContext::StopWatchdog(DWORD Ms)
 {
     SetEvent(m_hStop.Get());
-    if (m_hWatchdog.Get())
-        WaitForSingleObject(m_hWatchdog.Get(), INFINITE);
+    if (!m_hWatchdog.IsValid())
+        return true;
+    return WaitForSingleObject(m_hWatchdog.Get(), Ms) == WAIT_OBJECT_0;
 }
 
 void DeviceContext::InitAdapter()
@@ -767,10 +1206,12 @@ NTSTATUS DeviceContext::Add(const RDPIO_DISPLAY_MODE& Wanted, RDPIO_DISPLAY_ADDE
         Wanted.RefreshHz > 500)
         return STATUS_INVALID_PARAMETER;
 
-    std::lock_guard<std::mutex> Guard(m_Lock);
+    std::unique_lock<std::timed_mutex> Guard(m_Lock, std::defer_lock);
+    if (!Guard.try_lock_for(kRequestLockWait))
+        return STATUS_DEVICE_BUSY;
     m_LastPing = GetTickCount64();
     if (Wanted.Flags & RDPIO_DISPLAY_FLAG_REPLACE)
-        RemoveAllLocked();
+        RemoveAllLocked(RDPIO_TRACE_SLOT_CALLBACK);
     std::unique_lock<std::mutex> Table(m_TableLock);
     if (m_Monitors.size() >= RDPIO_DISPLAY_MAX_MONITORS)
         return STATUS_TOO_MANY_NODES;
@@ -807,6 +1248,13 @@ NTSTATUS DeviceContext::Add(const RDPIO_DISPLAY_MODE& Wanted, RDPIO_DISPLAY_ADDE
 
     WDF_OBJECT_ATTRIBUTES Attr;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, MonitorContextWrapper);
+    // The monitor's context goes with the monitor (its swap-chain thread is
+    // stopped, bounded, and its shared section closed).
+    Attr.EvtCleanupCallback = [](WDFOBJECT Object) {
+        auto* p = WdfObjectGet_MonitorContextWrapper(Object);
+        if (p)
+            p->Cleanup();
+    };
     IDDCX_MONITOR_INFO MonitorInfo = {};
     MonitorInfo.Size = sizeof(MonitorInfo);
     MonitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL;
@@ -822,11 +1270,16 @@ NTSTATUS DeviceContext::Add(const RDPIO_DISPLAY_MODE& Wanted, RDPIO_DISPLAY_ADDE
     MonitorCreate.ObjectAttributes = &Attr;
     MonitorCreate.pMonitorInfo = &MonitorInfo;
     IDARG_OUT_MONITORCREATE MonitorCreateOut = {};
-    NTSTATUS Status = IddCxMonitorCreate(m_Adapter, &MonitorCreate, &MonitorCreateOut);
+    NTSTATUS Status;
+    {
+        TraceCall Call(RDPIO_TRACE_SLOT_CALLBACK, RDPIO_TRACE_MONITOR_CREATE, Id);
+        Status = IddCxMonitorCreate(m_Adapter, &MonitorCreate, &MonitorCreateOut);
+    }
     if (!NT_SUCCESS(Status))
     {
         Forget();
         Log(L"IddCxMonitorCreate failed 0x%08x", Status);
+        TraceEvent(RDPIO_TRACE_MONITOR_CREATE, (UINT32)Status);
         return Status;
     }
     {
@@ -838,13 +1291,29 @@ NTSTATUS DeviceContext::Add(const RDPIO_DISPLAY_MODE& Wanted, RDPIO_DISPLAY_ADDE
         }
     }
     auto* Wrapper = WdfObjectGet_MonitorContextWrapper(MonitorCreateOut.MonitorObject);
-    Wrapper->pContext = new MonitorContext(MonitorCreateOut.MonitorObject, Id, Modes);
+    try
+    {
+        Wrapper->pContext = new MonitorContext(MonitorCreateOut.MonitorObject, Id, Modes);
+    }
+    catch (...)
+    {
+        Log(L"monitor %u: out of memory", Id);
+        TraceEvent(RDPIO_TRACE_EXCEPTION, RDPIO_TRACE_MONITOR_CREATE);
+        WdfObjectDelete(MonitorCreateOut.MonitorObject);
+        Forget();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     IDARG_OUT_MONITORARRIVAL ArrivalOut = {};
-    Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
+    {
+        TraceCall Call(RDPIO_TRACE_SLOT_CALLBACK, RDPIO_TRACE_MONITOR_ARRIVAL, Id);
+        Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
+    }
     if (!NT_SUCCESS(Status))
     {
         Log(L"IddCxMonitorArrival failed 0x%08x", Status);
+        TraceEvent(RDPIO_TRACE_MONITOR_ARRIVAL, (UINT32)Status);
+        // (Its context goes with it, through the cleanup callback.)
         WdfObjectDelete(MonitorCreateOut.MonitorObject);
         Forget();
         return Status;
@@ -858,7 +1327,7 @@ NTSTATUS DeviceContext::Add(const RDPIO_DISPLAY_MODE& Wanted, RDPIO_DISPLAY_ADDE
     return STATUS_SUCCESS;
 }
 
-void DeviceContext::RemoveAllLocked()
+void DeviceContext::RemoveAllLocked(UINT32 TraceSlot)
 {
     std::vector<Entry> Leaving;
     {
@@ -869,16 +1338,24 @@ void DeviceContext::RemoveAllLocked()
     {
         if (E.Monitor)
         {
-            NTSTATUS Status = IddCxMonitorDeparture(E.Monitor);
+            NTSTATUS Status;
+            {
+                TraceCall Call(TraceSlot, RDPIO_TRACE_MONITOR_DEPARTURE, E.Id);
+                Status = IddCxMonitorDeparture(E.Monitor);
+            }
             Log(L"monitor %u departs (0x%08x)", E.Id, Status);
+            TraceEvent(RDPIO_TRACE_MONITOR_DEPARTURE, (UINT32)Status);
         }
     }
 }
 
-void DeviceContext::RemoveAll()
+NTSTATUS DeviceContext::RemoveAll()
 {
-    std::lock_guard<std::mutex> Guard(m_Lock);
-    RemoveAllLocked();
+    std::unique_lock<std::timed_mutex> Guard(m_Lock, std::defer_lock);
+    if (!Guard.try_lock_for(kRequestLockWait))
+        return STATUS_DEVICE_BUSY;
+    RemoveAllLocked(RDPIO_TRACE_SLOT_CALLBACK);
+    return STATUS_SUCCESS;
 }
 
 void DeviceContext::Ping()
@@ -919,7 +1396,15 @@ std::vector<Mode> DeviceContext::ModesForMonitor(IDDCX_MONITOR Monitor)
 
 DWORD CALLBACK DeviceContext::WatchdogThread(LPVOID Argument)
 {
-    reinterpret_cast<DeviceContext*>(Argument)->Watchdog();
+    try
+    {
+        reinterpret_cast<DeviceContext*>(Argument)->Watchdog();
+    }
+    catch (...)
+    {
+        TraceEvent(RDPIO_TRACE_EXCEPTION, RDPIO_TRACE_WATCHDOG_REMOVE);
+        Log(L"exception on the watchdog thread; it stops");
+    }
     return 0;
 }
 
@@ -927,7 +1412,10 @@ void DeviceContext::Watchdog()
 {
     while (WaitForSingleObject(m_hStop.Get(), 1000) == WAIT_TIMEOUT)
     {
-        std::lock_guard<std::mutex> Guard(m_Lock);
+        // An addition or removal under way: look again next second.
+        std::unique_lock<std::timed_mutex> Guard(m_Lock, std::try_to_lock);
+        if (!Guard.owns_lock())
+            continue;
         bool Any;
         {
             std::lock_guard<std::mutex> T(m_TableLock);
@@ -936,7 +1424,8 @@ void DeviceContext::Watchdog()
         if (Any && GetTickCount64() - m_LastPing > RDPIO_DISPLAY_WATCHDOG_MS)
         {
             Log(L"the agent stopped pinging: removing its monitors");
-            RemoveAllLocked();
+            TraceEvent(RDPIO_TRACE_WATCHDOG_REMOVE, 0);
+            RemoveAllLocked(RDPIO_TRACE_SLOT_WATCHDOG);
         }
     }
 }
@@ -950,58 +1439,86 @@ VOID RdpioIoDeviceControl(WDFDEVICE Device, WDFREQUEST Request, size_t OutputBuf
 {
     UNREFERENCED_PARAMETER(OutputBufferLength);
     UNREFERENCED_PARAMETER(InputBufferLength);
-    auto* Wrapper = WdfObjectGet_DeviceContextWrapper(Device);
-    DeviceContext* Ctx = Wrapper ? Wrapper->pContext : nullptr;
-    NTSTATUS Status = STATUS_INVALID_DEVICE_REQUEST;
-    ULONG_PTR Info = 0;
-    if (!Ctx)
-    {
-        WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
-        return;
-    }
+    UINT32 Code = 0;
     switch (IoControlCode)
     {
-    case IOCTL_RDPIO_DISPLAY_INFO: {
-        RDPIO_DISPLAY_INFO* Out = nullptr;
-        Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*Out), (PVOID*)&Out, nullptr);
-        if (NT_SUCCESS(Status))
-        {
-            *Out = Ctx->Info();
-            Info = sizeof(*Out);
-        }
+    case IOCTL_RDPIO_DISPLAY_INFO:
+        Code = RDPIO_TRACE_IOCTL_INFO;
         break;
-    }
-    case IOCTL_RDPIO_DISPLAY_ADD: {
-        RDPIO_DISPLAY_MODE* In = nullptr;
-        Status = WdfRequestRetrieveInputBuffer(Request, sizeof(*In), (PVOID*)&In, nullptr);
-        if (!NT_SUCCESS(Status))
-            break;
-        const RDPIO_DISPLAY_MODE Wanted = *In; // (the same buffer is the output)
-        RDPIO_DISPLAY_ADDED Added = {};
-        Status = Ctx->Add(Wanted, &Added);
-        RDPIO_DISPLAY_ADDED* Out = nullptr;
-        if (NT_SUCCESS(Status) && NT_SUCCESS(WdfRequestRetrieveOutputBuffer(Request, sizeof(*Out), (PVOID*)&Out, nullptr)))
-        {
-            *Out = Added;
-            Info = sizeof(*Out);
-        }
+    case IOCTL_RDPIO_DISPLAY_ADD:
+        Code = RDPIO_TRACE_IOCTL_ADD;
         break;
-    }
     case IOCTL_RDPIO_DISPLAY_REMOVE:
-        Ctx->RemoveAll();
-        Status = STATUS_SUCCESS;
+        Code = RDPIO_TRACE_IOCTL_REMOVE;
         break;
     case IOCTL_RDPIO_DISPLAY_PING:
-        Ctx->Ping();
-        Status = STATUS_SUCCESS;
+        Code = RDPIO_TRACE_IOCTL_PING;
         break;
     }
-    WdfRequestCompleteWithInformation(Request, Status, Info);
+    TraceCall Call(RDPIO_TRACE_SLOT_CALLBACK, Code);
+    ULONG_PTR Info = 0;
+    // Completed exactly once, below, whatever happens inside.
+    const NTSTATUS Status = Guarded(Code, [&]() -> NTSTATUS {
+        auto* Wrapper = WdfObjectGet_DeviceContextWrapper(Device);
+        DeviceContext* Ctx = Wrapper ? Wrapper->pContext : nullptr;
+        if (!Ctx)
+            return STATUS_DEVICE_NOT_READY;
+        NTSTATUS S = STATUS_INVALID_DEVICE_REQUEST;
+        switch (IoControlCode)
+        {
+        case IOCTL_RDPIO_DISPLAY_INFO: {
+            RDPIO_DISPLAY_INFO* Out = nullptr;
+            S = WdfRequestRetrieveOutputBuffer(Request, sizeof(*Out), (PVOID*)&Out, nullptr);
+            if (NT_SUCCESS(S))
+            {
+                *Out = Ctx->Info();
+                Info = sizeof(*Out);
+            }
+            break;
+        }
+        case IOCTL_RDPIO_DISPLAY_ADD: {
+            RDPIO_DISPLAY_MODE* In = nullptr;
+            S = WdfRequestRetrieveInputBuffer(Request, sizeof(*In), (PVOID*)&In, nullptr);
+            if (!NT_SUCCESS(S))
+                break;
+            const RDPIO_DISPLAY_MODE Wanted = *In; // (the same buffer is the output)
+            RDPIO_DISPLAY_ADDED Added = {};
+            S = Ctx->Add(Wanted, &Added);
+            RDPIO_DISPLAY_ADDED* Out = nullptr;
+            if (NT_SUCCESS(S) && NT_SUCCESS(WdfRequestRetrieveOutputBuffer(Request, sizeof(*Out), (PVOID*)&Out, nullptr)))
+            {
+                *Out = Added;
+                Info = sizeof(*Out);
+            }
+            break;
+        }
+        case IOCTL_RDPIO_DISPLAY_REMOVE:
+            S = Ctx->RemoveAll();
+            break;
+        case IOCTL_RDPIO_DISPLAY_PING:
+            Ctx->Ping();
+            S = STATUS_SUCCESS;
+            break;
+        }
+        return S;
+    });
+    if (Status == STATUS_DEVICE_BUSY)
+    {
+        Log(L"request %u: another addition or removal is still under way", Code);
+        TraceEvent(RDPIO_TRACE_BUSY, Code);
+    }
+    else if (!NT_SUCCESS(Status) && Code != 0)
+    {
+        TraceEvent(Code, (UINT32)Status);
+    }
+    WdfRequestCompleteWithInformation(Request, Status, NT_SUCCESS(Status) ? Info : 0);
 }
 
 _Use_decl_annotations_
 NTSTATUS RdpioAdapterInitFinished(IDDCX_ADAPTER AdapterObject, const IDARG_IN_ADAPTER_INIT_FINISHED* pInArgs)
 {
+    TraceCall Call(RDPIO_TRACE_SLOT_CALLBACK, RDPIO_TRACE_ADAPTER_INIT);
+    TraceFailed(RDPIO_TRACE_ADAPTER_INIT, pInArgs->AdapterInitStatus);
     auto* Wrapper = WdfObjectGet_DeviceContextWrapper(AdapterObject);
     if (Wrapper && Wrapper->pContext)
         Wrapper->pContext->AdapterReady(NT_SUCCESS(pInArgs->AdapterInitStatus));
@@ -1014,72 +1531,100 @@ NTSTATUS RdpioAdapterCommitModes(IDDCX_ADAPTER AdapterObject, const IDARG_IN_COM
 {
     UNREFERENCED_PARAMETER(AdapterObject);
     UNREFERENCED_PARAMETER(pInArgs);
+    TraceCall Call(RDPIO_TRACE_SLOT_CALLBACK, RDPIO_TRACE_COMMIT_MODES);
     return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
 NTSTATUS RdpioParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION* pInArgs, IDARG_OUT_PARSEMONITORDESCRIPTION* pOutArgs)
 {
-    const UINT32 Serial = EdidSerial((const BYTE*)pInArgs->MonitorDescription.pData, pInArgs->MonitorDescription.DataSize);
-    std::vector<Mode> Modes = (Serial && g_Device) ? g_Device->ModesForSerial(Serial) : std::vector<Mode>{};
-    if (Modes.empty())
-        return STATUS_INVALID_PARAMETER;
-    pOutArgs->MonitorModeBufferOutputCount = (UINT)Modes.size();
-    if (pInArgs->MonitorModeBufferInputCount < Modes.size())
-        return (pInArgs->MonitorModeBufferInputCount > 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
-    for (size_t i = 0; i < Modes.size(); i++)
-        pInArgs->pMonitorModes[i] = MonitorMode(Modes[i], IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR);
-    pOutArgs->PreferredMonitorModeIdx = 0;
-    return STATUS_SUCCESS;
+    TraceCall Call(RDPIO_TRACE_SLOT_CALLBACK, RDPIO_TRACE_PARSE_DESCRIPTION);
+    return Guarded(RDPIO_TRACE_PARSE_DESCRIPTION, [&]() -> NTSTATUS {
+        const UINT32 Serial = EdidSerial((const BYTE*)pInArgs->MonitorDescription.pData, pInArgs->MonitorDescription.DataSize);
+        std::vector<Mode> Modes = (Serial && g_Device) ? g_Device->ModesForSerial(Serial) : std::vector<Mode>{};
+        if (Modes.empty())
+            return STATUS_INVALID_PARAMETER;
+        pOutArgs->MonitorModeBufferOutputCount = (UINT)Modes.size();
+        if (pInArgs->MonitorModeBufferInputCount < Modes.size())
+            return (pInArgs->MonitorModeBufferInputCount > 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
+        for (size_t i = 0; i < Modes.size(); i++)
+            pInArgs->pMonitorModes[i] = MonitorMode(Modes[i], IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR);
+        pOutArgs->PreferredMonitorModeIdx = 0;
+        return STATUS_SUCCESS;
+    });
 }
 
 _Use_decl_annotations_
 NTSTATUS RdpioMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* pInArgs,
     IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* pOutArgs)
 {
-    // (Only for a monitor without an EDID; ours always have one.)
-    std::vector<Mode> Modes = g_Device ? g_Device->ModesForMonitor(MonitorObject) : std::vector<Mode>{};
-    if (Modes.empty())
-        Modes.push_back({ 1920, 1080, 60 });
-    pOutArgs->DefaultMonitorModeBufferOutputCount = (UINT)Modes.size();
-    if (pInArgs->DefaultMonitorModeBufferInputCount == 0)
+    TraceCall Call(RDPIO_TRACE_SLOT_CALLBACK, RDPIO_TRACE_DEFAULT_MODES);
+    return Guarded(RDPIO_TRACE_DEFAULT_MODES, [&]() -> NTSTATUS {
+        // (Only for a monitor without an EDID; ours always have one.)
+        std::vector<Mode> Modes = g_Device ? g_Device->ModesForMonitor(MonitorObject) : std::vector<Mode>{};
+        if (Modes.empty())
+            Modes.push_back({ 1920, 1080, 60 });
+        pOutArgs->DefaultMonitorModeBufferOutputCount = (UINT)Modes.size();
+        if (pInArgs->DefaultMonitorModeBufferInputCount == 0)
+            return STATUS_SUCCESS;
+        if (pInArgs->DefaultMonitorModeBufferInputCount < Modes.size())
+            return STATUS_BUFFER_TOO_SMALL;
+        for (size_t i = 0; i < Modes.size(); i++)
+            pInArgs->pDefaultMonitorModes[i] = MonitorMode(Modes[i], IDDCX_MONITOR_MODE_ORIGIN_DRIVER);
+        pOutArgs->PreferredMonitorModeIdx = 0;
         return STATUS_SUCCESS;
-    if (pInArgs->DefaultMonitorModeBufferInputCount < Modes.size())
-        return STATUS_BUFFER_TOO_SMALL;
-    for (size_t i = 0; i < Modes.size(); i++)
-        pInArgs->pDefaultMonitorModes[i] = MonitorMode(Modes[i], IDDCX_MONITOR_MODE_ORIGIN_DRIVER);
-    pOutArgs->PreferredMonitorModeIdx = 0;
-    return STATUS_SUCCESS;
+    });
 }
 
 _Use_decl_annotations_
 NTSTATUS RdpioMonitorQueryModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_QUERYTARGETMODES* pInArgs, IDARG_OUT_QUERYTARGETMODES* pOutArgs)
 {
-    // What we can compose and hand on: exactly the monitor's modes.
-    std::vector<Mode> Modes = g_Device ? g_Device->ModesForMonitor(MonitorObject) : std::vector<Mode>{};
-    pOutArgs->TargetModeBufferOutputCount = (UINT)Modes.size();
-    if (pInArgs->TargetModeBufferInputCount >= Modes.size())
-    {
-        for (size_t i = 0; i < Modes.size(); i++)
-            pInArgs->pTargetModes[i] = TargetMode(Modes[i]);
-    }
-    return STATUS_SUCCESS;
+    TraceCall Call(RDPIO_TRACE_SLOT_CALLBACK, RDPIO_TRACE_TARGET_MODES);
+    return Guarded(RDPIO_TRACE_TARGET_MODES, [&]() -> NTSTATUS {
+        // What we can compose and hand on: exactly the monitor's modes.
+        std::vector<Mode> Modes = g_Device ? g_Device->ModesForMonitor(MonitorObject) : std::vector<Mode>{};
+        pOutArgs->TargetModeBufferOutputCount = (UINT)Modes.size();
+        if (pInArgs->TargetModeBufferInputCount >= Modes.size())
+        {
+            for (size_t i = 0; i < Modes.size(); i++)
+                pInArgs->pTargetModes[i] = TargetMode(Modes[i]);
+        }
+        return STATUS_SUCCESS;
+    });
 }
 
 _Use_decl_annotations_
 NTSTATUS RdpioMonitorAssignSwapChain(IDDCX_MONITOR MonitorObject, const IDARG_IN_SETSWAPCHAIN* pInArgs)
 {
     auto* Wrapper = WdfObjectGet_MonitorContextWrapper(MonitorObject);
-    Wrapper->pContext->AssignSwapChain(pInArgs->hSwapChain, pInArgs->RenderAdapterLuid, pInArgs->hNextSurfaceAvailable);
-    return STATUS_SUCCESS;
+    MonitorContext* Ctx = Wrapper ? Wrapper->pContext : nullptr;
+    TraceCall Call(RDPIO_TRACE_SLOT_SWAPCHAIN, RDPIO_TRACE_ASSIGN_SWAPCHAIN, Ctx ? Ctx->Id() : 0);
+    if (!Ctx)
+    {
+        // A monitor already on its way out: nothing will use this one.
+        WdfObjectDelete((WDFOBJECT)pInArgs->hSwapChain);
+        return STATUS_SUCCESS;
+    }
+    TraceEvent(RDPIO_TRACE_ASSIGN_SWAPCHAIN, Ctx->Id());
+    return Guarded(RDPIO_TRACE_ASSIGN_SWAPCHAIN, [&]() -> NTSTATUS {
+        Ctx->AssignSwapChain(pInArgs->hSwapChain, pInArgs->RenderAdapterLuid, pInArgs->hNextSurfaceAvailable);
+        return STATUS_SUCCESS;
+    });
 }
 
 _Use_decl_annotations_
 NTSTATUS RdpioMonitorUnassignSwapChain(IDDCX_MONITOR MonitorObject)
 {
     auto* Wrapper = WdfObjectGet_MonitorContextWrapper(MonitorObject);
-    Wrapper->pContext->UnassignSwapChain();
-    return STATUS_SUCCESS;
+    MonitorContext* Ctx = Wrapper ? Wrapper->pContext : nullptr;
+    TraceCall Call(RDPIO_TRACE_SLOT_SWAPCHAIN, RDPIO_TRACE_UNASSIGN_SWAPCHAIN, Ctx ? Ctx->Id() : 0);
+    if (!Ctx)
+        return STATUS_SUCCESS;
+    TraceEvent(RDPIO_TRACE_UNASSIGN_SWAPCHAIN, Ctx->Id());
+    return Guarded(RDPIO_TRACE_UNASSIGN_SWAPCHAIN, [&]() -> NTSTATUS {
+        Ctx->UnassignSwapChain();
+        return STATUS_SUCCESS;
+    });
 }
 
 #pragma endregion

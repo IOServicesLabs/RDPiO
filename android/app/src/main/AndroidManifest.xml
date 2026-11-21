@@ -28,8 +28,16 @@
         android:label="@string/app_name"
         android:theme="@style/Theme.Rdpio">
 
+        <!-- Turning the tablet or attaching its keyboard cover changes the
+             configuration; these two handle that in place (their views reflow,
+             and there are no per-orientation resources) instead of being made
+             anew, which lost the typed form, restarted the Microsoft sign-in
+             page and orphaned a sign-in under way. Rarer changes (dark mode,
+             display or font size) still remake them, so their sizes and
+             colours follow. -->
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation"
             android:exported="true"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
@@ -41,6 +49,7 @@
         <!-- The Microsoft sign-in page for Windows 365. -->
         <activity
             android:name=".SignInActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
 

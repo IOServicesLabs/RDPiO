@@ -94,8 +94,14 @@ const RTT_INFLATE_HIGH: f64 = 2.0;
 const RTT_INFLATE_LOW: f64 = 1.3;
 /// Maximum pressure level.
 const MAX_PRESSURE: u32 = 4;
-/// Each pressure level adds this much to the reported RDPGFX `queueDepth`.
-const BIAS_PER_LEVEL: u32 = 2;
+/// A typical encoded desktop frame, in bytes: about what a 1080p H.264 stream
+/// at 15 Mbit/s and 60 fps sends per frame. Converts "frames behind" into the
+/// byte unit of the RDPGFX `queueDepth` (MS-RDPEGFX 2.2.2.13 counts the
+/// unprocessed bytes buffered at the client).
+const NOMINAL_FRAME_BYTES: u32 = 32 * 1024;
+/// Each pressure level adds this much to the reported RDPGFX `queueDepth`:
+/// two nominal frames' worth of queued bytes.
+const BIAS_PER_LEVEL: u32 = 2 * NOMINAL_FRAME_BYTES;
 
 /// Turns observed loss + RTT inflation into back-pressure on the server, via a
 /// `queueDepth` bias added to the RDPGFX frame-acknowledge. Hysteresis (separate
@@ -277,5 +283,16 @@ mod tests {
         let mut c = Congestion::new();
         c.update(50, 50, Some(Duration::from_millis(5))); // 50% loss, one window
         assert_eq!(c.pressure(), 1, "a single bad window should not slam to max");
+    }
+
+    #[test]
+    fn bias_is_in_queued_bytes() {
+        let mut c = Congestion::new();
+        c.update(50, 50, Some(Duration::from_millis(5)));
+        // One level = two typical frames of queued bytes, not a frame count.
+        assert_eq!(c.queue_depth_bias(), 2 * NOMINAL_FRAME_BYTES);
+        // Even at full pressure it stays far from 0xFFFFFFFF, which in a frame
+        // ack means "suspend frame acknowledgement".
+        assert!(MAX_PRESSURE * BIAS_PER_LEVEL < u32::MAX / 2);
     }
 }

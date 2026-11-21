@@ -57,13 +57,16 @@ impl BulkTcp {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let mut rec = Vec::with_capacity(8 + 32 + (1 << 20));
         rec.extend_from_slice(&seq.to_le_bytes());
-        rec.extend_from_slice(&m.to_bytes());
+        m.write_to(&mut rec);
         let (_, tx) = &self.lanes[seq as usize % width.clamp(1, self.lanes.len())];
         tx.send(rec).map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "copy stream ended"))
     }
 
-    fn end(&self) {
-        if !self.dead.swap(true, Ordering::Relaxed) {
+    /// End the stream; true for the caller that ended it (the others only
+    /// see it go: one log line for the stream, not one per connection).
+    fn end(&self) -> bool {
+        let first = !self.dead.swap(true, Ordering::Relaxed);
+        if first {
             for (s, _) in &self.lanes {
                 let _ = s.shutdown(Shutdown::Both);
             }
@@ -72,6 +75,7 @@ impl BulkTcp {
         if cur.as_ref().is_some_and(|c| std::ptr::eq(&**c, self)) {
             *cur = None;
         }
+        first
     }
 }
 
@@ -97,6 +101,8 @@ fn tune(s: &TcpStream) {
 struct Reorder {
     next: u64,
     held: BTreeMap<u64, Vec<u8>>,
+    /// Buffers of held records already handed on, for the readers to reuse.
+    spare: Vec<Vec<u8>>,
 }
 
 /// What arrives goes to the clipboard as the link's messages do.
@@ -134,16 +140,15 @@ fn start_with(conns: Vec<TcpStream>, key: [u8; KEY_LEN], ours: Dir, theirs: Dir,
         std::thread::Builder::new().name("hyper-copy-tx".into()).spawn(move || {
             for rec in rx {
                 if let Err(e) = sealer.write(&mut s, &rec) {
-                    if !tcp.dead.load(Ordering::Relaxed) {
+                    if tcp.end() {
                         tracing::warn!(error = %e, "the copy stream broke: copies go over the link");
                     }
-                    tcp.end();
                     return;
                 }
             }
         })?;
     }
-    let order = Arc::new(Mutex::new(Reorder { next: 0, held: BTreeMap::new() }));
+    let order = Arc::new(Mutex::new(Reorder { next: 0, held: BTreeMap::new(), spare: Vec::new() }));
     for (i, s) in conns.into_iter().enumerate() {
         let mut opener = Opener::lane(&key, theirs, i as u8);
         if theirs == Dir::ClientToHost {
@@ -152,24 +157,48 @@ fn start_with(conns: Vec<TcpStream>, key: [u8; KEY_LEN], ours: Dir, theirs: Dir,
         let (tcp, order, sink) = (tcp.clone(), order.clone(), sink.clone());
         std::thread::Builder::new().name("hyper-copy-rx".into()).spawn(move || {
             let mut r = std::io::BufReader::with_capacity(1 << 20, s);
+            // Each record is read into this one (reused while records come in
+            // order; one held for later is swapped for a spare).
+            let mut rec = Vec::new();
             loop {
-                let rec = match opener.read(&mut r) {
-                    Ok(b) if b.len() >= 8 => b,
-                    Ok(_) | Err(_) if tcp.dead.load(Ordering::Relaxed) => return,
+                let read = opener.read_into(&mut r, &mut rec);
+                match read {
+                    Ok(()) if rec.len() >= 8 => {}
+                    Ok(()) | Err(_) if tcp.dead.load(Ordering::Relaxed) => return,
                     other => {
-                        tracing::info!(error = ?other.err(), "the copy stream ended");
-                        tcp.end();
+                        // (Only the connection that ends the stream says so;
+                        // the others' errors are its echo.)
+                        if tcp.end() {
+                            match other {
+                                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                                    tracing::info!("the copy stream ended: the other side closed it")
+                                }
+                                Err(e) => tracing::info!(error = %e, "the copy stream ended"),
+                                Ok(()) => tracing::info!("the copy stream ended: a record too short"),
+                            }
+                        }
                         return;
                     }
-                };
+                }
                 crate::hyper_link::bulk_moved();
                 let seq = u64::from_le_bytes(rec[..8].try_into().unwrap());
                 let mut o = order.lock().unwrap();
-                o.held.insert(seq, rec);
-                while let Some(rec) = { let n = o.next; o.held.remove(&n) } {
+                if seq == o.next {
                     o.next += 1;
                     if let Some(m) = Message::parse(&rec[8..]) {
                         sink(m);
+                    }
+                } else {
+                    let spare = o.spare.pop().unwrap_or_default();
+                    o.held.insert(seq, std::mem::replace(&mut rec, spare));
+                }
+                while let Some(done) = { let n = o.next; o.held.remove(&n) } {
+                    o.next += 1;
+                    if let Some(m) = Message::parse(&done[8..]) {
+                        sink(m);
+                    }
+                    if o.spare.len() < MAX_STREAMS as usize {
+                        o.spare.push(done);
                     }
                 }
             }
@@ -181,11 +210,13 @@ fn start_with(conns: Vec<TcpStream>, key: [u8; KEY_LEN], ours: Dir, theirs: Dir,
 
 /// Host: listen on `port` (TCP) for this session's client at `client`, and
 /// offer it over `link` with `streams` connections. The SYSTEM agent opens
-/// the port in the firewall first.
-pub fn host_offer(port: u16, client: IpAddr, streams: u8, link: &ReliableLink, clipboard: Option<Arc<ClipboardSync>>) {
+/// the port in the firewall first. Returns at once: the firewall (netsh,
+/// about 0.6 s the first time in an agent) and the offer are on the
+/// listening thread, not in the way of the stream's first frame. The offer
+/// goes once the port is open, as before.
+pub fn host_offer(port: u16, client: IpAddr, streams: u8, link: Arc<ReliableLink>, clipboard: Option<Arc<ClipboardSync>>) {
     let session = SESSION.load(Ordering::SeqCst);
     let streams = streams.clamp(1, MAX_STREAMS);
-    open_firewall(port);
     let listener = match TcpListener::bind(("0.0.0.0", port)) {
         Ok(l) => l,
         Err(e) => {
@@ -193,9 +224,15 @@ pub fn host_offer(port: u16, client: IpAddr, streams: u8, link: &ReliableLink, c
             return;
         }
     };
-    let key = new_key();
-    link.send(&Message::BulkTcp { port, key, streams });
     let spawned = std::thread::Builder::new().name("hyper-copy-listen".into()).spawn(move || {
+        open_firewall(port);
+        // (The session may have ended while netsh ran.)
+        if SESSION.load(Ordering::SeqCst) != session {
+            return;
+        }
+        let key = new_key();
+        link.send(&Message::BulkTcp { port, key, streams });
+        drop(link);
         let _ = listener.set_nonblocking(true);
         let until = Instant::now() + ACCEPT_WITHIN;
         let mut conns: Vec<Option<TcpStream>> = (0..streams).map(|_| None).collect();

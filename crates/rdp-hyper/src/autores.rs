@@ -79,6 +79,9 @@ fn thresholds(office: bool) -> (f64, f64) {
 /// The link is behind: frames queue on the way.
 const BEHIND_LATENCY_MS: f64 = 250.0;
 const BEHIND_RTT_MS: f64 = 500.0;
+/// …and, while the stream sends well under its target (the content needs no
+/// more), late by this much before a smaller picture is worth it.
+const CONTENT_LIMITED_LATENCY_MS: f64 = 1_000.0;
 /// Down after this long short of bits; up after `up_hold` clear.
 const DOWN_AFTER_S: f64 = 3.0;
 const UP_AFTER_S: f64 = 10.0;
@@ -162,6 +165,14 @@ impl AutoRes {
         }
         let target = if s.target_bps > 0.0 { s.target_bps } else { arrived };
         let budget = if behind { target.min(arrived) } else { target };
+        // Short of bits only if the stream uses its budget, or frames are
+        // seconds late. A quiet desktop sends a sliver of its target: a few
+        // hundred ms late there is Wi-Fi holding packets, not a link carrying
+        // too little, and a smaller picture can't help it (on a LAN with a
+        // 71 Mbps target and 2 Mbps sent, that halved the stream 15 times in
+        // 12 days, each three rebuilds within half a minute).
+        let pushing = arrived >= 0.5 * target;
+        let short = s.rtt_ms > BEHIND_RTT_MS || s.latency_ms > if pushing { BEHIND_LATENCY_MS } else { CONTENT_LIMITED_LATENCY_MS };
         // (Past 60 fps each frame differs less from the last and needs
         // fewer bits: counted as 60.)
         let fps = if s.fps >= 1.0 { s.fps.min(60.0) } else { 60.0 };
@@ -180,8 +191,8 @@ impl AutoRes {
             return None;
         }
 
-        // Down: behind, and too few bits for this size.
-        if behind && current > smallest && bpp_now < down_bpp {
+        // Down: behind with the bits short, and too few for this size.
+        if short && current > smallest && bpp_now < down_bpp {
             let since = *self.below_since.get_or_insert(s.now_s);
             if s.now_s - since >= DOWN_AFTER_S && changed_ok {
                 // The largest size with some room above the floor (else the smallest).
@@ -321,13 +332,54 @@ mod tests {
     }
 
     #[test]
-    fn a_lan_hiccup_comes_back_to_full_size() {
-        // 144 fps, the host at 30 Mbps; five seconds of a stalled Wi-Fi.
+    fn a_lan_hiccup_stays_at_full_size() {
+        // 144 fps, the host at 30 Mbps; five seconds of a stalled Wi-Fi. The
+        // stream sends far under its target: no smaller picture.
         let mut a = AutoRes::default();
         let (scale, changes) = run(&mut a, 0.0, 5, 100, false, |_| (2.0, 30.0, 600.0, 144.0));
-        assert_eq!(changes.len(), 1);
-        let (end, _) = run(&mut a, 5.0, 120, scale, false, |_| (12.0, 30.0, 18.0, 144.0));
+        assert!(changes.is_empty(), "{changes:?}");
+        let (end, changes) = run(&mut a, 5.0, 120, scale, false, |_| (12.0, 30.0, 18.0, 144.0));
         assert_eq!(end, 100);
+        assert!(changes.is_empty(), "{changes:?}");
+    }
+
+    /// The laptop on the host's LAN (2560x1600 at 60), a quiet desktop: the
+    /// host's target 71 Mbps, 1.4-2.3 Mbps sent at 6-10 fps, frames 300-600
+    /// ms late over Wi-Fi. That halved the stream; it's content, not the link.
+    #[test]
+    fn a_quiet_lan_stream_running_late_never_moves() {
+        let mut a = AutoRes::default();
+        for i in 0..600 {
+            let s = Sample {
+                now_s: i as f64,
+                received_bps: if i % 3 == 0 { 1.4e6 } else { 2.3e6 },
+                target_bps: 71e6,
+                latency_ms: 300.0 + (i % 7) as f64 * 50.0,
+                rtt_ms: 40.0,
+                fps: 6.0 + (i % 5) as f64,
+                shown_fps: 6.0 + (i % 5) as f64,
+                width: 2560,
+                height: 1600,
+            };
+            assert_eq!(a.step(&s, 100, false), None, "at {i} s");
+        }
+    }
+
+    /// The same quiet stream, but seconds late: that is the link (a relay
+    /// backed up), and it goes down as before.
+    #[test]
+    fn a_quiet_stream_seconds_late_still_goes_down() {
+        let mut a = AutoRes::default();
+        let (end, _) = run(&mut a, 0.0, 30, 100, false, |_| (2.0, 30.0, 1_500.0, 60.0));
+        assert!(end < 100);
+    }
+
+    /// A stream using its budget and a few hundred ms late is short of bits.
+    #[test]
+    fn a_stream_using_its_budget_and_running_late_goes_down() {
+        let mut a = AutoRes::default();
+        let (end, _) = run(&mut a, 0.0, 30, 100, false, |_| (8.0, 10.0, 400.0, 60.0));
+        assert!(end < 100);
     }
 
     #[test]

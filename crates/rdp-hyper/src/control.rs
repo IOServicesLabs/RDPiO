@@ -91,6 +91,15 @@ pub struct Feedback {
     /// (kbit/s; see [`crate::video::Stats::link_kbps`]): what the path carries
     /// at least. 0: not measured (too little sent, or an older client).
     pub link_kbps: u32,
+    /// The newest frame id at and below which the client has every frame
+    /// delivered or given up on (see
+    /// [`crate::video::Reassembler::resolved_through`]): the host knows
+    /// which keyframe has landed instead of counting reported frames. `None`:
+    /// nothing resolved yet, or an older client that doesn't say (the host
+    /// counts then, as before). It goes last, after byte 53, so an older
+    /// host, which reads no further, ignores it; an older client's report
+    /// ends before it and parses as `None`.
+    pub resolved_frame: Option<u32>,
 }
 
 /// Binary messages inside [`crate::wire::Kind::Control`] packets.
@@ -247,6 +256,7 @@ impl Control {
                 o.extend_from_slice(&f.window_us.to_le_bytes());
                 o.extend_from_slice(&f.ltr_frame.unwrap_or(u32::MAX).to_le_bytes());
                 o.extend_from_slice(&f.link_kbps.to_le_bytes());
+                o.extend_from_slice(&f.resolved_frame.unwrap_or(u32::MAX).to_le_bytes());
             }
             Self::Status { input_ack, width, height, fps, bitrate_kbps, fec_permille } => {
                 o.push(5);
@@ -337,6 +347,7 @@ impl Control {
                 window_us: u32_at(41).unwrap_or(0),
                 ltr_frame: u32_at(45).filter(|&v| v != u32::MAX),
                 link_kbps: u32_at(49).unwrap_or(0),
+                resolved_frame: u32_at(53).filter(|&v| v != u32::MAX),
             }),
             5 => Self::Status {
                 input_ack: u32_at(1)?,
@@ -410,8 +421,10 @@ mod tests {
                 window_us: 50_000,
                 ltr_frame: Some(77),
                 link_kbps: 400_000,
+                resolved_frame: Some(1_234),
             }),
             Control::Feedback(Feedback { frames: 3, ..Default::default() }),
+            Control::Feedback(Feedback { frames: 3, resolved_frame: Some(0), ..Default::default() }),
             Control::Recover,
             Control::Status { input_ack: 1, width: 2560, height: 1440, fps: 120, bitrate_kbps: 30_000, fec_permille: 100 },
             Control::Bye,
@@ -437,5 +450,58 @@ mod tests {
             assert_eq!(Control::parse(&c.to_bytes()), Some(c.clone()), "{c:?}");
         }
         assert_eq!(Control::parse(&[4, 1, 2]), None);
+    }
+
+    /// The resolved frame is optional both ways: a 0.4.1 client's report
+    /// (53 bytes) reads as before with no frame, and this client's report
+    /// reads in 0.4.1's host — whose parser is reproduced here as it was —
+    /// with every older field intact.
+    #[test]
+    fn feedback_with_a_resolved_frame_reads_both_ways() {
+        let new = Feedback {
+            shards: 11,
+            recovered: 2,
+            frames: 3,
+            frames_lost: 1,
+            bytes: 54_321,
+            delay_min_us: -6_000,
+            delay_avg_us: 7_000,
+            window_us: 100_000,
+            ltr_frame: Some(77),
+            link_kbps: 400_000,
+            resolved_frame: Some(4_242),
+        };
+        let bytes = Control::Feedback(new).to_bytes();
+        assert_eq!(bytes.len(), 57);
+        // An older client: the same report, without the frame.
+        let old = &bytes[..53];
+        assert_eq!(Control::parse(old), Some(Control::Feedback(Feedback { resolved_frame: None, ..new })));
+        // An older host: v0.4.1's parser (control.rs, `4 => Self::Feedback`).
+        fn parse_041(b: &[u8]) -> Option<Feedback> {
+            let u32_at = |i: usize| b.get(i..i + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()));
+            let u64_at = |i: usize| b.get(i..i + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()));
+            if *b.first()? != 4 {
+                return None;
+            }
+            Some(Feedback {
+                shards: u32_at(1)?,
+                recovered: u32_at(5)?,
+                frames: u32_at(9)?,
+                frames_lost: u32_at(13)?,
+                bytes: u64_at(17)?,
+                delay_min_us: u64_at(25)? as i64,
+                delay_avg_us: u64_at(33)? as i64,
+                window_us: u32_at(41).unwrap_or(0),
+                ltr_frame: u32_at(45).filter(|&v| v != u32::MAX),
+                link_kbps: u32_at(49).unwrap_or(0),
+                resolved_frame: None,
+            })
+        }
+        assert_eq!(parse_041(&bytes), Some(Feedback { resolved_frame: None, ..new }));
+        assert_eq!(parse_041(old), Some(Feedback { resolved_frame: None, ..new }));
+        // Nothing resolved yet goes as the old "none" marker.
+        let none = Control::Feedback(Feedback { resolved_frame: None, ..new }).to_bytes();
+        assert_eq!(&none[53..], &u32::MAX.to_le_bytes());
+        assert_eq!(Control::parse(&none), Some(Control::Feedback(Feedback { resolved_frame: None, ..new })));
     }
 }

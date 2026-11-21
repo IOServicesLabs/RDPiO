@@ -8,7 +8,7 @@
 //! every desktop (the secure one too), and the pointer beside the picture
 //! (the driver's hardware cursor) rather than in it.
 
-use std::sync::atomic::{fence, AtomicI32, Ordering};
+use std::sync::atomic::{fence, AtomicI32, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{Error, Interface, Result as WinResult, HSTRING};
@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIKeyedMutex, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE,
 };
-use windows::Win32::System::Memory::{MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS};
+use windows::Win32::System::Memory::{MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS};
 use windows::Win32::System::Threading::{OpenEventW, WaitForSingleObject, SYNCHRONIZATION_SYNCHRONIZE};
 
 pub const VERSION: u32 = 1;
@@ -40,7 +40,9 @@ pub struct Header {
     pub adapter_low: u32,
     pub adapter_high: i32,
     pub slot: u32,
-    pub reserved: u32,
+    /// Written here while frames are read (`ConsumerTick`); an older driver
+    /// ignores it (its `Reserved`).
+    pub consumer_tick: AtomicU32,
     pub frame_number: u64,
     pub present_qpc: u64,
     pub cursor_lock: AtomicI32,
@@ -132,6 +134,25 @@ pub fn for_output(device_name: &str) -> Option<DriverFrames> {
     }
 }
 
+/// Tell the driver `device_name`'s frames aren't read here, for a capture of
+/// one of its monitors that duplicates the output instead (a turned one): a
+/// tick left stale by an earlier capture would otherwise keep the driver, and
+/// the compositor with it, at a few frames a second. See
+/// [`DriverFrames::stop_reading`].
+pub fn not_reading(device_name: &str) {
+    let Some(id) = MONITORS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(n, _)| n.eq_ignore_ascii_case(device_name)).map(|x| x.1)
+    else {
+        return;
+    };
+    #[cfg(test)]
+    let prefix = TEST_PREFIX.lock().unwrap().clone().unwrap_or_else(|| DRIVER_PREFIX.to_owned());
+    #[cfg(not(test))]
+    let prefix = DRIVER_PREFIX;
+    if let Ok(mut d) = DriverFrames::open(&prefix, id) {
+        d.stop_reading();
+    }
+}
+
 /// Tests stand in for the driver in the session namespace (`Global\` needs
 /// a service's privilege).
 #[cfg(test)]
@@ -151,17 +172,51 @@ pub struct DriverFrames {
     hardware_cursor: Option<bool>,
     visible: Option<bool>,
     shape_id: Option<u32>,
+    /// The section is mapped writable: `consumer_tick` can be written.
+    writable: bool,
+    /// The last `consumer_tick` written.
+    tick: u32,
 }
 
 // The handles and the mapping are plain process-wide resources.
 unsafe impl Send for DriverFrames {}
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetTickCount64() -> u64;
+}
+
+/// `ConsumerTick` for `GetTickCount64()` = `ms`: 250 ms units, never 0 (0
+/// tells the driver nobody writes it).
+pub fn consumer_tick(ms: u64) -> u32 {
+    ((ms / 250) as u32).max(1)
+}
+
 impl DriverFrames {
     /// Open monitor `id`'s section and event, named `{prefix}{id}…`.
+    /// Writable when allowed, for `consumer_tick`; read-only otherwise, and
+    /// the driver then hands over every frame as if nobody wrote it.
     pub fn open(prefix: &str, id: u32) -> WinResult<Self> {
         unsafe {
-            let mapping = OpenFileMappingW(FILE_MAP_READ.0, false, &HSTRING::from(format!("{prefix}{id}")))?;
-            let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, core::mem::size_of::<Header>());
+            let name = HSTRING::from(format!("{prefix}{id}"));
+            let size = core::mem::size_of::<Header>();
+            let writable_view = OpenFileMappingW((FILE_MAP_READ | FILE_MAP_WRITE).0, false, &name).ok().and_then(|m| {
+                let v = MapViewOfFile(m, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size);
+                if v.Value.is_null() {
+                    let _ = CloseHandle(m);
+                    None
+                } else {
+                    Some((m, v))
+                }
+            });
+            let writable = writable_view.is_some();
+            let (mapping, view) = match writable_view {
+                Some(mv) => mv,
+                None => {
+                    let mapping = OpenFileMappingW(FILE_MAP_READ.0, false, &name)?;
+                    (mapping, MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, size))
+                }
+            };
             if view.Value.is_null() {
                 let e = Error::from_thread();
                 let _ = CloseHandle(mapping);
@@ -187,6 +242,8 @@ impl DriverFrames {
                 hardware_cursor: None,
                 visible: None,
                 shape_id: None,
+                writable,
+                tick: 0,
             };
             let version = core::ptr::read_volatile(core::ptr::addr_of!((*me.header()).version));
             if version != VERSION {
@@ -198,6 +255,38 @@ impl DriverFrames {
 
     fn header(&self) -> *const Header {
         self.view.Value as *const Header
+    }
+
+    /// Tell the driver frames are being read (`ConsumerTick`), at most once
+    /// per 250 ms: a driver that finds it stale takes frames off its
+    /// swap-chain only a few times a second. The capture asks for a frame at
+    /// least every 100 ms while it streams, a still screen included.
+    fn note_reading(&mut self) {
+        if !self.writable {
+            return;
+        }
+        let tick = consumer_tick(unsafe { GetTickCount64() });
+        if tick != self.tick {
+            self.tick = tick;
+            // (The view is writable: `writable`.)
+            unsafe { (*self.header()).consumer_tick.store(tick, Ordering::Relaxed) };
+        }
+    }
+
+    /// Tell the driver frames are no longer read from here (`ConsumerTick` =
+    /// 0, which it takes as "nobody writes it": every frame at full rate).
+    /// For a capture that leaves the driver's frames for Desktop Duplication
+    /// of the same monitor: a stale tick would otherwise have the driver take
+    /// frames off its swap-chain a few times a second, and the compositor
+    /// with it. Not done on drop, so a pause that closes the frames still
+    /// throttles. The next [`next_frame`](Self::next_frame) writes the tick
+    /// again.
+    pub fn stop_reading(&mut self) {
+        self.tick = 0;
+        if self.writable {
+            // (The view is writable: `writable`.)
+            unsafe { (*self.header()).consumer_tick.store(0, Ordering::Relaxed) };
+        }
     }
 
     /// Wait up to `ms` for a frame or pointer change.
@@ -226,6 +315,7 @@ impl DriverFrames {
     /// which must be on the frame's GPU (`state.adapter`) — check before
     /// using it. Lock its `mutex` with [`lock`] while reading it.
     pub fn next_frame(&mut self, device: &ID3D11Device) -> WinResult<Option<NextFrame>> {
+        self.note_reading();
         let Some(state) = self.state() else {
             return Ok(None);
         };
@@ -378,12 +468,63 @@ pub(crate) mod tests {
         assert_eq!(offset_of!(Header, frame_lock), 8);
         assert_eq!(offset_of!(Header, adapter_low), 24);
         assert_eq!(offset_of!(Header, slot), 32);
+        assert_eq!(offset_of!(Header, consumer_tick), 36);
         assert_eq!(offset_of!(Header, frame_number), 40);
         assert_eq!(offset_of!(Header, present_qpc), 48);
         assert_eq!(offset_of!(Header, cursor_lock), 56);
         assert_eq!(offset_of!(Header, y_hot), 92);
         assert_eq!(offset_of!(Header, shape), 96);
         assert_eq!(size_of::<Header>(), 96 + CURSOR_MAX * CURSOR_MAX * 4);
+    }
+
+    #[test]
+    fn the_consumer_tick_is_never_zero() {
+        // 0 means "nobody writes it" to the driver, so a wrap skips it.
+        assert_eq!(consumer_tick(0), 1);
+        assert_eq!(consumer_tick(249), 1);
+        assert_eq!(consumer_tick(250 * 7), 7);
+        assert_eq!(consumer_tick(250 * 7 + 249), 7);
+        assert_eq!(consumer_tick((u32::MAX as u64 + 1) * 250), 1);
+        assert_eq!(consumer_tick((u32::MAX as u64 + 2) * 250), 1);
+        assert_eq!(consumer_tick((u32::MAX as u64 + 3) * 250), 2);
+    }
+
+    #[test]
+    fn stop_reading_clears_the_consumer_tick() {
+        use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
+        use windows::Win32::System::Threading::CreateEventW;
+
+        // A section and event like the driver's, in this session's namespace.
+        let prefix = format!(r"Local\rdpio-test-frames-{}-", std::process::id());
+        let size = size_of::<Header>() as u32;
+        unsafe {
+            let mapping =
+                CreateFileMappingW(INVALID_HANDLE_VALUE, None, PAGE_READWRITE, 0, size, &HSTRING::from(format!("{prefix}1")))
+                    .unwrap();
+            let view = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size as usize);
+            assert!(!view.Value.is_null());
+            let header = view.Value as *mut Header;
+            (*header).version = VERSION;
+            let event = CreateEventW(None, false, false, &HSTRING::from(format!("{prefix}1-ready"))).unwrap();
+
+            let mut frames = DriverFrames::open(&prefix, 1).unwrap();
+            assert!(frames.writable);
+            frames.note_reading();
+            assert_ne!((*header).consumer_tick.load(Ordering::Relaxed), 0);
+            frames.stop_reading();
+            assert_eq!((*header).consumer_tick.load(Ordering::Relaxed), 0);
+            // Reading again writes the tick again, in the same 250 ms too.
+            frames.note_reading();
+            assert_ne!((*header).consumer_tick.load(Ordering::Relaxed), 0);
+            // Closing the frames leaves the tick as it was.
+            drop(frames);
+            assert_ne!((*header).consumer_tick.load(Ordering::Relaxed), 0);
+
+            let _ = UnmapViewOfFile(view);
+            let _ = CloseHandle(mapping);
+            let _ = CloseHandle(event);
+        }
     }
 
     #[test]
@@ -569,7 +710,13 @@ pub(crate) mod tests {
         unsafe {
             let fake = FakeDriver::new(&prefix, 3, &driver_dev, size, 41, 77);
             let mut frames = DriverFrames::open(&prefix, 3).expect("open");
+            assert_eq!((*fake.header).consumer_tick.load(Ordering::Relaxed), 0, "nothing read yet");
             assert!(frames.next_frame(&agent_dev).unwrap().is_none(), "nothing published yet");
+            // Reading says so to the driver (the section is writable here).
+            assert!(frames.writable);
+            let tick = (*fake.header).consumer_tick.load(Ordering::Relaxed);
+            assert_ne!(tick, 0, "the reader marks the section");
+            assert!(tick.abs_diff(consumer_tick(GetTickCount64())) <= 1);
 
             fake.publish(&driver_ctx, 0, [10, 20, 30, 255], size);
             driver_ctx.Flush();

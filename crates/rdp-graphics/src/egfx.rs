@@ -91,7 +91,8 @@ impl GfxPipeline {
     }
 
     /// A client `RDPGFX_FRAME_ACKNOWLEDGE_PDU` for a completed frame, reporting
-    /// `queue_depth` (the client's decode backlog) for server-side flow control.
+    /// `queue_depth` (the client's decode backlog in bytes) for server-side flow
+    /// control.
     pub fn frame_acknowledge(
         &self,
         queue_depth: u32,

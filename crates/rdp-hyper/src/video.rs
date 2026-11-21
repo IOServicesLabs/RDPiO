@@ -688,6 +688,15 @@ impl Reassembler {
         self.train.is_some()
     }
 
+    /// The newest frame id at and below which every frame is resolved here:
+    /// delivered, or given up on (`None` until a frame has been either).
+    /// Frames before the first one delivered count as resolved too: they
+    /// will never be. What the host needs to know whether a keyframe it sent
+    /// has reached the client, without counting frames.
+    pub fn resolved_through(&self) -> Option<u32> {
+        self.next.map(|n| n.wrapping_sub(1))
+    }
+
     /// The train arriving, timed into [`Stats::link_kbps`] if it came
     /// promptly and long enough to tell.
     fn finish_train(&mut self) {
@@ -940,6 +949,36 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// What's resolved: nothing at first; a frame delivered (and the ones
+    /// before it, never coming); one skipped is resolved once a newer frame
+    /// completes; one given up on for being a whole window old.
+    #[test]
+    fn resolved_through_follows_delivered_and_lost_frames() {
+        let mut r = Reassembler::new();
+        assert_eq!(r.resolved_through(), None);
+        // Frame 5 is the first to arrive (0..5 went before the client listened).
+        let data = frame(5, 3_000);
+        let packets = send(5, &data, 0.1);
+        assert!(packets.len() > 2);
+        r.push(&packets[0], 0);
+        assert_eq!(r.resolved_through(), None, "partly here");
+        for p in &packets[1..] {
+            r.push(p, 0);
+        }
+        assert_eq!(r.resolved_through(), Some(5));
+        // 6 never comes, 7 does: 6 is lost, both resolved.
+        for p in send(7, &frame(7, 2_000), 0.1) {
+            r.push(&p, 0);
+        }
+        assert_eq!(r.resolved_through(), Some(7));
+        // 8 partly here, then frames far newer arrive: 8 is given up on.
+        let eight = send(8, &frame(8, 5_000), 0.1);
+        r.push(&eight[0], 0);
+        let far = 8 + MAX_IN_FLIGHT as u32;
+        r.push(&send(far, &frame(far, 5_000), 0.1)[0], 0);
+        assert_eq!(r.resolved_through(), Some(far - MAX_IN_FLIGHT as u32));
     }
 
     /// A run of packets lost back to back: sent block after block it takes

@@ -20,6 +20,7 @@
 //! All best effort: a desktop without Wi-Fi, or a qWAVE refusal, just logs.
 
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
 
@@ -274,7 +275,16 @@ impl Drop for QosFlow {
 /// the default 15.6 ms tick turned into a 13-15 ms stall on one frame in ten
 /// — a 240 fps stream decoded at ~150 and showed ~30. Measured at 1080p HEVC,
 /// 50 Mbps: decode p90 13.4 ms → 0.5 ms.
-pub struct FineTimer;
+pub struct FineTimer(());
+
+/// How many [`FineTimer`]s live in this process (see [`fine_timer_held`]).
+static FINE_TIMERS: AtomicU32 = AtomicU32::new(0);
+
+/// Whether this process holds the 1 ms timer now: a millisecond's sleep then
+/// takes about that, where the default tick can stretch it to 15.6 ms.
+pub fn fine_timer_held() -> bool {
+    FINE_TIMERS.load(Ordering::Relaxed) > 0
+}
 
 #[link(name = "winmm")]
 extern "system" {
@@ -287,12 +297,14 @@ impl FineTimer {
         unsafe {
             timeBeginPeriod(1);
         }
-        Self
+        FINE_TIMERS.fetch_add(1, Ordering::Relaxed);
+        Self(())
     }
 }
 
 impl Drop for FineTimer {
     fn drop(&mut self) {
+        FINE_TIMERS.fetch_sub(1, Ordering::Relaxed);
         unsafe {
             timeEndPeriod(1);
         }
@@ -302,6 +314,19 @@ impl Drop for FineTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fine timer counts as held for as long as it lives (other tests may
+    /// hold their own meanwhile, so only that much is sure).
+    #[test]
+    fn a_fine_timer_is_held_while_it_lives() {
+        let timer = FineTimer::new();
+        assert!(fine_timer_held());
+        let held = FINE_TIMERS.load(Ordering::Relaxed);
+        assert!(held >= 1);
+        drop(timer);
+        // (Dropped exactly once: the count can't have wrapped below zero.)
+        assert!(FINE_TIMERS.load(Ordering::Relaxed) < u32::MAX / 2);
+    }
 
     /// On a real network path (set HYPER_QOS_TARGET=ip:port, e.g. the
     /// router): both socket kinds get marked, and the guards drop cleanly.

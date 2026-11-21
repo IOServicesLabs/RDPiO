@@ -1,5 +1,5 @@
-//! Hub data model: saved connections, DPAPI-protected passwords, MRU history,
-//! and the connection target handed to the existing connect bootstrap.
+//! Hub data model: saved connections, DPAPI-protected passwords and MRU
+//! history.
 //!
 //! Everything in this module is plain data plus small, pure logic so it can be
 //! unit-tested without a window. The only platform-specific dependency is DPAPI
@@ -10,9 +10,7 @@
 //! Serialization contract: [`ConnectionRecord`] and [`MruRecord`] are persisted
 //! as JSON under `%LOCALAPPDATA%\rdpio\` by `hub::store` (step-4). A password
 //! is only ever the base64 encoding of the opaque DPAPI blob, so the on-disk
-//! JSON contains no plaintext. [`ConnectionTarget`] keeps its password in
-//! memory only and marks it `#[serde(skip)]`, so even a blanket serialization
-//! cannot write it out.
+//! JSON contains no plaintext.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -150,96 +148,6 @@ impl MruRecord {
     }
 }
 
-/// Everything the existing connect bootstrap needs for one session, produced by
-/// the hub UI and consumed by `main.rs` (step-8). The password exists only in
-/// memory — the field is `#[serde(skip)]` so even a blanket serialization
-/// cannot write it out, and deserialization always yields `None`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConnectionTarget {
-    /// Display name (also used for the MRU entry and the connection bar).
-    pub display_name: String,
-    pub host: String,
-    pub port: u16,
-    pub username: Option<String>,
-    pub domain: Option<String>,
-    /// Plaintext password, in memory only. Never serialized.
-    #[serde(skip)]
-    pub password: Option<String>,
-    /// Set when the target came from a Saved entry; step-9 records it on the
-    /// MRU entry so a later Recent launch can reuse the saved password.
-    #[serde(skip)]
-    pub connection_id: Option<uuid::Uuid>,
-}
-
-impl ConnectionTarget {
-    /// Minimal target for a bare host[:port]; the display name defaults to the
-    /// host and all optional fields start unset.
-    pub fn new(host: impl Into<String>, port: u16) -> Self {
-        let host = host.into();
-        Self {
-            display_name: host.clone(),
-            host,
-            port,
-            username: None,
-            domain: None,
-            password: None,
-            connection_id: None,
-        }
-    }
-}
-
-/// Suggested display name for the New Connection form's display-name field.
-///
-/// This is the autofill dirty rule: the display name follows the host only
-/// while the user has not manually edited the display field.
-///
-/// - `display_dirty == true` (the user typed in the display field): returns
-///   `None`, so a later host edit never clobbers the typed name.
-/// - `display_dirty == false` (fresh form / untouched display): returns
-///   `Some(host)` — the current host text as the display name — but only when
-///   the host actually differs from the value currently shown
-///   (`host != current_display`, so typing the same host back does not rewrite
-///   the field and no recursive `EN_CHANGE` fires). A `None` (or empty)
-///   `current_display` means the field is blank, so the first host keystroke
-///   autofills it.
-///
-/// Pure and side-effect free, so the form's autofill rule can be unit-tested
-/// without a window. The hub form calls this on every host `EN_CHANGE` and
-/// applies the returned value, if any. The dirty flag is UI-only state — it is
-/// never persisted to the store, and a fresh form resets it to `false` before
-/// any host text is applied.
-pub fn autofill_display_name(
-    host: &str,
-    current_display: Option<&str>,
-    display_dirty: bool,
-) -> Option<String> {
-    if display_dirty {
-        return None;
-    }
-    let current = current_display.unwrap_or("");
-    if host == current {
-        return None;
-    }
-    Some(host.to_string())
-}
-
-/// Preferred username for the New Connection form's username field.
-///
-/// Prefers the last-used username from MRU history; when history yields no
-/// non-empty username, falls back to the current Windows user. Returns `None`
-/// only when neither source has a usable (present, non-blank) value, in which
-/// case the form leaves the field empty.
-///
-/// Pure and side-effect free, so the prefill rule can be unit-tested without a
-/// window or DPAPI. The hub form (step-10) calls it with
-/// `store.last_used_username()` as `last_used` and `GetUserNameW` as
-/// `current_user`.
-pub fn prefill_username(last_used: Option<&str>, current_user: Option<&str>) -> Option<String> {
-    let last_used = last_used.map(str::trim).filter(|s| !s.is_empty());
-    let current_user = current_user.map(str::trim).filter(|s| !s.is_empty());
-    last_used.or(current_user).map(String::from)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,125 +250,5 @@ mod tests {
         );
         let back: MruRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back, m);
-    }
-
-    #[test]
-    fn connection_target_serialization_never_emits_password() {
-        let t = ConnectionTarget {
-            display_name: "Box".into(),
-            host: "box.local".into(),
-            port: 3389,
-            username: Some("u".into()),
-            domain: None,
-            password: Some("PLAINTEXT-SECRET".into()),
-            connection_id: Some(uuid::Uuid::new_v4()),
-        };
-        let json = serde_json::to_string(&t).unwrap();
-        assert!(
-            !json.contains("PLAINTEXT-SECRET"),
-            "serialized ConnectionTarget leaked the plaintext: {json}"
-        );
-        assert!(!json.contains("password"));
-        // The in-memory-only fields are dropped by (de)serialization by design.
-        let back: ConnectionTarget = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.password, None);
-        assert_eq!(back.connection_id, None);
-        assert_eq!(back.host, "box.local");
-    }
-
-    #[test]
-    fn connection_target_new_defaults_sane() {
-        let t = ConnectionTarget::new("10.1.2.3", 3390);
-        assert_eq!(t.host, "10.1.2.3");
-        assert_eq!(t.port, 3390);
-        assert_eq!(t.display_name, "10.1.2.3");
-        assert_eq!(t.username, None);
-        assert_eq!(t.password, None);
-        assert_eq!(t.connection_id, None);
-    }
-
-    #[test]
-    fn autofill_display_name_changes_with_host_while_not_edited() {
-        // Not edited: the suggestion follows the host as it is typed. A blank
-        // display field (None or empty) is the fresh-form state.
-        assert_eq!(
-            autofill_display_name("10.0.0.5", None, false),
-            Some("10.0.0.5".to_string())
-        );
-        assert_eq!(
-            autofill_display_name("10.0.0.5", Some(""), false),
-            Some("10.0.0.5".to_string())
-        );
-        assert_eq!(
-            autofill_display_name("10.0.0.5", Some("10"), false),
-            Some("10.0.0.5".to_string())
-        );
-        // No actual change → nothing to apply (avoids rewriting the field).
-        assert_eq!(
-            autofill_display_name("10.0.0.5", Some("10.0.0.5"), false),
-            None,
-            "host equal to current display must not re-suggest"
-        );
-    }
-
-    #[test]
-    fn autofill_display_name_never_overwrites_after_manual_edit() {
-        // The user typed into the display field → dirty; never clobber, even
-        // when the host changes again afterwards.
-        assert_eq!(
-            autofill_display_name("10.0.0.6", Some("My Server"), true),
-            None,
-            "a manually edited display name must never be overwritten"
-        );
-        assert_eq!(
-            autofill_display_name("10.0.0.7", Some("My Server"), true),
-            None,
-            "later host edits must not clobber a dirty display name"
-        );
-        assert_eq!(
-            autofill_display_name("", Some("My Server"), true),
-            None,
-            "even an emptied display field stays untouched once edited"
-        );
-    }
-
-    #[test]
-    fn autofill_display_name_fresh_form_resets_dirty() {
-        // A fresh form clears the dirty flag and blanks the display field, so
-        // the next host edit autofills again even after a previous form had a
-        // manually edited display name.
-        assert_eq!(
-            autofill_display_name("box.local", None, false),
-            Some("box.local".to_string())
-        );
-        assert_eq!(
-            autofill_display_name("10.0.0.5", None, false),
-            Some("10.0.0.5".to_string())
-        );
-    }
-
-    #[test]
-    fn prefill_username_prefers_last_used_then_falls_back() {
-        // Last-used wins over the current Windows user.
-        assert_eq!(
-            prefill_username(Some("bob"), Some("alice")),
-            Some("bob".to_string())
-        );
-        // A blank last-used username is not usable → fall back to current user.
-        assert_eq!(
-            prefill_username(Some("   "), Some("alice")),
-            Some("alice".to_string())
-        );
-        // No MRU username at all → the current Windows user is the final
-        // fallback.
-        assert_eq!(
-            prefill_username(None, Some("alice")),
-            Some("alice".to_string())
-        );
-        // Neither source has a value → blank field.
-        assert_eq!(prefill_username(None, None), None);
-        assert_eq!(prefill_username(Some(""), None), None);
-        // A blank current-user fallback is not usable either.
-        assert_eq!(prefill_username(None, Some("  ")), None);
     }
 }

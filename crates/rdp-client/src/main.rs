@@ -12,7 +12,7 @@
 //!
 //! `--multimon` spans the remote desktop across every local monitor (a
 //! borderless window covering the virtual screen); `--fullscreen` is borderless
-//! fullscreen on the primary monitor; `--drive PATH` shares a local folder into
+//! fullscreen on the monitor the pointer is on; `--drive PATH` shares a local folder into
 //! the session; `--insecure` accepts self-signed TLS certs; `--cpu-yuv` forces
 //! CPU YUV→RGB if GPU-decoded colors look wrong; `--udp` enables the
 //! experimental UDP side-band transport (falls back to TCP); `--udp-debug` adds
@@ -250,6 +250,8 @@ fn main() {
         };
         let result: Option<Result<(), Box<dyn std::error::Error>>> = if flag("--hyper-display-install") || flag("--hyper-display-uninstall") {
             Some(virtual_display::install(flag("--hyper-display-uninstall")).map(|note| println!("{note}")))
+        } else if flag("--hyper-display-repair") {
+            Some(virtual_display::repair().map(|note| println!("{note}")))
         } else if flag("--hyper-set-password") {
             Some(hyper_direct::set_password())
         } else if flag("--hyper-host-settings") {
@@ -267,6 +269,13 @@ fn main() {
             hyper_client::set_scale(args.hyper_scale);
             hyper_client::set_upscale(args.upscale, args.sharpen, args.upscale_explicit);
             crate::window::set_system_keys_local(args.hyper_local_keys);
+            name_session(&args);
+            // Full screen (from the start or after Ctrl+Shift+F): the bar.
+            crate::connbar::want();
+            // The launcher keeps the Hyper passwords it hands over (or not, as
+            // the user chose): only a password typed or given here is kept
+            // per host.
+            hyper_client::set_remember_password(!args.hyper_password_from_env);
             match args.host.clone() {
                 Some(host) => Some(hyper_client::run_direct(
                     &host,
@@ -366,6 +375,8 @@ fn main() {
         // Windows opens a window and paints the live desktop. Other platforms
         // run the same protocol stack headless, logging decoded rectangles.
         #[cfg(windows)]
+        name_session(&args);
+        #[cfg(windows)]
         let result = win::run_connected(&args).map_err(|e| e.to_string());
         #[cfg(not(windows))]
         let result = run_connect(&args).map_err(|e| e.to_string());
@@ -379,30 +390,20 @@ fn main() {
 
     #[cfg(windows)]
     {
-        // No connection-target args (no `--host`, `--w365`, `--feed`): open the
-        // hub. Selecting a Recent or Saved entry returns a ConnectionTarget that
-        // is handed to the exact same bootstrap the CLI `--host` path uses;
-        // closing the hub with no selection exits 0.
-        // The launcher first; the hub when WebView2 is missing (or asked for).
-        if !std::env::args().any(|a| a == "--classic-hub") {
-            match launcher::run() {
-                Ok(()) => return,
-                Err(e) => tracing::warn!(error = %e, "the launcher could not open; using the classic hub"),
+        // No connection-target args (no `--host`, `--w365`, `--feed`): the
+        // launcher. When it can't open (no WebView2), say so and why; sessions
+        // still start from a terminal.
+        if let Err(e) = launcher::run() {
+            tracing::error!(error = %e, "the launcher could not open");
+            let text = windows::core::HSTRING::from(format!(
+                "rdpio's window could not open: {e}.\n\nIt needs the Microsoft Edge WebView2 Runtime (part of Windows 11; \
+                 it can be installed on Windows 10).\n\nSessions still start from a terminal: rdpio --host <pc> …"
+            ));
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+                let _ = MessageBoxW(None, &text, windows::core::w!("rdpio"), MB_OK | MB_ICONERROR);
             }
-        }
-        match hub::run() {
-            Ok(Some(target)) => {
-                let args = args_from_target(&args, &target);
-                if let Err(err) = win::run_connected(&args) {
-                    tracing::error!(error = %err, "connection attempt failed");
-                    std::process::exit(1);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::error!(error = %e, "hub could not be opened");
-                std::process::exit(1);
-            }
+            std::process::exit(1);
         }
     }
 
@@ -417,111 +418,13 @@ fn main() {
     }
 }
 
-/// Convert a hub-selected [`hub::ConnectionTarget`] into connection `Args`,
-/// carrying over any session flags the user passed alongside (e.g. `--multimon`,
-/// `--quality`). Only the target fields differ from the no-args parse; the
-/// result feeds the same `win::run_connected` bootstrap the `--host` path uses,
-/// so the session behaves identically to a CLI launch.
+/// A session's windows carry its connection's name (the launcher's name for
+/// it, else the host), so the taskbar and Alt+Tab tell sessions apart.
 #[cfg(windows)]
-fn args_from_target(base: &Args, target: &hub::ConnectionTarget) -> Args {
-    let mut args = base.clone();
-    args.host = Some(target.host.clone());
-    args.port = target.port;
-    args.user = target.username.clone();
-    args.domain = target.domain.clone();
-    args.password = target.password.clone();
-    // Step-9: thread the hub selection metadata through to the success point so
-    // the MRU entry records the display name and the saved-record link.
-    args.hub_display_name = Some(target.display_name.clone());
-    args.hub_connection_id = target.connection_id;
-    args
-}
-
-/// Parse a connection-target argv into a [`hub::ConnectionTarget`], the exact
-/// inverse of [`target_to_args`].
-///
-/// Recognizes the five target flags (`--host|-h`, `--port`, `--user|-u`,
-/// `--domain|-d`, `--password|-p`) using the same space-separated token syntax
-/// the CLI parser in [`Args::from_env`] uses; any other flag is skipped, so the
-/// full process argv can be fed straight in without tripping over session/UI
-/// knobs. Returns `None` when no `--host` was present — a connection target
-/// without a host is meaningless, and callers treat that as "not a connection
-/// launch". The display name defaults to the host and `connection_id` to `None`
-/// (the argv format carries neither; both are hub-only metadata).
-///
-/// Kept `pub` and side-effect free so the exact inverse property
-/// `parse_connection_args(target_to_args(&t)) == t` is unit-testable and so the
-/// keep-open child-launch path (step-6) can re-enter argv when it needs to.
-#[cfg(windows)]
-#[allow(dead_code)] // exercised by the round-trip tests; production call site arrives with the keep-open launch work
-pub fn parse_connection_args(
-    args: impl Iterator<Item = String>,
-) -> Option<hub::ConnectionTarget> {
-    let mut host: Option<String> = None;
-    let mut port: u16 = 3389;
-    let mut username: Option<String> = None;
-    let mut domain: Option<String> = None;
-    let mut password: Option<String> = None;
-
-    let mut it = args;
-    while let Some(flag) = it.next() {
-        match flag.as_str() {
-            "--host" | "-h" => host = it.next(),
-            "--port" => {
-                // Unparseable port keeps the default, matching Args::from_env.
-                if let Some(v) = it.next().and_then(|v| v.parse::<u16>().ok()) {
-                    port = v;
-                }
-            }
-            "--user" | "-u" => username = it.next(),
-            "--domain" | "-d" => domain = it.next(),
-            "--password" | "-p" => password = it.next(),
-            // Everything else (--multimon, --quality, …) is not part of the
-            // target and is skipped, matching the CLI parser's tolerance.
-            _ => {}
-        }
+fn name_session(args: &Args) {
+    if let Some(name) = args.hub_display_name.as_deref().or(args.host.as_deref()) {
+        crate::window::set_session_name(name);
     }
-
-    let host = host?;
-    Some(hub::ConnectionTarget {
-        display_name: host.clone(),
-        host,
-        port,
-        username,
-        domain,
-        password,
-        connection_id: None,
-    })
-}
-
-/// Serialize a [`hub::ConnectionTarget`] into connection argv, the exact
-/// inverse of [`parse_connection_args`]: `--host <host> --port <port>
-/// [--user <user>] [--domain <domain>] [--password <password>]`, always in
-/// that order with the optional fields omitted when unset. The detached child
-/// session launcher (`hub::spawn_connection_child`) appends this to the current
-/// executable so the child's `Args::from_env()` re-parses the exact target the
-/// hub selected.
-#[cfg(windows)]
-pub fn target_to_args(target: &hub::ConnectionTarget) -> Vec<String> {
-    let mut out = vec![
-        "--host".to_string(),
-        target.host.clone(),
-        "--port".to_string(),
-        target.port.to_string(),
-    ];
-    if let Some(user) = &target.username {
-        out.push("--user".to_string());
-        out.push(user.clone());
-    }
-    if let Some(domain) = &target.domain {
-        out.push("--domain".to_string());
-        out.push(domain.clone());
-    }
-    if let Some(password) = &target.password {
-        out.push("--password".to_string());
-        out.push(password.clone());
-    }
-    out
 }
 
 /// Record a successful connection in the hub's MRU history (step-9). No
@@ -549,6 +452,7 @@ fn record_mru(args: &Args) {
         username: args.user.clone(),
         domain: args.domain.clone(),
         password: args.password.clone(),
+        connection_id: args.hub_connection_id,
     });
 
     match hub::MruStore::load().and_then(|mut store| {
@@ -1019,9 +923,6 @@ pub(crate) const HYPER_PASSWORD_ENV: &str = "RDPIO_HYPER_PASSWORD";
 
 /// Minimal command-line arguments (no external arg-parsing dependency).
 ///
-/// `Clone` is derived so the hub hand-off (step-8) can carry any session flags
-/// (e.g. `--multimon`, `--quality`) from the no-args parse into the selected
-/// target's connect call.
 #[derive(Debug, Clone)]
 struct Args {
     host: Option<String>,
@@ -1037,7 +938,7 @@ struct Args {
     drive: Vec<String>,
     /// Span the remote desktop across all local monitors (`--multimon`).
     multimon: bool,
-    /// Borderless fullscreen on the primary monitor (`--fullscreen`).
+    /// Borderless fullscreen on the monitor the pointer is on (`--fullscreen`).
     fullscreen: bool,
     /// Force CPU YUV→RGB conversion instead of the GPU video processor
     /// (`--cpu-yuv`) — a safety valve if GPU-decoded colors look wrong.
@@ -1224,13 +1125,16 @@ struct Args {
     /// `rdp_hyper::autores`). An explicit `--render-scale F` with no
     /// `--hyper-scale` pins it at F too: one flag for "send fewer pixels".
     hyper_scale: Option<u32>,
-    /// Display name of the connection selected in the hub (hub launches only);
-    /// recorded on the MRU entry. `None` for plain CLI launches.
+    /// The launcher's name for the connection (`--launcher-name`); recorded on
+    /// the history entry. `None` for plain CLI launches.
     hub_display_name: Option<String>,
-    /// Saved-record id of the hub-selected connection when it came from the
-    /// Saved list; recorded on the MRU entry so a later Recent launch can reuse
-    /// the saved password. `None` for CLI / unsaved launches.
+    /// The saved connection the launcher started (`--launcher-id`); recorded
+    /// on the history entry, and the connection bar's Save updates it instead
+    /// of adding another. `None` for CLI / unsaved launches.
     hub_connection_id: Option<uuid::Uuid>,
+    /// The Hyper password came from the launcher (by environment): the
+    /// launcher keeps it, so the session does not remember it per host.
+    hyper_password_from_env: bool,
 }
 
 impl Args {
@@ -1262,6 +1166,7 @@ impl Args {
             quality: QualityPreset::default(),
             hub_display_name: None,
             hub_connection_id: None,
+            hyper_password_from_env: false,
             force_avc444: false,
             no_avc: false,
             render_scale: 1.0,
@@ -1455,6 +1360,8 @@ impl Args {
                 // connection (its password pipe is read before this).
                 "--launcher-name" => args.hub_display_name = it.next(),
                 "--launcher-id" => args.hub_connection_id = it.next().and_then(|v| v.parse().ok()),
+                // (`--classic-hub` asked for a window that is gone: the
+                // launcher opens instead, so old shortcuts still work.)
                 "--launcher-pipe" | "--classic-hub" => {
                     if flag == "--launcher-pipe" {
                         let _ = it.next();
@@ -1490,7 +1397,7 @@ impl Args {
                     let _ = it.next();
                 }
                 "--hyper-set-password" | "--hyper-service-install" | "--hyper-service-uninstall" | "--hyper-service"
-                | "--hyper-display-install" | "--hyper-display-uninstall"
+                | "--hyper-display-install" | "--hyper-display-uninstall" | "--hyper-display-repair"
                 | "--hyper-console-agent" => {}
                 "--hyper-host" => args.hyper_host = true,
                 "--hyper-audio-test" | "--hyper-camera-test" => {}
@@ -1548,6 +1455,7 @@ impl Args {
         }
         if args.hyper_password.is_none() {
             args.hyper_password = std::env::var(HYPER_PASSWORD_ENV).ok();
+            args.hyper_password_from_env = args.hyper_password.is_some();
         }
         std::env::remove_var(PASSWORD_ENV);
         std::env::remove_var(HYPER_PASSWORD_ENV);
@@ -1608,7 +1516,8 @@ AUTHENTICATION
     --forget-password      Clear the saved credential for this host and exit.
 
 DISPLAY
-    --fullscreen, -f       Borderless fullscreen on the current monitor.
+    --fullscreen, -f       Borderless fullscreen on the screen the pointer is on.
+                           The bar at the top edge minimizes or disconnects.
     --multimon, -m         Span every monitor as one desktop.
     --per-monitor          One window per monitor instead of one spanning window.
     --width <PX>           Desktop width  (default: the window's client area).
@@ -1941,15 +1850,18 @@ mod window;
 #[cfg(windows)]
 mod connbar;
 
-// Connection hub: saved-connection / MRU stores (DPAPI-protected passwords) and,
-// in later steps, the native Win32 hub window that launches sessions. Windows-only
-// because it reuses the DPAPI helpers in token_cache.rs and the Win32 window
-// pattern (the audit map lives in hub/mod.rs).
+// The keyboard shortcuts, listed once (launcher Settings, session hints).
+#[cfg(windows)]
+mod hotkeys;
+
+// Saved connections and history (DPAPI-protected passwords), shared by the
+// launcher, the connection bar and sessions. Windows-only because it reuses the
+// DPAPI helpers in token_cache.rs.
 #[cfg(windows)]
 mod hub;
 
 // The start window (WebView2): connections, their options, this PC's Hyper
-// host setup. Falls back to the hub above without WebView2.
+// host setup.
 #[cfg(windows)]
 mod launcher;
 
@@ -2142,19 +2054,25 @@ mod win {
             nv12: &[u8],
             rects: &[(u16, u16, u16, u16)],
         ) {
+            self.blit_nv12_owned(x, y, w, h, nv12.to_vec(), rects.to_vec());
+        }
+        fn blit_nv12_owned(
+            &mut self,
+            x: u16,
+            y: u16,
+            w: u16,
+            h: u16,
+            nv12: Vec<u8>,
+            rects: Vec<(u16, u16, u16, u16)>,
+        ) {
             // Hand the NV12 frame to the UI thread, which owns the D3D11 device
             // and converts it on the GPU (falling back to CPU there if needed).
+            // The decoder's own buffers move into the message: a software-
+            // decoded frame is megabytes, copied once per frame otherwise.
             if let Some(m) = self.metrics.as_ref() {
                 m.record_blit(nv12.len() as u64);
             }
-            let _ = self.tx.send(FrameMsg::BlitNv12 {
-                x,
-                y,
-                w,
-                h,
-                nv12: nv12.to_vec(),
-                rects: rects.to_vec(),
-            });
+            let _ = self.tx.send(FrameMsg::BlitNv12 { x, y, w, h, nv12, rects });
         }
         fn blit_texture(
             &mut self,
@@ -2628,6 +2546,43 @@ mod win {
             out
         }
 
+        /// Copy a `w`x`h` rectangle of the CPU shadow from (`sx`,`sy`) to
+        /// (`dx`,`dy`) in place: what [`Self::fb_region`] followed by
+        /// [`Self::fb_put`] does, without the buffer in between. The two
+        /// rectangles may overlap (a scroll is exactly that), so rows go
+        /// top-down when the picture moves up and bottom-up when it moves down
+        /// (no source row is overwritten before it is read), and each row is a
+        /// `copy_within`, which is overlap-safe sideways. Source pixels outside
+        /// the shadow read as black, as `fb_region` pads them.
+        fn fb_copy(&mut self, sx: u32, sy: u32, w: u32, h: u32, dx: u32, dy: u32) {
+            if self.fb_w == 0 {
+                self.fb_ensure(self.desktop_w.max(dx + w), self.desktop_h.max(dy + h));
+            }
+            if dx >= self.fb_w {
+                return;
+            }
+            let fb_w = self.fb_w as usize;
+            // Columns the destination has inside the shadow, and how many of
+            // those the source has too.
+            let dst_cols = (self.fb_w - dx).min(w) as usize;
+            let src_cols = if sx < self.fb_w {
+                ((self.fb_w - sx).min(w) as usize).min(dst_cols)
+            } else {
+                0
+            };
+            let rows = h.min(self.fb_h.saturating_sub(dy));
+            for i in 0..rows {
+                let row = if dy <= sy { i } else { rows - 1 - i };
+                let dst = ((dy + row) as usize * fb_w + dx as usize) * 4;
+                let copied = if sy + row < self.fb_h { src_cols } else { 0 };
+                if copied > 0 {
+                    let src = ((sy + row) as usize * fb_w + sx as usize) * 4;
+                    self.fb.copy_within(src..src + copied * 4, dst);
+                }
+                self.fb[dst + copied * 4..dst + dst_cols * 4].fill(0);
+            }
+        }
+
         /// Mirror every RGBA blit into the CPU desktop shadow.
         fn shadow_blits(&mut self, blits: &[session::GfxBlit]) {
             for b in blits {
@@ -2883,7 +2838,8 @@ mod win {
                 tracing::debug!("AVC420 stream parse failed");
                 return Vec::new();
             };
-            let h264 = stream.h264.to_vec();
+            // The access unit is read where it lies in `data` (no copy).
+            let h264 = stream.h264;
             let rects = Self::region_tuples(&stream.rects);
             let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
             let (sw, sh) = self.surface_dims(surface_id);
@@ -2893,7 +2849,7 @@ mod win {
                 surface_id,
                 sw,
                 sh,
-                &h264,
+                h264,
                 clamp(origin_x),
                 clamp(origin_y),
                 &rects,
@@ -2927,7 +2883,7 @@ mod win {
                 }
             }
             let frames =
-                Self::decode_stream(&mut self.cpu_decoders, surface_id, sw, sh, "main", &h264);
+                Self::decode_stream(&mut self.cpu_decoders, surface_id, sw, sh, "main", h264);
             let queued = self.pending_rects.entry(surface_id).or_default();
             let mut blits = Vec::new();
             for f in frames {
@@ -3346,13 +3302,10 @@ mod win {
                     if w == 0 || h == 0 {
                         continue;
                     }
-                    let mut rgba = vec![0u8; w as usize * h as usize * 4];
-                    for px in rgba.chunks_exact_mut(4) {
-                        px[0] = r;
-                        px[1] = g;
-                        px[2] = b;
-                        px[3] = 0xFF;
-                    }
+                    // One pixel repeated: the buffer is filled by doubling
+                    // block copies as it is built, with no zeroing pass and no
+                    // per-pixel loop (a fill is often a whole window's worth).
+                    let rgba = [r, g, b, 0xFF].repeat(w as usize * h as usize);
                     blits.push(session::GfxBlit::Rgba {
                         x: clamp(ox + rect.left as u32),
                         y: clamp(oy + rect.top as u32),
@@ -3387,7 +3340,11 @@ mod win {
                     let sy = soy + rect_src.top as u32;
                     // Shadow source pixels (for ClearCodec seeding of non-H.264
                     // content); the GPU copy reads the live framebuffer instead.
-                    let src = self.fb_region(sx, sy, w, h);
+                    // One destination (a scroll, a window move) is copied in
+                    // place. Several share one snapshot of the source, so an
+                    // earlier destination that overlaps the source cannot
+                    // change what the later ones receive.
+                    let snapshot = (dest_pts.len() > 1).then(|| self.fb_region(sx, sy, w, h));
                     let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
                     for p in dest_pts {
                         let dx = dox + p.x as u32;
@@ -3400,7 +3357,10 @@ mod win {
                             dx: clamp(dx),
                             dy: clamp(dy),
                         });
-                        self.fb_put(dx, dy, w, h, &src);
+                        match snapshot.as_deref() {
+                            Some(src) => self.fb_put(dx, dy, w, h, src),
+                            None => self.fb_copy(sx, sy, w, h, dx, dy),
+                        }
                     }
                 }
                 D_COPY.fetch_add(blits.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -3447,7 +3407,11 @@ mod win {
             {
                 let (ox, oy) = self.surfaces.output_origin(*surface_id).unwrap_or((0, 0));
                 let mut blits = Vec::new();
-                if let Some((w, h, px)) = self.gfx_cache.get(slot).cloned() {
+                // The entry is taken out for the copy and put back after it
+                // (`fb_put` needs the whole renderer): cloning the cached pixels
+                // on every replay was an allocation and a copy the size of the
+                // cached rectangle.
+                if let Some((w, h, px)) = self.gfx_cache.remove(slot) {
                     D_CACHE_BLIT.fetch_add(dest_pts.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
                     for p in dest_pts {
@@ -3460,6 +3424,7 @@ mod win {
                         });
                         self.fb_put(dx, dy, w, h, &px);
                     }
+                    self.gfx_cache.insert(*slot, (w, h, px));
                 } else {
                     // The slot was never populated (a SurfaceToCache we dropped or
                     // failed) → CacheToSurface paints nothing → black hole.
@@ -3756,9 +3721,9 @@ mod win {
         Ok(())
     }
 
-    /// The no-host demo window (slate background). Superseded by the hub
-    /// (step-8): launching without `--host` now opens `hub::run()` instead, so
-    /// this M0 window is kept only as a reference/demo entry point.
+    /// The no-host demo window (slate background). Superseded by the launcher:
+    /// launching without `--host` opens `launcher::run()` instead, so this M0
+    /// window is kept only as a reference/demo entry point.
     #[allow(dead_code)]
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let (width, height) = (1280u32, 720u32);
@@ -4164,10 +4129,11 @@ mod win {
                 );
             }
         } else if args.fullscreen {
-            // Borderless fullscreen on the primary monitor: size the desktop to
-            // it and place the window at its top-left. Single monitor, so no
+            // Borderless fullscreen on the monitor the pointer is on (the
+            // launcher's, when it started this): size the desktop to it and
+            // place the window at its top-left. Single monitor, so no
             // CS_MONITOR block is advertised.
-            if let Some(p) = crate::window::enumerate_monitors().primary_rect() {
+            if let Some(p) = crate::window::enumerate_monitors().launch_rect() {
                 let (pw, ph) = ((p.right - p.left).max(1), (p.bottom - p.top).max(1));
                 config.width = (pw as u32).min(u16::MAX as u32) as u16;
                 config.height = (ph as u32).min(u16::MAX as u32) as u16;
@@ -4176,7 +4142,7 @@ mod win {
                     width = config.width,
                     height = config.height,
                     origin = ?(p.left, p.top),
-                    "fullscreen: borderless on the primary monitor"
+                    "fullscreen: borderless on the monitor the pointer is on"
                 );
             } else {
                 tracing::warn!("fullscreen requested but no monitor enumerated; using a window");
@@ -4369,12 +4335,19 @@ mod win {
         crate::window::init_wake_event();
 
         // Borderless modes have no window frame to close from: add a floating
-        // connection bar (Pin + Disconnect) on the primary monitor.
+        // connection bar (Minimize, Disconnect, …) at the top of the window's
+        // screen, or of the primary one when the session spans several.
         let conn_bar = if args.multimon || args.per_monitor || args.fullscreen {
-            crate::window::enumerate_monitors()
-                .primary_rect()
-                .and_then(|p| crate::connbar::ConnBar::new(p.left, p.top, p.right - p.left).ok())
+            let single = !args.multimon && !args.per_monitor;
+            let screen = if single { window.monitor_rect() } else { crate::window::enumerate_monitors().primary_rect() };
+            let sessions: Vec<isize> = std::iter::once(window.hwnd_raw()).chain(extra_hwnds.iter().copied()).collect();
+            screen.and_then(|p| crate::connbar::ConnBar::new((p.left, p.top, p.right - p.left), &sessions, single).ok())
         } else {
+            // A window that hands over to Hyper can go full screen there
+            // (Ctrl+Shift+F): it gets a bar then.
+            if args.hyper {
+                crate::connbar::want();
+            }
             None
         };
         if span_origin.is_some() {
@@ -4469,7 +4442,11 @@ mod win {
                                 delay_ms = delay.as_millis() as u64,
                                 "GPU device not available yet; retrying"
                             );
-                            std::thread::sleep(delay);
+                            // The window stays responsive meanwhile (the lost
+                            // device can't draw, so nothing is shown).
+                            if let Waited::Closed = wait_pumping(&window, None, conn_bar.as_ref(), delay, None) {
+                                break 'session;
+                            }
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "could not rebuild the GPU device");
@@ -4486,16 +4463,24 @@ mod win {
                     c
                 }
                 None => match {
-                    refresh_w365_token(args, &mut config);
-                    connect::establish_reconnect(&mut config, cookie.as_ref())
+                    say(
+                        &mut renderer,
+                        &[
+                            format!("Connection lost: reconnecting… (try {} of {})", attempts + 1, MAX_RECONNECT + 1),
+                            "Ctrl+Shift+Q   quit".to_string(),
+                        ],
+                    );
+                    match reconnect_pumping(&window, &mut renderer, conn_bar.as_ref(), args, &mut config, cookie) {
+                        Some(r) => r,
+                        None => break 'session, // closed while connecting
+                    }
                 } {
                     Ok(c) => {
                         attempts = 0;
                         c
                     }
-                    Err(e) => {
+                    Err((rejected, e)) => {
                         attempts += 1;
-                        let rejected = crate::is_logon_rejection(e.as_ref());
                         if rejected {
                             crate::forget_rejected_password(args);
                         }
@@ -4511,8 +4496,24 @@ mod win {
                                 delay_ms = delay.as_millis() as u64,
                                 "reconnect failed; retrying"
                             );
-                            if net_listener::wait_with_network_wake(delay, &net_change_rx) {
-                                tracing::info!("network change detected; retrying reconnect immediately");
+                            say(
+                                &mut renderer,
+                                &[
+                                    format!(
+                                        "Connection lost: trying again in {} s (try {} of {})",
+                                        delay.as_secs_f32().ceil() as u32,
+                                        attempts + 1,
+                                        MAX_RECONNECT + 1
+                                    ),
+                                    "Ctrl+Shift+Q   quit".to_string(),
+                                ],
+                            );
+                            match wait_pumping(&window, Some(&mut renderer), conn_bar.as_ref(), delay, Some(&net_change_rx)) {
+                                Waited::Closed => break 'session,
+                                Waited::Woke => {
+                                    tracing::info!("network change detected; retrying reconnect immediately")
+                                }
+                                Waited::Elapsed => {}
                             }
                             window.set_title("Reconnecting… — RDPiO");
                             continue 'session;
@@ -4523,6 +4524,17 @@ mod win {
                         // coming back starts a fresh round. A rejected password
                         // stays rejected, so that one only waits for the close.
                         let wake = (!rejected).then_some(&net_change_rx);
+                        say(
+                            &mut renderer,
+                            &[
+                                if rejected {
+                                    "Disconnected: the password was rejected".to_string()
+                                } else {
+                                    "Disconnected: no connection. Trying again when the network changes".to_string()
+                                },
+                                "Ctrl+Shift+Q   close".to_string(),
+                            ],
+                        );
                         if idle_until_close(&window, &mut renderer, conn_bar.as_ref(), wake)? {
                             attempts = 0;
                             window.set_title("Reconnecting… — RDPiO");
@@ -4590,7 +4602,9 @@ mod win {
                     // render the session's files (WM_RENDERFORMAT) on a paste.
                     .with_owner(window.hwnd_raw()),
             ));
-            session.set_audio_sink(Box::new(crate::audio::Win32Audio::new()));
+            // WASAPI with a jitter buffer; RDPIO_RDPSND=waveout plays through
+            // waveOut as before.
+            session.set_audio_sink(crate::audio::rdpsnd_sink());
             if args.printers {
                 for (name, driver, default, sink) in crate::printer::Win32Printer::all() {
                     tracing::info!(%name, %driver, default, "redirecting a local printer");
@@ -4641,10 +4655,10 @@ mod win {
                     Some(addr) => {
                         let fps = args.hyper_fps.unwrap_or_else(crate::hyper_client::local_refresh_hz);
                         tracing::info!(host = %addr.ip(), fps, "--hyper: will offer to switch to the Hyper stream");
-                        // The stream is sized to this screen (as in direct mode),
-                        // not to the window it starts in.
-                        let screen = crate::window::enumerate_monitors()
-                            .primary_rect()
+                        // The stream is sized to the screen the window is on
+                        // (as in direct mode), not to the window it starts in.
+                        let screen = window
+                            .monitor_rect()
                             .map_or((client.0 as u32, client.1 as u32), |p| ((p.right - p.left) as u32, (p.bottom - p.top) as u32));
                         Some(crate::hyper_client::HyperRedirector::new(addr.ip(), screen.0, screen.1, fps, args.hyper_codec))
                     }
@@ -4892,13 +4906,15 @@ mod win {
             // Re-uploaded at each present while it lives (a still screen
             // presents nothing on its own); gone after ~8 s, with the region
             // asked of the server again so the panel's pixels don't linger on
-            // a quiet desktop.
-            let hint = crate::hyper_overlay::render(&[
-                "Ctrl+Shift+Q   quit".to_string(),
-                "Ctrl+Shift+M   lock the mouse in (games)".to_string(),
-                "Ctrl+Alt+End   Ctrl+Alt+Del on the host".to_string(),
-            ]);
-            let hint_until = std::time::Instant::now() + Duration::from_secs(8);
+            // a quiet desktop. Only the first connection shows it, not a
+            // reconnect; later, Ctrl+Shift+M's notice uses the same spot.
+            crate::hyper_overlay::set_picture_width(desktop.0 as u32);
+            let mut hint = if crate::hotkeys::first_time(false) {
+                crate::hyper_overlay::render(&crate::hotkeys::hint_lines(false, crate::window::embedded()))
+            } else {
+                None
+            };
+            let mut hint_until = std::time::Instant::now() + Duration::from_secs(8);
             let mut hint_repaint = std::time::Instant::now() - Duration::from_secs(1);
             let mut hint_erased = false;
             let mut metrics_report_start = std::time::Instant::now();
@@ -4924,8 +4940,27 @@ mod win {
                         break;
                     }
                     Frame::Continue { resize } => {
+                        // A resize a reconnect wait took from the window is
+                        // handled here as if this pump had seen it.
+                        let resize = with_carried_resize(resize);
                         if let Some(bar) = conn_bar.as_ref() {
                             bar.tick();
+                        }
+                        // Ctrl+Shift+M says on screen what it did, for 2 s, in
+                        // the hint's spot (whatever was there is asked for again).
+                        if let Some(text) = crate::hotkeys::toggle_notice(
+                            crate::window::capture_mode(),
+                            crate::window::system_keys_to_host(),
+                            false,
+                        ) {
+                            if let (Some((hw, hh, _)), false) = (&hint, hint_erased) {
+                                crate::session::request_refresh(16, 16, *hw as u32 + 1, *hh as u32 + 1);
+                            }
+                            crate::hyper_overlay::set_picture_width(desktop.0 as u32);
+                            hint = crate::hyper_overlay::render(&[text.to_string()]);
+                            hint_until = std::time::Instant::now() + Duration::from_secs(2);
+                            hint_repaint = std::time::Instant::now() - Duration::from_secs(1);
+                            hint_erased = false;
                         }
                         // Back from sleep: the socket is very likely dead without
                         // knowing it (no FIN/RST reached us, and an idle session
@@ -5249,14 +5284,10 @@ mod win {
                             }
                         } else if !hint_erased {
                             hint_erased = true;
+                            // (Drawn at (16, 16) in desktop pixels, the
+                            // framebuffer's: the same spot is asked for.)
                             if let Some((hw, hh, _)) = &hint {
-                                let (cw, ch) = (client.0.max(1) as u64, client.1.max(1) as u64);
-                                let (dw, dh) = (desktop.0 as u64, desktop.1 as u64);
-                                let x = (16u64 * dw / cw) as i32;
-                                let y = (16u64 * dh / ch) as i32;
-                                let w = (*hw as u64 * dw / cw + 1) as u32;
-                                let h = (*hh as u64 * dh / ch + 1) as u32;
-                                crate::session::request_refresh(x, y, w, h);
+                                crate::session::request_refresh(16, 16, *hw as u32 + 1, *hh as u32 + 1);
                             }
                         }
                         let pace_ready =
@@ -5393,6 +5424,10 @@ mod win {
                 tracing::info!(reconnect, network_drop = dropped, "session worker finished");
                 if !reconnect {
                     window.set_title("Disconnected — RDPiO");
+                    say(
+                        &mut renderer,
+                        &["Disconnected: the remote session ended".to_string(), "Ctrl+Shift+Q   close".to_string()],
+                    );
                     idle_until_close(&window, &mut renderer, conn_bar.as_ref(), None)?;
                     break 'session;
                 }
@@ -5403,6 +5438,172 @@ mod win {
 
         tracing::info!("window closed; shutting down");
         Ok(())
+    }
+
+    /// Put `lines` at the top-left of the picture and show it: the state of a
+    /// dropped session, readable where there is no title bar (fullscreen, a
+    /// launcher tab). Drawn into the framebuffer, so the next connection's
+    /// first full repaint covers it.
+    fn say(renderer: &mut Renderer, lines: &[String]) {
+        if let Some((w, h, px)) = crate::hyper_overlay::render(lines) {
+            renderer.update_rect(16, 16, w, h, &px);
+            let _ = renderer.present_frame();
+        }
+    }
+
+    /// The last window size seen while no session ran (packed as width << 16 |
+    /// height, 0 for none). `Window::pump` hands each resize out only once, so
+    /// a resize taken by a reconnect wait is kept here for the next session
+    /// loop, which then rescales input and asks the server for the new desktop
+    /// size exactly as for a resize it saw itself.
+    static CARRIED_RESIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn pack_size((w, h): (u32, u32)) -> u32 {
+        ((w & 0xffff) << 16) | (h & 0xffff)
+    }
+
+    fn unpack_size(packed: u32) -> Option<(u32, u32)> {
+        (packed != 0).then_some(((packed >> 16) & 0xffff, packed & 0xffff))
+    }
+
+    /// Keep a resize the session loop did not see (the newest one wins).
+    fn carry_resize(size: (u32, u32)) {
+        CARRIED_RESIZE.store(pack_size(size), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The resize for a session loop's pump: the window's own when it has one
+    /// (it is newer than anything carried), else the carried one. Either way
+    /// the carried size is used up.
+    fn with_carried_resize(resize: Option<(u32, u32)>) -> Option<(u32, u32)> {
+        let carried = unpack_size(CARRIED_RESIZE.swap(0, std::sync::atomic::Ordering::SeqCst));
+        resize.or(carried)
+    }
+
+    /// One turn of the message pump while no session runs. Keys and clicks
+    /// have nowhere to go and are dropped (not replayed into the next
+    /// session); the connection bar keeps working, and a resize is presented
+    /// when there is a working `renderer`, and kept for the next session loop
+    /// either way. False once the window closes.
+    fn pump_offline(
+        window: &Window,
+        renderer: Option<&mut Renderer>,
+        conn_bar: Option<&crate::connbar::ConnBar>,
+    ) -> bool {
+        match window.pump() {
+            Frame::Quit => false,
+            Frame::Continue { resize } => {
+                let _ = window.drain_input();
+                if let Some(bar) = conn_bar {
+                    bar.tick();
+                }
+                if let Some(size) = resize {
+                    carry_resize(size);
+                }
+                if let (Some((w, h)), Some(r)) = (resize, renderer) {
+                    if r.resize(w, h).is_ok() {
+                        let _ = r.present_frame();
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    /// How a [`wait_pumping`] ended.
+    enum Waited {
+        /// The window closed.
+        Closed,
+        /// The network changed (and the burst settled).
+        Woke,
+        /// The delay ran out.
+        Elapsed,
+    }
+
+    /// Wait out a reconnect backoff with the window alive. With `wake` (the
+    /// network-change listener) a change ends it early, as
+    /// `net_listener::wait_with_network_wake` does: a settle of up to 2 s
+    /// (never past `delay`) from the change, then the rest of the burst is
+    /// drained.
+    fn wait_pumping(
+        window: &Window,
+        mut renderer: Option<&mut Renderer>,
+        conn_bar: Option<&crate::connbar::ConnBar>,
+        delay: Duration,
+        wake: Option<&mpsc::Receiver<()>>,
+    ) -> Waited {
+        const SETTLE: Duration = Duration::from_secs(2);
+        let mut until = std::time::Instant::now() + delay;
+        let mut woke = false;
+        loop {
+            if !pump_offline(window, renderer.as_deref_mut(), conn_bar) {
+                return Waited::Closed;
+            }
+            if let (false, Some(rx)) = (woke, wake) {
+                if rx.try_recv().is_ok() {
+                    woke = true;
+                    until = std::time::Instant::now() + SETTLE.min(delay);
+                }
+            }
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            window.wait_for_work((left.as_millis() as u32).clamp(1, 100));
+        }
+        match wake {
+            Some(rx) if woke => {
+                net_listener::drain(rx);
+                Waited::Woke
+            }
+            _ => Waited::Elapsed,
+        }
+    }
+
+    /// One reconnect attempt (`refresh_w365_token`, then
+    /// `connect::establish_reconnect`) on a worker thread, while this thread
+    /// keeps the window pumping: a TCP connect to a dead network or a gateway
+    /// sign-in can take many seconds. The attempt works on a copy of `config`
+    /// that is written back when it finishes, so a redirection or a fresh
+    /// token carries over exactly as before. `Err` carries whether the logon
+    /// was rejected, and the error text. `None` when the window closed first:
+    /// the attempt is left to finish on its own, and its connection, if any,
+    /// is dropped.
+    fn reconnect_pumping(
+        window: &Window,
+        renderer: &mut Renderer,
+        conn_bar: Option<&crate::connbar::ConnBar>,
+        args: &Args,
+        config: &mut rdp_core::ClientConfig,
+        cookie: Option<rdp_pdu::logon::ReconnectCookie>,
+    ) -> Option<Result<connect::Established, (bool, String)>> {
+        let (done_tx, done_rx) = mpsc::channel();
+        let (a, mut c) = (args.clone(), config.clone());
+        let spawned = std::thread::Builder::new().name("rdp-reconnect".into()).spawn(move || {
+            refresh_w365_token(&a, &mut c);
+            let r = connect::establish_reconnect(&mut c, cookie.as_ref())
+                .map_err(|e| (crate::is_logon_rejection(e.as_ref()), e.to_string()));
+            let _ = done_tx.send((c, r));
+            // (The loop below wakes for it at once, not at its next poll.)
+            crate::window::signal_frame();
+        });
+        if let Err(e) = spawned {
+            return Some(Err((false, format!("could not start the reconnect: {e}"))));
+        }
+        loop {
+            if !pump_offline(window, Some(&mut *renderer), conn_bar) {
+                return None;
+            }
+            match done_rx.try_recv() {
+                Ok((c, r)) => {
+                    *config = c;
+                    return Some(r);
+                }
+                Err(mpsc::TryRecvError::Empty) => window.wait_for_work(50),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Some(Err((false, "the reconnect worker died".to_string())))
+                }
+            }
+        }
     }
 
     /// Keep the window responsive (and showing the last frame) until the user
@@ -5454,6 +5655,7 @@ mod win {
                         bar.tick();
                     }
                     if let Some((w, h)) = resize {
+                        carry_resize((w, h));
                         renderer.resize(w, h)?;
                         renderer.present_frame()?;
                     }
@@ -5585,25 +5787,46 @@ mod win {
         }
     }
 
-    /// Coalesce consecutive mouse-move events into the latest one. A high-DPI
+    /// Coalesce runs of consecutive mouse moves into one event. A high-DPI
     /// gaming mouse can generate 1000+ Hz of tiny motion PDUs; collapsing them
     /// cuts network traffic and server-side pointer work without affecting final
-    /// position. Button/wheel/key events break the coalescing chain so they are
-    /// never dropped.
+    /// position. Absolute moves keep the latest position; relative moves are
+    /// summed, so capture-mode travel is the same under load as when idle.
+    ///
+    /// Only a pure move merges, and only into a pure move of the same type. A
+    /// click, a release and a wheel tick carry the same message type as a move
+    /// (a button in capture mode is a relative event with a zero delta), so the
+    /// previous event's flags are checked too: a move must never replace one.
     fn coalesce_input_events(events: Vec<inpdu::EventBytes>) -> Vec<inpdu::EventBytes> {
-        const MOUSE_MOVE_TYPES: [u16; 2] = [inpdu::INPUT_EVENT_MOUSE, inpdu::INPUT_EVENT_MOUSEREL];
-        let mut out: Vec<inpdu::EventBytes> = Vec::with_capacity(events.len());
-        for e in events {
+        /// The message type of a pure pointer move (the move flag and nothing
+        /// else), or `None` for every other event.
+        fn pure_move(e: &inpdu::EventBytes) -> Option<u16> {
             let msg_type = u16::from_le_bytes([e[4], e[5]]);
             let flags = u16::from_le_bytes([e[6], e[7]]);
-            let is_move = MOUSE_MOVE_TYPES.contains(&msg_type)
-                && (flags & inpdu::PTRFLAGS_MOVE) != 0
-                && (flags & !(inpdu::PTRFLAGS_MOVE)) == 0;
-            if let Some(last) = out.last_mut() {
-                let last_type = u16::from_le_bytes([last[4], last[5]]);
-                if is_move && last_type == msg_type {
-                    *last = e;
-                    continue;
+            let is_move = (msg_type == inpdu::INPUT_EVENT_MOUSE
+                || msg_type == inpdu::INPUT_EVENT_MOUSEREL)
+                && flags == inpdu::PTRFLAGS_MOVE;
+            is_move.then_some(msg_type)
+        }
+        let delta = |e: &inpdu::EventBytes, at: usize| i16::from_le_bytes([e[at], e[at + 1]]);
+        let mut out: Vec<inpdu::EventBytes> = Vec::with_capacity(events.len());
+        for e in events {
+            if let (Some(msg_type), Some(last)) = (pure_move(&e), out.last_mut()) {
+                if pure_move(last) == Some(msg_type) {
+                    if msg_type == inpdu::INPUT_EVENT_MOUSE {
+                        *last = e;
+                        continue;
+                    }
+                    // Relative: the deltas add up. A sum past the 16-bit field
+                    // starts a new event instead of losing travel.
+                    if let (Some(dx), Some(dy)) = (
+                        delta(last, 8).checked_add(delta(&e, 8)),
+                        delta(last, 10).checked_add(delta(&e, 10)),
+                    ) {
+                        last[8..10].copy_from_slice(&dx.to_le_bytes());
+                        last[10..12].copy_from_slice(&dy.to_le_bytes());
+                        continue;
+                    }
                 }
             }
             out.push(e);
@@ -5783,6 +6006,187 @@ mod win {
             RawInput::FocusLost => None,
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{coalesce_input_events, inpdu, MfRenderer};
+
+        const LEFT_DOWN: u16 = inpdu::PTRFLAGS_BUTTON1 | inpdu::PTRFLAGS_DOWN;
+        const LEFT_UP: u16 = inpdu::PTRFLAGS_BUTTON1;
+
+        fn mv(x: u16, y: u16) -> inpdu::EventBytes {
+            inpdu::mouse_event(inpdu::PTRFLAGS_MOVE, x, y)
+        }
+
+        fn rel(dx: i16, dy: i16) -> inpdu::EventBytes {
+            inpdu::rel_mouse_event(inpdu::PTRFLAGS_MOVE, dx, dy)
+        }
+
+        #[test]
+        fn a_resize_seen_while_offline_reaches_the_next_session_pump_once() {
+            use super::{carry_resize, pack_size, unpack_size, with_carried_resize};
+            assert_eq!(unpack_size(pack_size((2560, 1440))), Some((2560, 1440)));
+            assert_eq!(unpack_size(0), None);
+            // Nothing carried: the pump's own resize passes through.
+            assert_eq!(with_carried_resize(None), None);
+            // The newest offline resize wins and is used up by one pump.
+            carry_resize((1280, 720));
+            carry_resize((1920, 1080));
+            assert_eq!(with_carried_resize(None), Some((1920, 1080)));
+            assert_eq!(with_carried_resize(None), None);
+            // A resize the pump saw itself is newer than a carried one.
+            carry_resize((1280, 720));
+            assert_eq!(with_carried_resize(Some((800, 600))), Some((800, 600)));
+            assert_eq!(with_carried_resize(None), None);
+        }
+
+        #[test]
+        fn a_move_does_not_replace_the_press_before_it() {
+            let events = vec![inpdu::mouse_event(LEFT_DOWN, 10, 10), mv(11, 10)];
+            assert_eq!(coalesce_input_events(events.clone()), events);
+        }
+
+        #[test]
+        fn a_move_does_not_replace_the_release_before_it() {
+            let events = vec![inpdu::mouse_event(LEFT_UP, 10, 10), mv(11, 10)];
+            assert_eq!(coalesce_input_events(events.clone()), events);
+        }
+
+        #[test]
+        fn a_move_does_not_replace_the_wheel_tick_before_it() {
+            let wheel = inpdu::mouse_event(inpdu::PTRFLAGS_WHEEL | 120, 10, 10);
+            let hwheel = inpdu::mouse_event(inpdu::PTRFLAGS_HWHEEL | 120, 10, 10);
+            let events = vec![wheel, mv(11, 10), hwheel, mv(12, 10)];
+            assert_eq!(coalesce_input_events(events.clone()), events);
+        }
+
+        #[test]
+        fn consecutive_moves_collapse_to_the_last() {
+            assert_eq!(coalesce_input_events(vec![mv(1, 1), mv(2, 2), mv(3, 3)]), vec![mv(3, 3)]);
+            // A whole click-drag in one batch: each run of moves collapses on
+            // its own side of the button events, which all survive in order.
+            let down = inpdu::mouse_event(LEFT_DOWN, 2, 2);
+            let up = inpdu::mouse_event(LEFT_UP, 9, 9);
+            assert_eq!(
+                coalesce_input_events(vec![mv(1, 1), mv(2, 2), down, mv(5, 5), mv(9, 9), up, mv(10, 9)]),
+                vec![mv(2, 2), down, mv(9, 9), up, mv(10, 9)]
+            );
+        }
+
+        #[test]
+        fn a_key_breaks_a_run_of_moves() {
+            let key = inpdu::keyboard_event(0, 0x1e);
+            let events = vec![mv(1, 1), key, mv(2, 2)];
+            assert_eq!(coalesce_input_events(events.clone()), events);
+        }
+
+        #[test]
+        fn relative_moves_add_up() {
+            assert_eq!(coalesce_input_events(vec![rel(3, 0), rel(5, 0)]), vec![rel(8, 0)]);
+            assert_eq!(
+                coalesce_input_events(vec![rel(3, -2), rel(-5, 7), rel(1, 1)]),
+                vec![rel(-1, 6)]
+            );
+        }
+
+        #[test]
+        fn a_relative_move_does_not_replace_the_button_before_it() {
+            // Capture mode sends buttons as zero-delta relative events.
+            let down = inpdu::rel_mouse_event(LEFT_DOWN, 0, 0);
+            let up = inpdu::rel_mouse_event(LEFT_UP, 0, 0);
+            let events = vec![down, rel(4, 4)];
+            assert_eq!(coalesce_input_events(events.clone()), events);
+            assert_eq!(
+                coalesce_input_events(vec![rel(1, 0), rel(2, 0), down, rel(3, 0), rel(4, 0), up]),
+                vec![rel(3, 0), down, rel(7, 0), up]
+            );
+        }
+
+        #[test]
+        fn relative_moves_split_when_the_sum_overflows() {
+            assert_eq!(
+                coalesce_input_events(vec![rel(i16::MAX - 1, 0), rel(5, 0), rel(1, 0)]),
+                vec![rel(i16::MAX - 1, 0), rel(6, 0)]
+            );
+            assert_eq!(
+                coalesce_input_events(vec![rel(0, i16::MIN + 2), rel(0, -3)]),
+                vec![rel(0, i16::MIN + 2), rel(0, -3)]
+            );
+        }
+
+        #[test]
+        fn absolute_and_relative_moves_do_not_merge() {
+            let events = vec![mv(1, 1), rel(2, 2), mv(3, 3)];
+            assert_eq!(coalesce_input_events(events.clone()), events);
+        }
+
+        /// A `w`x`h` desktop shadow in which every pixel is distinct.
+        fn shadow(w: u32, h: u32) -> MfRenderer {
+            let mut r = MfRenderer::new(w, h, None);
+            r.fb_ensure(w, h);
+            for (i, px) in r.fb.chunks_exact_mut(4).enumerate() {
+                px.copy_from_slice(&[i as u8, (i >> 8) as u8, 0x5A, 0xFF]);
+            }
+            r
+        }
+
+        /// `fb_copy` must leave the shadow exactly as the copy-out and copy-back
+        /// it replaces does.
+        fn assert_copy_matches(sx: u32, sy: u32, w: u32, h: u32, dx: u32, dy: u32) {
+            let mut buffered = shadow(10, 9);
+            let pixels = buffered.fb_region(sx, sy, w, h);
+            buffered.fb_put(dx, dy, w, h, &pixels);
+            let mut in_place = shadow(10, 9);
+            in_place.fb_copy(sx, sy, w, h, dx, dy);
+            assert!(
+                in_place.fb == buffered.fb,
+                "copy of {w}x{h} from ({sx},{sy}) to ({dx},{dy}) differs from a buffered copy"
+            );
+        }
+
+        #[test]
+        fn shadow_copy_handles_overlap_in_every_direction() {
+            // A 5x4 rectangle at (2,2) moved up, down, left, right and
+            // diagonally, by less than its own size (overlapping) and by more.
+            for (dx, dy) in [
+                (2, 1), (2, 0), // up
+                (2, 3), (2, 5), // down
+                (1, 2), (0, 2), // left
+                (3, 2), (5, 2), // right
+                (1, 1), (3, 3), (1, 3), (3, 1), // diagonals
+                (2, 2), // onto itself
+            ] {
+                assert_copy_matches(2, 2, 5, 4, dx, dy);
+            }
+        }
+
+        #[test]
+        fn shadow_copy_clips_like_a_buffered_copy() {
+            // Destination hanging off the right and bottom edges.
+            assert_copy_matches(0, 0, 5, 4, 7, 2);
+            assert_copy_matches(0, 0, 5, 4, 2, 7);
+            assert_copy_matches(1, 1, 5, 4, 8, 8);
+            // Source hanging off the edges: the missing pixels arrive black.
+            assert_copy_matches(7, 2, 5, 4, 1, 1);
+            assert_copy_matches(2, 7, 5, 4, 1, 1);
+            assert_copy_matches(7, 7, 5, 4, 6, 6);
+            // Source or destination wholly outside the shadow.
+            assert_copy_matches(10, 0, 3, 3, 1, 1);
+            assert_copy_matches(0, 9, 3, 3, 1, 1);
+            assert_copy_matches(1, 1, 3, 3, 10, 0);
+            assert_copy_matches(1, 1, 3, 3, 0, 9);
+        }
+
+        #[test]
+        fn shadow_copy_scrolls_rows_up_by_one() {
+            let before = shadow(4, 4);
+            let mut r = shadow(4, 4);
+            r.fb_copy(0, 1, 4, 3, 0, 0);
+            // Rows 1..4 moved to rows 0..3; the last row is left as it was.
+            assert_eq!(r.fb[..4 * 3 * 4], before.fb[4 * 4..]);
+            assert_eq!(r.fb[4 * 3 * 4..], before.fb[4 * 3 * 4..]);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5949,99 +6353,5 @@ mod policy_tests {
         assert_eq!(size, (3840, 1080));
         assert_eq!((defs[0].left, defs[0].right), (0, 1919));
         assert_eq!(slices[1], ((1920, 0), (1920, 1080)));
-    }
-}
-
-// Windows-only: the ConnectionTarget argv mapping is the exact inverse pair the
-// detached child launcher (hub::spawn_connection_child, step-4) serializes, and
-// ConnectionTarget itself only exists under cfg(windows) via `mod hub`.
-#[cfg(test)]
-#[cfg(windows)]
-mod connection_target_argv_tests {
-    use super::{parse_connection_args, target_to_args};
-    use crate::hub::ConnectionTarget;
-
-    /// Fully populated target: every optional field set. `display_name` equals
-    /// the host because the argv format cannot carry a display name — that
-    /// keeps the strict round-trip comparison exact.
-    fn full_target() -> ConnectionTarget {
-        ConnectionTarget {
-            display_name: "10.0.0.5".to_string(),
-            host: "10.0.0.5".to_string(),
-            port: 3390,
-            username: Some("alice".to_string()),
-            domain: Some("CORP".to_string()),
-            password: Some("s3cret".to_string()),
-            connection_id: None,
-        }
-    }
-
-    /// A fully populated target serializes to exactly this flag/value sequence,
-    /// in the documented order: --host, --port, --user, --domain, --password.
-    #[test]
-    fn target_to_args_emits_exact_flag_value_sequence() {
-        assert_eq!(
-            target_to_args(&full_target()),
-            vec![
-                "--host", "10.0.0.5",
-                "--port", "3390",
-                "--user", "alice",
-                "--domain", "CORP",
-                "--password", "s3cret",
-            ]
-        );
-    }
-
-    /// `target_to_args` then `parse_connection_args` must land back on the same
-    /// target — the two functions are exact inverses.
-    #[test]
-    fn parse_connection_args_round_trips_target_to_args() {
-        let t = full_target();
-        let back = parse_connection_args(target_to_args(&t).into_iter())
-            .expect("round-tripped argv must parse back to a target");
-        assert_eq!(back, t);
-    }
-
-    /// Unset optional fields are omitted from the argv, so a minimal target
-    /// round-trips as just `--host <host> --port <port>`.
-    #[test]
-    fn optional_fields_are_omitted_and_round_trip() {
-        let t = ConnectionTarget::new("server.corp", 3389);
-        assert_eq!(
-            target_to_args(&t),
-            vec!["--host", "server.corp", "--port", "3389"]
-        );
-        let back = parse_connection_args(target_to_args(&t).into_iter())
-            .expect("minimal argv must parse back to a target");
-        assert_eq!(back, t);
-    }
-
-    /// A target without a host is meaningless: the parser reports None.
-    #[test]
-    fn missing_host_parses_to_none() {
-        assert_eq!(
-            parse_connection_args(
-                ["--user", "alice", "--port", "3390"]
-                    .into_iter()
-                    .map(str::to_string)
-            ),
-            None
-        );
-    }
-
-    /// Non-target flags interspersed with the target flags must not disturb the
-    /// parse (the child argv can carry session knobs alongside the target).
-    #[test]
-    fn unknown_flags_are_skipped() {
-        let t = full_target();
-        let mut argv = vec![
-            "--multimon".to_string(),
-            "--quality".to_string(),
-            "gaming".to_string(),
-        ];
-        argv.extend(target_to_args(&t));
-        let back = parse_connection_args(argv.into_iter())
-            .expect("known target flags still parsed among unknown ones");
-        assert_eq!(back, t);
     }
 }

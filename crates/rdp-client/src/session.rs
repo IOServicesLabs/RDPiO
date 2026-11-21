@@ -26,6 +26,18 @@ use crate::transport::read_tpkt_pdu;
 /// PDUs clear per pass, low enough to keep input responsive under a graphics flood.
 const UDP_DRAIN_BUDGET: u32 = 256;
 
+/// Most bytes of framed channel chunks handed to the stream in one write (see
+/// [`ActiveSession::send_channel_pieces`]). This is what one TLS record holds:
+/// a longer write would only be cut into more records, each its own socket
+/// send, and on the gateway (WebSocket) path one write is one binary message,
+/// which this keeps to a single record's size.
+const CHANNEL_BATCH_BYTES: usize = 16 * 1024;
+
+/// Upper bound on what framing adds to one channel chunk: TPKT (4), X.224 data
+/// header (3), MCS Send Data Request header (8) and, on the legacy path, the
+/// security header and MAC (12).
+const CHANNEL_FRAME_OVERHEAD: usize = 32;
+
 /// Set by the platform when the *local* clipboard changes (so we re-advertise it
 /// to the server); drained by the session loops. Process-global — there is one
 /// session/window. See [`clipboard_changed`] / [`take_clipboard_changed`].
@@ -560,6 +572,17 @@ pub fn activate<S: Read + Write>(
             "legacy Standard RDP Security: requesting slow-path bitmap output (no EGFX/autodetect)"
         );
     }
+    // The channel joins are one network round trip per channel, in sequence
+    // (MS-RDPBCGR 3.2.5.3.8). That section lets them go when the client sets
+    // RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN (2.2.1.3.2) and the server answers
+    // with RNS_UD_SC_SKIP_CHANNELJOIN_SUPPORTED (2.2.1.4.2). The offer is made
+    // on the TLS/NLA path only (legacy Standard RDP Security connects exactly
+    // as before), and RDPIO_NO_SKIP_JOIN withdraws it: the flag is then not
+    // sent and the joins run whatever the server says.
+    let offer_skip_join = !standard_security && std::env::var_os("RDPIO_NO_SKIP_JOIN").is_none();
+    if !offer_skip_join {
+        core.early_capability_flags &= !gcc::RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN;
+    }
     // Advertise the dynamic VC manager (RDPGFX) plus the clipboard channel. The
     // server assigns channel ids in this order, so `advertised_channels` lines
     // up with `server.channel_ids` for name→id lookup.
@@ -629,19 +652,33 @@ pub fn activate<S: Read + Write>(
     let user_id = mcs::parse_attach_user_confirm(&confirm)?;
     tracing::info!(user_id, "attached user");
 
-    // 3) Join the user channel, the I/O channel, and each virtual channel.
+    // 3) Join the user channel, the I/O channel, and each virtual channel —
+    //    unless both sides agreed to skip that (see `offer_skip_join`): a server
+    //    that set its flag "considers all MCS channels as joined after the MCS
+    //    Attach User Confirm PDU has been sent" (MS-RDPBCGR 2.2.1.4.2), and the
+    //    client is to do the same and go straight on to the security exchange
+    //    (3.2.5.3.8). Without the server's flag the joins run as they always did.
     let mut channels = vec![user_id, server.io_channel_id];
     channels.extend(server.channel_ids.iter().copied());
-    for &channel in &channels {
-        stream.write_all(&mcs::frame(&mcs::channel_join_request(user_id, channel))?)?;
-        stream.flush()?;
-        let pdu = read_tpkt_pdu(stream)?;
-        let joined = mcs::parse_channel_join_confirm(&pdu)?;
-        if joined != channel {
-            return Err(proto_err(format!("joined {joined}, expected {channel}")));
+    let skip_join = offer_skip_join
+        && server.early_capability_flags & gcc::RNS_UD_SC_SKIP_CHANNELJOIN_SUPPORTED != 0;
+    if skip_join {
+        tracing::info!(
+            count = channels.len(),
+            "channel joins skipped: the server counts every channel as joined"
+        );
+    } else {
+        for &channel in &channels {
+            stream.write_all(&mcs::frame(&mcs::channel_join_request(user_id, channel))?)?;
+            stream.flush()?;
+            let pdu = read_tpkt_pdu(stream)?;
+            let joined = mcs::parse_channel_join_confirm(&pdu)?;
+            if joined != channel {
+                return Err(proto_err(format!("joined {joined}, expected {channel}")));
+            }
         }
+        tracing::info!(count = channels.len(), "channels joined");
     }
-    tracing::info!(count = channels.len(), "channels joined");
 
     // 4) Standard RDP Security: Security Exchange (RSA-encrypted client random)
     //    + session key derivation. (No-op on the TLS/NLA path.)
@@ -936,6 +973,56 @@ impl ActiveSession {
         }
     }
 
+    /// Send the chunks of a channel message (or of several, in order) on
+    /// `channel_id`. Each chunk is framed exactly as [`Self::send_channel`]
+    /// frames it — its own MCS Send Data Request — so the bytes on the wire are
+    /// those of sending them one at a time; they are only handed to the stream
+    /// in batches of up to [`CHANNEL_BATCH_BYTES`] instead of one write, TLS
+    /// record and socket send per 1600-byte chunk. A lone chunk (a frame ack, a
+    /// wave confirm) takes the direct path, with nothing copied.
+    fn send_channel_pieces<S: Write>(
+        &mut self,
+        stream: &mut S,
+        channel_id: u16,
+        pieces: &[Vec<u8>],
+    ) -> Result<(), ActivateError> {
+        if let [piece] = pieces {
+            return self.send_channel(stream, channel_id, piece);
+        }
+        let user_id = self.info.user_channel_id;
+        let framed: usize = pieces.iter().map(|p| p.len() + CHANNEL_FRAME_OVERHEAD).sum();
+        let mut batch = Vec::with_capacity(framed.min(CHANNEL_BATCH_BYTES));
+        let mut rest = pieces;
+        while !rest.is_empty() {
+            batch.clear();
+            // Legacy path: the cipher lock is taken once for the batch and held
+            // until the batch is on the wire, as `send_channel` holds it for
+            // one chunk (see [`SharedOutbound`]) — and released between
+            // batches, so the input sender is never kept waiting for more than
+            // one of them.
+            let mut cipher = self.outbound.as_ref().map(lock_outbound);
+            let mut taken = 0;
+            for piece in rest {
+                // Decided before the chunk is encrypted: once it has been
+                // through the cipher it has to go out in this batch.
+                if taken > 0 && batch.len() + piece.len() + CHANNEL_FRAME_OVERHEAD > CHANNEL_BATCH_BYTES {
+                    break;
+                }
+                let request = match cipher.as_mut() {
+                    Some(c) => mcs::send_data_request(user_id, channel_id, &c.wrap(0, piece)),
+                    None => mcs::send_data_request(user_id, channel_id, piece),
+                };
+                batch.extend_from_slice(&mcs::frame(&request)?);
+                taken += 1;
+            }
+            stream.write_all(&batch)?;
+            stream.flush()?;
+            drop(cipher);
+            rest = &rest[taken..];
+        }
+        Ok(())
+    }
+
     /// Send a DRDYNVC PDU on the (static) `drdynvc` channel, framing it with the
     /// `CHANNEL_PDU_HEADER` the static-VC layer requires — but WITHOUT
     /// `CHANNEL_FLAG_SHOW_PROTOCOL`, since drdynvc isn't opened with that option
@@ -949,10 +1036,27 @@ impl ActiveSession {
         channel_id: u16,
         dvc_pdu: &[u8],
     ) -> Result<(), ActivateError> {
-        for piece in rdp_channels::svc::chunks_dvc(dvc_pdu) {
-            self.send_channel(stream, channel_id, &piece)?;
+        self.send_channel_pieces(stream, channel_id, &rdp_channels::svc::chunks_dvc(dvc_pdu))
+    }
+
+    /// [`Self::send_dvc`] for the DRDYNVC PDUs of one message, in order: a
+    /// `DATA_FIRST` + `DATA` run (a camera frame, captured microphone audio) is
+    /// a dozen or more PDUs, which go out together instead of one write each.
+    #[cfg(any(windows, target_os = "android"))]
+    fn send_dvc_run<S: Write>(
+        &mut self,
+        stream: &mut S,
+        channel_id: u16,
+        dvc_pdus: &[Vec<u8>],
+    ) -> Result<(), ActivateError> {
+        if let [dvc_pdu] = dvc_pdus {
+            return self.send_dvc(stream, channel_id, dvc_pdu);
         }
-        Ok(())
+        let pieces: Vec<Vec<u8>> = dvc_pdus
+            .iter()
+            .flat_map(|pdu| rdp_channels::svc::chunks_dvc(pdu))
+            .collect();
+        self.send_channel_pieces(stream, channel_id, &pieces)
     }
 
     /// Install the OS clipboard provider, replacing the default no-op (so
@@ -984,9 +1088,7 @@ impl ActiveSession {
             .channel
             .process(&msg, self.clipboard.provider.as_mut());
         for resp in responses {
-            for piece in rdp_channels::svc::chunks(&resp) {
-                self.send_channel(stream, cliprdr_id, &piece)?;
-            }
+            self.send_channel_pieces(stream, cliprdr_id, &rdp_channels::svc::chunks(&resp))?;
         }
         Ok(())
     }
@@ -1015,9 +1117,7 @@ impl ActiveSession {
         }
         tracing::info!("paste requested the session's clipboard files; transferring");
         for req in requests {
-            for piece in rdp_channels::svc::chunks(&req) {
-                self.send_channel(stream, cliprdr_id, &piece)?;
-            }
+            self.send_channel_pieces(stream, cliprdr_id, &rdp_channels::svc::chunks(&req))?;
         }
         Ok(())
     }
@@ -1047,9 +1147,7 @@ impl ActiveSession {
             .channel
             .announce_local(has_text, has_files, has_image)
         {
-            for piece in rdp_channels::svc::chunks(&msg) {
-                self.send_channel(stream, cliprdr_id, &piece)?;
-            }
+            self.send_channel_pieces(stream, cliprdr_id, &rdp_channels::svc::chunks(&msg))?;
         }
         Ok(())
     }
@@ -1106,9 +1204,7 @@ impl ActiveSession {
             return Ok(());
         };
         for resp in completed {
-            for piece in rdp_channels::svc::chunks(&resp) {
-                self.send_channel(stream, rdpdr_id, &piece)?;
-            }
+            self.send_channel_pieces(stream, rdpdr_id, &rdp_channels::svc::chunks(&resp))?;
         }
         Ok(())
     }
@@ -1125,9 +1221,7 @@ impl ActiveSession {
         };
         let responses = self.audio.channel.process(&msg, self.audio.sink.as_mut());
         for resp in responses {
-            for piece in rdp_channels::svc::chunks(&resp) {
-                self.send_channel(stream, rdpsnd_id, &piece)?;
-            }
+            self.send_channel_pieces(stream, rdpsnd_id, &rdp_channels::svc::chunks(&resp))?;
         }
         Ok(())
     }
@@ -1159,9 +1253,7 @@ impl ActiveSession {
             return Ok(());
         };
         for resp in self.rdpdr.channel.process(&msg) {
-            for piece in rdp_channels::svc::chunks(&resp) {
-                self.send_channel(stream, rdpdr_id, &piece)?;
-            }
+            self.send_channel_pieces(stream, rdpdr_id, &rdp_channels::svc::chunks(&resp))?;
         }
         Ok(())
     }
@@ -1214,6 +1306,43 @@ impl ActiveSession {
                 &share,
             ),
         }
+    }
+
+    /// [`Self::send_input`] for several queued batches, in order. On the TLS
+    /// path their fast-path PDUs (each exactly what `send_input` would send for
+    /// that batch) go to the stream in one write instead of one write, TLS
+    /// record and socket send each. A batch that does not fit one fast-path
+    /// PDU, and everything on the legacy path, is sent as `send_input` does.
+    #[cfg(any(windows, target_os = "android"))]
+    pub fn send_input_batches<S: Write>(
+        &mut self,
+        stream: &mut S,
+        batches: &[Vec<rdp_pdu::input::EventBytes>],
+    ) -> Result<(), ActivateError> {
+        if self.outbound.is_some() || batches.len() < 2 {
+            for events in batches {
+                self.send_input(stream, events)?;
+            }
+            return Ok(());
+        }
+        let mut joined: Vec<u8> = Vec::new();
+        for events in batches.iter().filter(|e| !e.is_empty()) {
+            match rdp_pdu::fastpath::input_pdu(events) {
+                Some(fp) => joined.extend_from_slice(&fp),
+                None => {
+                    if !joined.is_empty() {
+                        stream.write_all(&joined)?;
+                        joined.clear();
+                    }
+                    self.send_input(stream, events)?;
+                }
+            }
+        }
+        if !joined.is_empty() {
+            stream.write_all(&joined)?;
+            stream.flush()?;
+        }
+        Ok(())
     }
 
     /// Stop (`None`) or resume (`Some` desktop rect, inclusive) the server's
@@ -1568,6 +1697,22 @@ pub trait FrameSink {
             }
             self.blit(x + rx, y + ry, cw as u16, ch as u16, &cropped);
         }
+    }
+    /// [`Self::blit_nv12`], taking ownership of the frame and its rects. The
+    /// decoder already produced owned buffers, so a sink that ships frames to
+    /// another thread can MOVE them instead of copying a whole frame. Default:
+    /// borrow and delegate to [`Self::blit_nv12`].
+    #[cfg(any(windows, target_os = "android"))]
+    fn blit_nv12_owned(
+        &mut self,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        nv12: Vec<u8>,
+        rects: Vec<(u16, u16, u16, u16)>,
+    ) {
+        self.blit_nv12(x, y, w, h, &nv12, &rects);
     }
     /// Blit a GPU NV12 texture (zero-copy DXVA decode) at (`x`,`y`), painting
     /// only the dirty `rects` (`slice` of a decoder's surface array, kept by
@@ -2026,11 +2171,142 @@ fn poll_tpkt_pdu<R: Read>(stream: &mut R, buf: &mut Vec<u8>) -> std::io::Result<
     }
 }
 
+/// Frames the decode thread may be behind (queued, not yet decoded) while frame
+/// acks still leave the moment a frame is parsed. Beyond it acks are held, so
+/// the server, which paces itself on acks, waits for decode instead of piling
+/// up latency in our queue.
+#[cfg(any(windows, target_os = "android"))]
+const ACK_ALLOWANCE: u64 = 2;
+/// The longest a frame ack is ever held, whatever decode is doing: a stalled
+/// decoder slows the server down but can never freeze it.
+#[cfg(any(windows, target_os = "android"))]
+const ACK_HOLD_MAX: std::time::Duration = std::time::Duration::from_millis(250);
+/// The largest `queueDepth` we report: 0xFFFFFFFF is SUSPEND_FRAME_ACKNOWLEDGEMENT.
+#[cfg(any(windows, target_os = "android"))]
+const MAX_QUEUE_DEPTH: u32 = u32::MAX - 1;
+
+/// Whether a frame ack may go out now, `held_for` after its frame was parsed,
+/// with `frames_in_flight` frames queued for decode and not yet decoded.
+#[cfg(any(windows, target_os = "android"))]
+fn ack_may_leave(frames_in_flight: u64, held_for: std::time::Duration) -> bool {
+    frames_in_flight <= ACK_ALLOWANCE || held_for >= ACK_HOLD_MAX
+}
+
+/// The RDPGFX `queueDepth` for a frame ack: payload bytes queued for decode and
+/// not yet decoded (MS-RDPEGFX 2.2.2.13 counts unprocessed bytes buffered at
+/// the client; 0 means "unavailable", which is also what an empty queue
+/// reported before), plus the network back-pressure bias.
+#[cfg(any(windows, target_os = "android"))]
+fn queue_depth_bytes(bytes_in_flight: u64, bias: u32) -> u32 {
+    bytes_in_flight
+        .saturating_add(u64::from(bias))
+        .min(u64::from(MAX_QUEUE_DEPTH)) as u32
+}
+
+/// Payload size of one EGFX command batch, as counted for `queueDepth`: the
+/// codec bytes plus each command's 8-byte RDPGFX header. Both threads compute
+/// it from the same batch, so what the network thread adds the decode thread
+/// takes away exactly.
+#[cfg(any(windows, target_os = "android"))]
+fn gfx_batch_bytes(commands: &[rdp_pdu::gfx::GfxCommand]) -> u64 {
+    use rdp_pdu::gfx::GfxCommand;
+    commands
+        .iter()
+        .map(|c| match c {
+            GfxCommand::WireToSurface1 { bitmap, .. } | GfxCommand::WireToSurface2 { bitmap, .. } => {
+                8 + bitmap.len() as u64
+            }
+            _ => 8,
+        })
+        .sum()
+}
+
+/// Complete frames (EndFrame commands) in one EGFX command batch.
+#[cfg(any(windows, target_os = "android"))]
+fn gfx_batch_frames(commands: &[rdp_pdu::gfx::GfxCommand]) -> u64 {
+    commands
+        .iter()
+        .filter(|c| matches!(c, rdp_pdu::gfx::GfxCommand::EndFrame { .. }))
+        .count() as u64
+}
+
+/// Decode progress as frame acks see it: frames queued and not yet decoded, and
+/// the `queueDepth` to report (with `bias` added). A decode loop that does not
+/// report progress (`queue` absent or untracked) holds nothing: 0 frames, and
+/// its batch `backlog` as the depth, as before byte counting existed.
+#[cfg(any(windows, target_os = "android"))]
+fn ack_progress(
+    queue: Option<&crate::metrics::DecodeQueue>,
+    backlog: &std::sync::atomic::AtomicUsize,
+    bias: u32,
+) -> (u64, u32) {
+    match queue.filter(|q| q.tracked()) {
+        Some(q) => (q.frames_in_flight(), queue_depth_bytes(q.bytes_in_flight(), bias)),
+        None => (0, queue_depth_bytes(backlog.load(Ordering::Relaxed) as u64, bias)),
+    }
+}
+
+/// One frame ack held back while decode is behind.
+#[cfg(any(windows, target_os = "android"))]
+struct HeldAck {
+    frame_id: u32,
+    /// The frame came over the UDP tunnel, so its ack goes back that way.
+    via_udp: bool,
+    since: std::time::Instant,
+}
+
+/// Frame acks waiting for decode to catch up, oldest first. Acks always leave
+/// in the order their frames arrived. Pure logic: the caller supplies the
+/// decode progress and the time.
+#[cfg(any(windows, target_os = "android"))]
+struct AckGate {
+    held: std::collections::VecDeque<HeldAck>,
+}
+
+#[cfg(any(windows, target_os = "android"))]
+impl AckGate {
+    fn new() -> Self {
+        // Room for well over 250 ms of frames, so holding never allocates.
+        Self { held: std::collections::VecDeque::with_capacity(64) }
+    }
+
+    /// A frame was parsed. True: send its ack now (nothing is held and decode
+    /// is within the allowance, which is every frame while decode keeps up).
+    /// False: the ack is held, to leave from [`release`](Self::release).
+    fn admit(&mut self, frame_id: u32, via_udp: bool, frames_in_flight: u64, now: std::time::Instant) -> bool {
+        if self.held.is_empty() && ack_may_leave(frames_in_flight, std::time::Duration::ZERO) {
+            return true;
+        }
+        self.held.push_back(HeldAck { frame_id, via_udp, since: now });
+        false
+    }
+
+    /// The oldest held ack, if it may leave now: decode is back within the
+    /// allowance, or it has been held [`ACK_HOLD_MAX`]. Call until `None`.
+    fn release(&mut self, frames_in_flight: u64, now: std::time::Instant) -> Option<(u32, bool)> {
+        let first = self.held.front()?;
+        if !ack_may_leave(frames_in_flight, now.saturating_duration_since(first.since)) {
+            return None;
+        }
+        self.held.pop_front().map(|a| (a.frame_id, a.via_udp))
+    }
+
+    /// When the oldest held ack must leave, whatever decode is doing.
+    fn deadline(&self) -> Option<std::time::Instant> {
+        self.held.front().map(|a| a.since + ACK_HOLD_MAX)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+}
+
 /// The decode/composite stage, run on a dedicated thread fed by
 /// [`run_graphics_session`]. It owns the stateful [`GfxRenderer`] and a clone of
-/// the frame sink. The network thread parses EGFX, acks frames *immediately*
-/// (so the server's frame clock is no longer gated by our decode time), and
-/// hands each message's owned `Vec<GfxCommand>` over `rx`.
+/// the frame sink. The network thread parses EGFX, acks frames as soon as they
+/// are parsed while decode keeps up (so the server's frame clock is not gated
+/// by our decode time), and hands each message's owned `Vec<GfxCommand>` over
+/// `rx`.
 ///
 /// This loop renders every command strictly in order — the ClearCodec/H.264
 /// caches are sequential, so a tile can never be dropped or reordered — but when
@@ -2038,11 +2314,14 @@ fn poll_tpkt_pdu<R: Read>(stream: &mut R, buf: &mut Vec<u8>) -> std::io::Result<
 /// tiles and presenting only the newest, so a decode backlog never wastes GPU
 /// time on frames the user will never see.
 ///
-/// `backlog` mirrors the channel depth; the network thread reports it as the
-/// RDPGFX frame-ack `queueDepth` so the server throttles its send rate to our
-/// decode rate (the correct flow control for a stateful codec — the server
-/// re-encodes from its current surface state rather than us skipping tiles). The
-/// loop exits when the sender is dropped (the connection closed).
+/// `backlog` mirrors the channel depth in batches. With `metrics`, the loop
+/// also reports the frames and bytes it has decoded to
+/// [`crate::metrics::DecodeQueue`]; the network thread reports the bytes still
+/// queued as the RDPGFX frame-ack `queueDepth` and holds acks when decode falls
+/// more than [`ACK_ALLOWANCE`] frames behind, so the server throttles its send
+/// rate to our decode rate (the correct flow control for a stateful codec — the
+/// server re-encodes from its current surface state rather than us skipping
+/// tiles). The loop exits when the sender is dropped (the connection closed).
 #[cfg(any(windows, target_os = "android"))]
 pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
     rx: std::sync::mpsc::Receiver<Vec<rdp_pdu::gfx::GfxCommand>>,
@@ -2053,6 +2332,13 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
 ) {
     use rdp_pdu::gfx::GfxCommand;
     use std::sync::atomic::Ordering;
+
+    // This loop reports decode progress, so the network thread may hold acks
+    // for it (and is woken from here when it does).
+    let decode_queue = metrics.as_deref().map(|m| &m.decode_queue);
+    if let Some(q) = decode_queue {
+        q.set_tracked(true);
+    }
 
     // Window for surfacing the achieved decode fps at info.
     let mut fps_log_start = std::time::Instant::now();
@@ -2100,7 +2386,7 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
                     match blit {
                         GfxBlit::Rgba { x, y, w, h, rgba } => sink.blit_owned(x, y, w, h, rgba),
                         GfxBlit::Nv12 { x, y, w, h, nv12, rects } => {
-                            sink.blit_nv12(x, y, w, h, &nv12, &rects)
+                            sink.blit_nv12_owned(x, y, w, h, nv12, rects)
                         }
                         #[cfg(windows)]
                         GfxBlit::Texture { x, y, w, h, texture, slice, held, rects } => {
@@ -2122,6 +2408,13 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
                         sink.present();
                         painted = false;
                     }
+                }
+            }
+            // This message is decoded: count it off, and wake the network
+            // thread if it is holding frame acks until we catch up.
+            if let Some(q) = decode_queue {
+                if q.decoded(gfx_batch_frames(commands), gfx_batch_bytes(commands)) {
+                    crate::net_wait::worker_wake::signal();
                 }
             }
         }
@@ -2157,6 +2450,9 @@ pub fn run_decode_loop<F: FrameSink, R: GfxRenderer>(
             fps_log_start = std::time::Instant::now();
             fps_log_frames = 0;
         }
+    }
+    if let Some(q) = decode_queue {
+        q.set_tracked(false);
     }
     tracing::info!("decode loop ended");
 }
@@ -2266,6 +2562,14 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     // by our decode time. Adaptive pacing now lives in the decode loop.
     let mut total_frames = 0u32;
     let mut last_ack = std::time::Instant::now();
+    // Decode progress shared with `run_decode_loop` (through `metrics`). When
+    // decode falls more than ACK_ALLOWANCE frames behind, acks wait in
+    // `ack_gate` until it catches up, or ACK_HOLD_MAX at most.
+    let decode_queue = metrics.as_deref().map(|m| &m.decode_queue);
+    if let Some(q) = decode_queue {
+        q.reset();
+    }
+    let mut ack_gate = AckGate::new();
     // Continuous network auto-detect (MS-RDPBCGR 2.2.14): we advertised
     // NETCHAR_AUTODETECT, so the server probes RTT/bandwidth during the session.
     // Answering keeps it on the fast-LAN profile. (Connect-time probes were
@@ -2299,6 +2603,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
     // Display updates suppressed on the server (see `set_output_hidden`); a
     // new connection starts with them on.
     let mut suppressed = false;
+    // Input batches drained in one pass, reused across passes.
+    let mut input_batches: Vec<Vec<rdp_pdu::input::EventBytes>> = Vec::new();
 
     loop {
         // The UI thread sets this when the window closes. The reverse-connect /
@@ -2313,8 +2619,12 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         // Forward any client input the UI thread queued. The worker owns the one
         // SChannel context, so input must be sent from here — it can't be split
         // onto a second thread the way the legacy plaintext socket can.
-        while let Ok(events) = input_rx.try_recv() {
-            session.send_input(stream, &events)?;
+        // Everything queued since the last pass goes out together.
+        input_batches.extend(input_rx.try_iter());
+        if !input_batches.is_empty() {
+            let sent = session.send_input_batches(stream, &input_batches);
+            input_batches.clear();
+            sent?;
         }
         let refresh = take_refresh_requests();
         if !refresh.is_empty() {
@@ -2421,8 +2731,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                 }
                 let pcm = m.poll();
                 for pdu in audio_in.data_pdus(&pcm) {
-                    for piece in graphics.wrap_audio_input(&pdu).into_iter().flatten() {
-                        session.send_dvc(stream, ch, &piece)?;
+                    if let Some(pieces) = graphics.wrap_audio_input(&pdu) {
+                        session.send_dvc_run(stream, ch, &pieces)?;
                     }
                 }
             }
@@ -2435,9 +2745,7 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         if let (Some((chan_id, _, cap)), Some(ch)) = (cam_capture.as_ref(), dvc_channel) {
             while let Some(frame) = cap.next_frame() {
                 let pdu = rdp_channels::camera::sample_response(0, &frame);
-                for piece in graphics.wrap_camera_device(*chan_id, &pdu) {
-                    session.send_dvc(stream, ch, &piece)?;
-                }
+                session.send_dvc_run(stream, ch, &graphics.wrap_camera_device(*chan_id, &pdu))?;
             }
         }
 
@@ -2511,14 +2819,20 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                             "udp back-pressure changed"
                         );
                     }
-                    let depth = backlog.load(std::sync::atomic::Ordering::Relaxed) as u32
-                        + congestion.queue_depth_bias();
+                    let (in_flight, depth) =
+                        ack_progress(decode_queue, &backlog, congestion.queue_depth_bias());
                     for command in &out.commands {
                         if let GfxCommand::EndFrame { frame_id } = command {
-                            total_frames += 1;
                             if let Some(m) = metrics.as_ref() {
                                 m.record_frame_received();
+                                m.record_decode_backlog(in_flight);
                             }
+                            // Decode too far behind: held, sent from the
+                            // release step before the next read.
+                            if !ack_gate.admit(*frame_id, true, in_flight, std::time::Instant::now()) {
+                                continue;
+                            }
+                            total_frames += 1;
                             if let Some(ack) = udp_graphics.frame_ack(*frame_id, total_frames, depth)
                             {
                                 let _ = tunnel.send(&ack);
@@ -2526,6 +2840,9 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                         }
                     }
                     if !out.commands.is_empty() {
+                        if let Some(q) = decode_queue {
+                            q.queued(gfx_batch_frames(&out.commands), gfx_batch_bytes(&out.commands));
+                        }
                         backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if decode_tx.send(out.commands).is_err() {
                             return Ok(()); // decode thread gone → end session
@@ -2548,6 +2865,46 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         if let Some(ch) = dvc_channel {
             for pdu in graphics.poll_redirector() {
                 session.send_dvc(stream, ch, &pdu)?;
+            }
+        }
+
+        // Send the frame acks held for decode once it is back within the
+        // allowance, or once one has waited ACK_HOLD_MAX. While any stay held,
+        // `acks_held` asks the decode thread to wake us as it finishes work.
+        // The flag is set before progress is read again, and the decode thread
+        // adds progress before it reads the flag, so a finish that lands in
+        // between is never missed.
+        if let (false, Some(q)) = (ack_gate.is_empty(), decode_queue) {
+            let mut in_flight = q.frames_in_flight();
+            loop {
+                let now = std::time::Instant::now();
+                while let Some((frame_id, via_udp)) = ack_gate.release(in_flight, now) {
+                    total_frames += 1;
+                    last_ack = now;
+                    if via_udp {
+                        let depth = queue_depth_bytes(q.bytes_in_flight(), congestion.queue_depth_bias());
+                        if let (Some(tunnel), Some(ack)) =
+                            (udp.as_mut(), udp_graphics.frame_ack(frame_id, total_frames, depth))
+                        {
+                            let _ = tunnel.send(&ack);
+                        }
+                    } else if let (Some(ch), Some(ack)) = (
+                        dvc_channel,
+                        graphics.frame_ack(frame_id, total_frames, queue_depth_bytes(q.bytes_in_flight(), 0)),
+                    ) {
+                        session.send_dvc(stream, ch, &ack)?;
+                    }
+                }
+                if ack_gate.is_empty() {
+                    q.set_acks_held(false);
+                    break;
+                }
+                q.set_acks_held(true);
+                let now_in_flight = q.frames_in_flight();
+                if now_in_flight == in_flight {
+                    break;
+                }
+                in_flight = now_in_flight;
             }
         }
 
@@ -2576,6 +2933,15 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                         // Pure safety tick (background chores); every latency-
                         // sensitive source wakes the worker via its event.
                         std::time::Duration::from_millis(500)
+                    };
+                    // A held frame ack leaves by its deadline even if the
+                    // decode thread never wakes us.
+                    let idle = match ack_gate.deadline() {
+                        Some(due) => idle.min(
+                            due.saturating_duration_since(std::time::Instant::now())
+                                .max(std::time::Duration::from_millis(1)),
+                        ),
+                        None => idle,
                     };
                     w.wait(idle);
                 }
@@ -2745,8 +3111,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         // MS-RDPECAM version negotiation is ours to begin.
         if out.camera_opened {
             for pdu in camera.start() {
-                for piece in graphics.wrap_camera(&pdu).into_iter().flatten() {
-                    session.send_dvc(stream, channel, &piece)?;
+                if let Some(pieces) = graphics.wrap_camera(&pdu) {
+                    session.send_dvc_run(stream, channel, &pieces)?;
                 }
             }
         }
@@ -2754,8 +3120,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         // arrived on the AUDIO_INPUT channel, sending its replies back.
         for msg in &out.audio_input {
             for resp in audio_in.process(msg) {
-                for piece in graphics.wrap_audio_input(&resp).into_iter().flatten() {
-                    session.send_dvc(stream, channel, &piece)?;
+                if let Some(pieces) = graphics.wrap_audio_input(&resp) {
+                    session.send_dvc_run(stream, channel, &pieces)?;
                 }
             }
         }
@@ -2765,8 +3131,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         // sink (shared with the static path) and ack back on the dynamic channel.
         for msg in &out.audio_output {
             for resp in session.process_audio_dvc(msg) {
-                for piece in graphics.wrap_audio_output(&resp).into_iter().flatten() {
-                    session.send_dvc(stream, channel, &piece)?;
+                if let Some(pieces) = graphics.wrap_audio_output(&resp) {
+                    session.send_dvc_run(stream, channel, &pieces)?;
                 }
             }
         }
@@ -2782,8 +3148,8 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
         // Drive the camera (MS-RDPECAM) enumerator likewise.
         for msg in &out.camera {
             for resp in camera.process(msg) {
-                for piece in graphics.wrap_camera(&resp).into_iter().flatten() {
-                    session.send_dvc(stream, channel, &piece)?;
+                if let Some(pieces) = graphics.wrap_camera(&resp) {
+                    session.send_dvc_run(stream, channel, &pieces)?;
                 }
             }
         }
@@ -2796,9 +3162,7 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
                 )
             });
             for resp in dev.process(msg) {
-                for piece in graphics.wrap_camera_device(*chan_id, &resp) {
-                    session.send_dvc(stream, channel, &piece)?;
-                }
+                session.send_dvc_run(stream, channel, &graphics.wrap_camera_device(*chan_id, &resp))?;
             }
             // Follow the stream state: open the capture device when the server
             // starts streaming (the single default webcam; multi-camera
@@ -2840,22 +3204,28 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
             tracing::trace!(commands = out.commands.len(), "EGFX commands decoded");
         }
 
-        // Ack each complete frame IMMEDIATELY (before decode), reporting the
-        // decode thread's backlog as the RDPGFX queueDepth so the server paces
-        // itself to our decode rate. Then hand the owned command batch to the
+        // Ack each complete frame IMMEDIATELY (before decode) while decode keeps
+        // up, reporting the bytes still queued for decode as the RDPGFX
+        // queueDepth so the server paces itself to our decode rate; when decode
+        // is more than ACK_ALLOWANCE frames behind, the ack is held (see the
+        // release step above). Then hand the owned command batch to the
         // decode thread — a move, no copy of the tile payloads.
-        let depth = backlog.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        let (in_flight, depth) = ack_progress(decode_queue, &backlog, 0);
         for command in &out.commands {
             if let GfxCommand::EndFrame { frame_id } = command {
-                total_frames += 1;
                 if let Some(m) = metrics.as_ref() {
                     m.record_frame_received();
+                    m.record_decode_backlog(in_flight);
                 }
+                let now = std::time::Instant::now();
+                if !ack_gate.admit(*frame_id, false, in_flight, now) {
+                    continue;
+                }
+                total_frames += 1;
                 // `ack_gap_us` is the server-visible frame clock: time since the
                 // previous frame-ack. If it tracks the network inter-frame
                 // interval (~16-33ms) the server is streaming at full rate; if it
                 // tracks decode time the client is the throttle.
-                let now = std::time::Instant::now();
                 tracing::debug!(
                     target: "perf",
                     frame_id,
@@ -2870,6 +3240,9 @@ pub fn run_graphics_session<S: Read + Write, F: FrameSink>(
             }
         }
         if !out.commands.is_empty() {
+            if let Some(q) = decode_queue {
+                q.queued(gfx_batch_frames(&out.commands), gfx_batch_bytes(&out.commands));
+            }
             backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if decode_tx.send(out.commands).is_err() {
                 return Ok(()); // decode thread gone → end session
@@ -3223,6 +3596,99 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// [`connect_response`] with a Server Core Data block (RDP 10.12, HYBRID
+    /// requested) carrying `early_capability_flags` ahead of the network data.
+    fn connect_response_with_core(early_capability_flags: u32) -> Vec<u8> {
+        let mut user = b"McDn".to_vec();
+        user.push(16 + 10);
+        user.extend_from_slice(&[0x01, 0x0c, 0x10, 0x00, 0x11, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00]);
+        user.extend_from_slice(&early_capability_flags.to_le_bytes());
+        user.extend_from_slice(&[0x03, 0x0c, 0x0a, 0x00, 0xeb, 0x03, 0x01, 0x00, 0xec, 0x03]);
+        let mut content = vec![0x0a, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00];
+        content.push(0x04);
+        content.push(user.len() as u8);
+        content.extend_from_slice(&user);
+        let mut cr = vec![0x7f, 0x66, content.len() as u8];
+        cr.extend_from_slice(&content);
+        mcs::frame(&cr).unwrap()
+    }
+
+    /// Run [`activate`] against a scripted server that sends `connect` and then
+    /// insists on exactly the channel joins in `joins` (none at all when they
+    /// are skipped) before the Client Info arrives.
+    fn activate_expecting_joins(connect: Vec<u8>, joins: Vec<u16>, protocol: SecurityProtocol) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let share_id = 0x0001_03EA;
+        let server = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            read_tpkt_pdu(&mut s).unwrap();
+            s.write_all(&connect).unwrap();
+            read_tpkt_pdu(&mut s).unwrap();
+            read_tpkt_pdu(&mut s).unwrap();
+            s.write_all(&mcs::frame(&[0x2e, 0x00, 0x00, 0x06]).unwrap())
+                .unwrap();
+            // The MCS choice byte follows the TPKT (4) and X.224 (3) headers.
+            for ch in joins {
+                let join = read_tpkt_pdu(&mut s).unwrap();
+                assert_eq!(join[7], 0x38, "expected a Channel Join Request");
+                s.write_all(&join_confirm(ch)).unwrap();
+            }
+            let info = read_tpkt_pdu(&mut s).unwrap();
+            assert_eq!(info[7], 0x64, "expected the Client Info (a Send Data Request)");
+            s.write_all(&sdi(1003, &[0x80, 0x00, 0x00, 0x00, 0x01, 0x02]))
+                .unwrap();
+            s.write_all(&demand_active(share_id)).unwrap();
+            for _ in 0..5 {
+                read_tpkt_pdu(&mut s).unwrap();
+            }
+            s.write_all(&font_map()).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let config = ClientConfig {
+            width: 1920,
+            height: 1080,
+            ..Default::default()
+        };
+        let session = activate(&mut stream, &config, protocol, None).unwrap();
+        assert_eq!(session.info().user_channel_id, 1007);
+        assert_eq!(session.info().io_channel_id, 1003);
+        assert_eq!(session.info().channel_ids, vec![1004]);
+        assert_eq!(session.info().share_id, share_id);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn activate_skips_the_channel_joins_when_the_server_waives_them() {
+        activate_expecting_joins(
+            connect_response_with_core(gcc::RNS_UD_SC_SKIP_CHANNELJOIN_SUPPORTED),
+            Vec::new(),
+            SecurityProtocol::HYBRID,
+        );
+    }
+
+    #[test]
+    fn activate_joins_the_channels_when_the_server_does_not_waive_them() {
+        // Every other server capability bit, but not the skip-join one.
+        activate_expecting_joins(
+            connect_response_with_core(0x0000_0007),
+            vec![1007, 1003, 1004],
+            SecurityProtocol::HYBRID,
+        );
+    }
+
+    #[test]
+    fn activate_keeps_the_channel_joins_on_legacy_security() {
+        // Standard RDP Security never offers to skip, so a server flag alone
+        // changes nothing there.
+        activate_expecting_joins(
+            connect_response_with_core(gcc::RNS_UD_SC_SKIP_CHANNELJOIN_SUPPORTED),
+            vec![1007, 1003, 1004],
+            SecurityProtocol::empty(),
+        );
+    }
+
     #[derive(Default)]
     struct RecordingSink {
         rects: Vec<(u16, u16, u16, u16, usize)>,
@@ -3365,6 +3831,88 @@ mod tests {
         assert!(buf.is_empty());
     }
 
+    /// A stream that keeps every `write` call apart, to count them.
+    #[derive(Default)]
+    struct WriteLog(Vec<Vec<u8>>);
+
+    impl Write for WriteLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn plain_session() -> ActiveSession {
+        ActiveSession {
+            info: SessionInfo {
+                user_channel_id: 1007,
+                io_channel_id: 1003,
+                share_id: 0x0001_03EA,
+                channel_ids: vec![1004],
+                channel_names: vec![],
+                encrypted: false,
+            },
+            inbound: None,
+            outbound: None,
+            cursor_cache: Default::default(),
+            clipboard: Default::default(),
+            audio: Default::default(),
+            rdpdr: Default::default(),
+            width: 1024,
+            height: 768,
+            keyboard_layout: 0x0409,
+            enable_rfx: false,
+        }
+    }
+
+    #[test]
+    fn batched_channel_chunks_put_the_same_bytes_on_the_wire() {
+        // A message of many chunks, larger than one batch, so it takes
+        // several writes; then a lone chunk.
+        let message: Vec<u8> = (0..60_000u32).map(|i| (i % 251) as u8).collect();
+        for pieces in [rdp_channels::svc::chunks(&message), rdp_channels::svc::chunks(b"x")] {
+            let mut one_by_one = WriteLog::default();
+            let mut session = plain_session();
+            for piece in &pieces {
+                session.send_channel(&mut one_by_one, 1004, piece).unwrap();
+            }
+            let mut batched = WriteLog::default();
+            plain_session()
+                .send_channel_pieces(&mut batched, 1004, &pieces)
+                .unwrap();
+            assert_eq!(batched.0.concat(), one_by_one.0.concat());
+            if pieces.len() > 1 {
+                assert!(batched.0.len() < pieces.len());
+                assert!(batched.0.iter().all(|w| w.len() <= CHANNEL_BATCH_BYTES));
+            }
+        }
+    }
+
+    #[cfg(any(windows, target_os = "android"))]
+    #[test]
+    fn queued_input_batches_put_the_same_bytes_on_the_wire() {
+        use rdp_pdu::input::{mouse_event, PTRFLAGS_MOVE};
+        let batches = vec![
+            vec![mouse_event(PTRFLAGS_MOVE, 1, 1)],
+            Vec::new(),
+            vec![mouse_event(PTRFLAGS_MOVE, 2, 2), mouse_event(PTRFLAGS_MOVE, 3, 3)],
+        ];
+        let mut one_by_one = WriteLog::default();
+        let mut session = plain_session();
+        for events in &batches {
+            session.send_input(&mut one_by_one, events).unwrap();
+        }
+        let mut batched = WriteLog::default();
+        plain_session()
+            .send_input_batches(&mut batched, &batches)
+            .unwrap();
+        assert_eq!(batched.0.concat(), one_by_one.0.concat());
+        assert_eq!(batched.0.len(), 1);
+    }
+
     #[test]
     fn security_session_wrap_unwrap_roundtrip() {
         use rdp_crypto::keys::SessionKeys;
@@ -3493,6 +4041,116 @@ mod tests {
             "activation did not send the RTT response: {:02x?}",
             stream.tx
         );
+    }
+}
+
+#[cfg(all(test, any(windows, target_os = "android")))]
+mod ack_gate_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn acks_leave_at_once_while_decode_keeps_up() {
+        let mut gate = AckGate::new();
+        let t = Instant::now();
+        for (id, in_flight) in [(1, 0), (2, 1), (3, ACK_ALLOWANCE)] {
+            assert!(gate.admit(id, false, in_flight, t), "frame {id} held at {in_flight} in flight");
+        }
+        assert!(gate.is_empty());
+        assert_eq!(gate.deadline(), None);
+    }
+
+    #[test]
+    fn acks_are_held_beyond_the_allowance_and_leave_in_order_when_decode_catches_up() {
+        let mut gate = AckGate::new();
+        let t = Instant::now();
+        assert!(!gate.admit(10, false, ACK_ALLOWANCE + 1, t));
+        assert!(!gate.admit(11, true, ACK_ALLOWANCE + 2, t + Duration::from_millis(16)));
+        // Once one is held, later acks queue behind it even if decode looks
+        // fine for a moment, so acks never overtake each other.
+        assert!(!gate.admit(12, false, 0, t + Duration::from_millis(17)));
+        // Still behind: nothing leaves.
+        assert_eq!(gate.release(ACK_ALLOWANCE + 1, t + Duration::from_millis(20)), None);
+        // Caught up: all of them, oldest first, each with its transport.
+        let now = t + Duration::from_millis(40);
+        assert_eq!(gate.release(ACK_ALLOWANCE, now), Some((10, false)));
+        assert_eq!(gate.release(ACK_ALLOWANCE, now), Some((11, true)));
+        assert_eq!(gate.release(ACK_ALLOWANCE, now), Some((12, false)));
+        assert_eq!(gate.release(ACK_ALLOWANCE, now), None);
+        assert!(gate.is_empty());
+        // And the next frame is acked at parse time again.
+        assert!(gate.admit(13, false, 1, now));
+    }
+
+    #[test]
+    fn a_stalled_decoder_never_holds_an_ack_past_the_limit() {
+        let mut gate = AckGate::new();
+        let t = Instant::now();
+        assert!(!gate.admit(1, false, 50, t));
+        assert!(!gate.admit(2, false, 50, t + Duration::from_millis(100)));
+        assert_eq!(gate.deadline(), Some(t + ACK_HOLD_MAX));
+        assert_eq!(gate.release(50, t + ACK_HOLD_MAX - Duration::from_millis(1)), None);
+        // Frame 1 is due; frame 2 is not yet, so only frame 1 goes.
+        assert_eq!(gate.release(50, t + ACK_HOLD_MAX), Some((1, false)));
+        assert_eq!(gate.release(50, t + ACK_HOLD_MAX), None);
+        assert_eq!(gate.deadline(), Some(t + Duration::from_millis(100) + ACK_HOLD_MAX));
+        assert_eq!(gate.release(50, t + Duration::from_millis(100) + ACK_HOLD_MAX), Some((2, false)));
+        assert!(gate.is_empty());
+    }
+
+    #[test]
+    fn queue_depth_is_bytes_plus_bias_and_never_means_suspend() {
+        assert_eq!(queue_depth_bytes(0, 0), 0);
+        assert_eq!(queue_depth_bytes(40_000, 0), 40_000);
+        assert_eq!(queue_depth_bytes(40_000, 65_536), 105_536);
+        assert_eq!(queue_depth_bytes(u64::MAX, u32::MAX), MAX_QUEUE_DEPTH);
+        assert_ne!(MAX_QUEUE_DEPTH, 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn batch_bytes_and_frames_count_what_the_decoder_will_take_off() {
+        use rdp_pdu::gfx::{GfxCommand, Rect16};
+        let batch = vec![
+            GfxCommand::StartFrame { timestamp: 0, frame_id: 7 },
+            GfxCommand::WireToSurface1 {
+                surface_id: 0,
+                codec_id: 0,
+                pixel_format: 0,
+                dest: Rect16 { left: 0, top: 0, right: 1, bottom: 1 },
+                bitmap: vec![0; 1000],
+            },
+            GfxCommand::WireToSurface2 {
+                surface_id: 0,
+                codec_id: 0,
+                codec_context_id: 1,
+                pixel_format: 0,
+                bitmap: vec![0; 500],
+            },
+            GfxCommand::EndFrame { frame_id: 7 },
+        ];
+        assert_eq!(gfx_batch_bytes(&batch), 4 * 8 + 1000 + 500);
+        assert_eq!(gfx_batch_frames(&batch), 1);
+        assert_eq!(gfx_batch_frames(&batch[..2]), 0);
+    }
+
+    #[test]
+    fn decode_progress_is_untracked_until_the_decode_loop_reports() {
+        let metrics = crate::metrics::Metrics::new();
+        let backlog = std::sync::atomic::AtomicUsize::new(3);
+        let q = &metrics.decode_queue;
+        q.queued(5, 50_000);
+        // No reporting decode loop yet: nothing in flight (nothing is held),
+        // and the depth is the old batch count.
+        assert_eq!(ack_progress(Some(q), &backlog, 0), (0, 3));
+        assert_eq!(ack_progress(None, &backlog, 2), (0, 5));
+        q.set_tracked(true);
+        assert_eq!(ack_progress(Some(q), &backlog, 0), (5, 50_000));
+        q.set_acks_held(true);
+        assert!(q.decoded(4, 45_000), "a decoder finishing work must see held acks");
+        assert_eq!(ack_progress(Some(q), &backlog, 100), (1, 5_100));
+        q.reset();
+        assert_eq!(ack_progress(Some(q), &backlog, 0), (0, 0));
+        assert!(!q.decoded(0, 0));
     }
 }
 

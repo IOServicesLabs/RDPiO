@@ -109,9 +109,24 @@ const KEY_WAIT_MAX_MS: f64 = 10_000.0;
 /// 300 KB keyframe on a 1 Mbps relay were tens of seconds of backlog. A LAN
 /// delivers a keyframe well within this.
 const KEY_PROBE_MS: u64 = 250;
+/// A keyframe the sender has finished, followed by at least two feedback
+/// windows this long together (ms) in which nothing at all arrived, is not
+/// coming any more: the client resolved it (lost) as far as the host's wait
+/// goes. On a still desktop nothing newer completes to report it lost, and
+/// every keyframe request was ignored until the wait ran out (seconds for a
+/// stream's first). On the LAN, a client's radio in power save holds what
+/// arrives for up to its listen interval (three 102.4 ms beacons); longer off
+/// it, where a relay may stall a moment.
+const KEY_STALL_LAN_MS: u64 = 300;
+const KEY_STALL_MS: u64 = 400;
 /// A queue within this long (ms) of a keyframe going out is (mostly) that
 /// keyframe's, draining: it's cut for once, not every window.
 const KEY_QUEUE_MS: u64 = 1_000;
+/// The newest frame the client hasn't resolved, followed by feedback windows
+/// this long together (two at least) with nothing sent and nothing arriving:
+/// part of it was lost, and on a still screen nothing newer comes to show the
+/// client — it's repaired (see [`RateController::tail_unresolved`]).
+const TAIL_QUIET_MS: u64 = 150;
 /// The delivery gap: over this long (ms)…
 const GAP_MS: u64 = 500;
 /// …delivered under this share of what was sent cuts to what's delivered,
@@ -289,6 +304,20 @@ pub struct Switches {
     /// bump was the stream's, the floor sank to half of that, and the
     /// stream sat at 1-3 Mbit/s. (Probes err low only, so the most is safe.)
     pub link_memory: bool,
+    /// A client that says which frame it has resolved through is taken at
+    /// its word (`exactack`; see [`Feedback::resolved_frame`]). Counted
+    /// instead, a lost feedback window or frames before the client's first
+    /// left the count short: keyframes that had landed read as on their way
+    /// for the whole wait (drain mode at 8 fps for 350 ms, requests ignored).
+    pub exact_ack: bool,
+    /// The newest frame lost in part with a still screen after it is
+    /// repaired (`tailrepair`; see [`TAIL_QUIET_MS`]). Needs `exact_ack`.
+    pub tail_repair: bool,
+    /// Every keyframe's queue is cut for once, not only the stream's first,
+    /// for a client that says which frame it has (`keyqonce`; see
+    /// `after_key` in [`RateController::update`]). A mode switch at 62 Mbps
+    /// was cut 18 times in 2 s, to the floor.
+    pub key_queue_once: bool,
 }
 
 impl Default for Switches {
@@ -313,6 +342,9 @@ impl Default for Switches {
             probe_idle: true,
             lan_floor: true,
             link_memory: true,
+            exact_ack: true,
+            tail_repair: true,
+            key_queue_once: true,
         }
     }
 }
@@ -372,6 +404,30 @@ pub struct RateController {
     /// The resolved count to wait for the newest keyframe, and until when
     /// at most (ms).
     key_wait: Option<(u64, u64)>,
+    /// Once the sender has finished the newest keyframe: the feedback windows
+    /// in a row since in which nothing arrived, and their length (ms; see
+    /// [`KEY_STALL_MS`]).
+    key_stall: Option<(u32, u64)>,
+    /// Frames counted resolved ahead of the client's word (a stalled
+    /// keyframe): its report of them, when a newer frame completes there, is
+    /// taken off instead of counted twice.
+    resolved_ahead: u64,
+    /// The client says which frame it has resolved through (see
+    /// [`Feedback::resolved_frame`]): `resolved` is its word, not a count.
+    exact: bool,
+    /// Feedback windows in a row with nothing sent and nothing arriving, and
+    /// their length (ms), and the frame count a tail repair was last asked at
+    /// (see [`Self::tail_unresolved`]).
+    tail_quiet: (u32, u64),
+    tail_asked: u64,
+    /// Tail repairs asked for since the last [`Self::take_tail_repairs`].
+    tail_repairs: u32,
+    /// The stream's first keyframe until the client resolves it: the count
+    /// that means it has, and when it went out (ms); then how long it took,
+    /// until [`Self::take_first_key`].
+    first_key: Option<(u64, u64)>,
+    first_key_done: Option<u64>,
+    first_key_seen: bool,
     /// Keyframe requests collapsed into one in flight (for the log).
     collapsed: u32,
     /// Since when nothing was sent and nothing arrived (ms): then every frame
@@ -488,6 +544,15 @@ impl RateController {
             sent_frames: 0,
             resolved: 0,
             key_wait: None,
+            key_stall: None,
+            resolved_ahead: 0,
+            exact: false,
+            tail_quiet: (0, 0),
+            tail_asked: 0,
+            tail_repairs: 0,
+            first_key: None,
+            first_key_done: None,
+            first_key_seen: false,
             collapsed: 0,
             quiet_since_ms: None,
             sent_at_last_update: 0,
@@ -750,6 +815,11 @@ impl RateController {
             (KEY_WAIT_BASE_MS + 2.0 * transmit_ms + queue_ms).clamp(KEY_WAIT_MIN_MS, KEY_WAIT_MAX_MS)
         };
         self.key_wait = Some((frame_id as u64 + 1, now_ms + wait as u64));
+        if !self.first_key_seen {
+            self.first_key_seen = true;
+            self.first_key = Some((frame_id as u64 + 1, now_ms));
+        }
+        self.key_stall = None;
         (self.key_sent_ms, self.key_probe, self.key_landed_ms, self.key_probe_cut) = (now_ms, (0, 0), None, false);
     }
 
@@ -771,6 +841,53 @@ impl RateController {
     /// Keyframe requests collapsed since the last call.
     pub fn take_collapsed(&mut self) -> u32 {
         std::mem::take(&mut self.collapsed)
+    }
+
+    /// For the log when a keyframe request is answered: the newest keyframe's
+    /// id and ms since it went out (`None`: none yet), and the frames the
+    /// client has resolved (its word, or the count), and whether that's its
+    /// word.
+    pub fn key_state(&self, now_ms: u64) -> (Option<(u32, u64)>, u64, bool) {
+        let key = self.key_wait.map(|(need, _)| ((need - 1) as u32, now_ms.saturating_sub(self.key_sent_ms)));
+        (key, self.resolved, self.exact)
+    }
+
+    /// The stream's first keyframe has been resolved by the client: how long
+    /// after it went out (ms), once.
+    pub fn take_first_key(&mut self) -> Option<u64> {
+        self.first_key_done.take()
+    }
+
+    /// The newest frame sent hasn't reached the client whole, and since it
+    /// went nothing was sent and nothing arrived for [`TAIL_QUIET_MS`] (two
+    /// windows at least): part of it was lost, and on a still screen no
+    /// newer frame comes to show the client (it declares a frame lost only
+    /// when a newer one completes). True once per newest frame: the host
+    /// repairs it then (from a long-term reference the client has, else a
+    /// keyframe), and the repair is a newer frame that tells the client.
+    /// Only for a client that says which frame it has (see
+    /// [`Feedback::resolved_frame`]), and not while a keyframe is on its way
+    /// (see [`KEY_STALL_MS`]) or the stream is paused.
+    pub fn tail_unresolved(&mut self, now_ms: u64) -> bool {
+        let due = self.exact
+            && self.switches.exact_ack
+            && self.switches.tail_repair
+            && !self.paused
+            && self.resolved < self.sent_frames
+            && self.tail_asked < self.sent_frames
+            && !self.key_in_flight(now_ms)
+            && self.tail_quiet.0 >= 2
+            && self.tail_quiet.1 >= TAIL_QUIET_MS;
+        if due {
+            self.tail_asked = self.sent_frames;
+            self.tail_repairs += 1;
+        }
+        due
+    }
+
+    /// Tail repairs asked for since the last call (for the log).
+    pub fn take_tail_repairs(&mut self) -> u32 {
+        std::mem::take(&mut self.tail_repairs)
     }
 
     /// The parity ratio for one frame. On a path that has lost nothing for a
@@ -878,17 +995,75 @@ impl RateController {
                 }
             }
         }
-        // Frames the client resolved. A lost feedback window leaves the count
-        // short for good, so a quiet second (nothing sent, nothing arriving)
-        // squares it: everything sent has been resolved by then.
-        self.resolved += (fb.frames + fb.frames_lost) as u64;
-        if fb.frames == 0 && fb.frames_lost == 0 && self.sent_frames == self.sent_at_last_update {
+        // Frames the client resolved: its word, from a client that says.
+        // (Never past what was sent: a report from frames of some other
+        // stream would read every keyframe as landed. A report a moment ahead
+        // of the sender finishing a frame is caught up by the next one.)
+        if let Some(id) = fb.resolved_frame.filter(|_| self.switches.exact_ack) {
+            self.exact = true;
+            self.resolved = self.resolved.max((id as u64 + 1).min(self.sent_frames));
+            self.resolved_ahead = 0;
+            self.quiet_since_ms = None;
+        }
+        // Counted, from an older client (or before the first frame resolves
+        // there, when nothing is reported either way). A lost feedback window
+        // leaves the count short for good, so a quiet second (nothing sent,
+        // nothing arriving) squares it: everything sent has been resolved by
+        // then.
+        let exact = self.exact && self.switches.exact_ack;
+        if !exact {
+            let reported = (fb.frames + fb.frames_lost) as u64;
+            let counted_ahead = reported.min(self.resolved_ahead);
+            self.resolved_ahead -= counted_ahead;
+            self.resolved += reported - counted_ahead;
+        }
+        if exact {
+            // (The client's word stands: nothing to square.)
+        } else if fb.frames == 0 && fb.frames_lost == 0 && self.sent_frames == self.sent_at_last_update {
             let since = *self.quiet_since_ms.get_or_insert(now_ms);
             if now_ms.saturating_sub(since) >= 1_000 {
                 self.resolved = self.resolved.max(self.sent_frames);
+                // Squared: credit left from a stall would take real reports
+                // off and leave the count short again (a stall's credit also
+                // covers a lost window's shortfall, never reported). At worst
+                // a stalled keyframe's lost report, still to come, is counted
+                // twice, and the next keyframe may read as landed a frame
+                // early.
+                self.resolved_ahead = 0;
             }
         } else {
             self.quiet_since_ms = None;
+        }
+        // A keyframe sent in full and then nothing arriving: the rest of it
+        // isn't coming (see [`KEY_STALL_MS`]). Any byte arriving starts the
+        // count over, so one crawling over a slow relay is still waited for.
+        if let Some((need, _)) = self.key_wait.filter(|_| self.key_in_flight(now_ms)) {
+            if let Some((windows, ms)) = &mut self.key_stall {
+                // (A probe train's padding is not the stream's: taken off above.)
+                if fb.bytes > 0 {
+                    (*windows, *ms) = (0, 0);
+                } else {
+                    (*windows, *ms) = (*windows + 1, *ms + window_ms);
+                }
+                let stall_ms = if self.lan { KEY_STALL_LAN_MS } else { KEY_STALL_MS };
+                if *windows >= 2 && *ms >= stall_ms && self.resolved < need {
+                    self.resolved_ahead += need - self.resolved;
+                    self.resolved = need;
+                }
+            } else if self.sent_frames >= need {
+                // (From the next window on: this one may have been sent into.)
+                self.key_stall = Some((0, 0));
+            }
+        }
+        // (For a tail repair: windows with nothing sent and nothing arriving.)
+        if fb.bytes > 0 || self.sent_frames != self.sent_at_last_update {
+            self.tail_quiet = (0, 0);
+        } else {
+            self.tail_quiet = (self.tail_quiet.0 + 1, self.tail_quiet.1 + window_ms);
+        }
+        if let Some((_, at)) = self.first_key.filter(|&(need, _)| self.resolved >= need) {
+            self.first_key = None;
+            self.first_key_done = Some(now_ms.saturating_sub(at));
         }
         self.sent_at_last_update = self.sent_frames;
         // Loss: rebuilt data shards are packets the network dropped.
@@ -1148,10 +1323,13 @@ impl RateController {
         if self.key_landed_ms.is_none() && self.key_wait.is_some_and(|(need, _)| self.resolved >= need) {
             self.key_landed_ms = Some(now_ms);
         }
-        // (The stream's first, landed within the probe's time: a link that
-        // carries it. One crawling over a slow link is the probe's, and its
-        // queue is the link's.)
-        let after_key = self.key_wait.is_some_and(|(need, _)| need == 1)
+        // (Landed within the probe's time: a link that carries it. One
+        // crawling over a slow link is the probe's, and its queue is the
+        // link's. The stream's first — or any, from a client that says which
+        // frame it has: counted, when a later keyframe landed was a guess. A
+        // mode switch's at 62 Mbps was cut 18 times in 2 s, to the floor.)
+        let every_key = self.switches.key_queue_once && self.exact && self.switches.exact_ack;
+        let after_key = self.key_wait.is_some_and(|(need, _)| need == 1 || every_key)
             && self.key_landed_ms.is_some_and(|t| t.saturating_sub(self.key_sent_ms) < KEY_PROBE_MS)
             && now_ms.saturating_sub(self.key_sent_ms) < KEY_QUEUE_MS;
         let recut = !after_key
@@ -1224,8 +1402,12 @@ impl RateController {
             } else {
                 f64::INFINITY
             };
+            // Growth per unit of time, not per window: the factors are a 50 ms
+            // window's, and the client reports every 100 ms when calm and every
+            // 250 ms with no video (per window, that grew 2-5x slower there).
+            let grow = (if warm { WARM_RAMP } else { 1.02 }).powf((window_ms as f64 / 50.0).clamp(0.5, 5.0));
             if busy && calm {
-                self.bitrate = (self.bitrate * if warm { WARM_RAMP } else { 1.02 }).min(ceiling);
+                self.bitrate = (self.bitrate * grow).min(ceiling);
                 if let Some(c) = &mut self.warm_cap {
                     *c = c.max(self.bitrate);
                 }
@@ -1237,7 +1419,7 @@ impl RateController {
             {
                 // Idle and clean for a while: back toward the resting rate
                 // (fast while far below what the link has shown).
-                self.bitrate = (self.bitrate * if warm { WARM_RAMP } else { 1.02 }).min(resting).min(ceiling);
+                self.bitrate = (self.bitrate * grow).min(resting).min(ceiling);
             }
         }
         // Under the LAN floor with nothing lost or standing lately: back to it.
@@ -1336,6 +1518,7 @@ mod tests {
             delay_avg_us: delay_avg,
             window_us: 50_000,
             link_kbps: 0,
+            resolved_frame: None,
         }
     }
 
@@ -1808,6 +1991,264 @@ mod tests {
         assert!(!r.collapse_keyframe_request(1_300));
     }
 
+    /// Counted, a stall's credit covers a lost window's shortfall too, which
+    /// the client never reports. A quiet second drops what is left of it, so
+    /// real reports after it count and a keyframe that lands reads as landed.
+    #[test]
+    fn a_quiet_second_drops_a_stalls_leftover_credit() {
+        let quiet = |r: &mut RateController, at: u64| {
+            r.update(&Feedback { shards: 0, frames: 0, bytes: 0, ..fb(0, 5_000, 0, 0) }, 100, at)
+        };
+        let mut r = RateController::new(Limits::default());
+        for _ in 0..10 {
+            r.note_sent(1_000, 1_100);
+        }
+        // Frames 0-6 reported; the window with 7-9 never came.
+        r.update(&Feedback { frames: 7, ..fb(7_000, 5_000, 0, 0) }, 100, 100);
+        // Keyframe 10, and nothing more of it arrives: given up on.
+        r.note_keyframe(10, 300_000, 150);
+        r.note_sent(300_000, 330_000);
+        let mut t = 200;
+        for _ in 0..5 {
+            quiet(&mut r, t);
+            t += 100;
+        }
+        assert!(!r.collapse_keyframe_request(t), "given up on");
+        // Keyframe 11 lands, reporting 10 lost.
+        r.note_keyframe(11, 300_000, t);
+        r.note_sent(300_000, 330_000);
+        t += 100;
+        r.update(&Feedback { frames: 1, frames_lost: 1, ..fb(300_000, 5_000, 0, 0) }, 100, t);
+        // A still screen for a second and more.
+        for _ in 0..15 {
+            t += 100;
+            quiet(&mut r, t);
+        }
+        // Frames 12 and 13, then keyframe 14, all reported as they land.
+        r.note_sent(1_000, 1_100);
+        r.note_sent(1_000, 1_100);
+        t += 100;
+        r.update(&Feedback { frames: 2, ..fb(2_200, 5_000, 0, 0) }, 100, t);
+        r.note_keyframe(14, 100_000, t + 10);
+        r.note_sent(100_000, 110_000);
+        t += 100;
+        r.update(&Feedback { frames: 1, ..fb(110_000, 5_000, 0, 0) }, 100, t);
+        assert_eq!(r.key_state(t + 1).1, 15);
+        assert!(!r.collapse_keyframe_request(t + 1), "keyframe 14 landed");
+        assert_eq!(r.drain_fps(t + 1), None);
+    }
+
+    /// A stream's first keyframe, sent in full, and then nothing arrives (a
+    /// still desktop: nothing newer completes to report it lost). The next
+    /// request is answered within a few windows, not after the 10 s wait.
+    #[test]
+    fn a_keyframe_nothing_more_of_arrives_is_given_up_on() {
+        let quiet = |r: &mut RateController, window_ms: u64, at: u64| {
+            r.update(&Feedback { shards: 0, frames: 0, bytes: 0, ..fb(0, 5_000, 0, 0) }, window_ms, at)
+        };
+        for lan in [true, false] {
+            let mut r = RateController::new(Limits::default());
+            r.set_lan(lan);
+            r.note_keyframe(0, 300_000, 0);
+            assert!(r.collapse_keyframe_request(10), "not sent yet");
+            r.note_sent(300_000, 330_000);
+            // Feedback every 100 ms: the window the sender finished in, then
+            // three with nothing (a LAN) or four (elsewhere).
+            let mut t = 100;
+            quiet(&mut r, 100, t);
+            assert!(r.collapse_keyframe_request(t + 1));
+            let windows = if lan { 3 } else { 4 };
+            for _ in 0..windows {
+                t += 100;
+                assert!(r.collapse_keyframe_request(t - 1), "lan={lan}: still waiting at {t}");
+                quiet(&mut r, 100, t);
+            }
+            assert!(!r.collapse_keyframe_request(t + 1), "lan={lan}: answered at {t}");
+            assert_eq!(r.drain_fps(t + 1), None);
+            // The next keyframe (1) completes there, and with it the client
+            // reports 0 lost: that one isn't counted twice.
+            r.note_sent(300_000, 330_000);
+            r.note_keyframe(1, 300_000, t + 10);
+            r.update(&Feedback { frames: 1, frames_lost: 1, ..fb(300_000, 5_000, 0, 0) }, 100, t + 100);
+            assert!(!r.collapse_keyframe_request(t + 101));
+            // So frame 2 and keyframe 3 go, and 2 alone arrives: 3 is still
+            // on its way (counted twice, the request was answered).
+            r.note_sent(10_000, 11_000);
+            r.note_sent(300_000, 330_000);
+            r.note_keyframe(3, 300_000, t + 120);
+            r.update(&Feedback { frames: 1, ..fb(10_000, 5_000, 0, 0) }, 100, t + 200);
+            assert!(r.collapse_keyframe_request(t + 201), "lan={lan}: keyframe 3 is on its way");
+        }
+        // Still arriving (a relay crawling, a window with nothing now and
+        // then): waited for. (Under a second: then the quiet-second rule
+        // squares the count whatever arrives.)
+        let mut r = RateController::new(Limits::default());
+        r.note_keyframe(0, 300_000, 0);
+        r.note_sent(300_000, 330_000);
+        for t in 1..=9u64 {
+            let bytes = if t % 2 == 0 { 2_000 } else { 0 };
+            r.update(&Feedback { frames: 0, ..fb(bytes, 5_000, 0, 0) }, 100, t * 100);
+        }
+        assert!(r.collapse_keyframe_request(901));
+    }
+
+    /// A client that says which frame it has: a keyframe it has is known at
+    /// once, though the window that reported frames 10-19 was lost. Counted,
+    /// the same keyframe reads as on its way until its wait runs out (drain
+    /// mode at 8 fps meanwhile, requests ignored).
+    #[test]
+    fn the_clients_word_ends_the_keyframe_wait() {
+        for exact in [false, true] {
+            let id = |v: u32| exact.then_some(v);
+            let mut r = RateController::new(Limits::default());
+            for _ in 0..20 {
+                r.note_sent(1_000, 1_100);
+            }
+            // Frames 0-9 reported; the window with 10-19 never came.
+            r.update(&Feedback { frames: 10, resolved_frame: id(9), ..fb(10_000, 5_000, 0, 0) }, 50, 50);
+            r.note_keyframe(20, 100_000, 100);
+            r.note_sent(100_000, 110_000);
+            assert!(r.collapse_keyframe_request(150), "exact={exact}: on its way");
+            // It arrives.
+            r.update(&Feedback { frames: 1, resolved_frame: id(20), ..fb(110_000, 5_000, 0, 0) }, 50, 200);
+            assert_eq!(!r.collapse_keyframe_request(400), exact, "exact={exact}: answered");
+            assert_eq!(r.drain_fps(400).is_none(), exact, "exact={exact}: no drain mode");
+            // The stream's first keyframe, resolved 100 ms after it went (once).
+            assert_eq!(r.take_first_key(), exact.then_some(100));
+            assert_eq!(r.take_first_key(), None);
+        }
+        // Switched off: counted, whatever the client says.
+        let mut r = RateController::new(Limits::default());
+        r.set_switches(Switches { exact_ack: false, ..Switches::default() });
+        for _ in 0..21 {
+            r.note_sent(1_000, 1_100);
+        }
+        r.update(&Feedback { frames: 10, resolved_frame: Some(9), ..fb(10_000, 5_000, 0, 0) }, 50, 50);
+        r.note_keyframe(20, 100_000, 100);
+        r.update(&Feedback { frames: 1, resolved_frame: Some(20), ..fb(110_000, 5_000, 0, 0) }, 50, 200);
+        assert!(r.collapse_keyframe_request(400));
+        // A report ahead of what was sent (frames of some other stream) is
+        // not taken past it.
+        let mut r = RateController::new(Limits::default());
+        r.note_sent(1_000, 1_100);
+        r.update(&Feedback { frames: 1, resolved_frame: Some(5_000), ..fb(1_100, 5_000, 0, 0) }, 50, 50);
+        r.note_keyframe(1, 100_000, 100);
+        assert!(r.collapse_keyframe_request(150));
+    }
+
+    /// The newest frame lost in part, and then a still screen: repaired once
+    /// after two quiet windows; again if the repair is lost too; never for a
+    /// client that doesn't say which frame it has, or while paused.
+    #[test]
+    fn a_lost_last_frame_on_a_still_screen_is_repaired() {
+        let run = |exact: bool, paused: bool| {
+            let id = |v: u32| exact.then_some(v);
+            let quiet = |r: &mut RateController, have: u32, at: u64| {
+                r.update(&Feedback { shards: 0, frames: 0, bytes: 0, resolved_frame: id(have), ..fb(0, 5_000, 0, 0) }, 100, at)
+            };
+            let mut r = RateController::new(Limits::default());
+            r.set_lan(true);
+            r.set_paused(paused);
+            for _ in 0..10 {
+                r.note_sent(1_000, 1_100);
+            }
+            r.update(&Feedback { frames: 10, resolved_frame: id(9), ..fb(10_000, 5_000, 0, 0) }, 100, 100);
+            assert!(!r.tail_unresolved(101), "all there");
+            // Frame 10 goes, and only part of it arrives.
+            r.note_sent(1_000, 1_100);
+            r.update(&Feedback { frames: 0, resolved_frame: id(9), ..fb(500, 5_000, 0, 0) }, 100, 200);
+            let mut asked = Vec::new();
+            for t in [300, 400, 500, 600] {
+                quiet(&mut r, 9, t);
+                if r.tail_unresolved(t + 1) {
+                    asked.push(t);
+                }
+            }
+            // The repair (frame 11) is lost too.
+            r.note_sent(1_000, 1_100);
+            r.update(&Feedback { frames: 0, resolved_frame: id(9), ..fb(0, 5_000, 0, 0) }, 100, 700);
+            for t in [800, 900, 1_000] {
+                quiet(&mut r, 9, t);
+                if r.tail_unresolved(t + 1) {
+                    asked.push(t);
+                }
+            }
+            // The next one (12) arrives: the client has everything.
+            r.note_sent(1_000, 1_100);
+            r.update(&Feedback { frames: 1, frames_lost: 2, resolved_frame: id(12), ..fb(1_100, 5_000, 0, 0) }, 100, 1_100);
+            for t in [1_200, 1_300, 1_400] {
+                quiet(&mut r, 12, t);
+                if r.tail_unresolved(t + 1) {
+                    asked.push(t);
+                }
+            }
+            (asked, r.take_tail_repairs())
+        };
+        assert_eq!(run(true, false), (vec![400, 900], 2));
+        assert_eq!(run(false, false), (vec![], 0));
+        assert_eq!(run(true, true), (vec![], 0));
+    }
+
+    /// Every keyframe's queue is cut for once (a mode switch's or a resize's,
+    /// not only the stream's first), from a client that says which frame it
+    /// has. Counted, when a later keyframe landed is a guess: every window.
+    #[test]
+    fn a_later_keyframes_queue_is_cut_for_once() {
+        let run = |switches: Switches, exact: bool, lan: bool| {
+            let id = |v: u32| exact.then_some(v);
+            let link_kbps = if lan { 500_000 } else { 0 };
+            let mut r = RateController::new(Limits { start_bps: 60_000_000, ..Limits::default() });
+            r.set_switches(switches);
+            r.set_lan(lan);
+            for _ in 0..500 {
+                r.note_sent(1_000, 1_100);
+            }
+            r.update(&Feedback { frames: 500, link_kbps, resolved_frame: id(499), ..fb(10_000, 5_000, 0, 0) }, 50, 50);
+            r.take_cuts();
+            // A mode switch's keyframe, in within 100 ms…
+            r.note_keyframe(500, 200_000, 100);
+            r.note_sent(200_000, 220_000);
+            r.update(&Feedback { frames: 1, link_kbps, resolved_frame: id(500), ..fb(220_000, 5_000, 0, 0) }, 50, 200);
+            // …and most of a second of its queue draining, the stream busy.
+            let queue = if lan { 20_000 } else { 40_000 };
+            for t in 1..=16u64 {
+                r.note_sent(340_000, 375_000);
+                let window = Feedback { frames: 1, link_kbps, resolved_frame: id(500 + t as u32), ..fb(375_000, 5_000 + queue, 0, 0) };
+                r.update(&window, 50, 200 + t * 50);
+            }
+            let cuts = r.take_cuts();
+            cuts[CUT_QUEUE] + cuts[CUT_SOFT]
+        };
+        let on = Switches::default();
+        let off = Switches { key_queue_once: false, ..on };
+        for lan in [false, true] {
+            assert!(run(on, true, lan) <= 2, "lan={lan}: {}", run(on, true, lan));
+            assert!(run(on, false, lan) > 4, "lan={lan}, counted: {}", run(on, false, lan));
+            assert!(run(off, true, lan) > 4, "lan={lan}, switched off: {}", run(off, true, lan));
+        }
+    }
+
+    /// Growth is per second, however often the client reports: the same 5 s
+    /// of busy, clean feedback at 50 ms and at 100 ms windows end at about the
+    /// same rate (per window, the 100 ms one grew half as fast).
+    #[test]
+    fn growth_does_not_depend_on_the_feedback_interval() {
+        let run = |window_ms: u64| {
+            let mut r = RateController::new(Limits { start_bps: 2_000_000, ..Limits::default() });
+            let mut t = 0;
+            while t < 5_000 {
+                t += window_ms;
+                let used = r.bitrate_bps() as u64 / 8 * window_ms / 1000;
+                r.update(&Feedback { window_us: window_ms as u32 * 1000, ..fb(used, 5_000, 0, 0) }, window_ms, t);
+            }
+            r.bitrate_bps() as f64
+        };
+        let (at_50, at_100, at_250) = (run(50), run(100), run(250));
+        assert!(at_50 > 4_000_000.0, "it grew: {at_50}");
+        assert!((at_100 / at_50 - 1.0).abs() < 0.02, "50 ms: {at_50}, 100 ms: {at_100}");
+        assert!((at_250 / at_50 - 1.0).abs() < 0.05, "50 ms: {at_50}, 250 ms: {at_250}");
+    }
+
     #[test]
     fn a_clean_path_lowers_parity_for_big_non_key_frames() {
         let mut r = RateController::new(Limits::default());
@@ -2018,6 +2459,9 @@ mod tests {
                     probe_idle: false,
                     lan_floor: false,
                     link_memory: false,
+                    exact_ack: false,
+                    tail_repair: false,
+                    key_queue_once: false,
                 },
                 fps_follow: false,
                 warm_bps: None,

@@ -228,9 +228,56 @@ pub fn system_keys_to_host() -> bool {
     system_keys_remote()
 }
 
+/// Whether a Hyper stream (or its reconnect) has the window now.
+pub fn in_hyper() -> bool {
+    SYSTEM_KEYS_NEED_CAPTURE.load(Ordering::SeqCst)
+}
+
 /// Whether the stats overlay is on (Ctrl+Shift+S).
 pub fn stats_overlay() -> bool {
     STATS.load(Ordering::Relaxed)
+}
+
+/// Ctrl+Shift+S's switch, for the connection bar's Stats button.
+pub fn toggle_stats() {
+    STATS.fetch_xor(true, Ordering::Relaxed);
+    signal_frame();
+}
+
+/// Whether this process's window lives in a Workspace tab of the launcher.
+pub fn embedded() -> bool {
+    EMBEDDED.load(Ordering::Relaxed)
+}
+
+/// Ctrl+Shift+F's switch for `hwnd` (a session window of this process), for
+/// the connection bar's Window button.
+pub fn toggle_fullscreen_of(hwnd: isize) {
+    unsafe {
+        toggle_fullscreen(HWND(hwnd as *mut c_void));
+    }
+    signal_frame();
+}
+
+/// The connection's name, put before every session window's title (see
+/// [`set_session_name`]).
+static SESSION_NAME: OnceLock<String> = OnceLock::new();
+
+/// Name this process's session windows after the connection ("Office PC"):
+/// the taskbar and Alt+Tab then tell two sessions apart. Once, before the
+/// first window.
+pub fn set_session_name(name: &str) {
+    let name = name.trim();
+    if !name.is_empty() {
+        let _ = SESSION_NAME.set(name.to_string());
+    }
+}
+
+/// `title` with the connection's name before it.
+fn titled(title: &str) -> String {
+    match SESSION_NAME.get() {
+        Some(name) => format!("{name} — {title}"),
+        None => title.to_string(),
+    }
 }
 
 /// Whether Ctrl and Alt are both held right now. main.rs maps
@@ -439,8 +486,21 @@ pub fn install_keyboard_hook() {
 
 /// True when the foreground window is one of ours (matches our window class), so
 /// the hook only captures system keys while the user is actually in the session.
+/// In a Workspace tab the foreground window is the launcher's (a tab is a
+/// child window): there it counts while the launcher is in front and the
+/// session itself has the keyboard. (The cross-process parent/child link
+/// shares one input state, so `GetFocus` on this thread names the child.)
 unsafe fn foreground_is_ours() -> bool {
-    is_ours(GetForegroundWindow())
+    let fg = GetForegroundWindow();
+    if is_ours(fg) {
+        return true;
+    }
+    let tab = EMBEDDED_HWND.load(Ordering::Relaxed);
+    if tab == 0 || fg.0.is_null() {
+        return false;
+    }
+    let tab = HWND(tab as *mut c_void);
+    GetAncestor(tab, GA_ROOT) == fg && GetFocus() == tab
 }
 
 /// Whether `hwnd` is one of this process's windows (our window class; another
@@ -504,6 +564,8 @@ pub const WM_RDPIO_EMBEDDED: u32 = WM_APP + 0x32;
 pub const WM_RDPIO_POPOUT: u32 = WM_APP + 0x33;
 /// This process's window lives inside the launcher (see [`embed_parent`]).
 static EMBEDDED: AtomicBool = AtomicBool::new(false);
+/// That window (0: none), for the keyboard hook (see [`foreground_is_ours`]).
+static EMBEDDED_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// The launcher window to open inside (a Workspace tab): `RDPIO_EMBED_PARENT`,
 /// set by the launcher that started this session.
@@ -622,7 +684,7 @@ impl Window {
             // all we need. Ignore "class already exists" on the off chance.
             let _ = RegisterClassExW(&wc);
 
-            let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+            let title_w: Vec<u16> = titled(title).encode_utf16().chain(std::iter::once(0)).collect();
 
             // A windowed session the launcher opened in a Workspace tab: a
             // child of the launcher's window, hidden until the launcher puts it
@@ -653,6 +715,7 @@ impl Window {
                 let _ = SetPropW(hwnd, TOPMOST_PROP, Some(HANDLE(1 as *mut c_void)));
             }
 
+            EMBEDDED_HWND.store(if parent.is_some() { hwnd.0 as isize } else { 0 }, Ordering::Relaxed);
             if let Some(p) = parent {
                 tracing::info!("opening inside the launcher's Workspace");
                 let _ = PostMessageW(Some(p), WM_RDPIO_EMBEDDED, WPARAM(hwnd.0 as usize), LPARAM(std::process::id() as isize));
@@ -691,6 +754,11 @@ impl Window {
     /// The raw `HWND` value, for handing to the GPU backend.
     pub fn hwnd_raw(&self) -> isize {
         self.hwnd.0 as isize
+    }
+
+    /// The rectangle of the monitor the window is (mostly) on.
+    pub fn monitor_rect(&self) -> Option<rdp_pdu::gcc::VirtualScreenRect> {
+        monitor_rect_of(self.hwnd)
     }
 
     /// No one can see this window's picture: it's minimized, on another
@@ -765,9 +833,10 @@ impl Window {
         }
     }
 
-    /// Update the window title (e.g. to show a reconnecting status).
+    /// Update the window title (e.g. to show a reconnecting status), after the
+    /// connection's name when there is one.
     pub fn set_title(&self, title: &str) {
-        let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let title_w: Vec<u16> = titled(title).encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
             let _ = SetWindowTextW(self.hwnd, PCWSTR(title_w.as_ptr()));
         }
@@ -792,6 +861,19 @@ impl Window {
     /// is signalled: whether that's what ended the wait (the wait took its
     /// signal).
     pub fn wait_for_work_or(&self, timeout_ms: u32, also: Option<isize>) -> bool {
+        self.wait_with_mask(timeout_ms, also, QS_ALLINPUT)
+    }
+
+    /// [`wait_for_work_or`](Self::wait_for_work_or) that sleeps through pointer
+    /// motion (`WM_MOUSEMOVE`, raw input): for a caller that has motion waiting
+    /// to be merged until `timeout_ms` anyway. Keys, buttons, the wheel, sent
+    /// messages (the keyboard hook) and `also` still end it at once; the
+    /// motion is read by the next pump.
+    pub fn wait_for_work_but_motion(&self, timeout_ms: u32, also: Option<isize>) -> bool {
+        self.wait_with_mask(timeout_ms, also, QUEUE_STATUS_FLAGS(QS_ALLINPUT.0 & !(QS_MOUSEMOVE.0 | QS_RAWINPUT.0)))
+    }
+
+    fn wait_with_mask(&self, timeout_ms: u32, also: Option<isize>, mask: QUEUE_STATUS_FLAGS) -> bool {
         let handle = WAKE_EVENT.load(Ordering::Acquire);
         unsafe {
             if handle == 0 {
@@ -810,7 +892,7 @@ impl Window {
             let r = MsgWaitForMultipleObjectsEx(
                 Some(&handles),
                 timeout_ms,
-                QS_ALLINPUT,
+                mask,
                 MWMO_INPUTAVAILABLE,
             );
             also.is_some() && r.0 == 1
@@ -833,6 +915,9 @@ impl Window {
         if QUIT.load(Ordering::SeqCst) {
             return Frame::Quit;
         }
+        // The connection bar of a full-screen session, in every loop that
+        // pumps (Remote Desktop, Hyper, their reconnect waits).
+        crate::connbar::tick(self.hwnd.0 as isize);
 
         let packed = PENDING_RESIZE.swap(0, Ordering::SeqCst);
         let resize = (packed != 0).then_some(((packed >> 16) & 0xffff, packed & 0xffff));
@@ -923,6 +1008,39 @@ impl VirtualDesktop {
             .or_else(|| self.rects.first())
             .copied()
     }
+
+    /// The monitor a session started now goes full screen on: the one the
+    /// pointer is on (a session the launcher starts is started from a click
+    /// in it, so that's the launcher's screen), else the primary.
+    pub fn launch_rect(&self) -> Option<rdp_pdu::gcc::VirtualScreenRect> {
+        let mut pt = windows::Win32::Foundation::POINT::default();
+        if unsafe { GetCursorPos(&mut pt) }.is_err() {
+            return self.primary_rect();
+        }
+        monitor_at(&self.rects, (pt.x, pt.y)).or_else(|| self.primary_rect())
+    }
+}
+
+/// The rectangle of the monitor `hwnd` is (mostly) on.
+pub fn monitor_rect_of(hwnd: HWND) -> Option<rdp_pdu::gcc::VirtualScreenRect> {
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe { GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info) }
+        .as_bool()
+        .then(|| {
+            let r = info.rcMonitor;
+            rdp_pdu::gcc::VirtualScreenRect {
+                left: r.left,
+                top: r.top,
+                right: r.right,
+                bottom: r.bottom,
+                primary: (info.dwFlags & MONITORINFOF_PRIMARY) != 0,
+            }
+        })
+}
+
+/// The monitor among `rects` (right and bottom exclusive) that holds `pt`.
+fn monitor_at(rects: &[rdp_pdu::gcc::VirtualScreenRect], (x, y): (i32, i32)) -> Option<rdp_pdu::gcc::VirtualScreenRect> {
+    rects.iter().find(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom).copied()
 }
 
 /// `EnumDisplayMonitors` callback: append each monitor's `rcMonitor` rectangle
@@ -1094,6 +1212,11 @@ unsafe fn capture_recenter(hwnd: HWND) {
     }
 }
 
+/// How often relative motion parks the cursor again (see the WM_INPUT handler).
+const RECENTER_EVERY_MS: u32 = 100;
+/// The message time (`GetMessageTime`, ms) of the last park from WM_INPUT.
+static LAST_RECENTER: AtomicU32 = AtomicU32::new(0);
+
 /// Register for raw mouse input (usage page 1, usage 2) delivered as WM_INPUT
 /// to this window. Process-wide, once.
 unsafe fn ensure_raw_mouse(hwnd: HWND) {
@@ -1126,6 +1249,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let height = ((lparam.0 >> 16) & 0xffff) as u32;
             if width > 0 && height > 0 {
                 PENDING_RESIZE.store((width << 16) | height, Ordering::SeqCst);
+                // (On-screen notices are sized for the window's screen.)
+                crate::hyper_overlay::set_view(width, windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd));
             }
             if CAPTURE.load(Ordering::SeqCst) && GetFocus() == hwnd {
                 capture_clip(hwnd);
@@ -1207,6 +1332,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         capture_recenter(hwnd);
                     }
                 } else {
+                    // (Released mid-window, as when it was parked per packet.)
+                    if crate::session::rel_mouse_supported() {
+                        capture_recenter(hwnd);
+                    }
                     let _ = ClipCursor(None);
                 }
                 // Re-evaluate cursor visibility immediately.
@@ -1282,9 +1411,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             dx: m.lLastX,
                             dy: m.lLastY,
                         });
-                        // Keep the (hidden) local cursor parked mid-window so it
-                        // never reaches the clip edge.
-                        capture_recenter(hwnd);
+                        // Keep the (hidden) local cursor parked mid-window — every
+                        // RECENTER_EVERY_MS, not per packet: a 1-8 kHz mouse made
+                        // that thousands of SetCursorPos a second, each injecting
+                        // a packet and a WM_MOUSEMOVE of its own. ClipCursor keeps
+                        // it in the window meanwhile, raw deltas don't depend on
+                        // where it is, and clicks in this mode carry no position.
+                        let now = GetMessageTime() as u32;
+                        if now.wrapping_sub(LAST_RECENTER.load(Ordering::Relaxed)) >= RECENTER_EVERY_MS {
+                            LAST_RECENTER.store(now, Ordering::Relaxed);
+                            capture_recenter(hwnd);
+                        }
                     }
                 }
             }
@@ -1522,6 +1659,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_RDPIO_POPOUT => {
             // Out of the Workspace tab: a window of its own, where the tab was.
             if EMBEDDED.swap(false, Ordering::Relaxed) {
+                EMBEDDED_HWND.store(0, Ordering::Relaxed);
                 let mut r = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut r);
                 let _ = SetParent(hwnd, None);
@@ -1685,6 +1823,18 @@ fn fully_covered(target: (i32, i32, i32, i32), above: &[(i32, i32, i32, i32)]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Full screen goes to the screen the pointer is on; a pointer between
+    /// screens (or none found) leaves it to the primary.
+    #[test]
+    fn the_screen_under_the_pointer() {
+        let r = |left, top, right, bottom, primary| rdp_pdu::gcc::VirtualScreenRect { left, top, right, bottom, primary };
+        let screens = [r(0, 0, 1920, 1080, true), r(1920, -200, 4480, 1240, false)];
+        assert_eq!(monitor_at(&screens, (100, 100)).map(|m| m.left), Some(0));
+        assert_eq!(monitor_at(&screens, (1920, 0)).map(|m| m.left), Some(1920));
+        assert_eq!(monitor_at(&screens, (1919, 1079)).map(|m| m.left), Some(0));
+        assert_eq!(monitor_at(&screens, (100, 1100)), None);
+    }
 
     /// Real windows: one put over another covers it; moved aside, it doesn't.
     /// `cargo test -p rdp-client --bin rdpio covered_by_a_window -- --ignored`

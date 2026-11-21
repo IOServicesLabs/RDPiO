@@ -1554,6 +1554,15 @@ struct KeptMonitor {
 /// How long a dropped client's monitor is kept.
 const KEEP_MONITOR: Duration = Duration::from_secs(15);
 
+/// Whether a client's stream gets a virtual monitor of its own size: it
+/// asked to be fitted, no stream size is forced here (`sized`), and this
+/// PC's settings allow it. (Whether a driver can make one is asked
+/// separately.) The offer and the stream decide alike: an offer of the exact
+/// size is a promise the stream keeps.
+fn wants_virtual(fit: bool, sized: bool, settings: &HostSettings) -> bool {
+    fit && !sized && settings.virtual_display && settings.match_resolution
+}
+
 /// Hand a signed-in client this host's rdpio over its session, until it has
 /// it (or goes quiet). Nothing else happens meanwhile: no display changes, no
 /// stream.
@@ -1618,9 +1627,12 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
     socket.set_read_timeout(Some(Duration::from_millis(250)))?;
     crate::hyper_host::recover_after_crash();
     // rdpio Display, when installed: each client gets a monitor of its own
-    // size and refresh rate.
-    let virtual_display = crate::virtual_display::VirtualDisplay::open();
-    tracing::info!(port = opts.port, virtual_display = virtual_display.is_some(), "Hyper direct agent listening");
+    // size and refresh rate. Checked again before every offer, and restarted
+    // between streams when Windows stopped it.
+    let mut virtual_display = crate::virtual_display::VirtualDisplay::new();
+    virtual_display.heal(Duration::from_secs(7));
+    let (display_state, display_using) = (virtual_display.state(), virtual_display.backend_name());
+    tracing::info!(port = opts.port, virtual_display = %display_state, using = display_using, "Hyper direct agent listening");
     let mut sign_in = SignIn::new(secret);
     // A password set while the agent runs applies from the next sign-in.
     let secret_stamp = || std::fs::metadata(secret_path()).and_then(|m| m.modified()).ok();
@@ -1649,12 +1661,22 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
             tracing::info!("no quick reconnect; removing the kept virtual monitor");
             drop(kept.take());
         }
+        if kept.as_ref().is_some_and(|k| !k.monitor.alive()) {
+            tracing::info!("the kept virtual monitor went with its driver; dropping it");
+            drop(kept.take());
+        }
         if grace_until.is_some_and(|t| Instant::now() > t) {
             tracing::info!("client didn't come back; locking the console");
             grace_until = None;
             drop(kept.take());
             lock_session();
             crate::hyper_host::clear_streaming();
+        }
+        // Between streams: notice the driver coming or going, and restart it
+        // when Windows stopped it, so a client usually finds it running.
+        if grace_until.is_none() && kept.is_none() && returning.is_none() {
+            virtual_display.poll();
+            virtual_display.heal(Duration::from_secs(7));
         }
         let (n, from) = match returning.take() {
             Some((d, from)) => {
@@ -1681,6 +1703,11 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
                 }
             }
         }
+        // The virtual display as it is right before an offer.
+        if auth::is_auth(&buf[..n]) {
+            virtual_display.refresh_if_older(Duration::from_millis(300));
+        }
+        let display_usable = virtual_display.usable();
         // The integrated GPU the stream's virtual monitor goes on, on battery
         // or as set (decided with the offer: it caps the codec and the
         // refresh rate) — and whether this stream could go there at all (a
@@ -1691,10 +1718,11 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
             let monitor = rdp_gpu::hyper::list_monitors().ok()?.into_iter().next()?;
             // With the virtual display, exactly the client's screen (made
             // after sign-in); else the desktop, scaled down to fit it.
-            let virtual_monitor = virtual_display.is_some() && want.fit && opts.stream_size.is_none();
+            let settings = host_settings();
+            let virtual_monitor = display_usable && wants_virtual(want.fit, opts.stream_size.is_some(), &settings);
             let exact = virtual_monitor.then(|| crate::virtual_display::even_size(want.width, want.height));
             // (Only a virtual monitor moves GPUs: the host's own stays put.)
-            let battery = virtual_monitor.then(|| crate::host_battery::plan(&want.codecs, host_settings().host_gpu)).flatten();
+            let battery = virtual_monitor.then(|| crate::host_battery::plan(&want.codecs, settings.host_gpu)).flatten();
             let size = exact.or_else(|| crate::hyper_host::client_stream_size(&opts, (monitor.width, monitor.height), want));
             let (width, height) = size.unwrap_or((monitor.width, monitor.height));
             let fps = opts.max_fps.map_or(want.refresh_hz, |cap| want.refresh_hz.min(cap)).max(30);
@@ -1740,8 +1768,8 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
         let settings = host_settings();
         // A monitor kept from a dropped stream at this very size: streamed again.
         let kept_monitor = kept.take();
-        let (virtual_monitor, made_for) = match (&virtual_display, client.fit_to) {
-            (Some(vd), Some((w, h))) if opts.stream_size.is_none() && settings.virtual_display && settings.match_resolution => {
+        let (virtual_monitor, made_for) = match client.fit_to {
+            Some((w, h)) if display_usable && wants_virtual(true, opts.stream_size.is_some(), &settings) => {
                 // Rendered on the fastest GPU (a hybrid laptop's
                 // discrete one), where the encoder is: left to Windows,
                 // it's the integrated GPU the panel hangs off. On battery
@@ -1751,19 +1779,44 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
                 let render_luid = battery_gpu.as_ref().map(|p| p.luid).or_else(rdp_gpu::gpu::chosen_adapter_luid);
                 let made_for = (w, h, client.fps, client.scale, render_luid.unwrap_or(0));
                 match kept_monitor {
-                    Some(k) if k.made_for == made_for => {
+                    Some(k) if k.made_for == made_for && k.monitor.alive() => {
                         tracing::info!(device = %k.monitor.device_name, "a quick reconnect: streaming the kept virtual monitor");
                         (Some(k.monitor), Some(made_for))
                     }
                     other => {
-                        // (A different size: the old one goes first.)
+                        // (A different size, or its driver gone: the old one
+                        // goes first.)
                         drop(other);
+                        // The GPU it renders on warmed up while the monitor
+                        // comes (about a second): the stream's capture then
+                        // makes its device in ~20 ms, not ~150.
+                        if let Some(luid) = render_luid {
+                            rdp_gpu::hyper::warm_device(luid, Duration::from_secs(5));
+                        }
                         let render_adapter = render_luid.map(|l| LUID { LowPart: l as u32, HighPart: (l >> 32) as i32 });
-                        let m = vd
-                            .show(w, h, client.fps, render_adapter)
-                            .inspect(|m| crate::virtual_display::set_scale(&m.device_name, client.scale))
-                            .inspect_err(|e| tracing::warn!(error = %e, "no virtual monitor; streaming the host's own"))
-                            .ok();
+                        let m = match virtual_display.show_healed(w, h, client.fps, render_adapter) {
+                            Ok(m) => {
+                                // The client's display scale, beside the
+                                // stream's start (a helper run as the user
+                                // takes about half a second). After the
+                                // monitor's exact mode: the scale counts from
+                                // that mode's recommended one. It logs how it
+                                // went.
+                                let (name, scale) = (m.device_name.clone(), client.scale);
+                                let started = std::thread::Builder::new()
+                                    .name("vd-scale".into())
+                                    .spawn(move || crate::virtual_display::set_scale(&name, scale));
+                                if started.is_err() {
+                                    crate::virtual_display::set_scale(&m.device_name, client.scale);
+                                }
+                                Some(m)
+                            }
+                            Err(e) => {
+                                let (state, using) = (virtual_display.state(), virtual_display.backend_name());
+                                tracing::warn!(error = %e, state = %state, using, "no virtual monitor; streaming the host's own");
+                                None
+                            }
+                        };
                         (m, Some(made_for))
                     }
                 }
@@ -1794,7 +1847,7 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
         if virtual_monitor.is_some() {
             crate::host_battery::watch(settings.host_gpu, battery_gpu.is_some(), fits_integrated);
         }
-        let end = crate::hyper_host::stream(socket.try_clone()?, client.addr, client.recv, client.send, &stream_opts, &device_name, fps, client.codec, true);
+        let end = crate::hyper_host::stream(socket.try_clone()?, client.addr, client.recv, client.send, &stream_opts, &device_name, fps, client.codec, true, true);
         crate::host_battery::unwatch();
         COMEBACK.lock().unwrap().take();
         returning = take_returning();
@@ -1806,11 +1859,21 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
         // cable be back before the client is, it's streamed again.
         let comes_back = matches!(end, Ok(crate::hyper_host::StreamEnd::Lost | crate::hyper_host::StreamEnd::GpuMove));
         match (virtual_monitor, made_for) {
-            (Some(monitor), Some(made_for)) if comes_back && crate::host_ab::ab("keepmonitor", true) => {
+            (Some(monitor), Some(made_for)) if comes_back && monitor.alive() && crate::host_ab::ab("keepmonitor", true) => {
                 tracing::info!(secs = KEEP_MONITOR.as_secs(), "keeping the virtual monitor for a quick reconnect");
                 kept = Some(KeptMonitor { monitor, made_for, until: Instant::now() + KEEP_MONITOR });
             }
             (m, _) => drop(m),
+        }
+        // The stream's monitor went with its driver: restart the driver now,
+        // briefly, so the client's next sign-in finds it running. (Its handle
+        // closed as the monitor went, which a restart needs.) Only for an end
+        // that holds the session for that sign-in: one that locks the console
+        // locks it first, and the idle loop restarts the driver after.
+        let display_lost = matches!(end, Ok(crate::hyper_host::StreamEnd::DisplayLost));
+        if heal_after(end.as_ref().ok()) && (crate::virtual_display::lost() || display_lost) && !crate::virtual_display::showing() {
+            virtual_display.refresh();
+            virtual_display.heal(crate::virtual_display::SIGN_IN_HEAL);
         }
         // The stream's marker stays until the console is locked: a crash
         // before that is still recovered (and locked) by the next agent.
@@ -1824,6 +1887,13 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
             // it not come back.
             Ok(crate::hyper_host::StreamEnd::GpuMove) => {
                 tracing::info!("the stream moves to the other GPU; holding the session for the client's new sign-in");
+                grace_until = Some(Instant::now() + RECONNECT_GRACE);
+            }
+            // The same for a stream that lost its monitor or broke after it
+            // ran: told to sign in again, onto a new monitor and pipeline.
+            // (One that keeps breaking ends as an error instead: locked.)
+            Ok(end @ (crate::hyper_host::StreamEnd::DisplayLost | crate::hyper_host::StreamEnd::Broke)) => {
+                tracing::info!(?end, "holding the session for the client's new sign-in");
                 grace_until = Some(Instant::now() + RECONNECT_GRACE);
             }
             Ok(crate::hyper_host::StreamEnd::Bye | crate::hyper_host::StreamEnd::Stopping) => {
@@ -1848,6 +1918,14 @@ pub fn run_console_agent(opts: HostOptions) -> Result<(), Box<dyn std::error::Er
 
 use crate::hyper_host::lock_session;
 
+/// Whether a stream's end (None: an error) restarts a lost display driver
+/// at once: only the ends that hold the session for the client's next
+/// sign-in. The others lock the console without waiting on the driver.
+fn heal_after(end: Option<&crate::hyper_host::StreamEnd>) -> bool {
+    use crate::hyper_host::StreamEnd;
+    matches!(end, Some(StreamEnd::DisplayLost | StreamEnd::Broke | StreamEnd::Lost | StreamEnd::GpuMove))
+}
+
 /// How long the console stays unlocked for a client that dropped off the
 /// network (it reconnects automatically).
 const RECONNECT_GRACE: Duration = Duration::from_secs(20);
@@ -1855,6 +1933,30 @@ const RECONNECT_GRACE: Duration = Duration::from_secs(20);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_held_session_waits_on_a_driver_restart() {
+        use crate::hyper_host::StreamEnd;
+        for end in [StreamEnd::DisplayLost, StreamEnd::Broke, StreamEnd::Lost, StreamEnd::GpuMove] {
+            assert!(heal_after(Some(&end)), "{end:?}");
+        }
+        for end in [StreamEnd::Bye, StreamEnd::Stopping, StreamEnd::Moved, StreamEnd::Takeover] {
+            assert!(!heal_after(Some(&end)), "{end:?}");
+        }
+        assert!(!heal_after(None));
+    }
+
+    #[test]
+    fn a_virtual_monitor_only_where_the_settings_allow_it() {
+        let on = HostSettings::default();
+        assert!(wants_virtual(true, false, &on));
+        // Not asked to fit, or a size forced on this host.
+        assert!(!wants_virtual(false, false, &on));
+        assert!(!wants_virtual(true, true, &on));
+        // Either setting off: the offer mustn't promise the exact size.
+        assert!(!wants_virtual(true, false, &HostSettings { virtual_display: false, ..on }));
+        assert!(!wants_virtual(true, false, &HostSettings { match_resolution: false, ..on }));
+    }
 
     /// Run the agent's sign-in loop on loopback until one client signs in.
     fn agent(secret: [u8; 32], stop: Arc<AtomicBool>) -> (SocketAddr, std::thread::JoinHandle<Option<SocketAddr>>) {

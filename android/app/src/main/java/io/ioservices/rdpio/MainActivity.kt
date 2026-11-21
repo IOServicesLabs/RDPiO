@@ -3,6 +3,7 @@ package io.ioservices.rdpio
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
@@ -38,6 +39,11 @@ class MainActivity : Activity() {
     private lateinit var saved: LinearLayout
     private lateinit var resume: Button
     private lateinit var cloud: LinearLayout
+    /** The centred column of cards (its width follows the window: see [onConfigurationChanged]). */
+    private lateinit var content: LinearLayout
+
+    /** Counts [fill]s: a password unsealed for an earlier one isn't put in the form. */
+    private var fillSeq = 0
 
     /** Windows 365: the signed-in account ("" when not), its Cloud PCs, and what's happening. */
     private var cloudUser = ""
@@ -80,9 +86,9 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(28), dp(24), dp(28))
         }
-        val content = LinearLayout(this).apply {
+        content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(dp(560).coerceAtMost(resources.displayMetrics.widthPixels - dp(32)), ViewGroup.LayoutParams.WRAP_CONTENT)
+            layoutParams = LinearLayout.LayoutParams(contentWidth(), ViewGroup.LayoutParams.WRAP_CONTENT)
         }
         column.gravity = Gravity.CENTER_HORIZONTAL
         column.addView(content)
@@ -136,9 +142,15 @@ class MainActivity : Activity() {
         form.addView(label("Frame rate"))
         fps = spinner(fpsChoices.map { if (it == 0) "This screen's fastest ($maxHz Hz)" else "$it fps" })
         form.addView(fps)
-        form.addView(label("Resolution"))
+        form.addView(label("PC display size"))
         resolution = spinner(resolutionChoices.map { pct -> "${w * pct / 100}×${h * pct / 100}" + if (pct == 100) " (this screen)" else "" })
         form.addView(resolution)
+        form.addView(TextView(this).apply {
+            text = "What the PC renders at. To send fewer pixels on a slow connection use Menu → Game/Office resolution (Auto by default)."
+            setTextColor(muted)
+            textSize = 12f
+            setPadding(0, dp(4), 0, 0)
+        })
         form.addView(label("Text size on the PC"))
         scale = spinner(scaleChoices.map { if (it == 0) "Automatic (${Screen.autoScale(this)}%)" else "$it%" })
         form.addView(scale)
@@ -170,7 +182,7 @@ class MainActivity : Activity() {
         content.addView(TextView(this).apply {
             text = "On the PC: install rdpio and its Hyper service (rdpio --hyper-service-install, once, as admin), " +
                 "set the password with rdpio --hyper-set-password, and use the same rdpio version as this app (${packageManager.getPackageInfo(packageName, 0).versionName}).\n\n" +
-                "Keyboard: Ctrl+Shift+M locks the mouse (games), Ctrl+Shift+O game/office, Ctrl+Shift+S stats, Ctrl+Shift+Tab switch session, Ctrl+Shift+Q disconnect, Shift+Esc the menu, Ctrl+Alt+End = Ctrl+Alt+Del."
+                Hotkeys.ALL
             setTextColor(muted)
             textSize = 12f
             setPadding(dp(4), dp(18), dp(4), 0)
@@ -185,8 +197,25 @@ class MainActivity : Activity() {
         Store.load(this).firstOrNull()?.let { fill(it) }
         cloudUser = CloudStore.user(this)
         CloudStore.imported(this).forEach { Native.w365Import(it) }
-        val refresh = CloudStore.refresh(this)
-        if (refresh != null) signIn(refresh, true) else showCloud()
+        // (The kept refresh token is unsealed on the sign-in thread.)
+        if (CloudStore.hasRefresh(this)) signIn(null, true) else showCloud()
+    }
+
+    /** The cards' width: 560 dp, or the window's less a margin when narrower. */
+    private fun contentWidth() = dp(560).coerceAtMost(resources.displayMetrics.widthPixels - dp(32))
+
+    /**
+     * Turned, resized or a keyboard attached (handled here, see the manifest):
+     * the views reflow by themselves; only the cards' fixed width is redone.
+     */
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val lp = content.layoutParams
+        val width = contentWidth()
+        if (lp.width != width) {
+            lp.width = width
+            content.layoutParams = lp
+        }
     }
 
     override fun onResume() {
@@ -233,8 +262,10 @@ class MainActivity : Activity() {
                 })
                 isClickable = true
                 setOnClickListener {
-                    fill(pc)
-                    if (pc.password.isNotEmpty()) go(pc) else password.requestFocus()
+                    if (pc.password.isNotEmpty()) fill(pc) { go(pc) } else {
+                        fill(pc)
+                        password.requestFocus()
+                    }
                 }
                 setOnLongClickListener {
                     AlertDialog.Builder(this@MainActivity)
@@ -252,16 +283,34 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun fill(pc: Pc) {
+    /**
+     * The form from [pc]. A saved password is unsealed off the UI thread (a
+     * Keystore round trip) and put in when it's ready, then [then] runs; a
+     * newer fill meanwhile wins.
+     */
+    private fun fill(pc: Pc, then: (() -> Unit)? = null) {
+        val seq = ++fillSeq
         host.setText(pc.host)
         port.setText(pc.port.toString())
-        password.setText(if (pc.password.isNotEmpty()) Secret.open(pc.password) ?: "" else "")
-        remember.isChecked = pc.password.isNotEmpty() || password.text.isEmpty()
+        password.setText("")
+        remember.isChecked = true
         office.isChecked = pc.office
         fps.setSelection(fpsChoices.indexOf(pc.fps).coerceAtLeast(0))
         resolution.setSelection(resolutionChoices.indexOf(pc.resolution).coerceAtLeast(0))
         scale.setSelection(scaleChoices.indexOf(pc.scale).coerceAtLeast(0))
         codec.setSelection(codecChoices.indexOf(pc.codec).coerceAtLeast(0))
+        if (pc.password.isEmpty()) {
+            then?.invoke()
+            return
+        }
+        thread(name = "unseal") {
+            val pw = Secret.open(pc.password)
+            runOnUiThread {
+                if (seq != fillSeq || isDestroyed) return@runOnUiThread
+                password.setText(pw ?: "")
+                then?.invoke()
+            }
+        }
     }
 
     /** Sign in with the form (or [saved]'s settings), then open the stream. */
@@ -325,13 +374,26 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Sign in with a code from [SignInActivity], or again with the kept refresh token; then list the Cloud PCs. */
-    private fun signIn(code: String, refresh: Boolean) {
+    /**
+     * Sign in with a code from [SignInActivity], or again with the kept
+     * refresh token (code null: unsealed here, off the UI thread); then list
+     * the Cloud PCs.
+     */
+    private fun signIn(code: String?, refresh: Boolean) {
         cloudStatus = "Signing in…"
         cloudError = ""
         showCloud()
         thread(name = "w365-sign-in") {
-            val r = Native.w365SignIn(code, refresh).split('\n')
+            val token = code ?: CloudStore.refresh(this)
+            if (token == null) {
+                // (The kept token couldn't be unsealed: as with none kept.)
+                runOnUiThread {
+                    cloudStatus = ""
+                    showCloud()
+                }
+                return@thread
+            }
+            val r = Native.w365SignIn(token, refresh).split('\n')
             if (r[0] != "ok") {
                 runOnUiThread {
                     cloudStatus = ""
@@ -400,6 +462,8 @@ class MainActivity : Activity() {
             })
         } else {
             if (cloudUser.isNotEmpty()) cloud.addView(note(cloudUser))
+            // (Whether one is kept, not unsealed: that's a Keystore round trip.)
+            val keptPassword = CloudStore.hasPassword(this)
             cloudPcs.forEachIndexed { i, (name, key) ->
                 cloud.addView(LinearLayout(this).apply {
                     orientation = LinearLayout.VERTICAL
@@ -412,7 +476,7 @@ class MainActivity : Activity() {
                         setTextColor(textColor)
                     })
                     addView(TextView(context).apply {
-                        text = (if (CloudStore.password(this@MainActivity) != null) "password saved" else "asks for the password") + "   — tap to connect"
+                        text = (if (keptPassword) "password saved" else "asks for the password") + "   — tap to connect"
                         textSize = 12f
                         setTextColor(muted)
                     })
@@ -469,10 +533,24 @@ class MainActivity : Activity() {
         })
     }
 
-    /** The Cloud PC's sign-in needs the account's password (RDSTLS): the kept one, or ask. */
+    /**
+     * The Cloud PC's sign-in needs the account's password (RDSTLS): the kept
+     * one (unsealed off the UI thread), or ask.
+     */
     private fun connectCloud(index: Int, name: String) {
         if (busy) return
-        CloudStore.password(this)?.let { return startCloud(index, name, it, true) }
+        if (!CloudStore.hasPassword(this)) return askCloudPassword(index, name)
+        thread(name = "unseal") {
+            val kept = CloudStore.password(this)
+            runOnUiThread {
+                // (A second tap meanwhile: the first one's connect wins.)
+                if (busy || isDestroyed) return@runOnUiThread
+                if (kept != null) startCloud(index, name, kept, true) else askCloudPassword(index, name)
+            }
+        }
+    }
+
+    private fun askCloudPassword(index: Int, name: String) {
         val pw = field("Password for $cloudUser", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
         val keep = switch("Remember the password", true)
         val box = LinearLayout(this).apply {

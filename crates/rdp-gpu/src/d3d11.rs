@@ -129,6 +129,17 @@ pub fn device_adapter_luid(device: &ID3D11Device) -> Option<i64> {
     unsafe { device.cast::<IDXGIDevice>().ok()?.GetAdapter().ok().as_ref().and_then(luid_of) }
 }
 
+/// Which GPU and driver `adapter` is, as text that stays the same from one
+/// run to the next until the GPU or its driver changes: vendor, device,
+/// subsystem and revision ids and the user-mode driver's version.
+pub(crate) fn adapter_identity(adapter: &IDXGIAdapter) -> Option<String> {
+    unsafe {
+        let d = adapter.GetDesc().ok()?;
+        let driver = adapter.CheckInterfaceSupport(&IDXGIDevice::IID).ok()?;
+        Some(format!("{:04x}:{:04x}:{:08x}:{:02x} driver {driver:x}", d.VendorId, d.DeviceId, d.SubSysId, d.Revision))
+    }
+}
+
 /// Lightweight D3D11 timestamp-query pair for one GPU operation per frame.
 /// D3D11 timestamps are asynchronous: `begin`/`end` issue commands, and
 /// `collect` reads back the *previous* frame's completed queries.
@@ -341,6 +352,22 @@ pub struct D3D11Renderer {
     /// This window's video layer was given up on (no overlay plane after all,
     /// or it failed): pictures take the one-pass draw instead.
     video_layer_failed: bool,
+    /// Small panels (Hyper's stats, a hint) copied over the picture by
+    /// [`present_nv12`](Self::present_nv12), set by [`set_overlay`](Self::set_overlay).
+    overlays: [Option<Overlay>; OVERLAY_SLOTS],
+}
+
+/// How many panels [`D3D11Renderer::set_overlay`] holds.
+pub const OVERLAY_SLOTS: usize = 2;
+
+/// One panel over the one-pass picture: an RGBA texture uploaded when its
+/// pixels change, and where it sits in the picture.
+struct Overlay {
+    tex: ID3D11Texture2D,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
 }
 
 /// Hyper's video layer: the stream's pictures as NV12 in a DirectComposition
@@ -632,6 +659,9 @@ impl D3D11Renderer {
     }
 
     fn create(hwnd_raw: isize, width: u32, height: u32, software: bool) -> WinResult<Self> {
+        // Start compiling the NV12 shaders now, off this thread, so they are
+        // ready by the first video frame (a no-op once done or started).
+        warm_shaders();
         unsafe {
             let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
             // BGRA support is required for later Direct2D / Media Foundation interop.
@@ -793,6 +823,7 @@ impl D3D11Renderer {
                 video_layer: None,
                 video_layer_failed: false,
                 fit_upload: None,
+                overlays: [None, None],
             };
             renderer.create_rtv()?;
             // Enable multithread protection so the session worker can use the
@@ -2065,9 +2096,11 @@ impl D3D11Renderer {
     /// passes per frame — on an integrated GPU, whose memory is the system's,
     /// gigabytes a second at high frame rates.
     ///
-    /// Only for a picture shown 1:1 with nothing over it: a scaled one (the
-    /// upscaler's kernels), sharpening or per-monitor windows take the usual
+    /// Only for a picture shown 1:1: a scaled one (the upscaler's kernels),
+    /// sharpening or per-monitor windows take the usual
     /// [`blit_texture_slice`](Self::blit_texture_slice) + [`present_frame`](Self::present_frame).
+    /// The panels of [`set_overlay`](Self::set_overlay) are copied over it
+    /// (and keep it off the video layer meanwhile).
     /// `Ok(false)`: not done here (nothing drawn, nothing presented). The
     /// framebuffer isn't touched, so a later [`present_frame`](Self::present_frame)
     /// shows the picture last blitted into it, not this one.
@@ -2080,8 +2113,10 @@ impl D3D11Renderer {
         if (rect.2, rect.3) != (w, h) {
             return Ok(false);
         }
-        // On a hardware overlay plane where the display has one.
-        if self.video_layer_wanted && !self.video_layer_failed && w % 2 == 0 && h % 2 == 0 && rect.0 % 2 == 0 && rect.1 % 2 == 0 {
+        // On a hardware overlay plane where the display has one (not under a
+        // panel: the layer sits above anything drawn into the backbuffer).
+        let panels = self.overlays.iter().any(Option::is_some);
+        if !panels && self.video_layer_wanted && !self.video_layer_failed && w % 2 == 0 && h % 2 == 0 && rect.0 % 2 == 0 && rect.1 % 2 == 0 {
             match unsafe { self.present_on_layer(tex, slice, rect) } {
                 Ok(()) => return Ok(true),
                 Err(e) => {
@@ -2111,6 +2146,19 @@ impl D3D11Renderer {
             if shader.draw(&rtv, tex, slice, (0.0, 0.0, w as f32, h as f32), dst, false, false).is_err() {
                 return Ok(false);
             }
+            if panels {
+                if let Ok(back_buffer) = self.swap_chain.GetBuffer::<ID3D11Texture2D>(0) {
+                    for o in self.overlays.iter().flatten() {
+                        // (Clipped to the picture, as the framebuffer clips them.)
+                        let (right, bottom) = (o.w.min(w.saturating_sub(o.x)), o.h.min(h.saturating_sub(o.y)));
+                        if right == 0 || bottom == 0 {
+                            continue;
+                        }
+                        let src = D3D11_BOX { left: 0, top: 0, front: 0, right, bottom, back: 1 };
+                        self.context.CopySubresourceRegion(&back_buffer, 0, rect.0 + o.x, rect.1 + o.y, 0, &o.tex, 0, Some(&src));
+                    }
+                }
+            }
         }
         self.wait_for_frame();
         let (sync, flags) = self.present_params();
@@ -2119,6 +2167,37 @@ impl D3D11Renderer {
         // present copies it whole.
         self.rotate_dirty(true);
         res.map(|()| true)
+    }
+
+    /// Panel `slot` (below [`OVERLAY_SLOTS`]) over the pictures of
+    /// [`present_nv12`](Self::present_nv12): `(x, y, w, h, rgba)` in picture
+    /// pixels (`rgba` tightly packed, as for [`update_rect`](Self::update_rect)),
+    /// or `None` to take it away. Uploaded here, once: call it when the panel
+    /// changes, not per frame. [`present_frame`](Self::present_frame) doesn't
+    /// draw these (the caller puts panels into the framebuffer there), and a
+    /// [`rebuild`](Self::rebuild) drops them.
+    pub fn set_overlay(&mut self, slot: usize, panel: Option<(u16, u16, u16, u16, &[u8])>) {
+        let Some(entry) = self.overlays.get_mut(slot) else {
+            return;
+        };
+        let Some((x, y, w, h, rgba)) = panel.filter(|&(_, _, w, h, px)| w > 0 && h > 0 && px.len() >= w as usize * h as usize * 4) else {
+            *entry = None;
+            return;
+        };
+        let (x, y, w, h) = (x as u32, y as u32, w as u32, h as u32);
+        // (The texture is kept while the panel's size holds: the stats
+        // change their numbers once a second, not their size.)
+        let tex = match entry.take() {
+            Some(o) if (o.w, o.h) == (w, h) => Some(o.tex),
+            _ => self.create_copy_texture(w, h),
+        };
+        let Some(tex) = tex else {
+            return;
+        };
+        unsafe {
+            self.context.UpdateSubresource(&tex, 0, None, rgba.as_ptr() as *const core::ffi::c_void, w * 4, w * 4 * h);
+        }
+        self.overlays[slot] = Some(Overlay { tex, x, y, w, h });
     }
 
     /// A video picture from the CPU (`nv12`: tightly packed, `sw`×`sh`, BT.601
@@ -3600,42 +3679,104 @@ struct Nv12Shader {
     rtv: Option<ID3D11RenderTargetView>,
 }
 
+/// Bytecode of [`NV12_HLSL`]'s entry points. Compiling needs no device, so it
+/// is done once per process and shared by every renderer (see [`warm_shaders`]).
+struct Nv12Bytecode {
+    vs: Vec<u8>,
+    ps: Vec<u8>,
+    /// `None` when `ps_nv12_slice` did not compile.
+    ps_slice: Option<Vec<u8>>,
+}
+
+/// Filled by [`warm_shaders`]' thread or by the first [`Nv12Shader::new`],
+/// whichever finishes first. Only ever read with `get()`, never waited on.
+static NV12_BYTECODE: std::sync::OnceLock<Nv12Bytecode> = std::sync::OnceLock::new();
+/// Set once a warm-up thread has been started, so it starts at most once.
+static NV12_WARMING: AtomicBool = AtomicBool::new(false);
+
+/// Compile the NV12 colour-conversion shaders on a short-lived background
+/// thread, so the first GPU-decoded video frame does not wait for the HLSL
+/// compiler to load and run on the UI thread. Returns at once. Nothing ever
+/// waits for it: a renderer that needs the shaders before the warm-up is done
+/// compiles them itself, as it always has. Calling it again is a no-op.
+pub fn warm_shaders() {
+    if NV12_BYTECODE.get().is_some() || NV12_WARMING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("shader-warmup".into())
+        .spawn(|| {
+            let start = std::time::Instant::now();
+            match unsafe { compile_nv12() } {
+                Ok(code) => {
+                    let _ = NV12_BYTECODE.set(code);
+                    tracing::debug!(
+                        elapsed_us = start.elapsed().as_micros() as u64,
+                        "NV12 shaders compiled ahead of the first video frame"
+                    );
+                }
+                // The renderer's own compile repeats it and logs the reason.
+                Err(e) => tracing::debug!(error = %e, "NV12 shader warm-up failed"),
+            }
+        });
+    if spawned.is_err() {
+        NV12_WARMING.store(false, Ordering::Release);
+    }
+}
+
+/// Copy a compiled blob out into owned bytes.
+unsafe fn blob_bytes(blob: &ID3DBlob) -> Vec<u8> {
+    core::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec()
+}
+
+/// Compile [`NV12_HLSL`]'s three entry points. The vertex and plain pixel
+/// shader are required; the texture-array variant is optional.
+unsafe fn compile_nv12() -> WinResult<Nv12Bytecode> {
+    let vs = compile_hlsl(
+        NV12_HLSL,
+        windows::core::s!("nv12.hlsl"),
+        windows::core::s!("vs_main"),
+        windows::core::s!("vs_5_0"),
+    )?;
+    let ps = compile_hlsl(
+        NV12_HLSL,
+        windows::core::s!("nv12.hlsl"),
+        windows::core::s!("ps_nv12"),
+        windows::core::s!("ps_5_0"),
+    )?;
+    let ps_slice = compile_hlsl(
+        NV12_HLSL,
+        windows::core::s!("nv12.hlsl"),
+        windows::core::s!("ps_nv12_slice"),
+        windows::core::s!("ps_5_0"),
+    )
+    .ok();
+    Ok(Nv12Bytecode {
+        vs: blob_bytes(&vs),
+        ps: blob_bytes(&ps),
+        ps_slice: ps_slice.as_ref().map(|b| blob_bytes(b)),
+    })
+}
+
 impl Nv12Shader {
     fn new(device: &ID3D11Device, context: &ID3D11DeviceContext) -> WinResult<Self> {
         unsafe {
-            let vs_blob = compile_hlsl(
-                NV12_HLSL,
-                windows::core::s!("nv12.hlsl"),
-                windows::core::s!("vs_main"),
-                windows::core::s!("vs_5_0"),
-            )?;
-            let ps_blob = compile_hlsl(
-                NV12_HLSL,
-                windows::core::s!("nv12.hlsl"),
-                windows::core::s!("ps_nv12"),
-                windows::core::s!("ps_5_0"),
-            )?;
-            let vs_code = core::slice::from_raw_parts(
-                vs_blob.GetBufferPointer() as *const u8,
-                vs_blob.GetBufferSize(),
-            );
-            let ps_code = core::slice::from_raw_parts(
-                ps_blob.GetBufferPointer() as *const u8,
-                ps_blob.GetBufferSize(),
-            );
+            // The warmed-up bytecode when it is ready; otherwise compile here,
+            // as before the warm-up existed, and keep the result for later
+            // renderers. `get()` never blocks on a warm-up still running.
+            let code = match NV12_BYTECODE.get() {
+                Some(code) => code,
+                None => {
+                    let compiled = compile_nv12()?;
+                    let _ = NV12_BYTECODE.set(compiled);
+                    NV12_BYTECODE.get().expect("NV12 bytecode just stored")
+                }
+            };
             let mut vs: Option<ID3D11VertexShader> = None;
-            device.CreateVertexShader(vs_code, None, Some(&mut vs))?;
+            device.CreateVertexShader(&code.vs, None, Some(&mut vs))?;
             let mut ps: Option<ID3D11PixelShader> = None;
-            device.CreatePixelShader(ps_code, None, Some(&mut ps))?;
-            let ps_slice = compile_hlsl(
-                NV12_HLSL,
-                windows::core::s!("nv12.hlsl"),
-                windows::core::s!("ps_nv12_slice"),
-                windows::core::s!("ps_5_0"),
-            )
-            .ok()
-            .and_then(|blob| {
-                let code = core::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+            device.CreatePixelShader(&code.ps, None, Some(&mut ps))?;
+            let ps_slice = code.ps_slice.as_deref().and_then(|code| {
                 let mut ps: Option<ID3D11PixelShader> = None;
                 device.CreatePixelShader(code, None, Some(&mut ps)).ok()?;
                 ps

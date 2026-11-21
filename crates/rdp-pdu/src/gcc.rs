@@ -29,6 +29,11 @@ pub const RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT: u16 = 0x0080;
 /// The client speaks the Graphics Pipeline (MS-RDPEGFX) dynamic channel; without
 /// it Windows opens no graphics channel and the desktop stays black.
 pub const RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL: u16 = 0x0100;
+/// The client can do without the MCS Channel Join Request / Confirm exchange:
+/// when the server answers with [`RNS_UD_SC_SKIP_CHANNELJOIN_SUPPORTED`], every
+/// channel counts as joined once the Attach User Confirm arrives (MS-RDPBCGR
+/// 2.2.1.3.2, 3.2.5.3.8). A server that does not know the bit ignores it.
+pub const RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN: u16 = 0x0800;
 
 // `TS_UD_CS_CORE.connectionType` values (MS-RDPBCGR 2.2.1.3.2). Only honored when
 // `RNS_UD_CS_VALID_CONNECTION_TYPE` is set. The server uses this hint to pick its
@@ -131,10 +136,14 @@ impl Default for ClientCoreData {
             // below, and NETCHAR_AUTODETECT tells it we answer its RTT/bandwidth
             // probes (MS-RDPBCGR 2.2.14) — together they keep the host on its
             // lowest-latency LAN profile instead of a conservative default.
+            // SKIP_CHANNELJOIN offers to drop the channel-join round trips (one
+            // per channel) from the connect; it only takes effect when the
+            // server sets its own flag in reply.
             early_capability_flags: RNS_UD_CS_SUPPORT_ERRINFO_PDU
                 | RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL
                 | RNS_UD_CS_VALID_CONNECTION_TYPE
-                | RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT,
+                | RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT
+                | RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN,
             // Known fast LAN to the host. We still answer continuous auto-detect
             // probes (NETCHAR_AUTODETECT above); LAN is the safe baseline if the
             // server skips detection.
@@ -523,6 +532,12 @@ pub const SC_SECURITY: u16 = 0x0C02;
 /// `SC_NET` — server network data (MCS channel ids).
 pub const SC_NET: u16 = 0x0C03;
 
+/// `TS_UD_SC_CORE.earlyCapabilityFlags` bit (MS-RDPBCGR 2.2.1.4.2): the server
+/// supports skipping the MCS Channel Join Request / Confirm PDUs and, having set
+/// this, "considers all MCS channels as joined after the MCS Attach User Confirm
+/// PDU has been sent". The answer to [`RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN`].
+pub const RNS_UD_SC_SKIP_CHANNELJOIN_SUPPORTED: u32 = 0x0000_0008;
+
 /// An RSA public key extracted from the server's Proprietary Certificate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RsaPublicKey {
@@ -541,6 +556,10 @@ pub struct ServerData {
     /// MCS channel ids assigned to the virtual channels we requested, in order.
     pub channel_ids: Vec<u16>,
     pub version: u32,
+    /// `TS_UD_SC_CORE.earlyCapabilityFlags` (`RNS_UD_SC_*`); 0 when the server
+    /// sent a core block without the field (it is optional, as is the
+    /// `clientRequestedProtocols` before it).
+    pub early_capability_flags: u32,
     pub encryption_method: u32,
     pub encryption_level: u32,
     /// Server random (Standard RDP Security key exchange input).
@@ -622,6 +641,12 @@ pub fn parse_server_data(user_data: &[u8]) -> Option<ServerData> {
         match kind {
             SC_CORE if payload.len() >= 4 => {
                 sd.version = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                // version(4), then the optional clientRequestedProtocols(4) and
+                // earlyCapabilityFlags(4): the flags are only there when both
+                // are (MS-RDPBCGR 2.2.1.4.2), so a shorter block leaves them 0.
+                if payload.len() >= 12 {
+                    sd.early_capability_flags = le_u32(&payload[8..12]);
+                }
             }
             SC_SECURITY if payload.len() >= 8 => {
                 sd.encryption_method = le_u32(&payload[0..4]);
@@ -902,6 +927,57 @@ mod tests {
         let sd = parse_server_data(&ud).unwrap();
         assert_eq!(sd.io_channel_id, 1003);
         assert_eq!(sd.channel_ids, vec![1004]);
+    }
+
+    #[test]
+    fn cs_core_offers_to_skip_the_channel_joins() {
+        let mut out = Vec::new();
+        ClientCoreData::default().encode(&mut out);
+        // earlyCapabilityFlags sits 72 bytes before the end (see the LAN test).
+        let flags = u16::from_le_bytes([out[out.len() - 72], out[out.len() - 71]]);
+        assert_eq!(flags & RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN, 0x0800);
+    }
+
+    /// "McDn" + PER length + an SC_CORE block carrying `payload`, then `rest`.
+    fn server_core(payload: &[u8], rest: &[u8]) -> Vec<u8> {
+        let core_len = 4 + payload.len();
+        let mut ud = b"McDn".to_vec();
+        ud.push((core_len + rest.len()) as u8);
+        ud.extend_from_slice(&[0x01, 0x0c, core_len as u8, 0x00]); // SC_CORE (LE) + length
+        ud.extend_from_slice(payload);
+        ud.extend_from_slice(rest);
+        ud
+    }
+
+    #[test]
+    fn parse_server_data_reads_the_core_early_capability_flags() {
+        // version = RDP 10.12, clientRequestedProtocols = SSL | HYBRID,
+        // earlyCapabilityFlags = DYNAMIC_DST | SKIP_CHANNELJOIN_SUPPORTED; then
+        // the SC_NET block, which must still be reached.
+        let sd = parse_server_data(&server_core(
+            &[0x11, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00],
+            &[0x03, 0x0c, 0x0a, 0x00, 0xeb, 0x03, 0x01, 0x00, 0xec, 0x03],
+        ))
+        .unwrap();
+        assert_eq!(sd.version, 0x0008_0011);
+        assert_eq!(sd.early_capability_flags, 0x0000_000A);
+        assert_ne!(sd.early_capability_flags & RNS_UD_SC_SKIP_CHANNELJOIN_SUPPORTED, 0);
+        assert_eq!(sd.io_channel_id, 1003);
+        assert_eq!(sd.channel_ids, vec![1004]);
+    }
+
+    #[test]
+    fn parse_server_data_accepts_a_core_block_without_the_optional_fields() {
+        // The version alone (older servers), and the version with
+        // clientRequestedProtocols but no flags. The protocols value here has
+        // bit 0x8 set (HYBRID_EX): it must not be read as the skip-join flag.
+        let version_only: &[u8] = &[0x04, 0x00, 0x08, 0x00];
+        let with_protocols: &[u8] = &[0x04, 0x00, 0x08, 0x00, 0x0b, 0x00, 0x00, 0x00];
+        for payload in [version_only, with_protocols] {
+            let sd = parse_server_data(&server_core(payload, &[])).unwrap();
+            assert_eq!(sd.version, 0x0008_0004);
+            assert_eq!(sd.early_capability_flags, 0);
+        }
     }
 
     #[test]
